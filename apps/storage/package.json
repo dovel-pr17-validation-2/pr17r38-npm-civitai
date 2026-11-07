@@ -13,8 +13,8 @@
     "smoke": "tsx scripts/smoke.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.490.0",
-    "@aws-sdk/s3-request-presigner": "^3.490.0",
+    "@aws-sdk/client-s3": "^3.1164.0",
+    "@aws-sdk/s3-request-presigner": "^3.1164.0",
     "@civitai/storage": "workspace:*",
     "fastify": "^5.12.6",
     "prom-client": "^14.2.0",
