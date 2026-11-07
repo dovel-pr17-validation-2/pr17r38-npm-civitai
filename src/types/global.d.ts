@@ -1,0 +1,216 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+import type { MantineSize } from '@mantine/core';
+import type { FileWithPath } from '@mantine/dropzone';
+import type { ImageAnalysisInput } from '~/server/schema/image.schema';
+import type { TrainingResults } from '~/server/schema/model-file.schema';
+import type { MediaType } from '~/shared/utils/prisma/enums';
+import type { ColorDomain } from '~/shared/constants/domain.constants';
+import type { LabelTypes } from '~/store/training.store';
+
+export {};
+
+declare global {
+  /**
+   * @see https://stackoverflow.com/a/59774743
+   */
+  type AsyncReturnType<T extends (...args: any) => Promise<any>> = T extends (
+    ...args: any
+  ) => Promise<infer R>
+    ? R
+    : any;
+
+  type BrowserNativeObject = Date | FileList | File;
+  type DeepPartial<T> = T extends BrowserNativeObject
+    ? T
+    : T extends object
+    ? {
+        [K in keyof T]?: DeepPartial<T[K]>;
+      }
+    : T;
+
+  type Prettify<T> = {
+    [K in keyof T]: T[K];
+  } & NonNullable<unknown>;
+
+  type StringLiteral<T> = T extends string ? (string extends T ? never : T) : never;
+
+  // Utility type to extract string values recursively
+  type Values<T> = T extends object
+    ? Values<T[keyof T]> // Recurse into nested objects
+    : T;
+
+  type MixedObject = Record<string, any>;
+  type BaseEntity = { id: number | string } & MixedObject;
+
+  type Entries<T> = {
+    [K in keyof T]: [K, T[K]];
+  }[keyof T][];
+
+  type CustomFile = {
+    id?: number;
+    url: string;
+    previewUrl?: string;
+    onLoad?: () => void;
+    name?: string;
+    meta?: Record<string, unknown> | null;
+    file?: FileWithPath;
+    height?: number | null;
+    width?: number | null;
+    hash?: string;
+    tags?: Array<{ id: number; name: string; isCategory: boolean }>;
+    // navigation properties
+    uuid?: string;
+    analysis?: ImageAnalysisInput;
+    status?: 'processing' | 'uploading' | 'complete' | 'blocked' | 'error';
+    blockedFor?: string[];
+    message?: string;
+  };
+
+  type DeepRequired<T> = T extends BrowserNativeObject | Blob
+    ? T
+    : {
+        [K in keyof T]-?: NonNullable<DeepRequired<T[K]>>;
+      };
+
+  type DeepNonNullable<T> = { [P in keyof T]-?: NonNullable<T[P]> } & NonNullable<T>;
+
+  type Nullable<T> = { [K in keyof T]: T[K] | null };
+  type Primitive = string | number | boolean | bigint | symbol | undefined | null;
+  type Builtin = Primitive | Date | Error | RegExp;
+  type IsUnknown<Type> = IsAny<Type> extends true ? false : unknown extends Type ? true : false;
+
+  // eslint-disable-next-line no-var, vars-on-top
+  var navigation: { currentEntry: { index: number }; entries(): { url: string | null }[] };
+
+  type TrackedFile = {
+    file: File;
+    progress: number;
+    uploaded: number;
+    size: number;
+    speed: number;
+    timeRemaining: number;
+    name: string;
+    status: 'pending' | 'error' | 'success' | 'uploading' | 'aborted' | 'blocked';
+    abort: () => void;
+    uuid: string;
+    meta?: Record<string, unknown>;
+    id?: number;
+  };
+
+  type ModelFileFormat =
+    | 'SafeTensor'
+    | 'PickleTensor'
+    | 'GGUF'
+    | 'Diffusers'
+    | 'Core ML'
+    | 'ONNX'
+    | 'Other';
+  type ModelFileSize = 'full' | 'pruned';
+  type ModelFileFp =
+    | 'fp32'
+    | 'fp16'
+    | 'bf16'
+    | 'mxfp8'
+    | 'fp8_mixed'
+    | 'fp8_scaled'
+    | 'fp8'
+    | 'int8'
+    | 'nf4'
+    | 'nvfp4'
+    | 'int4';
+  type ModelFileQuantType =
+    | 'None'
+    | 'Q8_0'
+    | 'Q6_K'
+    | 'Q5_K_M'
+    | 'Q5_K_S'
+    | 'Q5_1'
+    | 'Q5_0'
+    | 'Q4_K_XL'
+    | 'Q4_K_M'
+    | 'Q4_K_S'
+    | 'Q4_1'
+    | 'Q4_0'
+    | 'Q3_K_L'
+    | 'Q3_K_XL'
+    | 'Q3_K_M'
+    | 'Q3_K_S'
+    | 'Q2_K_XL'
+    | 'Q2_K'
+    | 'Q2_K_S'
+    | 'IQ4_XS'
+    | 'IQ4_KS'
+    | 'IQ4_NL'
+    | 'IQ3_M'
+    | 'IQ3_S'
+    | 'IQ3_XS'
+    | 'IQ3_XXS'
+    | 'IQ2_XS'
+    | 'IQ2_XXS'
+    | 'IQ2_S'
+    | 'IQ2_M'
+    | 'IQ1_S'
+    | 'IQ1_M'
+    | 'TQ2_0'
+    | 'TQ1_0';
+  type ModelFileComponentType =
+    | 'Checkpoint'
+    | 'VAE'
+    | 'TextEncoder'
+    | 'UNet'
+    | 'DiffusionModel'
+    | 'CLIPVision'
+    | 'CLIP'
+    | 'VisionLanguage'
+    | 'ControlNet'
+    | 'Upscaler'
+    | 'Workflow'
+    | 'Config'
+    | 'Other';
+
+  type UserFilePreferences = {
+    format: ModelFileFormat;
+    size: ModelFileSize;
+    fp: ModelFileFp;
+    quantType?: ModelFileQuantType;
+  };
+
+  type BasicFileMetadata = {
+    format?: ModelFileFormat;
+    size?: ModelFileSize;
+    fp?: ModelFileFp;
+    quantType?: ModelFileQuantType;
+    isRequired?: boolean;
+  };
+
+  // TODO should find a way to merge this with ModelFileMetadata
+  type FileMetadata = BasicFileMetadata & {
+    labelType?: LabelTypes;
+    ownRights?: boolean;
+    shareDataset?: boolean;
+    numImages?: number;
+    numCaptions?: number;
+    uploadDomain?: ColorDomain;
+    selectedEpochUrl?: string;
+    trainingResults?: TrainingResults;
+  };
+
+  type TypeCategory = { id: number; name: string; priority: number; adminOnly: boolean };
+
+  type UploadResult = { url: string; id: string; type: MediaType };
+
+  type ImageUploadResponse = { id: string; uploadURL: string } | { error: string };
+
+  type ElementDataAttributes = {
+    [key: `data-${string}`]: string;
+  };
+
+  interface Window {
+    Twitch: any;
+    isAuthed?: boolean;
+    authChecked?: boolean;
+  }
+
+  type MantineSpacing = MantineSize | number;
+}

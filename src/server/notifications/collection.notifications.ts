@@ -1,0 +1,104 @@
+import { NotificationCategory } from '~/server/common/enums';
+import { createNotificationProcessor } from '~/server/notifications/base.notifications';
+
+export const collectionNotifications = createNotificationProcessor({
+  'contest-collection-item-status-change': {
+    displayName: 'Your item has been reviewed',
+    category: NotificationCategory.Update,
+    toggleable: false,
+    prepareMessage: ({ details }) => ({
+      message: `The item you submitted to the contest "${details.collectionName}" has been ${details.status}.`,
+      url: details.imageId
+        ? `/images/${details.imageId}`
+        : details.modelId
+        ? `/models/${details.modelId}`
+        : details.articleId
+        ? `/articles/${details.articleId}`
+        : details.postId
+        ? `/posts/${details.postId}`
+        : `/collections/${details.collectionId}`,
+    }),
+  },
+  'collection-item-accepted': {
+    displayName: 'Your submission was accepted',
+    category: NotificationCategory.Update,
+    prepareMessage: ({ details }) => ({
+      message: `Your submission to ${details.collectionName} was accepted.`,
+      url: details.imageId
+        ? `/images/${details.imageId}`
+        : details.modelId
+        ? `/models/${details.modelId}`
+        : details.articleId
+        ? `/articles/${details.articleId}`
+        : details.postId
+        ? `/posts/${details.postId}`
+        : `/collections/${details.collectionId}`,
+    }),
+  },
+  'collection-item-rejected': {
+    displayName: "Your submission wasn't accepted",
+    category: NotificationCategory.Update,
+    prepareMessage: ({ details }) => ({
+      message: details.reason
+        ? `Your submission to ${details.collectionName} wasn't accepted. ${details.reason}`
+        : `Your submission to ${details.collectionName} wasn't accepted.`,
+      url: details.imageId
+        ? `/images/${details.imageId}`
+        : details.modelId
+        ? `/models/${details.modelId}`
+        : details.articleId
+        ? `/articles/${details.articleId}`
+        : details.postId
+        ? `/posts/${details.postId}`
+        : `/collections/${details.collectionId}`,
+    }),
+  },
+  // No longer sent — `collection-item-rejected` carries the reason instead. Kept because
+  // getNotificationMessage resolves at render time, so removing it would blank out notifications
+  // already delivered to users.
+  'beggars-board-rejected': {
+    displayName: 'Beggars board entry declined',
+    category: NotificationCategory.Buzz,
+    toggleable: false,
+    prepareMessage: () => ({
+      message: `Your entry to the Buzz Beggars Board was declined. Try again!`,
+      url: `/collections/3870938`,
+    }),
+  },
+  'beggars-board-expired': {
+    displayName: 'Beggars board entry expired',
+    category: NotificationCategory.Buzz,
+    toggleable: false,
+    prepareMessage: () => ({
+      message: `Your submission to the Buzz Beggars Board has expired. Time to make a new entry!`,
+      url: `/collections/3870938`,
+    }),
+  },
+  'collection-update': {
+    displayName: 'New items added to a collection you follow',
+    category: NotificationCategory.Update,
+    toggleable: true,
+    prepareMessage: ({ details }) => ({
+      message: `New items have been added to the "${details.collectionName}" collection.`,
+      url: `/collections/${details.collectionId}`,
+    }),
+  },
+  'collection-submission-received': {
+    displayName: 'New entry submitted to your collection',
+    category: NotificationCategory.Update,
+    toggleable: true,
+    prepareMessage: ({ details }) => ({
+      message: `A new entry was submitted to "${details.collectionName}" and is waiting for review.`,
+      url: `/collections/${details.collectionId}/review`,
+    }),
+  },
+  'collection-invite-received': {
+    displayName: 'You were invited to collaborate on a collection',
+    category: NotificationCategory.Update,
+    toggleable: true,
+    prepareMessage: ({ details }) => ({
+      message: `You've been invited to help run "${details.collectionName}".`,
+      url: `/collections/${details.collectionId}`,
+    }),
+  },
+});

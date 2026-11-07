@@ -1,0 +1,297 @@
+import { useState } from 'react';
+import {
+  Button,
+  Card,
+  Checkbox,
+  Stack,
+  Text,
+  Title,
+  TextInput,
+  Modal,
+  Group,
+  List,
+  Radio,
+  ThemeIcon,
+  Alert,
+  Anchor,
+} from '@mantine/core';
+import { IconAlertTriangle, IconTrash } from '@tabler/icons-react';
+import { useAccountContext } from '~/components/CivitaiWrapped/AccountProvider';
+import { PointerCard } from '~/components/Account/SettingsLayout';
+import { SUPPORT_LINKS } from '~/components/Support/support.constants';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { showErrorNotification } from '~/utils/notifications';
+import { trpc } from '~/utils/trpc';
+
+export function DeleteCard({ flat }: { flat?: boolean } = {}) {
+  const currentUser = useCurrentUser();
+  const { logout } = useAccountContext();
+  const { data: subscriptions, isLoading: subscriptionsLoading } =
+    trpc.subscriptions.getAllUserSubscriptions.useQuery(undefined, {
+      enabled: !!currentUser,
+    });
+  const hasActiveMembership = !subscriptionsLoading && !!subscriptions && subscriptions.length > 0;
+  // The server refuses too (`deleteUserHandler`); this just says so before the user gets there.
+  const restricted = !!currentUser?.muted;
+  // Inline content only: PointerCard already wraps `description` in a <Text>.
+  const restrictedNotice = restricted ? (
+    <>
+      Restricted accounts can&apos;t be closed from account settings. You can still have your
+      account deleted:{' '}
+      <Anchor href={SUPPORT_LINKS.portal} target="_blank" rel="noopener noreferrer" inherit>
+        open a ticket through our support portal
+      </Anchor>{' '}
+      and our team will process it.
+    </>
+  ) : null;
+
+  const deleteAccountMutation = trpc.user.delete.useMutation({
+    async onSuccess() {
+      await logout();
+    },
+    onError(error) {
+      showErrorNotification({ error: new Error(error.message) });
+    },
+  });
+
+  const [membershipWarningModalOpen, setMembershipWarningModalOpen] = useState(false);
+  const [contentModalOpen, setContentModalOpen] = useState(false);
+  const [confirmModalOpen, setConfirmModalOpen] = useState(false);
+  const [modelsChoice, setModelsChoice] = useState('');
+  const [imagesChoice, setImagesChoice] = useState('');
+  const [removeAppData, setRemoveAppData] = useState(false);
+  const [confirmDeleteInput, setConfirmDeleteInput] = useState('');
+
+  const handleDeleteClick = () => {
+    if (hasActiveMembership) {
+      setMembershipWarningModalOpen(true);
+    } else {
+      setContentModalOpen(true);
+    }
+  };
+
+  const handleMembershipWarningConfirm = () => {
+    setMembershipWarningModalOpen(false);
+    setTimeout(() => setContentModalOpen(true), 200);
+  };
+
+  const handleContinue = () => {
+    setContentModalOpen(false);
+    setTimeout(() => setConfirmModalOpen(true), 200);
+  };
+
+  const handleBack = () => {
+    setConfirmModalOpen(false);
+    setTimeout(() => setContentModalOpen(true), 200);
+  };
+
+  const handleCancelAll = () => {
+    setContentModalOpen(false);
+    setConfirmModalOpen(false);
+    setModelsChoice('');
+    setImagesChoice('');
+    setRemoveAppData(false);
+    setConfirmDeleteInput('');
+  };
+
+  const handleConfirmDeletion = () => {
+    setConfirmModalOpen(false);
+    if (currentUser) {
+      deleteAccountMutation.mutateAsync({
+        id: currentUser.id,
+        removeModels: modelsChoice === 'delete',
+        removeImages: imagesChoice === 'now',
+        removeAppData,
+      });
+    }
+  };
+
+  return (
+    <>
+      {/* MEMBERSHIP WARNING MODAL: Show if user has active membership */}
+      <Modal
+        opened={membershipWarningModalOpen}
+        onClose={() => setMembershipWarningModalOpen(false)}
+        title={
+          <Group gap="xs">
+            <ThemeIcon color="red" variant="light" size="lg">
+              <IconAlertTriangle size={20} />
+            </ThemeIcon>
+            <Text fw={600} size="lg">
+              You have an active Membership on this account!
+            </Text>
+          </Group>
+        }
+        centered
+        size="md"
+      >
+        <Stack>
+          <Text fw={500}>Deleting your account will:</Text>
+          <List spacing="xs" size="sm">
+            <List.Item>Permanently cancel your active Membership</List.Item>
+            <List.Item>Permanently remove any remaining Membership time</List.Item>
+            <List.Item>Permanently delete any remaining Buzz balance</List.Item>
+          </List>
+          <Alert color="red" variant="light">
+            <Text size="sm" fw={500}>
+              This cannot be undone. Your Membership and Buzz cannot be refunded, restored, or
+              transferred to another account after deletion.
+            </Text>
+          </Alert>
+          <Stack mt="md">
+            <Button
+              color="red"
+              fullWidth
+              onClick={handleMembershipWarningConfirm}
+              styles={{ label: { whiteSpace: 'normal', lineHeight: 1.4 } }}
+              style={{ height: 'auto', padding: '10px 16px' }}
+            >
+              Yes, permanently delete my account and forfeit my Membership &amp; any remaining Buzz
+              balance
+            </Button>
+            <Button
+              fullWidth
+              variant="outline"
+              onClick={() => setMembershipWarningModalOpen(false)}
+            >
+              Cancel
+            </Button>
+          </Stack>
+        </Stack>
+      </Modal>
+
+      <Modal
+        opened={contentModalOpen}
+        onClose={handleCancelAll}
+        title="What happens to your content?"
+        centered
+      >
+        <Stack>
+          <Radio.Group label="Your models" value={modelsChoice} onChange={setModelsChoice}>
+            <Stack gap="sm" mt="xs">
+              <Radio value="delete" label="Delete them" />
+              <Radio
+                value="keep"
+                label="Keep them public"
+                description="Transferred to an anonymous owner"
+              />
+            </Stack>
+          </Radio.Group>
+          <Radio.Group label="Your images" value={imagesChoice} onChange={setImagesChoice}>
+            <Stack gap="sm" mt="xs">
+              <Radio
+                value="now"
+                label="Delete now"
+                description="Queued right away and cleared in the background — it can take up to a day for them all to disappear"
+              />
+              <Radio
+                value="later"
+                label="Delete after 7 days"
+                description="Hidden in the background (up to a day), then deleted automatically when the window closes"
+              />
+            </Stack>
+          </Radio.Group>
+          <Checkbox
+            label="Also delete my data in apps"
+            description="Everything apps have saved for you, including what you posted in them. Deleted 7 days after your account closes; restore the account before then and it stays"
+            checked={removeAppData}
+            onChange={(event) => setRemoveAppData(event.currentTarget.checked)}
+          />
+          <Group justify="flex-end">
+            <Button variant="outline" onClick={handleCancelAll}>
+              Cancel
+            </Button>
+            <Button color="red" disabled={!modelsChoice || !imagesChoice} onClick={handleContinue}>
+              Continue
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+
+      <Modal opened={confirmModalOpen} onClose={handleCancelAll} title="Confirm" centered>
+        <Stack>
+          <Text>This cannot be undone.</Text>
+          <List spacing="xs" size="sm">
+            <List.Item>
+              {modelsChoice === 'delete'
+                ? 'Your models will be deleted'
+                : 'Your models will stay public under an anonymous owner'}
+            </List.Item>
+            <List.Item>
+              {imagesChoice === 'now'
+                ? 'Your images will be deleted in the background, which can take up to a day'
+                : 'Your images will be hidden in the background within a day, then deleted after 7 days'}
+            </List.Item>
+            <List.Item>
+              {removeAppData
+                ? 'Your data in apps will be deleted after 7 days'
+                : 'Your data in apps will be kept'}
+            </List.Item>
+          </List>
+          <Text size="sm" c="dimmed">
+            Your account closes right away. Images are removed by a background queue, so some may
+            still be visible for up to a day after you confirm.
+          </Text>
+          <Text>
+            Please type <b>DELETE</b> in the box below to confirm:
+          </Text>
+          <TextInput
+            placeholder="Type DELETE to confirm"
+            value={confirmDeleteInput}
+            onChange={(event) => setConfirmDeleteInput(event.currentTarget.value)}
+          />
+          <Group justify="flex-end">
+            <Button variant="outline" onClick={handleBack}>
+              Back
+            </Button>
+            <Button
+              color="red"
+              disabled={confirmDeleteInput.trim().toUpperCase() !== 'DELETE'}
+              onClick={handleConfirmDeletion}
+            >
+              Delete my account
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+
+      {flat ? (
+        <PointerCard
+          id="delete-account"
+          tone="danger"
+          icon={<IconAlertTriangle size={18} />}
+          title="Delete account"
+          description={
+            restrictedNotice ??
+            'You choose what happens to your models and images. This cannot be undone.'
+          }
+          action={
+            <Button
+              color="red"
+              size="compact-sm"
+              leftSection={<IconTrash size={14} />}
+              disabled={restricted}
+              onClick={handleDeleteClick}
+            >
+              Delete account
+            </Button>
+          }
+        />
+      ) : (
+        <Card withBorder>
+          <Stack>
+            <Title order={2}>Delete account</Title>
+            <Text size="sm">
+              Once you delete your account, there is no going back. Please be certain when taking
+              this action.
+            </Text>
+            {restrictedNotice && <Text size="sm">{restrictedNotice}</Text>}
+            <Button variant="outline" color="red" disabled={restricted} onClick={handleDeleteClick}>
+              Delete your account
+            </Button>
+          </Stack>
+        </Card>
+      )}
+    </>
+  );
+}

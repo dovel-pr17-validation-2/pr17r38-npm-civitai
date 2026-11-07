@@ -1,0 +1,36 @@
+import * as z from 'zod';
+import { paginationSchema } from '~/server/schema/base.schema';
+import { CryptoTransactionStatus } from '~/shared/utils/prisma/enums';
+
+export type CreateBuzzCharge = z.infer<typeof createBuzzChargeSchema>;
+export const createBuzzChargeSchema = z.object({
+  // No `.min`/`.max` here, unlike the Stripe route: a negative or a 1e15 `unitAmount` parses.
+  // Keep `.int()` — the service's `unitAmount !== buzzAmount / 10` check compares two
+  // client-supplied values against each other, so a consistent fractional pair passes it and
+  // reaches `createCharge` as a sub-cent `local_price.amount` like "10.004".
+  unitAmount: z.number().int('The transaction amount must be a whole number of cents'),
+  buzzAmount: z.number(),
+});
+
+export type CreateCodeOrder = z.infer<typeof createCodeOrderSchema>;
+export const createCodeOrderSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('Buzz'),
+    buzzAmount: z.number().int().min(1000),
+  }),
+  z.object({
+    type: z.literal('Membership'),
+    tier: z.enum(['bronze', 'silver', 'gold']),
+    months: z.number().int().min(1).max(12),
+  }),
+]);
+
+export type GetPaginatedUserTransactionHistorySchema = z.infer<
+  typeof getPaginatedUserTransactionHistorySchema
+>;
+export const getPaginatedUserTransactionHistorySchema = paginationSchema.merge(
+  z.object({
+    limit: z.coerce.number().min(1).max(200).default(60),
+    statuses: z.array(z.enum(CryptoTransactionStatus)).optional(),
+  })
+);

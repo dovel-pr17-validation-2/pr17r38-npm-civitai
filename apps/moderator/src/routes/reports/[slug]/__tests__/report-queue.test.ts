@@ -1,0 +1,212 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { isHttpError, isRedirect } from '@sveltejs/kit';
+import {
+  DEFAULT_REPORT_REASONS,
+  DEFAULT_REPORT_STATUSES,
+  ReportReason,
+  ReportStatus,
+  reportReasons,
+} from '$lib/reports';
+
+/**
+ * Filter resolution above `getReports` — where every recorded defect in this area has been: a filter
+ * silently omitted, or a default set that drifted from what the queue badge counts.
+ */
+
+const getReports = vi.fn(async (_params: unknown) => ({
+  items: [] as { id: number; entityId: number | null }[],
+  totalItems: 0,
+  page: 1,
+  limit: 20,
+}));
+
+vi.mock('$lib/server/reports.service', () => ({
+  getReports,
+  getReportStatusCounts: vi.fn(async () => ({})),
+  setReportStatus: vi.fn(),
+  updateReportNotes: vi.fn(),
+  getReportedGame: vi.fn(),
+  getGameMirrors: vi.fn(async () => []),
+}));
+vi.mock('$lib/server/moderation-board.service', () => ({ getResolvedPostReportIds: vi.fn() }));
+vi.mock('$lib/server/user-actions.service', () => ({ removePlacement: vi.fn() }));
+vi.mock('$lib/server/game-frame', () => ({ delistGame: vi.fn(), delistReason: vi.fn() }));
+vi.mock('$lib/server/db', () => ({ dbRead: {}, dbWrite: {} }));
+const getStorylineReportHolds = vi.fn(async (_reportIds: number[]) => [] as unknown[]);
+const getDeletedReportStorylines = vi.fn(async (_reportIds: number[]) => [] as unknown[]);
+vi.mock('$lib/server/storyline-takedown.service', () => ({
+  getReportedStorylines: vi.fn(async () => []),
+  getStorylineReportHolds,
+  getDeletedReportStorylines,
+  getReportStorylineId: vi.fn(),
+  setStorylineTakedown: vi.fn(),
+}));
+vi.mock('$lib/server/service-offering-takedown.service', () => ({
+  getReportedServiceOfferings: vi.fn(async () => []),
+  getReportServiceOfferingId: vi.fn(),
+  takedownServiceOffering: vi.fn(),
+}));
+vi.mock('$lib/server/access', () => ({ canAccess: vi.fn(() => true) }));
+
+const { load } = await import('../+page.server');
+
+/** `load` for one slug and query string. `redirect()`/`error()` throw, so callers that expect one catch. */
+const run = (slug: string, query = '?status=Pending') =>
+  load({
+    params: { slug },
+    url: new URL(`https://mod.example/reports/${slug}${query}`),
+    locals: { user: { id: 1 } },
+  } as never);
+
+const caught = async (slug: string, query?: string) => {
+  try {
+    await run(slug, query);
+  } catch (thrown) {
+    return thrown;
+  }
+  throw new Error('expected load to throw');
+};
+
+/** The params `load` passed down to the service. */
+const asked = () => getReports.mock.calls[0][0] as Record<string, unknown>;
+
+beforeEach(() => vi.clearAllMocks());
+
+describe('report queue load', () => {
+  it('404s an unknown report type rather than querying for it', async () => {
+    const thrown = await caught('not-a-report-type');
+
+    expect(isHttpError(thrown)).toBe(true);
+    expect((thrown as { status: number }).status).toBe(404);
+    expect(getReports).not.toHaveBeenCalled();
+  });
+
+  it('canonicalizes a bare landing so the active default filters are in the URL', async () => {
+    const thrown = await caught('image', '');
+
+    expect(isRedirect(thrown)).toBe(true);
+    const location = (thrown as { location: string }).location;
+    const statuses = new URL(location, 'https://mod.example').searchParams.getAll('status');
+    expect(statuses).toEqual(DEFAULT_REPORT_STATUSES);
+    expect(getReports).not.toHaveBeenCalled();
+  });
+
+  it('reads a present-but-empty status as an explicit "all", not as absent', async () => {
+    await run('image', '?status=');
+
+    expect(asked().statuses).toBe('all');
+  });
+
+  it('reads a present-but-empty reason as an explicit "all", and stops hiding automated', async () => {
+    const data = await run('image', '?status=Pending&reason=');
+
+    expect(asked().reasons).toBe('all');
+    expect(data).toMatchObject({ hidingAutomated: false });
+  });
+
+  it('hides automated reports by default — they outnumber human ones by orders of magnitude', async () => {
+    const data = await run('image', '?status=Pending');
+
+    expect(asked().reasons).toEqual(DEFAULT_REPORT_REASONS);
+    expect(data).toMatchObject({ hidingAutomated: true });
+  });
+
+  it('does not echo the default reasons into the filter control', async () => {
+    const data = await run('image', '?status=Pending');
+
+    expect(data).toMatchObject({ reasons: [] });
+  });
+
+  it('drops values that are not real statuses or reasons instead of passing them to SQL', async () => {
+    await run('image', '?status=Pending&status=Nope&reason=NSFW&reason=Nope');
+
+    expect(asked().statuses).toEqual([ReportStatus.Pending]);
+    expect(asked().reasons).toEqual([ReportReason.NSFW]);
+  });
+
+  it('passes page and reportedBy through, and floors a bad page at 1', async () => {
+    await run('image', '?status=Pending&page=-4&reportedBy=%20alice%20');
+
+    expect(asked()).toMatchObject({ page: 1, reportedBy: 'alice', type: 'image' });
+  });
+});
+
+describe('the storyline queue', () => {
+  it('shows the chapters removed while each of its reports was open', async () => {
+    const holds = [{ postId: 602, reportIds: [80] }];
+    getReports.mockResolvedValueOnce({
+      items: [
+        { id: 80, entityId: 2 },
+        { id: 81, entityId: 3 },
+      ],
+      totalItems: 2,
+      page: 1,
+      limit: 20,
+    });
+    getStorylineReportHolds.mockResolvedValueOnce(holds);
+
+    const data = (await run('storyline')) as { storylineHolds: unknown };
+
+    expect(getStorylineReportHolds).toHaveBeenCalledWith([80, 81]);
+    expect(data.storylineHolds).toBe(holds);
+  });
+
+  // A deleted storyline's report has no entity id; the page reads what the delete kept by report.
+  it('reads what each report kept of a deleted storyline, by report id', async () => {
+    const deleted = [{ reportId: 81, title: 'Gone', held: null }];
+    getReports.mockResolvedValueOnce({
+      items: [
+        { id: 80, entityId: 2 },
+        { id: 81, entityId: null },
+      ],
+      totalItems: 2,
+      page: 1,
+      limit: 20,
+    });
+    getDeletedReportStorylines.mockResolvedValueOnce(deleted);
+
+    const data = (await run('storyline')) as { deletedStorylines: unknown };
+
+    expect(getDeletedReportStorylines).toHaveBeenCalledWith([80, 81]);
+    expect(data.deletedStorylines).toBe(deleted);
+  });
+
+  for (const slug of ['game', 'service'])
+    it(`is not read for the ${slug} queue`, async () => {
+      getReports.mockResolvedValueOnce({
+        items: [{ id: 80, entityId: 2 }],
+        totalItems: 1,
+        page: 1,
+        limit: 20,
+      });
+      const data = (await run(slug)) as { storylineHolds: unknown };
+
+      expect(getStorylineReportHolds).not.toHaveBeenCalled();
+      expect(data.storylineHolds).toEqual([]);
+    });
+});
+
+describe('the default reason set', () => {
+  // Literals, NOT `reportReasons.filter(r => r !== Automated)` — that reproduces the definition in
+  // `lib/reports.ts` character for character and so cannot fail. Narrowing this list once left
+  // pending NSFW, CSAM and StickerPlacement reports behind a zero badge.
+  it('carries every reason a human files, and excludes only Automated', () => {
+    expect([...DEFAULT_REPORT_REASONS].sort()).toEqual([
+      'AdminAttention',
+      'CSAM',
+      'Claim',
+      'NSFW',
+      'Ownership',
+      'Spam',
+      'StickerPlacement',
+      'TOSViolation',
+    ]);
+  });
+
+  // Derived on purpose: here the relationship to the enum IS the property.
+  it('leaves no newly added reason silently unqueued', () => {
+    expect([...DEFAULT_REPORT_REASONS].sort()).toEqual(
+      reportReasons.filter((r) => r !== ReportReason.Automated).sort()
+    );
+  });
+});

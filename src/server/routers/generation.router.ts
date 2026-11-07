@@ -1,0 +1,246 @@
+import { gateRuleSchema } from '~/shared/generation/gates';
+import { getByIdSchema } from './../schema/base.schema';
+import {
+  checkResourcesCoverageSchema,
+  generationStatusModeSchema,
+  getGenerationDataSchema,
+  getResourceDataByIdsSchema,
+  resolveImageMetaSchema,
+  resolveWildcardPackSchema,
+  resolveResourceFileSchema,
+  setEvictableSchema,
+  setAdditionalResourceFeeWaivedSchema,
+  setPartnerDisclosureSchema,
+  // sendFeedbackSchema,
+} from '~/server/schema/generation.schema';
+import {
+  checkResourcesCoverage,
+  getGenerationData,
+  getGenerationStatus,
+  getGateRules,
+  getGeneratorMessages,
+  getGenerationConfig,
+  getResourceData,
+  resolveImageMeta,
+  saveGateRule,
+  deleteGateRule,
+  saveGeneratorMessage,
+  deleteGeneratorMessage,
+  setGenerationStatus,
+  setSelfHostedGenerationStatus,
+  // textToImage,
+  // textToImageTestRun,
+  toggleGenerationDisabled,
+  setEvictable,
+  setAdditionalResourceFeeWaived,
+  setPartnerDisclosure,
+} from '~/server/services/generation/generation.service';
+import { generatorMessageSchema } from '~/shared/generation/messages';
+import { moderatorProcedure, protectedProcedure, publicProcedure, router } from '~/server/trpc';
+import { edgeCacheIt, purgeOnSuccess, rateLimit } from '~/server/middleware.trpc';
+import { resolveWildcardPackForUser } from '~/server/services/wildcard-pack.service';
+import { resolveResourceFileForUser } from '~/server/services/resource-file.service';
+import { CacheTTL } from '~/server/common/constants';
+import {
+  getWorkflowDefinitions,
+  setWorkflowDefinition,
+} from '~/server/services/orchestrator/comfy/comfy.utils';
+import * as z from 'zod';
+import { TokenScope } from '~/shared/constants/token-scope.constants';
+import { getRequestBrowsingLevel } from '~/server/utils/browsing-level';
+import { canViewPoiModel } from '~/server/utils/poi-model-visibility';
+import { coverageAudience } from '~/server/services/generation/coverage-source';
+
+export const generationRouter = router({
+  getWorkflowDefinitions: publicProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .query(({ ctx }) =>
+      getWorkflowDefinitions().then((res) =>
+        res
+          .filter((x) => {
+            if (x.status === 'disabled') return false;
+            if (x.status === 'mod-only' && !ctx.user?.isModerator) return false;
+            return true;
+          })
+          .map(({ template, ...rest }) => rest)
+      )
+    ),
+  setWorkflowDefinition: moderatorProcedure
+    .input(z.any())
+    .mutation(({ input }) => setWorkflowDefinition(input.key, input)),
+  getGenerationData: publicProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(getGenerationDataSchema)
+    .query(async ({ input, ctx }) => {
+      const data = await getGenerationData({
+        query: input,
+        user: ctx.user,
+        browsingLevel: getRequestBrowsingLevel(ctx),
+        mediaViewer: ctx,
+      });
+      if (input.type !== 'modelVersion' && input.type !== 'modelVersions') return data;
+      return {
+        ...data,
+        resources: data.resources.filter((r) =>
+          canViewPoiModel(r.model.poi, r.model.userId, ctx.user)
+        ),
+      };
+    }),
+  checkResourcesCoverage: publicProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(checkResourcesCoverageSchema)
+    .use(edgeCacheIt({ ttl: CacheTTL.sm }))
+    .query(({ input }) => checkResourcesCoverage(input)),
+  getStatus: publicProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .use(edgeCacheIt({ ttl: CacheTTL.xs, tags: () => ['generation-status'] }))
+    .query(async () => {
+      // Don't expose the moderator-identity audit stamps on the public,
+      // edge-cached endpoint — they're moderator-only (getStatusModerator).
+      const { updatedBy, selfHostedUpdatedBy, ...status } = await getGenerationStatus();
+
+      // Only surface the status message to clients while the gate is actually
+      // engaged. The message stays persisted in Redis (so operators don't have
+      // to re-enter it when toggling), but a stale/irrelevant message isn't
+      // returned while the mode is 'enabled'. getStatusModerator still returns
+      // the raw stored message so the mod UI can see/edit it.
+      if (status.mode === 'enabled') status.message = null;
+      return status;
+    }),
+  getStatusModerator: moderatorProcedure.query(() => getGenerationStatus()),
+  setStatus: moderatorProcedure
+    .input(
+      z.object({
+        mode: generationStatusModeSchema,
+        message: z.string().max(2000).nullish(),
+      })
+    )
+    .use(purgeOnSuccess(['generation-status']))
+    .mutation(({ input, ctx }) =>
+      setGenerationStatus({
+        mode: input.mode,
+        message: input.message,
+        updatedBy: { id: ctx.user.id, username: ctx.user.username ?? 'unknown' },
+      })
+    ),
+  setSelfHostedStatus: moderatorProcedure
+    .input(z.object({ mode: generationStatusModeSchema }))
+    .use(purgeOnSuccess(['generation-status']))
+    .mutation(({ input, ctx }) =>
+      setSelfHostedGenerationStatus({
+        mode: input.mode,
+        updatedBy: { id: ctx.user.id, username: ctx.user.username ?? 'unknown' },
+      })
+    ),
+  getGenerationConfig: publicProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .query(({ ctx }) =>
+      getGenerationConfig({
+        id: ctx.user?.id,
+        isModerator: ctx.user?.isModerator,
+        tier: ctx.user?.tier,
+      })
+    ),
+  getGateRules: moderatorProcedure.query(() => getGateRules()),
+  saveGateRule: moderatorProcedure
+    .input(gateRuleSchema)
+    .mutation(({ input }) => saveGateRule(input)),
+  deleteGateRule: moderatorProcedure
+    .input(z.object({ id: z.string() }))
+    .mutation(({ input }) => deleteGateRule(input.id)),
+  getGeneratorMessages: moderatorProcedure.query(() => getGeneratorMessages()),
+  saveGeneratorMessage: moderatorProcedure
+    .input(generatorMessageSchema)
+    .mutation(({ input }) => saveGeneratorMessage(input)),
+  deleteGeneratorMessage: moderatorProcedure
+    .input(z.object({ id: z.string() }))
+    .mutation(({ input }) => deleteGeneratorMessage(input.id)),
+  toggleGenerationDisabled: moderatorProcedure
+    .input(getByIdSchema)
+    .mutation(({ input, ctx }) =>
+      toggleGenerationDisabled({ ...input, isModerator: ctx.user.isModerator })
+    ),
+  setEvictable: moderatorProcedure
+    .input(setEvictableSchema)
+    .mutation(({ input, ctx }) => setEvictable({ ...input, isModerator: ctx.user.isModerator })),
+  setAdditionalResourceFeeWaived: moderatorProcedure
+    .input(setAdditionalResourceFeeWaivedSchema)
+    .mutation(({ input, ctx }) =>
+      setAdditionalResourceFeeWaived({ ...input, isModerator: ctx.user.isModerator })
+    ),
+  setPartnerDisclosure: moderatorProcedure
+    .input(setPartnerDisclosureSchema)
+    .mutation(({ input, ctx }) =>
+      setPartnerDisclosure({ ...input, isModerator: ctx.user.isModerator })
+    ),
+  getCoverageAudience: publicProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .query(({ ctx }) => coverageAudience(ctx.user ?? undefined)),
+  getResourceDataByIds: publicProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(getResourceDataByIdsSchema)
+    .query(async ({ input, ctx }) =>
+      (
+        await getResourceData(input.ids, {
+          user: ctx.user,
+          withPreview: true,
+          browsingLevel: getRequestBrowsingLevel(ctx),
+        })
+      ).filter((r) => canViewPoiModel(r.model.poi, r.model.userId, ctx.user))
+    ),
+  resolveImageMeta: publicProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(resolveImageMetaSchema)
+    .query(({ input, ctx }) =>
+      resolveImageMeta({ input, user: ctx.user, browsingLevel: getRequestBrowsingLevel(ctx) })
+    ),
+  // App Blocks wildcard-pack import (W13) — the SESSION-authed resolve step for
+  // the page-host message bridge. A page block posts GET_WILDCARD_PACK to the
+  // PageBlockHost, which calls this with the viewer's real session, then fetches
+  // + unzips the returned signed URL CLIENT-SIDE (bytes never touch a web pod).
+  //
+  // A MUTATION deliberately (not a query, though it reads): the response carries
+  // a short-lived signed download URL, which a `.query` would leak into the
+  // `?input=…` cache key / URL / Referer where it's replayable within its TTL —
+  // the same reasoning as blocks.getMyBuzzBalance. Gating + maturity live in
+  // resolveWildcardPackForUser (all download-gate refusals → NOT_FOUND; a pack
+  // above the viewer's maturity ceiling → FORBIDDEN).
+  resolveWildcardPack: protectedProcedure
+    .use(
+      rateLimit({
+        // A gated file-resolve reachable per block-import click. Bound the rate
+        // so a page block can't hammer the delivery-worker signing path.
+        limit: 30,
+        period: 60,
+        errorMessage: 'Too many wildcard-pack requests — slow down.',
+      })
+    )
+    .input(resolveWildcardPackSchema)
+    .mutation(({ input, ctx }) =>
+      resolveWildcardPackForUser({
+        modelVersionId: input.modelVersionId,
+        user: ctx.user,
+        canViewNsfw: ctx.features.canViewNsfw,
+      })
+    ),
+  // App Blocks GET_RESOURCE_FILE. A mutation for the same signed-URL reason as
+  // resolveWildcardPack; the limiter keys on the procedure path, so this is its
+  // own 30/min bucket.
+  resolveResourceFile: protectedProcedure
+    .use(
+      rateLimit({
+        limit: 30,
+        period: 60,
+        errorMessage: 'Too many resource-file requests — slow down.',
+      })
+    )
+    .input(resolveResourceFileSchema)
+    .mutation(({ input, ctx }) =>
+      resolveResourceFileForUser({
+        modelVersionId: input.modelVersionId,
+        fileId: input.fileId,
+        user: ctx.user,
+        canViewNsfw: ctx.features.canViewNsfw,
+      })
+    ),
+});

@@ -1,0 +1,3716 @@
+/**
+ * Orchestration New Service
+ *
+ * Unified service for submitting generation workflows and what-if requests
+ * using the generation-graph v2 data structure.
+ *
+ * This service uses the generation-graph discriminators to route requests
+ * to the appropriate orchestrator step type:
+ *
+ * 1. WORKFLOW DISCRIMINATOR (first level):
+ *    - vid2vid:interpolate → videoInterpolation step
+ *    - vid2vid:upscale → videoUpscaler step
+ *    - img2img:upscale → comfy step (img2img-upscale)
+ *    - img2img:remove-background → comfy step
+ *    - img2img:preprocess → preprocessImage step
+ *    - vid2vid:preprocess → preprocessVideo step
+ *    - All other workflows → ecosystem discriminator
+ *
+ * 2. ecosystem DISCRIMINATOR (second level - via ecosystemGraph):
+ *    - Routes to appropriate step type based on ecosystem
+ */
+
+import type {
+  PreprocessImageInput,
+  PreprocessImageStepTemplate,
+  WorkflowCost,
+  WorkflowStepTemplate,
+} from '@civitai/orchestration-client';
+// The pinned @civitai/orchestration-client predates preprocessVideo; this comes from
+// orchestration-client.
+import type {
+  Priority as DownloadPriority,
+  PreprocessVideoStepTemplate,
+} from '@civitai/orchestration-client';
+import type { DownloadPreparation } from '~/shared/orchestrator/download-preparation';
+import {
+  attachEstimatedPreparation,
+  normalizePreparation,
+} from '~/shared/orchestrator/download-preparation';
+import { createVideoPreprocessStep } from './handlers/video-preprocess.handler';
+import { collectStepWarnings } from './step-warnings';
+import type { GenerationData, LooseGenerationData } from './form-graph/types';
+import { AVATAR_WORKFLOW } from '~/shared/constants/avatar-styles.constants';
+import { workflowOutputRestrictions } from './form-graph/output-restrictions';
+import {
+  getInputTypeForWorkflow,
+  isWorkflowAvailable,
+  workflowConfigByKey,
+} from '~/shared/generation/config/workflows';
+import type { GenerationCtx } from '~/shared/generation/context';
+import { resourceSchema, type ResourceData } from '~/shared/generation/values';
+import {
+  getGateRules,
+  resolveTestingAccess,
+  getResourceData,
+  getSelfHostedDisabledEcosystems,
+} from '~/server/services/generation/generation.service';
+import { applicableRulesFor, gatedSelectionRefusal } from '~/shared/generation/gates';
+import { emitModelSubstitutions } from '~/server/metrics/emit-model-substitutions';
+import {
+  createModelSubstitutionCollector,
+  projectModelSubstitutions,
+  readModelSubstitutionsFromMetadata,
+  WORKFLOW_METADATA_MODEL_SUBSTITUTIONS_KEY,
+  type GenerationSurface,
+  type PersistedModelSubstitution,
+} from '~/shared/generation/model-substitution';
+import { classifyModelSubstitutionReason } from '~/shared/generation/workflow-capability';
+import type { GenerationResource, GenerationResourceValue } from '~/shared/types/generation.types';
+import {
+  redis,
+  REDIS_KEYS,
+  REDIS_SYS_KEYS,
+  sysRedis,
+  withSysReadDeadline,
+} from '~/server/redis/client';
+import type { RedisKeyTemplateCache } from '~/server/redis/client';
+import { fetchThroughCache } from '~/server/utils/cache-helpers';
+import { logSysRedisFailOpen } from '~/server/redis/fail-open-log';
+import { generationStatusSchema } from '~/server/schema/generation.schema';
+import type { GenerationStatus, GenerationStatusMode } from '~/server/schema/generation.schema';
+import type { TextToImageResponse } from '~/server/services/orchestrator/types';
+import {
+  assertGenerationInputsUsable,
+  generationInputUrlsIn,
+} from '~/server/services/generation-input-urls';
+import type { GenerationInputEntryPoint } from '~/server/services/generation-input-urls';
+import { buildWorkflowTips } from '~/server/services/orchestrator/workflow-tips';
+import {
+  getWorkflow,
+  setWorkflowDownloadPriority,
+  submitWorkflow,
+  updateWorkflow as clientUpdateWorkflow,
+} from '~/server/services/orchestrator/workflows';
+import {
+  assertWorkflowOwner,
+  workflowOwnerId,
+} from '~/server/services/orchestrator/assert-workflow-owner';
+import {
+  getAirEcosystem,
+  getEcosystemByAirSegment,
+  isRawAirResource,
+  parseRawAirResourceUrn,
+  rawAirGenerationResource,
+  rawAirResourceId,
+  type RawAirResource,
+} from '~/shared/utils/air';
+import type { WorkflowUpdateSchema } from '~/server/schema/orchestrator/workflows.schema';
+import type { ColorDomain } from '~/shared/constants/domain.constants';
+import { CacheTTL } from '~/server/common/constants';
+import { canGenerateWithEpoch } from '~/server/common/model-helpers';
+import {
+  isActiveTrainingStepStatus,
+  trainingWorkflowEpochBlobs,
+} from '~/server/services/orchestrator/training/training-epoch-blobs';
+import { mapDataToGraphInput } from './legacy-metadata-mapper';
+import { getHighestTierSubscription } from '~/server/services/subscriptions.service';
+import { sleep, throwBadRequestError } from '~/server/utils/errorHandling';
+import { withSpan } from '~/server/utils/otel-helpers';
+import { getOrchestratorCallbacks } from '~/server/orchestrator/orchestrator.utils';
+import { REMIX_APP_TAG } from '~/shared/remix-apps/tags';
+import { getPolyGenPrimaryModel } from '~/server/orchestrator/polygen/polygen-output';
+import { BuzzTypes, type BuzzSpendType } from '~/shared/constants/buzz.constants';
+import { Availability } from '~/shared/utils/prisma/enums';
+import { isDefined } from '~/utils/type-guards';
+import { getResourceResidency } from '~/server/services/resource-residency.service';
+import { WORKFLOW_TAGS, VID_QUANTITY_BY_TIER } from '~/shared/constants/generation.constants';
+import { includesPoi, isBlankAuditInput } from '~/utils/metadata/audit';
+import { BlocklistType } from '~/server/common/enums';
+import { stripBenignPhrases } from '~/server/services/blocklist.service';
+import { normalizeText } from '~/utils/normalize-text';
+import { ecosystemByKey } from '~/shared/constants/basemodel.constants';
+import { toStepMetadata, asResourceValue } from '~/shared/utils/resource.utils';
+import { anyTipEligible } from '~/shared/utils/creator-tip';
+import { randomInt } from 'crypto';
+import { MAX_RANDOM_SEED } from '~/shared/constants/generation.constants';
+import { auditPromptServer } from '~/server/services/orchestrator/promptAuditing';
+import { createXGuardModerationRequest } from '~/server/services/orchestrator/orchestrator.service';
+import { submitSourceForSurface } from '~/server/services/orchestrator/orchestrator-submit-metrics';
+import { clampExternalModerationSource } from '~/server/prom/external-moderation.metrics';
+import { generationValidationRefusedCounter } from '~/server/prom/generation-validation.metrics';
+import { logToAxiom } from '~/server/logging/client';
+import type { FeatureAccess } from '~/server/services/feature-flags.service';
+import { expandSnippetsToTargets } from '~/server/services/wildcard-set-resolver.service';
+import { parsePromptSnippetReferences } from '~/utils/prompt-helpers';
+
+// Ecosystem handlers - unified router
+import { createFormGraphStepInput } from './form-graph';
+import { createAvatarSteps, expandAvatarData } from './form-graph/avatar.handler';
+import { substitutionsFromNotes } from '~/shared/generation/model-substitution';
+import { generationHub } from '~/shared/form-graph/generation/hub.graph';
+import { reconcileSelectors } from '~/shared/form-graph/generation/reconcile';
+import { createComfyInput, resourcesToImageMetadataResources } from './handlers/comfy-input';
+import { withImageMetadata } from './step-image-metadata';
+import { sanitizeStepErrors } from './provider-errors';
+import { resolveSourceImageIds, signProvenance, unionSourceImageIds } from './remix-provenance';
+import { removeEmpty } from '~/utils/object-helpers';
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/** Context provided by the router */
+export type GenerationContext = {
+  token: string;
+  userId: number;
+  experimental?: boolean;
+  allowMatureContent?: boolean;
+  isGreen?: boolean;
+  currencies?: BuzzSpendType[];
+  isModerator?: boolean;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  track?: any; // Tracker class from createContext
+  civitaiTip?: number;
+  creatorTip?: number;
+  tags?: string[];
+  sourceMetadata?: {
+    params?: Record<string, unknown>;
+    resources?: Array<Record<string, unknown>>;
+    [key: string]: unknown;
+  };
+  sourceMetadataMap?: Record<
+    string,
+    {
+      params?: Record<string, unknown>;
+      resources?: Array<Record<string, unknown>>;
+      transformations?: Array<{
+        workflow: string;
+        params?: Record<string, unknown>;
+        resources?: Array<Record<string, unknown>>;
+      }>;
+    }
+  >;
+  /**
+   * Provenance tokens minted by `orchestrator.mintRemixProvenance` for the source
+   * images this submission started from. Verified here, never trusted: a token is
+   * sealed with a server key and bound to the submitting user, so it is a
+   * credential rather than a claim. See `remix-provenance.ts`.
+   */
+  sourceProvenance?: string[];
+  remixOfId?: number;
+  // Forwarded to orchestrator workflow-create as `externalId`; makes the submit
+  // idempotent on retry and lets the funnel dashboard join Generator_Submit to
+  // orchestration.jobs.externalId. See civitai/civitai-orchestration#229.
+  externalId?: string;
+  /** User saw a soft-block prompt warning and chose to proceed. See `auditPromptServer`. */
+  acknowledgedSoftBlock?: boolean;
+  /** Stored as `metadata.remixRun`; user-writable afterwards, like the rest of the metadata. */
+  remixRun?: Record<string, unknown>;
+};
+
+/** Options for submitting a generation */
+export type GenerateOptions = {
+  input: Record<string, unknown>;
+  externalCtx: GenerationCtx;
+  downloadPriority?: DownloadPriority;
+  inputGate: GenerationInputGate;
+} & GenerationContext;
+
+/**
+ * Which caller a graph input came through, for `assertGenerationInputsUsable`. `'checked-by-caller'`
+ * is for server-composed input whose urls the calling route already checked (comics, iterate).
+ */
+export type GenerationInputGate =
+  | { entry: GenerationInputEntryPoint; isApiCaller: boolean }
+  | 'checked-by-caller';
+
+/** Every url the validated graph input carries must pass the generation input gate. */
+async function assertGraphInputsUsable(
+  data: unknown,
+  userId: number | undefined,
+  gate: GenerationInputGate
+) {
+  if (gate === 'checked-by-caller') return;
+  await assertGenerationInputsUsable({
+    urls: generationInputUrlsIn(data),
+    userId: userId ?? 0,
+    ...gate,
+  });
+}
+
+/** Options for what-if requests */
+export type WhatIfOptions = {
+  input: Record<string, unknown>;
+  externalCtx: GenerationCtx;
+  inputGate: GenerationInputGate;
+  userId?: number;
+  isModerator?: boolean;
+  experimental?: boolean;
+  token: string;
+  currencies?: BuzzSpendType[];
+  downloadPriority?: DownloadPriority;
+};
+
+/**
+ * Step input returned by step creators.
+ * Based on WorkflowStepTemplate with required $type and input.
+ * Allows optional overrides for priority and metadata at the creator level.
+ *
+ * Step creators that need per-step source metadata (e.g., upscale, remove-bg,
+ * or chained workflows) should call `buildResolvedSource` and set the
+ * `resolvedSource` field so the wrapper uses pre-computed source metadata.
+ */
+type StepInput = Omit<WorkflowStepTemplate, 'priority'> & {
+  // orchestration-client steps (preprocessVideo, ming, qwen) carry its wider
+  // Priority, which adds 'idle'
+  priority?: WorkflowStepTemplate['priority'] | DownloadPriority;
+  input: unknown;
+  /** Pre-computed source metadata from step creators via `buildResolvedSource`. */
+  resolvedSource?: { metadata: Record<string, unknown>; imageMetadata: string };
+};
+
+/** The ecosystem-bearing arms of the parsed payload. */
+type EcosystemGraphOutput = Extract<GenerationData, { ecosystem: string }>;
+
+/**
+ * A Map that throws an error when getting a value that doesn't exist.
+ * Used for AIR lookups where a missing value indicates a data problem.
+ */
+export class StrictAirMap extends Map<number, string> {
+  /**
+   * Gets the AIR string for a resource ID.
+   * @throws Error if the resource ID is not found in the map.
+   */
+  getOrThrow(resourceId: number): string {
+    const air = this.get(resourceId);
+    if (!air) {
+      // A missing AIR means the submitted form data references a resource that did
+      // NOT enrich (a deleted/unavailable resource, or a form↔enrichment mismatch)
+      // — a CLIENT/DATA fault, not a server failure. Throw a BAD_REQUEST TRPCError
+      // (via throwBadRequestError) so `classifyErrorFault` treats it as a client
+      // fault → logged at info, surfaced as HTTP 400 — instead of a plain Error that
+      // tRPC wraps into a generic INTERNAL_SERVER_ERROR (500). This was ~10% of the
+      // orchestrator.whatIfFromGraph / generateFromGraph 500s (the loudest single
+      // instance being the dead resource 3005242). Message preserved verbatim.
+      throw throwBadRequestError(
+        `AIR not found for resource ID ${resourceId}. ` +
+          `This indicates a mismatch between form data and enriched resources.`
+      );
+    }
+    return air;
+  }
+}
+
+/**
+ * Context passed to generation handlers.
+ * Provides pre-computed AIR strings from server-side resource enrichment.
+ */
+export type GenerationHandlerCtx = {
+  /**
+   * Map of resource version ID to pre-computed AIR string.
+   * Use `airs.getOrThrow(id)` to get the AIR and throw if not found.
+   */
+  airs: StrictAirMap;
+  /**
+   * The user initiating the generation request.
+   */
+  user: { id: number; isModerator: boolean };
+  /**
+   * Index in the final flat steps array at which this handler's first step
+   * will sit. Handlers that emit cross-step `$ref` objects (e.g. preprocess
+   * → gen step) must use this as the base when computing ref indices —
+   * variants from the snippets-overlay loop are concatenated into one array,
+   * so per-variant local indices would resolve to the wrong step.
+   *
+   * Defaults to 0 when not threaded (e.g. legacy single-variant callers or
+   * what-if cost estimation, where refs aren't resolved).
+   */
+  baseStepIndex: number;
+};
+
+// =============================================================================
+// External Context Builder
+// =============================================================================
+
+/** Result of buildGenerationContext including status for early checks */
+export type GenerationContextResult = {
+  externalCtx: GenerationCtx;
+  status: {
+    mode: GenerationStatusMode;
+    message?: string;
+  };
+};
+
+async function getGenerationStatus(): Promise<GenerationStatus> {
+  // Fail open: a sysRedis outage shouldn't crash generation context build.
+  let raw: string | null | undefined;
+  try {
+    // Wall-clock deadline so a silent sysRedis half-open can't park this read
+    // (runs while building the generation context) ~11min.
+    raw = await withSysReadDeadline(
+      sysRedis.hGet(REDIS_SYS_KEYS.SYSTEM.FEATURES, REDIS_SYS_KEYS.GENERATION.STATUS)
+    );
+  } catch (err) {
+    logSysRedisFailOpen('defaults-firing', 'getGenerationStatus orchestration-new', err);
+    raw = undefined;
+  }
+  return generationStatusSchema.parse(JSON.parse(raw ?? '{}')) as GenerationStatus;
+}
+
+/**
+ * Builds the GenerationCtx from user tier information.
+ * Fetches generation status (tier-based limits) and the per-user gated
+ * version IDs (so the graph filters dropdowns and validates submissions
+ * against the same gate that `getResourceCanGenerate` enforces).
+ *
+ * @param userTier - The user's subscription tier
+ * @param flags - Feature access flags
+ * @param user - User info used to resolve mod-only / testing gating
+ * @param surface - 🔴 REQUIRED, and deliberately not defaulted (issue #3520).
+ *   Which caller is validating: `onsite` (the on-site generator under a cookie
+ *   session), `api` (the same tRPC procedures reached with a bearer token —
+ *   #3665; resolve it with `generationSurfaceForRequest(ctx)`, never a literal),
+ *   `block` (the App Blocks bridge) or `preset` (comics / preset generation).
+ *   It becomes the
+ *   `surface` label on `civitai_generation_model_substitutions_total`, and the
+ *   split is load-bearing: #3520 calls the substitution CORRECT on-site and
+ *   unobservable through the bridge, so one un-split series measures a
+ *   contaminated quantity. Required (not optional-with-a-default) so a NEW
+ *   generation entry point is a compile error here rather than silent
+ *   misattribution to whichever surface the default happened to name.
+ * @returns GenerationCtx with limits, user info, and gated IDs, plus status for availability checks
+ */
+export async function buildGenerationContext(
+  userTier: GenerationCtx['user']['tier'] = 'free',
+  flags: Partial<FeatureAccess> | undefined,
+  user: { id?: number; isModerator?: boolean } | undefined,
+  surface: GenerationSurface
+): Promise<GenerationContextResult> {
+  const [status, hasTestingAccess, gateRules] = await Promise.all([
+    getGenerationStatus(),
+    resolveTestingAccess(user ?? {}),
+    getGateRules(),
+  ]);
+  const limits = status.limits[userTier];
+
+  return {
+    externalCtx: {
+      limits: {
+        maxQuantity: limits.quantity,
+        maxResources: limits.resources,
+        vidQuantity: VID_QUANTITY_BY_TIER[userTier] ?? 1,
+      },
+      user: {
+        isMember: userTier !== 'free',
+        tier: userTier,
+      },
+      flags,
+      // Server-side enforcement of the self-hosted toggle: the ecosystem node
+      // rejects these on submit, so a free user in `memberOnly` (or anyone in
+      // `disabled`) can't generate a self-hosted ecosystem even if they bypass
+      // the client. Mods get an empty list.
+      selfHostedDisabledEcosystems: getSelfHostedDisabledEcosystems({
+        selfHostedMode: status.selfHostedMode,
+        isMember: userTier !== 'free',
+        isModerator: user?.isModerator,
+      }),
+      selfHostedMode: status.selfHostedMode,
+      // Server-side enforcement of gate rules: graph nodes reject hidden/disabled targets on submit.
+      gateRules: applicableRulesFor(gateRules, {
+        isModerator: !!user?.isModerator,
+        isMember: userTier !== 'free',
+        hasTestingAccess,
+      }),
+      // 🔴 PER-REQUEST, and attached to THIS freshly-built object literal only
+      // (issue #3520). `status` / `gateRules` above are awaited from process-
+      // and redis-level CACHES; hanging a mutable
+      // collector off anything reachable through them would accumulate
+      // substitutions across users and leak one caller's requested model id into
+      // another caller's snapshot. This function returns a brand-new object on
+      // every call with no memoization, so the collector's lifetime is exactly
+      // one request. The `surface` rides on the collector because `validateInput`
+      // (where the metric is emitted) is shared by every surface and cannot tell
+      // them apart.
+      modelSubstitutions: createModelSubstitutionCollector(
+        classifyModelSubstitutionReason,
+        surface
+      ),
+    },
+    status: {
+      mode: status.mode,
+      message: status.message ?? undefined,
+    },
+  };
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+/** Resource reference with optional epoch for getResourceData */
+type ResourceRef = { id: number; epoch?: number };
+
+/**
+ * Collects all resource references from generation graph output.
+ * Returns IDs with epoch info from model, resources, and vae fields where present.
+ */
+function collectResourceIds(data: GenerationData): ResourceRef[] {
+  const refs: ResourceRef[] = [];
+
+  if ('model' in data && data.model?.id) {
+    refs.push({
+      id: data.model.id,
+      epoch: 'epochDetails' in data.model ? data.model.epochDetails?.epochNumber : undefined,
+    });
+  }
+  if ('resources' in data && data.resources) {
+    refs.push(
+      // Raw-AIR resources (negative synthetic ids) have no ModelVersion row —
+      // they're validated separately in validateRawAirResources.
+      ...data.resources
+        .filter((r) => !isRawAirResource(r))
+        .map((r) => ({
+          id: r.id,
+          epoch: 'epochDetails' in r ? r.epochDetails?.epochNumber : undefined,
+        }))
+    );
+  }
+  if ('upscaler' in data && data.upscaler?.id) {
+    refs.push({ id: data.upscaler.id });
+  }
+  if ('vae' in data && data.vae?.id) {
+    refs.push({
+      id: data.vae.id,
+      epoch: 'epochDetails' in data.vae ? data.vae.epochDetails?.epochNumber : undefined,
+    });
+  }
+
+  return refs;
+}
+
+/** Enriched resource with air string (always populated by getResourceData) */
+type EnrichedResource = GenerationResource & { air: string };
+
+/** Raw orchestrator-blob AIR resources present in the graph output (negative ids). */
+function collectRawAirResources(data: GenerationData): RawAirResource[] {
+  if (!('resources' in data) || !data.resources) return [];
+  return data.resources.filter(isRawAirResource).map((r) => ({
+    id: r.id,
+    air: r.air,
+    workflowId: r.workflowId,
+    strength: r.strength,
+    name: r.name,
+  }));
+}
+
+/**
+ * Validates raw orchestrator-blob AIR resources — training epochs referenced
+ * directly by blob key, with no ModelVersion row.
+ *
+ * Ownership is the load-bearing check: the blob key is unguessable but that is
+ * NOT authorization, so each resource must name the training workflow it came
+ * from, that workflow is fetched with the CALLER'S orchestrator token (the
+ * orchestrator scopes reads to the token's consumer — a stranger's workflowId
+ * 404s), and the AIR's blob key must match one of the workflow's epoch blobs.
+ *
+ * NSFW/POI/canGenerate gates deliberately don't apply here: there is no model
+ * row to read flags from, and the content is the caller's own training output —
+ * the ownership + ecosystem checks replace the DB-side canGenerate derivation.
+ */
+async function validateRawAirResources({
+  resources,
+  user,
+  orchestratorToken,
+  requestEcosystem,
+}: {
+  resources: RawAirResource[];
+  user?: { id?: number; isModerator?: boolean };
+  orchestratorToken?: string;
+  requestEcosystem?: string;
+}): Promise<void> {
+  if (resources.length === 0) return;
+  if (!user?.id) throw throwBadRequestError('You must be logged in to use epoch resources.');
+  if (!orchestratorToken)
+    throw throwBadRequestError('Epoch resources are not supported on this generation path.');
+
+  const requestAirEcosystem = requestEcosystem ? getAirEcosystem(requestEcosystem) : undefined;
+  const byWorkflow = new Map<string, { blobKey: string; label: string; airEcoKey: string }[]>();
+  // The pairing check below makes a duplicate id imply a duplicate AIR — except through an FNV
+  // collision between two different AIRs, which would silently overwrite in the AIR map.
+  const airById = new Map<number, string>();
+  for (const resource of resources) {
+    const label = resource.name ?? resource.air;
+    const parsed = parseRawAirResourceUrn(resource.air);
+    if (!parsed) throw throwBadRequestError(`Invalid epoch resource: ${label}`);
+    // The id must be THE id for this AIR: two resources claiming one id but different AIRs
+    // would silently overwrite each other in the AIR map after validation.
+    if (resource.id !== rawAirResourceId(resource.air)) {
+      throw throwBadRequestError(`Epoch resource "${label}" has a mismatched resource id.`);
+    }
+    const priorAir = airById.get(resource.id);
+    if (priorAir !== undefined && priorAir !== resource.air) {
+      throw throwBadRequestError(`Epoch resource "${label}" conflicts with another resource.`);
+    }
+    airById.set(resource.id, resource.air);
+    // The AIR segment can be a root OR child ecosystem key ('sdxl',
+    // 'flux2klein'); compare root-to-root against the request's ecosystem.
+    const airEco = getEcosystemByAirSegment(parsed.ecosystem);
+    if (!airEco) {
+      throw throwBadRequestError(
+        `Epoch resource "${label}" references an unknown ecosystem "${parsed.ecosystem}".`
+      );
+    }
+    if (requestAirEcosystem && getAirEcosystem(airEco.key) !== requestAirEcosystem) {
+      throw throwBadRequestError(
+        `Epoch resource "${label}" is not compatible with the selected ecosystem.`
+      );
+    }
+    if (!resource.workflowId) {
+      throw throwBadRequestError(
+        `Epoch resource "${label}" must reference the training workflow it came from.`
+      );
+    }
+    // Owner check on the `<userId>-<timestamp>` id shape. An unreadable owner is a rejection,
+    // not a fall-through — every real workflow id parses, and assertBlockWorkflowMintedForViewer
+    // set that rule for request-supplied workflow ids (the orchestrator has resolved a correct
+    // token to the wrong user before). The token-scoped fetch below stays the authoritative guard.
+    const claimedOwner = workflowOwnerId(resource.workflowId);
+    if (claimedOwner === null || claimedOwner !== user.id) {
+      throw throwBadRequestError(`You do not have access to epoch resource "${label}".`);
+    }
+    const list = byWorkflow.get(resource.workflowId) ?? [];
+    list.push({ blobKey: parsed.blobKey, label, airEcoKey: airEco.key });
+    byWorkflow.set(resource.workflowId, list);
+  }
+
+  const userId = user.id;
+  await Promise.all(
+    [...byWorkflow].map(async ([workflowId, entries]) => {
+      // The userId segment scopes the cached ownership proof to the user whose
+      // token fetched it. fetchThroughCache does not cache rejections, so a
+      // NOT_FOUND for a deleted or not-owned workflow (the orchestrator scopes
+      // the read to the caller's token) is re-checked every time.
+      const cacheKey = `${REDIS_KEYS.CACHES.TRAINING_EPOCH_BLOBS}:${userId}:${workflowId}` as const;
+      const { blobKeys, completedAt, stepStatus, ecosystem } = await fetchThroughCache(
+        cacheKey,
+        async () => {
+          const workflow = await getWorkflow({ token: orchestratorToken, path: { workflowId } });
+          return trainingWorkflowEpochBlobs(workflow);
+        },
+        { ttl: CacheTTL.xs * 5 }
+      );
+      const availableBlobKeys = new Set(blobKeys);
+      // The AIR's ecosystem segment is caller-supplied: without this, an owned blob could be
+      // relabeled under a different ecosystem and routed through the wrong handler. Unknown
+      // workflow ecosystem (older runs, pre-field cache entries) skips the check — the request
+      // ecosystem match above still applies.
+      const trainedEco = ecosystem ? getEcosystemByAirSegment(ecosystem) : undefined;
+      const trainedEcoRoot = trainedEco ? getAirEcosystem(trainedEco.key) : undefined;
+      for (const entry of entries) {
+        if (!availableBlobKeys.has(entry.blobKey)) {
+          throw throwBadRequestError(
+            `Epoch resource "${entry.label}" does not belong to the referenced training workflow.`
+          );
+        }
+        if (trainedEcoRoot && getAirEcosystem(entry.airEcoKey) !== trainedEcoRoot) {
+          throw throwBadRequestError(
+            `Epoch resource "${entry.label}" does not match the ecosystem its training run used.`
+          );
+        }
+      }
+      // Same 15-day window as ModelVersion-backed epochs. A null completion
+      // date is trusted only while the step is still active (mid-training —
+      // window not started); a terminal step without one (a canceled/failed/
+      // expired run) is treated as expired, or canceling a run would keep its
+      // last epoch generatable forever.
+      const epochExpired = completedAt
+        ? !canGenerateWithEpoch(completedAt)
+        : !isActiveTrainingStepStatus(stepStatus);
+      if (epochExpired) {
+        throw throwBadRequestError(
+          'One of the epochs you are trying to generate with has expired. Make it a private model to continue using it.'
+        );
+      }
+    })
+  );
+}
+
+/** Result of resource validation */
+type ResourceValidationResult = {
+  enrichedResources: EnrichedResource[];
+  rawAirResources: RawAirResource[];
+  isPrivateGeneration: boolean;
+  hasPoiResource: boolean;
+  hasTipEligibleResource: boolean;
+};
+
+/**
+ * Validates and enriches resources from generation graph output.
+ *
+ * Performs:
+ * - Subscription validation for private/epoch resources
+ * - Expired epoch check
+ * - canGenerate validation
+ * - POI resource detection
+ * - Private generation detection
+ */
+async function validateAndEnrichResources(
+  resourceRefs: ResourceRef[],
+  user?: { id?: number; isModerator?: boolean; tier?: string },
+  rawAir?: {
+    resources: RawAirResource[];
+    orchestratorToken?: string;
+    requestEcosystem?: string;
+  }
+): Promise<ResourceValidationResult> {
+  const rawAirResources = rawAir?.resources ?? [];
+  if (resourceRefs.length === 0 && rawAirResources.length === 0) {
+    return {
+      enrichedResources: [],
+      rawAirResources: [],
+      isPrivateGeneration: false,
+      hasPoiResource: false,
+      hasTipEligibleResource: false,
+    };
+  }
+
+  // Span localizes the gen-path park: resource resolution is the heavy lookup
+  // inside validateAndEnrichResources (delegates to getResourceData, which has
+  // its own finer-grained sub-spans). Raw-AIR validation is an independent
+  // orchestrator read, so the two run concurrently.
+  const [resources] = await Promise.all([
+    resourceRefs.length > 0
+      ? withSpan('gen:validateResources:getResourceData', () =>
+          getResourceData(resourceRefs, { user })
+        )
+      : Promise.resolve([] as Awaited<ReturnType<typeof getResourceData>>),
+    rawAirResources.length > 0
+      ? withSpan('gen:validateResources:rawAir', () =>
+          validateRawAirResources({
+            resources: rawAirResources,
+            user,
+            orchestratorToken: rawAir?.orchestratorToken,
+            requestEcosystem: rawAir?.requestEcosystem,
+          })
+        )
+      : Promise.resolve(),
+  ]);
+
+  // Check for private/epoch resources requiring subscription. Raw-AIR resources
+  // ARE epoch resources — same subscription gate as the ModelVersion-backed kind.
+  const hasPrivateOrEpoch =
+    rawAirResources.length > 0 ||
+    resources.some((r) => r.availability === Availability.Private || !!r.epochDetails);
+
+  if (hasPrivateOrEpoch && user?.id && !user?.isModerator) {
+    // Span localizes the gen-path park: subscription lookup for private/epoch use.
+    const subscription = await withSpan('gen:validateResources:subscription', () =>
+      getHighestTierSubscription(user.id!)
+    );
+    if (!subscription) {
+      throw throwBadRequestError('Using Private resources require an active subscription.');
+    }
+  }
+
+  // Check for expired epochs
+  const expiredEpoch = resources.find((r) => r.epochDetails?.isExpired);
+  if (expiredEpoch) {
+    throw throwBadRequestError(
+      'One of the epochs you are trying to generate with has expired. Make it a private model to continue using it.'
+    );
+  }
+
+  // Check canGenerate
+  const unavailable = resources.filter((r) => !r.canGenerate);
+  if (unavailable.length > 0) {
+    throw throwBadRequestError(
+      `Some of your resources are not available for generation: ${unavailable
+        .map((r) => r.name)
+        .join(', ')}`
+    );
+  }
+
+  const enrichedResources: EnrichedResource[] = resources;
+
+  return {
+    enrichedResources,
+    rawAirResources,
+    isPrivateGeneration: hasPrivateOrEpoch,
+    hasPoiResource: resources.some((r) => r.model.poi),
+    // Raw-AIR epochs are not ModelVersions, so the orchestrator has no creator to tip for them.
+    hasTipEligibleResource: anyTipEligible(resources),
+  };
+}
+
+// =============================================================================
+// Validation
+// =============================================================================
+
+/**
+ * Normalizes workflow between txt2img and img2img:edit based on image state.
+ * - txt2img + images present + edit-capable ecosystem → img2img:edit
+ * - img2img:edit + no images → txt2img
+ * - img2img / img2img:face-fix / img2img:hires-fix + no images → corresponding txt variant
+ *
+ * Runs before graph validation so the correct workflow's image requirements apply.
+ */
+function normalizeImageWorkflow(input: Record<string, unknown>): Record<string, unknown> {
+  const workflow = input.workflow as string | undefined;
+  const images = input.images as unknown[] | undefined;
+  const ecosystem = input.ecosystem as string | undefined;
+  const hasImages = Array.isArray(images) && images.length > 0;
+
+  if (workflow === 'txt2img' && hasImages && ecosystem) {
+    const eco = ecosystemByKey.get(ecosystem);
+    if (eco && isWorkflowAvailable('img2img:edit', eco.id)) {
+      return { ...input, workflow: 'img2img:edit' };
+    }
+  } else if (workflow === 'img2img:edit' && !hasImages) {
+    return { ...input, workflow: 'txt2img' };
+  } else if (!hasImages && workflow?.startsWith('img2img')) {
+    // img2img variants without images → corresponding txt variant
+    const txtVariant = workflow.replace('img2img', 'txt2img');
+    if (txtVariant !== workflow) {
+      return { ...input, workflow: txtVariant };
+    }
+  }
+
+  return input;
+}
+
+/**
+ * Normalizes video workflows without images back to txt2vid.
+ * Handles the case where a user submits img2vid or img2vid:ref2vid
+ * without images (e.g., after removing images from the form).
+ *
+ * For img2vid:ref2vid, elements count as "has content" — if elements are
+ * provided, the workflow is kept even when images is empty.
+ */
+function normalizeVideoWorkflow(input: Record<string, unknown>): Record<string, unknown> {
+  let workflow = input.workflow as string | undefined;
+  const images = input.images as unknown[] | undefined;
+  const hasImages = Array.isArray(images) && images.length > 0;
+
+  if (workflow === 'img2vid' && !hasImages) {
+    workflow = 'txt2vid';
+  } else if (workflow === 'img2vid:ref2vid' && !hasImages) {
+    // Keep ref2vid if elements are provided (elements substitute for images)
+    const elements = input.elements as unknown[] | undefined;
+    const hasElements = Array.isArray(elements) && elements.length > 0;
+    if (!hasElements) workflow = 'txt2vid';
+  }
+
+  return { ...input, workflow };
+}
+
+/**
+ * Applies all workflow normalizations to input.
+ * Handles txt2img ↔ img2img:edit and video workflow corrections.
+ */
+function normalizeInput(input: Record<string, unknown>): Record<string, unknown> {
+  // Back-compat: older stored/remixed inputs carry a singular `sourceImage`;
+  // fold it into `images[]` so normalization and the graph nodes see one shape.
+  if (input.sourceImage && !input.images) {
+    const { sourceImage, ...rest } = input;
+    input = { ...rest, images: [sourceImage] };
+  }
+
+  // Resolve workflow variants to their base workflow before processing.
+  // e.g., 'img2vid:first-last' → 'img2vid' so handlers don't need to know about variants.
+  const config = workflowConfigByKey.get(input.workflow as string);
+  if (config?.variantOf) {
+    input = { ...input, workflow: config.variantOf };
+  }
+  return normalizeVideoWorkflow(normalizeImageWorkflow(input));
+}
+
+/**
+ * Validates input using the generation graph and returns the validated output.
+ * The output type is discriminated by the workflow property.
+ *
+ * Also returns the set of computed-node keys active for this branch so callers
+ * can strip them from anything that gets persisted as form-input metadata
+ * (computed values like `triggerWords` are derived, not user input).
+ */
+export function validateInput(input: Record<string, unknown>, externalCtx: GenerationCtx) {
+  // The tRPC entries are `.input(z.any())`, and `generateFromGraph` reads its form values off
+  // `input.input`, so a payload sent flat arrives as `undefined` — refuse it as a 400 here
+  // rather than let `normalizeInput` throw a TypeError (a 500) dereferencing it.
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw throwBadRequestError(
+      'Validation failed: input: expected an object of generation form values'
+    );
+  }
+  const normalized = normalizeInput(input);
+  // `reconcileSelectors` first: it settles the model/workflow/ecosystem trio before the
+  // hub dispatches on them.
+  const result = generationHub.parse(reconcileSelectors(normalized).raw, externalCtx);
+
+  // Issue #3520 — count silent checkpoint substitutions. This is the single choke point every
+  // SERVER-side validation passes through (submit, whatIf, and the App Blocks bridge), so one
+  // emit here covers all of them.
+  //
+  // The hub does not write to the external context — it returns a correction note per
+  // substitution — so the events are derived from the notes and fed to the collector, which
+  // carries the `surface` tag this function cannot otherwise tell apart. Runs regardless of
+  // success: a parse that substituted and then failed elsewhere still substituted, and dropping
+  // those would bias the number toward "this never happens".
+  const resolved = (result.success ? result.state : undefined) as
+    | { ecosystem?: string; workflow?: string }
+    | undefined;
+  for (const event of substitutionsFromNotes(result.notes, {
+    ecosystem: resolved?.ecosystem ?? (normalized.ecosystem as string | undefined),
+    workflow: resolved?.workflow ?? (normalized.workflow as string | undefined),
+  })) {
+    externalCtx.modelSubstitutions?.record(event);
+  }
+  // `void` is safe by contract — `emitModelSubstitutions` resolves on every path and never
+  // rejects. Deliberately not awaited: this is on the submit path.
+  void emitModelSubstitutions(externalCtx.modelSubstitutions);
+
+  if (!result.success) {
+    const failingKeys = Object.keys(result.errors).sort();
+    // The shadow comparison was the only thing that saw a hub refusal, and it went with the
+    // data-graph. One emit here covers submit, whatIf and the App Blocks bridge, which is the
+    // population the removal changes: a caller with no `formGraphGenerator` flag used to be
+    // served the v1 result, and the bridge passes no flags.
+    //
+    // Labels are clamped on purpose — see `generation-validation.metrics`. The workflow
+    // arrives PRE-parse, so it is an arbitrary caller string; the field is a graph key, never
+    // the value an error message would carry.
+    try {
+      const rawWorkflow = normalized.workflow;
+      generationValidationRefusedCounter.inc({
+        surface: externalCtx.modelSubstitutions?.surface ?? 'unknown',
+        workflow:
+          typeof rawWorkflow === 'string' && workflowConfigByKey.has(rawWorkflow)
+            ? rawWorkflow
+            : 'unknown',
+        field: failingKeys[0] ?? 'none',
+      });
+    } catch {
+      // Observability must never turn a 400 into a 500.
+    }
+    const errorMessages = Object.entries(result.errors)
+      .map(([key, error]) => `${key}: ${error.message}`)
+      .join(', ');
+    throw throwBadRequestError(`Validation failed: ${errorMessages}`);
+  }
+
+  const data = result.data as GenerationData;
+  refuseGatedSelection(data, externalCtx);
+  return { data, computedKeys: new Set(result.computedKeys ?? []) };
+}
+
+function refuseGatedSelection(data: GenerationData, externalCtx: GenerationCtx) {
+  const refusal = gatedSelectionRefusal(externalCtx.gateRules ?? [], {
+    ecosystem: 'ecosystem' in data ? (data.ecosystem as string | undefined) : undefined,
+    workflow: data.workflow,
+    versionIds: collectResourceIds(data).map((r) => r.id),
+  });
+  if (refusal) throw throwBadRequestError(refusal);
+}
+
+// =============================================================================
+// Workflow Discriminator Handlers (Level 1)
+// =============================================================================
+
+/**
+ * Handle vid2vid:interpolate workflow
+ */
+function createVideoInterpolationInput(data: LooseGenerationData): StepInput {
+  if (!data.video?.url) {
+    throw throwBadRequestError('Video URL is required for video interpolation');
+  }
+
+  return {
+    $type: 'videoInterpolation',
+    input: {
+      video: data.video.url,
+      interpolationFactor: data.interpolationFactor as 2 | 3 | 4,
+    },
+  };
+}
+
+/**
+ * Handle vid2vid:upscale workflow
+ */
+function createVideoUpscaleInput(data: LooseGenerationData): StepInput {
+  const { video, scaleFactor } = data;
+
+  if (!video?.url) {
+    throw throwBadRequestError('Video URL is required for video upscaling');
+  }
+
+  return {
+    $type: 'videoUpscaler',
+    input: {
+      video: video.url,
+      scaleFactor: scaleFactor,
+    },
+  };
+}
+
+/**
+ * Handle img2img:upscale workflow.
+ * Returns an array of step inputs — one per non-excluded image in the batch.
+ */
+async function createImageUpscaleSteps(
+  data: LooseGenerationData,
+  handlerCtx: GenerationHandlerCtx,
+  sourceCtx?: SourceCtx
+): Promise<StepInput[]> {
+  const images = data.images ?? [];
+  const targetDimensions = Array.isArray(data.targetDimensions) ? data.targetDimensions : [];
+
+  // Guarded rather than typed: these builders take the loose bag because the hub omits the
+  // `workflowKind` discriminant from emitted data, so the standalone arms are not narrowable.
+  if (!data.upscaler) throw throwBadRequestError('An upscaler is required for img2img:upscale');
+  const upscalerAir = handlerCtx.airs.getOrThrow(data.upscaler.id);
+
+  // Build steps for non-null entries (images that can be upscaled)
+  const steps: Promise<StepInput>[] = [];
+  for (let i = 0; i < images.length; i++) {
+    const dims = targetDimensions[i];
+    if (!dims) continue; // null = excluded
+
+    const image = images[i];
+    if (!image?.url) {
+      throw throwBadRequestError(`Invalid image data at index ${i}`);
+    }
+
+    steps.push(
+      createComfyInput({
+        key: 'img2img-upscale',
+        params: {
+          image: image.url,
+          upscaleWidth: dims.width,
+          upscaleHeight: dims.height,
+          outputFormat: data.outputFormat,
+          upscaler: upscalerAir,
+        },
+      }).then((step) => {
+        if (!sourceCtx) return step;
+        return { ...step, resolvedSource: buildResolvedSource(image.url, sourceCtx) };
+      })
+    );
+  }
+
+  if (steps.length === 0) {
+    throw throwBadRequestError('No images can be upscaled with the selected settings');
+  }
+
+  return Promise.all(steps);
+}
+
+/**
+ * Handle img2img:remove-background workflow
+ */
+async function createImageRemoveBackgroundInput(
+  data: LooseGenerationData,
+  sourceCtx?: SourceCtx
+): Promise<StepInput> {
+  const sourceImage = data.images?.[0];
+  if (!sourceImage?.url) {
+    throw throwBadRequestError('Image URL is required for background removal');
+  }
+
+  const step = await createComfyInput({
+    key: 'img2img-background-removal',
+    params: {
+      image: sourceImage.url,
+      width: sourceImage.width,
+      height: sourceImage.height,
+    },
+  });
+
+  if (!sourceCtx) return step;
+  return { ...step, resolvedSource: buildResolvedSource(sourceImage.url, sourceCtx) };
+}
+
+/**
+ * Handle img2img:preprocess workflow.
+ *
+ * The graph stores kind-specific params as a free-form `kindParams` record
+ * (per-kind specs live in `preprocessKindParamSpecs`). This handler merges
+ * the kind discriminator and the params record into a `PreprocessImageInput`.
+ * The orchestrator validates the resulting shape against the typed union.
+ */
+async function createImagePreprocessInput(
+  data: LooseGenerationData,
+  sourceCtx?: SourceCtx
+): Promise<StepInput> {
+  const sourceImage = data.images?.[0];
+  if (!sourceImage?.url) {
+    throw throwBadRequestError('Image URL is required for preprocess');
+  }
+
+  // kindParams is a free-form record, so it spreads FIRST — last-wins would
+  // let a caller override the validated kind and the clamped resolution.
+  const input = removeEmpty({
+    ...(data.kindParams ?? {}),
+    kind: data.preprocessKind,
+    image: sourceImage.url,
+    resolution: data.preprocessResolution,
+  }) as unknown as PreprocessImageInput;
+
+  const step: StepInput = {
+    $type: 'preprocessImage',
+    input,
+  } as PreprocessImageStepTemplate as StepInput;
+
+  if (!sourceCtx) return step;
+  return { ...step, resolvedSource: buildResolvedSource(sourceImage.url, sourceCtx) };
+}
+
+// =============================================================================
+// Main Router
+// =============================================================================
+
+/** Context for step-level metadata (imageMetadata, params/resources, source lineage) */
+type StepMetadataCtx = {
+  stepMetadata: { params?: Record<string, unknown>; resources?: Array<Record<string, unknown>> };
+  isWhatIf: boolean;
+  sourceCtx?: SourceCtx;
+  provenance?: string;
+};
+
+/**
+ * Creates fully-formed step inputs with imageMetadata and step-level metadata applied.
+ * Routes to the appropriate step creator, then applies metadata to all returned steps.
+ *
+ * Step creators that need per-step source metadata (upscale, remove-bg, or future
+ * chained workflows) pre-compute via `buildResolvedSource`. For all other steps,
+ * metadata is applied generically using `buildImageMetadata`.
+ */
+async function createStepInputs(
+  data: GenerationData,
+  handlerCtx: GenerationHandlerCtx,
+  metadataCtx: StepMetadataCtx
+): Promise<StepInput[]> {
+  let rawResult: StepInput | StepInput[];
+
+  // Route to step creator
+  switch (data.workflow) {
+    case 'vid2vid:interpolate':
+      rawResult = createVideoInterpolationInput(data as LooseGenerationData);
+      break;
+
+    case 'vid2vid:upscale':
+      rawResult = createVideoUpscaleInput(data as LooseGenerationData);
+      break;
+
+    case 'img2img:upscale':
+      rawResult = await createImageUpscaleSteps(
+        data as LooseGenerationData,
+        handlerCtx,
+        metadataCtx.sourceCtx
+      );
+      break;
+
+    case 'img2img:remove-background':
+      rawResult = await createImageRemoveBackgroundInput(
+        data as LooseGenerationData,
+        metadataCtx.sourceCtx
+      );
+      break;
+
+    case 'img2img:preprocess':
+      rawResult = await createImagePreprocessInput(
+        data as LooseGenerationData,
+        metadataCtx.sourceCtx
+      );
+      break;
+
+    case 'vid2vid:preprocess':
+      rawResult = createVideoPreprocessStep(data as never) as StepInput;
+      break;
+
+    case 'img2img:avatar':
+      rawResult = createAvatarSteps(data as LooseGenerationData, handlerCtx);
+      break;
+
+    default: {
+      // Ecosystem workflows - ecosystem must be defined
+      if (!('ecosystem' in data) || !data.ecosystem) {
+        throw throwBadRequestError('ecosystem is required for ecosystem workflows');
+      }
+      rawResult = await createFormGraphStepInput(data as EcosystemGraphOutput, handlerCtx);
+      break;
+    }
+  }
+
+  const rawSteps = Array.isArray(rawResult) ? rawResult : [rawResult];
+  if (metadataCtx.isWhatIf) return rawSteps;
+
+  // Apply imageMetadata + step-level metadata to each step
+  return rawSteps.map((step) => {
+    const { resolvedSource, metadata: additionalMetadata, ...rest } = step;
+
+    // Step creator pre-computed source metadata — use it directly
+    if (resolvedSource) {
+      return {
+        ...rest,
+        input: withImageMetadata(rest.input as object, rest.$type, resolvedSource.imageMetadata),
+        metadata: resolvedSource.metadata,
+      };
+    }
+
+    // TODO (remove by 2026-04-10): Step-computed params (e.g. upscaleWidth/upscaleHeight) are
+    // now computed nodes on the graph and flow into workflow.metadata automatically via
+    // toStepMetadata. This merge is kept for backwards compatibility in case any handler
+    // still returns additionalMetadata.params. Remove once confirmed no handlers do this.
+    const mergedMeta = { ...metadataCtx.stepMetadata };
+    if (
+      additionalMetadata &&
+      'params' in additionalMetadata &&
+      typeof additionalMetadata.params === 'object'
+    ) {
+      mergedMeta.params = { ...mergedMeta.params, ...additionalMetadata.params };
+      metadataCtx.stepMetadata.params = mergedMeta.params;
+    }
+
+    // Source context fallback (step creators that don't pre-compute)
+    if (metadataCtx.sourceCtx) {
+      const resolved = buildResolvedSource(undefined, metadataCtx.sourceCtx);
+      if (resolved) {
+        return {
+          ...rest,
+          input: withImageMetadata(rest.input as object, rest.$type, resolved.imageMetadata),
+          metadata: resolved.metadata,
+        };
+      }
+    }
+
+    // Standard: build imageMetadata from merged step metadata.
+    // Don't store full params/resources on step — they live on workflow.metadata.
+    // Preserve handler-set metadata fields (e.g. suppressOutput for multi-step workflows).
+    const handlerMeta =
+      additionalMetadata && typeof additionalMetadata === 'object'
+        ? Object.fromEntries(
+            Object.entries(additionalMetadata).filter(([k]) => k !== 'params' && k !== 'resources')
+          )
+        : {};
+    return {
+      ...rest,
+      input: withImageMetadata(
+        rest.input as object,
+        rest.$type,
+        buildImageMetadata(mergedMeta.params, mergedMeta.resources, metadataCtx.provenance)
+      ),
+      metadata: handlerMeta,
+    };
+  });
+}
+
+type SourceMetadataInput = {
+  params?: Record<string, unknown>;
+  resources?: Array<Record<string, unknown>>;
+};
+
+/**
+ * Context for building per-step source metadata.
+ * Passed to step creators so they can store the original generation's
+ * params/resources on each step (for "remix from original" after
+ * enhancement chains or multi-step workflows).
+ */
+type SourceCtx = {
+  sourceMetadata?: SourceMetadataInput;
+  sourceMetadataMap?: Record<string, SourceMetadataInput>;
+  workflow: string;
+  provenance?: string;
+};
+
+/**
+ * Build the imageMetadata JSON string from params and resources.
+ * This is used by all step types to embed generation metadata in the step input.
+ *
+ * `provenance` is a signed statement of which on-site images were inputs to this
+ * job. The orchestrator bakes this blob into the output file, so it comes back
+ * on upload and can be verified without trusting the client — see
+ * remix-provenance.ts.
+ */
+function buildImageMetadata(
+  params?: Record<string, unknown>,
+  resources?: Array<Record<string, unknown>>,
+  provenance?: string
+): string {
+  return JSON.stringify(
+    removeEmpty({
+      ...params,
+      provenance,
+      resources: resourcesToImageMetadataResources(resources),
+    })
+  );
+}
+
+/**
+ * Builds resolved source metadata for a step.
+ * The step stores the original generation's params/resources (what you'd remix to)
+ * plus the workflow key (what action this step performed).
+ * The step's own params (form input) live on workflow.metadata.
+ *
+ * @param sourceImageUrl - The source image URL to look up per-image metadata (undefined = use single sourceMetadata)
+ * @param ctx - Source context with per-image metadata and workflow key
+ * @returns Resolved source (metadata + imageMetadata string), or undefined if no source metadata
+ */
+function buildResolvedSource(
+  sourceImageUrl: string | undefined,
+  ctx: SourceCtx
+): { metadata: Record<string, unknown>; imageMetadata: string } | undefined {
+  // Look up per-image metadata from map, falling back to single sourceMetadata
+  const source =
+    ctx.sourceMetadataMap && sourceImageUrl
+      ? ctx.sourceMetadataMap[sourceImageUrl] ?? ctx.sourceMetadata
+      : ctx.sourceMetadata;
+  if (!source) return undefined;
+
+  const { params, resources } = source;
+  return {
+    metadata: {
+      params: params ?? {},
+      resources: resourcesToImageMetadataResources(resources),
+      workflow: ctx.workflow,
+    },
+    imageMetadata: buildImageMetadata(params, resources, ctx.provenance),
+  };
+}
+
+/**
+ * Creates workflow steps from validated generation-graph data.
+ * Returns steps + workflow-level metadata (the form input snapshot).
+ *
+ * Performs:
+ * - Resource validation (subscription, expired epochs, canGenerate, POI)
+ * - POI prompt detection
+ * - Private generation detection
+ */
+export async function createWorkflowStepsFromGraph({
+  data,
+  computedKeys,
+  isWhatIf = false,
+  user,
+  sourceMetadata,
+  sourceMetadataMap,
+  remixOfId,
+  sourceImageIds,
+  isGreen,
+  orchestratorToken,
+}: {
+  data: GenerationData;
+  /**
+   * Computed-node keys from the generation-graph branch. Stripped from
+   * `stepMetadata.params` so derived values (e.g. `triggerWords`) don't
+   * leak into workflow.metadata or imageMetadata as if they were form input.
+   */
+  computedKeys?: Set<string>;
+  isWhatIf?: boolean;
+  user?: { id?: number; isModerator?: boolean; tier?: string };
+  sourceMetadata?: SourceMetadataInput;
+  sourceMetadataMap?: Record<string, SourceMetadataInput>;
+  remixOfId?: number;
+  /**
+   * On-site images the server resolved from this submission's input images.
+   * Unlike `remixOfId` — which the client asserts — this is derived from what
+   * the job actually consumes, and is what a verified derivation link is built
+   * from. See remix-provenance.ts.
+   */
+  sourceImageIds?: number[];
+  /**
+   * Site context — `.com` (SFW) vs `.red` (NSFW). Passed into the snippet
+   * resolver so it can filter category rows by `nsfwLevel` and never surface
+   * NSFW content to SFW users.
+   */
+  isGreen?: boolean;
+  /**
+   * The caller's orchestrator token. Required to accept raw-AIR (training
+   * epoch blob) resources — it is what the ownership check fetches the source
+   * training workflow with. Paths that don't thread it (e.g. the App Blocks
+   * bridge) reject raw-AIR resources.
+   */
+  orchestratorToken?: string;
+}): Promise<{
+  steps: WorkflowStepTemplate[];
+  workflowMetadata?: Record<string, unknown>;
+  /**
+   * Extra workflow tags this assembly contributed (e.g. `wildcards` when the
+   * snippet resolver ran). Concatenated into the final tag list by the
+   * caller — keeps "rules that depend on how steps were built" colocated
+   * with the step-build path instead of leaking decisions out as flags.
+   */
+  tags: string[];
+  hasTipEligibleResource: boolean;
+}> {
+  data = expandAvatarData(data);
+
+  // Validate and enrich resources
+  const resourceIds = collectResourceIds(data);
+  // Span localizes the gen-path park: resource validation/enrichment sub-step.
+  const {
+    enrichedResources,
+    rawAirResources,
+    isPrivateGeneration,
+    hasPoiResource,
+    hasTipEligibleResource,
+  } = await withSpan('gen:createSteps:validateResources', () =>
+    validateAndEnrichResources(resourceIds, user, {
+      resources: collectRawAirResources(data),
+      orchestratorToken,
+      requestEcosystem: 'ecosystem' in data ? data.ecosystem : undefined,
+    })
+  );
+
+  // Check for POI in prompt
+  const prompt = 'prompt' in data ? (data.prompt as string) : undefined;
+  // Gate first: the refusal below is the only reader, and the strip is a redis/DB read that
+  // rejects on failure. Computing it unconditionally would put that read — and a new way to
+  // fail — on `whatIfFromGraph` and the App Blocks path, neither of which audits the prompt.
+  const poiGateActive = 'disablePoi' in data && !!data.disablePoi;
+  const hasPoi =
+    poiGateActive &&
+    (hasPoiResource ||
+      (!!prompt &&
+        !!includesPoi(
+          // Normalize before stripping, as the image-scan POI taggers do. Stripping raw text
+          // leaves the detector reading a different alphabet than the strip matched against.
+          await stripBenignPhrases(normalizeText(prompt), BlocklistType.PromptBenignPhrase)
+        )));
+  if (hasPoi) {
+    throw throwBadRequestError(
+      'Your request contains or attempts to use the likeness of a real person. Generating these type of content while viewing X-XXX ratings is not allowed.'
+    );
+  }
+
+  // Build AIR map from enriched resources for handlers. Raw-AIR resources join
+  // it under their synthetic negative ids, so handlers' `airs.getOrThrow(r.id)`
+  // resolves them with no handler changes.
+  const airs = new StrictAirMap(enrichedResources.map((r) => [r.id, r.air]));
+  for (const r of rawAirResources) airs.set(r.id, r.air);
+  const handlerCtx: GenerationHandlerCtx = {
+    airs,
+    user: { id: user?.id ?? 0, isModerator: !!user?.isModerator },
+    // Updated per variant inside the snippets-overlay loop below.
+    baseStepIndex: 0,
+  };
+
+  // Resolve seed before creating step input and metadata so both use the same value.
+  // Always shallow-clone so downstream mutations (e.g. the audio prompt strip below)
+  // don't affect the caller's `data`.
+  const resolvedData = {
+    ...data,
+    // Int32-safe bound: some engines (e.g. google/nano-banana-2) type `seed`
+    // as Nullable<Int32>, so a generated seed above 2^31-1 fails orchestrator
+    // deserialization. MAX_RANDOM_SEED keeps the default within Int32 range.
+    seed: 'seed' in data && data.seed != null ? data.seed : randomInt(MAX_RANDOM_SEED),
+  };
+
+  // Convert graph output to legacy {resources, params} format for storage.
+  // This is the TEMPLATE snapshot — `params.prompt`/`negativePrompt` still
+  // contain the user-authored text with literal `#category` references.
+  // Per-step substituted prompts flow through the variant rebuilds below.
+  const stepMetadata = toStepMetadata(
+    resolvedData as Record<string, unknown> & {
+      model?: { id: number; model: { type: string } };
+      resources?: { id: number; model: { type: string } }[];
+      vae?: { id: number; model: { type: string } };
+    }
+  );
+
+  // Strip computed-node values (e.g. triggerWords) from params — they're
+  // derived from inputs at runtime, not form input, and shouldn't be persisted
+  // to workflow.metadata or imageMetadata.
+  if (computedKeys && computedKeys.size > 0) {
+    const params = stepMetadata.params as Record<string, unknown>;
+    for (const key of computedKeys) {
+      if (key in params) delete params[key];
+    }
+  }
+
+  const needsSourceMetadata = workflowConfigByKey.get(data.workflow)?.enhancement === true;
+
+  const provenance =
+    !isWhatIf && user?.id && sourceImageIds?.length
+      ? signProvenance({ userId: user.id, sourceImageIds })
+      : undefined;
+
+  // Build source context for workflows with source lineage (not needed for what-if)
+  const sourceCtx: SourceCtx | undefined =
+    !isWhatIf && needsSourceMetadata
+      ? { sourceMetadata, sourceMetadataMap, workflow: data.workflow, provenance }
+      : undefined;
+
+  // Snippet fan-out unifies into a single step-build loop by always producing
+  // a non-empty list of "overlays" — each overlay is a per-step delta to apply
+  // on top of `resolvedData` before creating step inputs. For submissions
+  // without a snippets node (or with one at defaults / no refs), the helper
+  // returns `[{}]` — a single empty overlay — so the loop runs exactly once
+  // and behaves identically to a pre-snippets build. What-if requests always
+  // get the trivial overlay (cost estimation runs against the template).
+  // Span localizes the gen-path park: snippet-overlay resolution sub-step
+  // (only runs for non-what-if submissions).
+  const snippetResult = isWhatIf
+    ? { overlays: [{} as Record<string, string>], parsedTargets: {}, expanded: false }
+    : await withSpan('gen:createSteps:snippetOverlays', () =>
+        getSnippetOverlays({ resolvedData, userId: user?.id, isGreen })
+      );
+  const { overlays, parsedTargets, expanded: snippetsExpanded } = snippetResult;
+
+  // Span localizes the gen-path park: graph→steps assembly sub-step — builds the
+  // per-overlay steps (createStepInputs), the request-wrapped steps, the
+  // workflow-level metadata, and the extra tags from the resolved data.
+  // Return the assembled result directly as this function's result so the span
+  // wraps the whole assembly and no fragile re-destructure/rename is needed.
+  return withSpan('gen:createSteps:assemble', async () => {
+    const steps: StepInput[] = [];
+    for (const overlay of overlays) {
+      const isSnippetVariant = !isEmptyObject(overlay);
+      const variantData = isSnippetVariant
+        ? ({ ...resolvedData, ...overlay } as typeof resolvedData)
+        : resolvedData;
+      const variantStepMetadata = isSnippetVariant
+        ? buildVariantStepMetadata(variantData, computedKeys)
+        : stepMetadata;
+
+      // Advance baseStepIndex per variant so cross-step `$ref` objects (e.g.
+      // preprocess → gen wiring inside controlnet handlers) resolve to the
+      // correct global step position after concatenation.
+      const variantSteps = await createStepInputs(
+        variantData,
+        { ...handlerCtx, baseStepIndex: steps.length },
+        {
+          stepMetadata: variantStepMetadata,
+          isWhatIf,
+          sourceCtx,
+          provenance,
+        }
+      );
+
+      // Per-step metadata for snippet variants records ONLY the substituted
+      // snippet-target fields (e.g. `prompt`, `negativePrompt`) — a small DELTA — in
+      // `params`, plus `partialParams: true` to flag it as such. The workflow-level
+      // metadata already carries the full template + params snapshot, so we keep the
+      // per-step payload tiny (no full params duplicated per variant) and let the
+      // client spread the delta over the workflow params when reading.
+      // See docs/generation-metadata-architecture.md.
+      if (isSnippetVariant) {
+        for (const step of variantSteps) {
+          const existingMeta = (step.metadata ?? {}) as Record<string, unknown>;
+          const existingParams = (existingMeta.params as Record<string, unknown> | undefined) ?? {};
+          step.metadata = {
+            ...existingMeta,
+            params: { ...existingParams, ...overlay },
+            partialParams: true,
+          };
+        }
+      }
+
+      steps.push(...variantSteps);
+    }
+
+    // Wrap with request-level concerns: priority, outputFormat
+    // isPrivateGeneration lives on workflow.metadata, not per-step.
+    // `remixOfId` is ALSO copied onto each step's metadata: the orchestrator's
+    // `WorkflowStepHandler.GenerateJobsAsync` reads `workflowStep.Metadata["remixOfId"]`
+    // (not workflow-level metadata) to thread the remix source id into the job
+    // record → MongoDB `prod.jobs.Properties.remixOfId` → CDC → ClickHouse
+    // `orchestration.jobs`, which is what makes the remix product loop measurable.
+    // See civitai-orchestration#216. Kept on workflow.metadata as well for the
+    // app's own replay/normalization path (NormalizedWorkflowMetadata.remixOfId).
+    // Intermediate steps (videoInterpolation) don't get outputFormat injected.
+    const wrappedSteps = steps.map((step) => ({
+      $type: step.$type,
+      input: {
+        ...(step.input as object),
+        // A handler-set outputFormat wins (e.g. model3DPreview pins 'png');
+        // otherwise inherit the workflow's image outputFormat choice. For
+        // non-image workflows `data.outputFormat` is undefined, so this also
+        // avoids clobbering an intermediate step's own format with undefined.
+        outputFormat: (step.input as { outputFormat?: string }).outputFormat ?? data.outputFormat,
+      },
+      priority: data.priority,
+      metadata: isWhatIf
+        ? undefined
+        : ({
+            ...((step.metadata as object) ?? {}),
+            ...(remixOfId != null ? { remixOfId } : {}),
+          } as object),
+    })) as WorkflowStepTemplate[];
+
+    // Build workflow-level metadata — the form input snapshot for workflow-level
+    // replay. `params.snippets` rides along automatically because it's a
+    // graph-level node captured by `toStepMetadata`.
+    //
+    // Snippet-specific persistence cleanup:
+    // - When the resolver didn't fire (snippets node at defaults, no refs, no
+    //   batch request), strip the entire `snippets` entry so non-snippet
+    //   generations don't carry an unused blob. The `wildcards` workflow tag
+    //   remains the canonical "did this use snippets" signal.
+    // - When the resolver did fire, overwrite `snippets.targets` with the
+    //   parsed-refs snapshot (each `#ref` as `{ category, selections: [] }`)
+    //   so workflow.metadata records exactly which refs the submission used.
+    //   And drop `snippets.seed` — that field is preview-only and remixes
+    //   should re-roll the random picks.
+    const persistedParams = removeEmpty(stepMetadata.params as Record<string, unknown>);
+    if (!snippetsExpanded) {
+      delete persistedParams.snippets;
+    } else if (persistedParams.snippets && typeof persistedParams.snippets === 'object') {
+      const persistedSnippets = persistedParams.snippets as Record<string, unknown>;
+      persistedSnippets.targets = parsedTargets;
+      delete persistedSnippets.seed;
+    }
+    const workflowMetadata = isWhatIf
+      ? undefined
+      : removeEmpty({
+          params: persistedParams,
+          resources: stepMetadata.resources,
+          remixOfId,
+          // The read path for outputs whose file carries no embedded metadata —
+          // every video today. The SIGNED token, never the ids themselves:
+          // `orchestrator.updateWorkflow`/`patch` let a user write whatever they
+          // like here, so a plain field would be their claim wearing our name.
+          provenance,
+          isPrivateGeneration,
+        });
+
+    const extraTags: string[] = [];
+    if (snippetsExpanded) extraTags.push(WORKFLOW_TAGS.WILDCARDS);
+    if (data.workflow === AVATAR_WORKFLOW) extraTags.push('avatar');
+
+    return {
+      steps: wrappedSteps,
+      workflowMetadata,
+      tags: extraTags,
+      hasTipEligibleResource,
+    };
+  });
+}
+
+/**
+ * Validate generation-graph `input` and assemble the orchestrator workflow
+ * steps WITHOUT submitting — the validate + step-build half of
+ * `generateFromGraph`, exposed for callers that drive their own
+ * `submitWorkflow`.
+ *
+ * App Blocks is the motivating caller: it wraps each submit with App-Blocks-
+ * specific belts (per-call buzz budget, cumulative daily Buzz cap, token-
+ * derived maturity clamp, daily-boost autoclaim) and so can't use the bundled
+ * `generateFromGraph` (which submits internally). It builds the step here, runs
+ * its own whatIf + budget checks, then calls `submitWorkflow` itself.
+ *
+ * NOTE: this does NOT audit the prompt — `generateFromGraph` audits before
+ * step-build, but this entry leaves auditing to the caller (App Blocks audits
+ * with its token-derived `isGreen`/`isModerator` in the router). Resource
+ * enrichment, canGenerate/availability gating, and POI detection still run
+ * (inside `createWorkflowStepsFromGraph`), so the resource belt is intact.
+ */
+export async function createWorkflowStepsFromGraphInput({
+  input,
+  externalCtx,
+  user,
+  isWhatIf,
+  isGreen,
+  inputGate,
+}: {
+  input: Record<string, unknown>;
+  externalCtx: GenerationCtx;
+  user?: { id?: number; isModerator?: boolean };
+  isWhatIf?: boolean;
+  isGreen?: boolean;
+  inputGate: GenerationInputGate;
+}): Promise<{ steps: WorkflowStepTemplate[]; workflowMetadata?: Record<string, unknown> }> {
+  const { data, computedKeys } = validateInput(input, externalCtx);
+  await assertGraphInputsUsable(data, user?.id, inputGate);
+  const sourceImageIds = isWhatIf
+    ? undefined
+    : await resolveSourceImageIds(
+        extractInputImageUrls(data as unknown as Record<string, unknown>)
+      );
+  // `workflowMetadata` carries `{ params, resources, remixOfId, isPrivateGeneration }`
+  // (built by `createWorkflowStepsFromGraph`, run through `removeEmpty`) and is
+  // what the queue/remix view reads via `WorkflowData.params/resources/remixOfId`.
+  // It is intentionally `undefined` on whatIf — the caller must only attach it to
+  // the REAL submit body, mirroring `generateFromGraph` (see below). Return it so
+  // the App-Blocks submit path can carry it; the normal path bakes it in directly.
+  const { steps, workflowMetadata } = await createWorkflowStepsFromGraph({
+    data,
+    computedKeys,
+    user: user && { ...user, tier: externalCtx.user.tier },
+    isWhatIf,
+    sourceImageIds,
+    isGreen,
+  });
+  return { steps, workflowMetadata };
+}
+
+type SnippetsPayloadShape = {
+  wildcardSetIds?: number[];
+  mode?: 'random' | 'batch';
+  batchCount?: number;
+  seed?: number;
+  targets?: Record<string, unknown>;
+};
+
+type ParsedTargetsSnapshot = Record<string, Array<{ category: string; selections: [] }>>;
+
+/**
+ * Build per-step overlays for snippet fan-out and the parsed-refs snapshot
+ * that ends up persisted as `workflow.metadata.params.snippets.targets`.
+ * Returns:
+ * - `overlays`: array of `{ targetKey -> substitutedText }` records, one per
+ *   workflow step. Always non-empty — `[{}]` (a single empty overlay) when
+ *   there's nothing to expand, so the orchestrator loop runs uniformly.
+ * - `parsedTargets`: `{ targetKey -> [{ category, selections: [] }, ...] }`
+ *   built server-side from the templates. `selections` is always empty today (there
+ *   is no per-value picker); the orchestrator overwrites `snippets.targets` with
+ *   this snapshot at persistence time.
+ * - `expanded`: true when the resolver actually ran (drives the `wildcards`
+ *   tag, persisted-snippets shape, etc.).
+ *
+ * Target keys come from `snippets.targets` (declared by the ecosystem
+ * text block's `snippets` set). Targets that aren't present on
+ * `resolvedData` (e.g. `negativePrompt` declared but the active branch
+ * doesn't have one) are silently skipped.
+ *
+ * Seed precedence: `snippets.seed` (preview-locked) wins over `resolvedData.seed`
+ * (image-gen seed). When neither is present, sample fresh.
+ */
+async function getSnippetOverlays({
+  resolvedData,
+  userId,
+  isGreen,
+}: {
+  resolvedData: Record<string, unknown> & { seed?: number };
+  userId: number | undefined;
+  isGreen: boolean | undefined;
+}): Promise<{
+  overlays: Array<Record<string, string>>;
+  parsedTargets: ParsedTargetsSnapshot;
+  expanded: boolean;
+}> {
+  const trivial = {
+    overlays: [{} as Record<string, string>],
+    parsedTargets: {} as ParsedTargetsSnapshot,
+    expanded: false,
+  };
+  if (userId == null) return trivial;
+  const snippets = (resolvedData as { snippets?: SnippetsPayloadShape }).snippets;
+  if (!snippets) return trivial;
+
+  // Targets declared by the active branch's text blocks.
+  // We iterate these — NOT a hardcoded list — so each ecosystem controls its
+  // own snippet-eligible editors.
+  const declaredTargetKeys = Object.keys(snippets.targets ?? {});
+
+  // Build templates from declared targets that have an actual string value on
+  // resolvedData. Missing targets fall out silently — e.g. an editor might
+  // be declared in the snippets node by a registration effect but its branch
+  // doesn't bring its node value into the active context.
+  //
+  // `parsedTargets` only records keys whose template contained at least one
+  // `#ref` — targets that registered themselves but had no refs in this
+  // submission don't pollute the persisted record. The graph state's
+  // `snippets.targets` is the "accepts snippets" declaration; the persisted
+  // `targets` is the "had refs to substitute" history.
+  const targetTemplates: Record<string, string> = {};
+  const parsedTargets: ParsedTargetsSnapshot = {};
+  let totalRefs = 0;
+  for (const key of declaredTargetKeys) {
+    const value = (resolvedData as Record<string, unknown>)[key];
+    if (typeof value !== 'string') continue;
+    targetTemplates[key] = value;
+    const refs = parsePromptSnippetReferences(value);
+    if (refs.length > 0) {
+      parsedTargets[key] = refs.map((r) => ({ category: r.category, selections: [] }));
+      totalRefs += refs.length;
+    }
+  }
+
+  const wildcardSetIds = snippets.wildcardSetIds ?? [];
+  const mode = snippets.mode ?? 'random';
+  const batchCount = snippets.batchCount ?? 1;
+
+  // Fast path: no references and no batch fan-out requested — behave exactly
+  // like a pre-snippets submission. Avoids a useless DB round-trip on the
+  // hot path of every non-snippet generation.
+  if (totalRefs === 0 && batchCount <= 1) return trivial;
+
+  // Seed precedence: form's preview-locked `snippets.seed` first, then the
+  // image-gen seed on resolvedData, then a fresh sample. Spec:
+  // resolver random = PRNG keyed by `(seed ?? generationSeed, ...)`.
+  const seed = snippets.seed ?? resolvedData.seed ?? randomInt(MAX_RANDOM_SEED);
+
+  const result = await expandSnippetsToTargets({
+    snippets: { wildcardSetIds, mode, batchCount, targets: {} },
+    targetTemplates,
+    seed,
+    userId,
+    // Default to SFW context if the caller didn't supply one — strictest
+    // sensible fallback so the resolver never accidentally surfaces NSFW
+    // content on an unidentified call path.
+    isGreen: isGreen ?? true,
+  });
+  return { overlays: result.expansions, parsedTargets, expanded: true };
+}
+
+function isEmptyObject(o: Record<string, unknown>): boolean {
+  for (const _ in o) return false;
+  return true;
+}
+
+/**
+ * Build the per-variant `stepMetadata` for a snippet expansion: same shape as
+ * the workflow-level `stepMetadata` but with substituted prompts and the
+ * computed-node keys stripped. Pulled out into a helper so the orchestrator
+ * loop's snippet-variant arm stays readable.
+ */
+function buildVariantStepMetadata(
+  variantData: Record<string, unknown>,
+  computedKeys: Set<string> | undefined
+) {
+  const meta = toStepMetadata(
+    variantData as Record<string, unknown> & {
+      model?: { id: number; model: { type: string } };
+      resources?: { id: number; model: { type: string } }[];
+      vae?: { id: number; model: { type: string } };
+    }
+  );
+  if (computedKeys && computedKeys.size > 0) {
+    const params = meta.params as Record<string, unknown>;
+    for (const key of computedKeys) {
+      if (key in params) delete params[key];
+    }
+  }
+  return meta;
+}
+
+// =============================================================================
+// Public API
+// =============================================================================
+
+/**
+ * Collect base/source image URLs from validated graph input — used to capture
+ * what a (blocked) prompt was operating on for the moderator restriction-review
+ * UI. Covers the standard `images` array plus, defensively, a legacy singular
+ * `sourceImage`.
+ */
+function extractInputImageUrls(data: Record<string, unknown>): string[] | undefined {
+  const urls: string[] = [];
+  const images = data.images;
+  if (Array.isArray(images)) {
+    for (const img of images) {
+      const url = (img as { url?: string } | null | undefined)?.url;
+      if (typeof url === 'string') urls.push(url);
+    }
+  }
+  const sourceImageUrl = (data.sourceImage as { url?: string } | null | undefined)?.url;
+  if (typeof sourceImageUrl === 'string') urls.push(sourceImageUrl);
+  for (const key of ['keyframes', 'styleReferences']) {
+    const entries = data[key];
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      const url = (entry as { image?: { url?: string } } | null | undefined)?.image?.url;
+      if (typeof url === 'string') urls.push(url);
+    }
+  }
+  return urls.length ? urls : undefined;
+}
+
+/** Long enough for a healthy whatIf, short enough that a slow one never delays a generation. */
+const DOWNLOAD_ESTIMATE_TIMEOUT_MS = 2_000;
+
+/**
+ * Whether a download is already moving for one of this submit's models — the only case where a whatIf
+ * can produce a queue position and an ETA worth showing.
+ *
+ * Deliberately NOT `unavailable`: that is "nothing is pulling it", which is the resting state for most
+ * of the catalogue, so triggering on it would price a second workflow on a large share of all submits
+ * to produce an estimate the orchestrator has no queue for.
+ */
+async function hasQueuedDownloads(data: unknown) {
+  const { model, vae, resources } = data as {
+    model?: { id?: number } | null;
+    vae?: { id?: number } | null;
+    resources?: { id?: number }[] | null;
+  };
+  const ids = [model, vae, ...(resources ?? [])]
+    .map((r) => r?.id)
+    .filter((id): id is number => typeof id === 'number');
+  if (!ids.length) return false;
+  const residency = await getResourceResidency(ids).catch(() => []);
+  return residency.some(({ availability }) => ['loading', 'queued'].includes(availability.status));
+}
+
+/**
+ * Submits a generation workflow using generation-graph input.
+ *
+ * Validates:
+ * - Graph input validation
+ * - Resource validation (subscription, epochs, canGenerate, POI)
+ * - Prompt POI detection
+ *
+ * Note: Generation status check should be done in the router before calling this function.
+ */
+export async function generateFromGraph({
+  input,
+  externalCtx,
+  token,
+  userId,
+  isModerator,
+  experimental,
+  isGreen,
+  allowMatureContent,
+  currencies,
+  civitaiTip,
+  creatorTip,
+  tags: customTags = [],
+  sourceMetadata,
+  sourceMetadataMap,
+  sourceProvenance,
+  remixOfId,
+  track,
+  externalId,
+  acknowledgedSoftBlock,
+  downloadPriority,
+  inputGate,
+  remixRun,
+}: GenerateOptions) {
+  const { data, computedKeys } = validateInput(input, externalCtx);
+  await assertGraphInputsUsable(data, userId, inputGate);
+
+  const inputImages = extractInputImageUrls(data as unknown as Record<string, unknown>);
+  // One read for both consumers below, so the provenance check and the prompt
+  // audit cannot disagree about what was submitted.
+  const prompt = 'prompt' in data && typeof data.prompt === 'string' ? data.prompt : undefined;
+
+  // Both routes, because neither covers the other — see `unionSourceImageIds`.
+  // The short version: the form re-uploads a remix's on-site source as an
+  // orchestrator blob before submit, so the URL route alone reports nothing for
+  // the flow the Remix menu drives (measured: 98 on-site URLs survived out of
+  // 2,526 on the engine that button picks).
+  const sourceImageIds = await unionSourceImageIds({
+    urlSourceImageIds: await resolveSourceImageIds(inputImages),
+    tokens: sourceProvenance,
+    userId,
+    prompt,
+  });
+
+  // Audit prompt before generation. An image-input family may submit an empty prompt beside a
+  // negative prompt, so the gate is `isBlankAuditInput` — the same both-fields-empty rule
+  // `auditPromptServer` applies — not the prompt alone.
+  const negativePrompt =
+    'negativePrompt' in data ? (data.negativePrompt as string | undefined) : undefined;
+  if (!isBlankAuditInput(prompt, negativePrompt)) {
+    const promptText = prompt ?? '';
+    const inputVideo = (
+      'video' in data ? (data.video as { url?: string } | null | undefined) : undefined
+    )?.url;
+    try {
+      await auditPromptServer({
+        prompt: promptText,
+        negativePrompt,
+        userId,
+        isGreen: !!isGreen,
+        isModerator,
+        track,
+        remixOfId,
+        inputImages,
+        inputVideo,
+        sourceImageIds,
+        orchestratorToken: token,
+        acknowledgedSoftBlock,
+        // Observability only — see `~/server/prom/external-moderation.metrics`. Reuses the ONE
+        // surface→source mapping that already exists for the submit metric rather than inventing a
+        // parallel vocabulary, so the two families can never disagree about which requests are
+        // preset/cron work. The clamp is the type-safe bridge between the two label sets: any value
+        // the submit family gains that this one does not have falls to `other` instead of failing
+        // to compile or minting an unbounded label.
+        moderationSource: clampExternalModerationSource(
+          submitSourceForSurface(externalCtx.modelSubstitutions?.surface)
+        ),
+      });
+    } catch (err) {
+      // Legacy regex/external audit blocked the prompt. Fire-and-forget an
+      // XGuard scan against the same input so moderators can review whether
+      // XGuard would have agreed — feeds the "should XGuard replace the
+      // legacy gate?" decision. Doesn't gate the rethrow.
+      createXGuardModerationRequest({
+        mode: 'prompt',
+        entityType: 'prompt',
+        positivePrompt: promptText,
+        negativePrompt,
+        userId,
+        recordForReview: true,
+      }).catch((e) => {
+        logToAxiom({
+          type: 'error',
+          name: 'generation-xguard-scan',
+          message: (e as Error).message,
+          userId,
+        }).catch();
+      });
+      throw err;
+    }
+  }
+
+  // Audit ACE Audio creative fields (musicDescription + lyrics). Routed through
+  // the same auditor as image/video prompts so regex + external moderation apply.
+  const musicDescription =
+    'musicDescription' in data && typeof data.musicDescription === 'string'
+      ? data.musicDescription
+      : undefined;
+  const lyrics = 'lyrics' in data && typeof data.lyrics === 'string' ? data.lyrics : undefined;
+  if ((musicDescription && musicDescription.trim()) || (lyrics && lyrics.trim())) {
+    await auditPromptServer({
+      prompt: [musicDescription, lyrics].filter((v) => v && v.trim()).join('\n'),
+      userId,
+      isGreen: !!isGreen,
+      isModerator,
+      track,
+      acknowledgedSoftBlock,
+      // Same population as the prompt audit above — the ACE Audio creative fields go through the
+      // same auditor on the same submission, so they must carry the same label or the `generate`
+      // count would undercount its own calls.
+      moderationSource: clampExternalModerationSource(
+        submitSourceForSurface(externalCtx.modelSubstitutions?.surface)
+      ),
+    });
+  }
+
+  // One user for validation and for the reply: coverage of a cold checkpoint depends on tier and
+  // isModerator, so formatting the reply with less would contradict what validation accepted.
+  const user = { id: userId, isModerator, tier: externalCtx.user.tier };
+
+  const {
+    steps,
+    workflowMetadata,
+    tags: assemblyTags,
+    hasTipEligibleResource,
+  } = await createWorkflowStepsFromGraph({
+    data,
+    computedKeys,
+    user,
+    sourceMetadata,
+    sourceMetadataMap,
+    remixOfId,
+    sourceImageIds,
+    isGreen,
+    orchestratorToken: token,
+  });
+
+  // Determine workflow tags
+  const ecosystem = 'ecosystem' in data ? data.ecosystem : undefined;
+  const outputTag =
+    data.output === 'image'
+      ? WORKFLOW_TAGS.IMAGE
+      : data.output === 'audio'
+      ? WORKFLOW_TAGS.AUDIO
+      : WORKFLOW_TAGS.VIDEO;
+
+  const tags = [
+    WORKFLOW_TAGS.GENERATION,
+    outputTag,
+    data.workflow,
+    ecosystem,
+    ...assemblyTags,
+    ...customTags,
+  ].filter(isDefined);
+
+  const tips = buildWorkflowTips({ civitaiTip, creatorTip, hasTipEligibleResource });
+
+  // Check if private generation (from workflow metadata)
+  const isPrivateGeneration = !!(workflowMetadata as { isPrivateGeneration?: boolean })
+    ?.isPrivateGeneration;
+
+  // Silent checkpoint substitutions recorded by the validation at the top of
+  // this function (#3520 / #3665). Read off THIS request's per-request collector
+  // — never a shared or cached object — so it describes this submit and no one
+  // else's. `ecosystem`/`workflow` are dropped: the caller knows what it sent.
+  const modelSubstitutions = projectModelSubstitutions(externalCtx.modelSubstitutions);
+
+  // 🔴 PERSIST, not just reply. `formatGenerationResponse2` recovers this from
+  // the workflow's own metadata on EVERY later read, which is what lets a caller
+  // that polls or reconnects still find out it was billed for model A and given
+  // model B. A reply-only field is gone the moment the client moves on, and
+  // nothing retains the submitted body to reconstruct it from.
+  //
+  // Byte-identical when nothing was substituted: the key is only added when
+  // there is something to add.
+  const metadataWithSubstitutions =
+    workflowMetadata && modelSubstitutions?.length
+      ? {
+          ...(workflowMetadata as Record<string, unknown>),
+          [WORKFLOW_METADATA_MODEL_SUBSTITUTIONS_KEY]: modelSubstitutions,
+        }
+      : workflowMetadata;
+  const metadata = remixRun
+    ? { ...(metadataWithSubstitutions as Record<string, unknown> | undefined), remixRun }
+    : metadataWithSubstitutions;
+
+  const priceDownloads = () =>
+    submitWorkflow({
+      token,
+      body: {
+        steps,
+        experimental,
+        // @ts-ignore - BuzzSpendType is properly supported
+        currencies: currencies ? BuzzTypes.toOrchestratorType(currencies) : undefined,
+      },
+      query: { whatif: true },
+    }).catch(() => undefined);
+
+  // A download boost is a fixed fee, so it is only sent when a whatIf shows something waiting to
+  // download. If that check fails the generation still goes out, unboosted and unbilled for it.
+  const boostWhatIf = downloadPriority ? await priceDownloads() : undefined;
+  const boostDownloads = !!boostWhatIf?.steps?.some((step) => readPreparation(step));
+  // The submit reply predates the orchestrator queueing any download, so the queue card's first
+  // render has nothing to show. A whatIf of the same steps does, and runs alongside the submit.
+  //
+  // 🔴 Never let the ESTIMATE hold the reply: a generation that is accepted is the headline property,
+  // and this only buys the card a head start on numbers its own poll fetches seconds later. A boosted
+  // submit does wait, because the fee is only charged when its whatIf shows something to download.
+  const downloadWhatIf =
+    boostWhatIf ??
+    ((await hasQueuedDownloads(data))
+      ? Promise.race([priceDownloads(), sleep(DOWNLOAD_ESTIMATE_TIMEOUT_MS).then(() => undefined)])
+      : Promise.resolve(undefined));
+
+  // Submit workflow to orchestrator
+  const workflow = (await submitWorkflow({
+    token,
+    // THE population this instrument exists to size: the submit leg of `generateFromGraph`, which
+    // carries 82–98% of that procedure's latency.
+    //
+    // 🔴 Derived from the request's OWN surface, not hardcoded. `generateFromGraph` has two entry
+    // points, and only one of them is the tRPC procedure: `preset-image-gen.service` reaches this exact
+    // code with surface `preset`, and one of ITS callers is the `process-enqueued-comic-panels` CRON
+    // JOB, which runs outside the tRPC request path entirely. Stamping a flat `generate` here would
+    // therefore have blended a background job into the very number that gets divided against
+    // `orchestrator.generateFromGraph`'s wall time — the same contamination this label exists to
+    // remove, one level up from where it was first looked for. Reusing `GenerationSurface` (already
+    // bounded, already tested, already fixed at context construction by the caller) rather than
+    // inventing a parallel vocabulary means the two can never drift apart.
+    // The mapping itself lives in the metrics module, where the `source` vocabulary is defined and
+    // where it is unit-tested; `modelSubstitutions` is optional on the ctx type and an absent collector
+    // resolves to `other`, never to `generate`.
+    source: submitSourceForSurface(externalCtx.modelSubstitutions?.surface),
+    body: {
+      tags,
+      steps,
+      tips,
+      experimental,
+      metadata,
+      callbacks: getOrchestratorCallbacks(userId, { remixApp: tags.includes(REMIX_APP_TAG) }),
+      ...workflowOutputRestrictions({
+        workflow: data.workflow,
+        isPrivateGeneration,
+        allowMatureContent,
+      }),
+      // @ts-ignore - BuzzSpendType is properly supported
+      currencies: currencies ? BuzzTypes.toOrchestratorType(currencies) : undefined,
+      externalId,
+      ...(boostDownloads ? { downloadPriority } : {}),
+    },
+  })) as TextToImageResponse;
+
+  await assertWorkflowOwner(workflow, userId, token);
+
+  // Format and return response
+  const [formatted] = await formatGenerationResponse2([workflow], user);
+  const priced = await downloadWhatIf;
+  attachEstimatedPreparation(
+    formatted.steps,
+    (priced?.steps ?? []).map((step) => ({ name: step.name, preparation: readPreparation(step) })),
+    // What the workflow BECAME, not what was asked for: restating an estimate as Express on a
+    // workflow the orchestrator left in the free lane shows the payer a boost they did not get.
+    readDownloadPriority(workflow) === 'high'
+  );
+
+  // 🔴 ALSO ON THE REPLY, and deliberately not only via the metadata round-trip.
+  // The formatter recovers substitutions from `workflow.metadata`, but only when
+  // that metadata `hasWfMeta` (a `params` key) — a submit whose graph produced no
+  // workflow metadata would round-trip nothing. Attaching the request's own
+  // record here makes the submit reply authoritative for the validation it just
+  // performed, independent of what the orchestrator echoed back.
+  //
+  // Additive: the key is absent when nothing was substituted, so the response is
+  // unchanged in the common case.
+  //
+  // 🔴 A CONDITIONAL SPREAD, NOT A TERNARY OVER THE WHOLE OBJECT. Writing
+  // `cond ? { ...formatted, modelSubstitutions } : formatted` produces a UNION
+  // return type, and TypeScript will not let a consumer read a property that
+  // exists on only one arm — `result.modelSubstitutions` fails with TS2339 from
+  // the typed tRPC client, so the field ships looking done and is unusable from
+  // the web app. The spread form below infers the optional property instead, and
+  // matches what `whatIfFromGraph` does.
+  return { ...formatted, ...(modelSubstitutions?.length ? { modelSubstitutions } : {}) };
+}
+
+// =============================================================================
+// What-If Defaults
+// =============================================================================
+
+/**
+ * Submits a what-if request using generation-graph input.
+ * Returns cost estimation without actually running the generation.
+ *
+ * Note: What-if requests skip generation status check as they are cost estimates only.
+ */
+export async function whatIfFromGraph({
+  input,
+  externalCtx,
+  userId,
+  isModerator,
+  experimental,
+  token,
+  currencies,
+  downloadPriority,
+  inputGate,
+}: WhatIfOptions) {
+  // Provide fallback for fields that don't affect cost estimation.
+  // The client excludes content fields (prompt/negativePrompt for image/video,
+  // musicDescription/lyrics for ACE audio) from whatIf queries for optimization,
+  // so we default them to pass validation when not provided.
+  const whatIfInput = {
+    prompt: 'cost-estimation',
+    negativePrompt: '',
+    musicDescription: 'cost-estimation',
+    lyrics: 'cost-estimation',
+    ...input,
+  };
+  const { data, computedKeys } = validateInput(whatIfInput, externalCtx);
+  await assertGraphInputsUsable(data, userId, inputGate);
+  const { steps } = await createWorkflowStepsFromGraph({
+    data,
+    computedKeys,
+    isWhatIf: true,
+    user: userId ? { id: userId, isModerator, tier: externalCtx.user.tier } : undefined,
+    orchestratorToken: token,
+  });
+
+  // Submit what-if request to orchestrator
+  const workflow = await submitWorkflow({
+    token,
+    body: {
+      steps,
+      experimental,
+      // @ts-ignore - BuzzSpendType is properly supported
+      currencies: currencies ? BuzzTypes.toOrchestratorType(currencies) : undefined,
+      ...(downloadPriority ? { downloadPriority } : {}),
+    },
+    query: {
+      whatif: true,
+    },
+  });
+
+  let ready = true;
+  for (const workflowStep of workflow.steps ?? []) {
+    const support = workflowStep.queuePosition?.support;
+    if (support && support !== 'available') ready = false;
+  }
+  const preparation = workflow.steps?.map(readPreparation).find(isDefined);
+
+  // Silent checkpoint substitutions from the validation above (#3520 / #3665).
+  //
+  // 🔴 THIS IS THE ONE THAT MATTERS MOST FOR AN EXTERNAL CALLER. A whatIf spends
+  // nothing and creates no persisted workflow, so it is the only place a client
+  // can discover — BEFORE committing buzz — that the model it named is not the
+  // model that will run. It is also the only signal for a SAME-PRICE
+  // substitution: cost divergence only helps if you already knew the expected
+  // price, and a swap between similarly-priced models is otherwise invisible.
+  //
+  // Nothing is persisted on this path, so unlike the submit path the reply is
+  // the only carrier; there is no metadata round-trip to fall back on.
+  const modelSubstitutions = projectModelSubstitutions(externalCtx.modelSubstitutions);
+  const warnings = collectStepWarnings(workflow.steps);
+
+  return {
+    allowMatureContent: workflow.allowMatureContent,
+    transactions: workflow.transactions?.list,
+    cost: workflow.cost,
+    ready,
+    preparation,
+    // Both additive and OMITTED when empty, matching the App Blocks snapshot contract.
+    // 🔴 Consequence a client must know: an absent `modelSubstitutions` means "no
+    // substitution" OR "a server that predates this field" — the two are
+    // indistinguishable. Callers that need to tell them apart should probe a
+    // known-bad version id once.
+    ...(modelSubstitutions?.length ? { modelSubstitutions } : {}),
+    ...(warnings.length ? { warnings } : {}),
+  };
+}
+
+// =============================================================================
+// Simplified Generation Response Formatting
+// =============================================================================
+
+import type {
+  AudioBlob,
+  BasicAnimationsBlobs,
+  ImageBlob,
+  Model3dBlob,
+  NsfwLevel,
+  TransactionInfo,
+  VideoBlob,
+  Workflow,
+  WorkflowStatus,
+  WorkflowStep,
+  WorkflowStepQueuePosition,
+} from '@civitai/orchestration-client';
+import type { SessionUser } from '~/types/session';
+import type * as z from 'zod';
+import type { workflowQuerySchema } from '~/server/schema/orchestrator/workflows.schema';
+import { queryWorkflows } from './workflows';
+import { parseAIR } from '~/shared/utils/air';
+import {
+  exceedsNsfwLevel,
+  isMature,
+  maxNsfwLevel,
+} from '~/shared/constants/orchestrator.constants';
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/**
+ * Fields shared by all normalized blob outputs.
+ * Note: `workflowId`, `stepName`, and `jobId` are intentionally absent — on the client,
+ * consumers read workflow/step info via parent refs on `BlobData` (`blob.workflow.id`,
+ * `blob.step.name`), and `jobId` has no client-side consumers.
+ */
+interface NormalizedBlobBase {
+  id: string;
+  url: string;
+  seed?: number | null;
+  available: boolean;
+  urlExpiresAt?: string | null;
+  nsfwLevel?: NsfwLevel;
+  blockedReason?: string | null;
+}
+
+/** Normalized image output. */
+export interface NormalizedImageOutput extends NormalizedBlobBase {
+  type: 'image';
+  width: number;
+  height: number;
+  aspect: number;
+  previewUrl?: string | null;
+  previewUrlExpiresAt?: string | null;
+}
+
+/** Normalized video output. */
+export interface NormalizedVideoOutput extends NormalizedBlobBase {
+  type: 'video';
+  width: number;
+  height: number;
+  aspect: number;
+}
+
+/** Normalized audio output. */
+export interface NormalizedAudioOutput extends NormalizedBlobBase {
+  type: 'audio';
+  duration?: number | null;
+}
+
+/**
+ * A 3D file inside a `NormalizedModel3DAsset`. Mirrors the per-blob fields
+ * already used in `NormalizedModel3DOutput.variants[]` so the client can
+ * treat any 3D file uniformly.
+ */
+export type NormalizedModel3DFile = {
+  id: string;
+  format: string;
+  url: string;
+  available: boolean;
+  urlExpiresAt?: string | null;
+};
+
+/**
+ * A semantically distinct 3D mesh bundle (e.g. the rigged variant, the
+ * animated variant, a walking-template). Carries the primary mesh plus
+ * optional alternate-format export and armature-only sibling — both
+ * optional because not every emitter produces them.
+ */
+export type NormalizedModel3DAsset = NormalizedModel3DFile & {
+  /** Alternate-format export of this same asset (e.g. FBX of the GLB). */
+  fbx?: NormalizedModel3DFile;
+  /** Armature/skeleton-only export — `basicAnimations` entries only. */
+  armature?: NormalizedModel3DFile;
+};
+
+/**
+ * Normalized 3D-model output (PolyGen). A single output represents one
+ * generated mesh; the primary URL points at the canonical format (GLB),
+ * `variants` carries alternate-format exports of the BASE mesh (e.g.
+ * FBX of the same GLB), and `rigged` / `animated` / `basicAnimations`
+ * carry semantically distinct sibling meshes when the workflow was asked
+ * to emit them (`enableRigging` / `enableAnimation` on the PolyGen input).
+ *
+ * The thumbnail fields carry a 2D preview image suitable for queue/grid
+ * cards — the in-browser 3D viewer mounts only on detail pages to avoid
+ * spinning up N WebGL contexts in the feed.
+ */
+export interface NormalizedModel3DOutput extends NormalizedBlobBase {
+  type: 'model3d';
+  format: string;
+  /** Alternate-format exports of the BASE mesh. The PolyGen base FBX lands here. */
+  variants?: NormalizedModel3DFile[];
+  thumbnailId?: string | null;
+  thumbnailUrl?: string | null;
+  thumbnailUrlExpiresAt?: string | null;
+  thumbnailNsfwLevel?: NsfwLevel;
+  /** Rigged sibling mesh (PolyGen `riggedModel` + optional `riggedFbxModel`). */
+  rigged?: NormalizedModel3DAsset;
+  /** Animated sibling mesh (PolyGen `animatedModel` + optional `animatedFbxModel`). */
+  animated?: NormalizedModel3DAsset;
+  /** Motion templates (PolyGen `basicAnimations`). Each entry carries its own armature-only export. */
+  basicAnimations?: {
+    walking?: NormalizedModel3DAsset;
+    running?: NormalizedModel3DAsset;
+  };
+}
+
+/** Normalized output (image, video, audio, or 3D model) from a workflow step. */
+export type NormalizedWorkflowStepOutput =
+  | NormalizedImageOutput
+  | NormalizedVideoOutput
+  | NormalizedAudioOutput
+  | NormalizedModel3DOutput;
+
+/** Step metadata with mapped params and enriched resources */
+export interface NormalizedStepMetadata {
+  /**
+   * Source generation params (for steps with source lineage — e.g., upscale, remove-bg).
+   * Undefined for standard generation steps (use workflow.metadata.params instead).
+   */
+  params?: Partial<LooseGenerationData> & Record<string, unknown>;
+  /**
+   * When true, `params` is a partial DELTA (e.g. a wildcard/snippet variant's substituted
+   * `prompt`/`negativePrompt`) rather than a complete snapshot. The client (`StepData.params`)
+   * spreads it over `workflow.metadata.params`; the server passes the small delta through rather
+   * than pre-merging, to keep the API payload small (no full params duplicated per variant).
+   * Absent for complete-snapshot (enhancement) and standard steps. Set deliberately at the write
+   * site that produces the delta — not derived. See docs/generation-metadata-architecture.md.
+   */
+  partialParams?: boolean;
+  /**
+   * True when `params`/`resources` are the source generation rather than this step's own
+   * input. The raw `metadata.workflow` marker that distinguishes them doesn't survive
+   * normalization, so readers have no other way to tell. Never set when the source params
+   * are empty — an absent flag always means "fall back to workflow params".
+   */
+  sourceLineage?: boolean;
+  /**
+   * Source generation resources (for steps with source lineage).
+   * Undefined for standard generation steps (use workflow.metadata.resources instead).
+   */
+  resources?: GenerationResourceValue[];
+  /** Remix reference (legacy — new writes put this on workflow.metadata) */
+  remixOfId?: number;
+  /**
+   * Per-output metadata keyed by blob id (favorite, feedback, hidden, etc.).
+   * Current/canonical key. New writes target this.
+   */
+  output?: Record<
+    string,
+    {
+      hidden?: boolean;
+      feedback?: 'liked' | 'disliked';
+      favorite?: boolean;
+      comments?: string;
+      postId?: number;
+    }
+  >;
+  /**
+   * Legacy per-output metadata key. Present on workflows created before the
+   * rename; merged into `output` by client readers for display. Do not write.
+   */
+  images?: Record<
+    string,
+    {
+      hidden?: boolean;
+      feedback?: 'liked' | 'disliked';
+      favorite?: boolean;
+      comments?: string;
+      postId?: number;
+    }
+  >;
+  /**
+   * When true, this step's output should be hidden from the user.
+   * Used for intermediate steps in multi-step workflows (e.g., Wan 2.2 videoGen before interpolation).
+   */
+  suppressOutput?: boolean;
+}
+
+export type StepMetadataTransformation = {
+  workflow: string;
+  params?: Record<string, unknown>;
+  resources?: Record<string, unknown>[];
+};
+
+const readPreparation = (step: WorkflowStep) =>
+  normalizePreparation((step as { preparation?: unknown }).preparation);
+const readDownloadPriority = (workflow: Workflow) =>
+  (workflow as { downloadPriority?: DownloadPriority | null }).downloadPriority ?? undefined;
+
+/** Normalized workflow step */
+export interface NormalizedStep {
+  $type: string;
+  name: string;
+  status?: WorkflowStatus;
+  timeout?: string | null;
+  completedAt?: string | null;
+  queuePosition?: WorkflowStepQueuePosition;
+  preparation?: DownloadPreparation;
+  /** Metadata with resolved params/resources */
+  metadata: NormalizedStepMetadata;
+  /** Output items (image / video / audio) */
+  output: NormalizedWorkflowStepOutput[];
+  /**
+   * TEMPORARY: legacy alias of `output` emitted by the server during the rollout
+   * window so pre-rename clients that read `step.images` keep rendering. Always
+   * identical to `output`. Remove once stale clients are expected to have updated.
+   */
+  images?: NormalizedWorkflowStepOutput[];
+  /** Step errors */
+  errors?: string[];
+}
+
+/** Workflow-level metadata — the generation form input snapshot. */
+export interface NormalizedWorkflowMetadata {
+  /** The generation form params (prompt, steps, model settings, etc.) */
+  params: Record<string, unknown>;
+  /** The generation form resources (model, LoRAs, VAE, etc.) — enriched */
+  resources: GenerationResourceValue[];
+  /** Remix reference */
+  remixOfId?: number;
+  /** Whether the generation was private */
+  isPrivateGeneration?: boolean;
+  /**
+   * Checkpoint versions the graph SILENTLY replaced during the validation that
+   * produced this workflow (issues #3520 / #3665).
+   *
+   * 🔴 PRESENT ON EVERY LATER READ, not just the submit reply — that is the
+   * whole point. It is recovered from the orchestrator workflow's own
+   * `metadata`, so a caller that polls, reconnects, or lists its history still
+   * learns it was billed for model A and given model B. Omitted entirely when
+   * nothing was substituted, which is the overwhelmingly common case.
+   *
+   * 🔴 THE PASSTHROUGH BELOW IS LOAD-BEARING AND EASY TO LOSE. `normalizedWfMeta`
+   * is built from an explicit key ALLOWLIST, so persisting the key is not enough
+   * on its own: before #3665 the generation path could write it and the formatter
+   * would silently drop it on read-back. If you add a field here, add it there.
+   *
+   * 🔴 WHERE AN INTEGRATOR READS IT — three places, and they are not the same:
+   *   - `whatIfFromGraph`      → TOP-LEVEL `modelSubstitutions` on the reply.
+   *                              Nothing is persisted on that path, so the reply
+   *                              is the only carrier.
+   *   - `generateFromGraph`    → BOTH top-level (authoritative for the validation
+   *                              just performed) AND here under `metadata`.
+   *   - any LATER read (poll / queryGeneratedImages / history) → HERE ONLY.
+   * A client that only reads the top-level field will see substitutions on the
+   * submit and never again; one that only reads `metadata` will miss the whatIf
+   * entirely. Read both.
+   */
+  modelSubstitutions?: PersistedModelSubstitution[];
+}
+
+/** Normalized workflow response */
+export interface NormalizedWorkflow {
+  id: string;
+  status: WorkflowStatus;
+  createdAt: Date;
+  transactions: TransactionInfo[];
+  cost: WorkflowCost;
+  tags: string[];
+  allowMatureContent?: boolean | null;
+  /** The highest rating the orchestrator will release; an unlock does not lift it. */
+  nsfwCap?: NsfwLevel | null;
+  downloadPriority?: DownloadPriority;
+  duration?: number;
+  /** Workflow-level metadata — the form input snapshot for replay. */
+  metadata?: NormalizedWorkflowMetadata;
+  steps: NormalizedStep[];
+}
+
+// =============================================================================
+// Resource Helpers
+// =============================================================================
+
+/**
+ * Extracts resource refs from step metadata (IDs + step-level overrides).
+ * Checks metadata.params.resources first (video format with AIR strings),
+ * then falls back to metadata.resources (standard format with IDs).
+ */
+function getResourceRefsFromStep(
+  step: WorkflowStep
+): Array<{ id: number; strength?: number | null; epochNumber?: number }> {
+  const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+  const params = (metadata.params ?? {}) as Record<string, unknown>;
+
+  // Try params.resources first (video workflows store resources here)
+  const paramsResources = params.resources as
+    | Array<{ air?: string; id?: number; strength?: number } & Partial<ResourceData>>
+    | undefined;
+  if (paramsResources && paramsResources.length > 0) {
+    return paramsResources.map((r) => {
+      // Handle AIR format (video workflows use { air, strength })
+      if (r.air && !r.id) {
+        const { version } = parseAIR(r.air);
+        return { id: version, strength: r.strength };
+      }
+      return {
+        id: r.id!,
+        strength: r.strength,
+        epochNumber: r.epochDetails?.epochNumber,
+      };
+    });
+  }
+
+  // Enhancement steps store resources via `resourcesToImageMetadataResources`, which keys them
+  // `modelVersionId` rather than `id` — so both fields are read.
+  const metadataResources = metadata.resources as
+    | Array<ResourceData & { modelVersionId?: number }>
+    | undefined;
+  const refs = (metadataResources ?? [])
+    .map((r) => ({
+      id: r.id ?? r.modelVersionId,
+      strength: r.strength,
+      epochNumber: r.epochDetails?.epochNumber,
+    }))
+    .filter((r) => r.id != null);
+
+  // Legacy: also collect from source.resources (old format stored original gen in source)
+  const source = metadata.source as { resources?: Array<Record<string, unknown>> } | undefined;
+  if (source?.resources) {
+    const existingIds = new Set(refs.map((r) => r.id));
+    for (const r of source.resources) {
+      const id = r.id as number | undefined;
+      if (id && !existingIds.has(id)) {
+        refs.push({ id, strength: r.strength as number | undefined, epochNumber: undefined });
+      }
+    }
+  }
+
+  return refs;
+}
+
+/**
+ * Returns enriched resources for display in the queue.
+ * Preserves full GenerationResource data (model.name, model.id, version name, etc.)
+ * and applies per-step strength overrides and epoch details.
+ */
+function getResourcesFromStep(
+  step: WorkflowStep,
+  allResources: GenerationResource[]
+): GenerationResourceValue[] {
+  const refs = getResourceRefsFromStep(step);
+  return refs
+    .map((ref) => {
+      // Match by both id and epochNumber to handle the same model version used with different epochs
+      const enriched =
+        allResources.find(
+          (r) =>
+            r.id === ref.id && (r.epochDetails?.epochNumber ?? r.epochNumber) === ref.epochNumber
+        ) ?? allResources.find((r) => r.id === ref.id);
+      if (!enriched) return null;
+      return {
+        ...asResourceValue(enriched, ref.strength),
+        epochDetails: enriched.epochDetails
+          ? enriched.epochDetails
+          : ref.epochNumber
+          ? { jobId: '', fileName: '', epochNumber: ref.epochNumber, isExpired: false }
+          : undefined,
+      };
+    })
+    .filter(isDefined);
+}
+
+// =============================================================================
+// Output Formatting
+// =============================================================================
+
+type StepWithOutput = WorkflowStep & {
+  input?: {
+    seed?: number;
+    aspectRatio?: string | { value?: string; width?: number; height?: number };
+  };
+  output?: {
+    images?: ImageBlob[];
+    video?: VideoBlob;
+    // Extra videos produced by engines that batch multiple outputs in a single
+    // job (e.g. LTX 2.3). Each slot uses Seed + slotIndex.
+    additionalVideos?: VideoBlob[] | null;
+    blobs?: ImageBlob[];
+    // Audio steps bundle a cover image into a VideoBlob when they have one, so the
+    // container type varies per result — discriminate on blob.type, not on $type.
+    blob?: ImageBlob | VideoBlob | AudioBlob;
+    // PolyGen: composite output with a primary 3D model, optional alternate-
+    // format export, a 2D preview thumbnail, and optional rigged / animated
+    // / motion-template sibling meshes (each with their own glb + fbx
+    // exports, plus armature-only siblings for basicAnimations entries).
+    model?: Model3dBlob;
+    fbxModel?: Model3dBlob;
+    thumbnail?: ImageBlob;
+    riggedModel?: Model3dBlob;
+    riggedFbxModel?: Model3dBlob;
+    animatedModel?: Model3dBlob;
+    animatedFbxModel?: Model3dBlob;
+    basicAnimations?: BasicAnimationsBlobs;
+    errors?: string[];
+    externalTOSViolation?: boolean;
+    message?: string;
+  };
+};
+
+/**
+ * Intermediate shape carried out of `normalizeStepOutput` — `formatStepOutputs`
+ * turns it into a `NormalizedWorkflowStepOutput`. The `model3d` variant bundles
+ * the primary model with its optional alternate-format export and thumbnail
+ * so a single PolyGen step produces a single output card (not three).
+ */
+type NormalizedBlobItem =
+  | ImageBlob
+  | VideoBlob
+  | AudioBlob
+  | (Model3dBlob & {
+      fbxModel?: Model3dBlob | null;
+      thumbnail?: ImageBlob | null;
+      riggedModel?: Model3dBlob | null;
+      riggedFbxModel?: Model3dBlob | null;
+      animatedModel?: Model3dBlob | null;
+      animatedFbxModel?: Model3dBlob | null;
+      basicAnimations?: BasicAnimationsBlobs | null;
+    });
+
+/**
+ * Normalizes step output (images/videos/audio) to a common format
+ */
+export function normalizeStepOutput(step: StepWithOutput): NormalizedBlobItem[] {
+  const output = step.output;
+  if (!output) return [];
+
+  switch (step.$type) {
+    case 'comfy':
+      return output.blobs?.map((blob) => ({ ...blob, type: 'image' as const })) ?? [];
+    case 'imageGen':
+    case 'textToImage':
+    // model3DPreview renders 2D preview image(s) of a prior polyGen mesh; its
+    // output shape mirrors an image step. The queue card reads these as the
+    // 3D thumbnail (the step is suppressOutput, so they don't render as cards).
+    case 'model3DPreview':
+      return output.images?.map((img) => ({ ...img, type: 'image' as const })) ?? [];
+    case 'imageUpscaler':
+    case 'preprocessImage':
+      return output.blob ? [{ ...(output.blob as ImageBlob), type: 'image' as const }] : [];
+    case 'videoGen': {
+      // LTX 2.3 batches multiple videos in a single job — primary in `video`,
+      // remainder in `additionalVideos` (each slot uses Seed + slotIndex).
+      const primary = output.video ? [{ ...output.video, type: 'video' as const }] : [];
+      const additional =
+        output.additionalVideos?.map((v) => ({ ...v, type: 'video' as const })) ?? [];
+      return [...primary, ...additional];
+    }
+    case 'videoUpscaler':
+    case 'videoEnhancement':
+    case 'videoInterpolation':
+      return output.video ? [{ ...output.video, type: 'video' as const }] : [];
+    // vid2vid:preprocess emits the control map as its deliverable, so its
+    // output is not suppressed and has to normalize here. The blob is a
+    // VideoBlob, so it cannot share the preprocessImage case above.
+    case 'preprocessVideo':
+      return output.blob ? [{ ...(output.blob as VideoBlob), type: 'video' as const }] : [];
+    case 'aceStepAudio':
+      // Cover-image mode returns VideoBlob; audio-only returns AudioBlob. Discriminate on blob.type.
+      if (!output.blob) return [];
+      if (output.blob.type === 'video')
+        return [{ ...(output.blob as VideoBlob), type: 'video' as const }];
+      return [{ ...(output.blob as AudioBlob), type: 'audio' as const }];
+    case 'miniMaxMusic3':
+    case 'yuE2':
+    case 'soniloAudioGen':
+      return output.blob ? [{ ...(output.blob as AudioBlob), type: 'audio' as const }] : [];
+    case 'polyGen': {
+      // Bundle every PolyGen sibling onto a single item — the format step
+      // turns this into one NormalizedModel3DOutput per generated mesh
+      // (regardless of how many rigged/animated/motion-template variants
+      // the workflow emitted).
+      const primary = getPolyGenPrimaryModel(output);
+      if (!primary) return [];
+      const fbxIsPrimary = primary === output.fbxModel;
+      return [
+        {
+          ...primary,
+          type: 'model3d' as const,
+          fbxModel: fbxIsPrimary ? null : output.fbxModel ?? null,
+          thumbnail: output.thumbnail ?? null,
+          riggedModel: output.riggedModel ?? null,
+          riggedFbxModel: output.riggedFbxModel ?? null,
+          animatedModel: output.animatedModel ?? null,
+          animatedFbxModel: output.animatedFbxModel ?? null,
+          basicAnimations: output.basicAnimations ?? null,
+        },
+      ];
+    }
+    default:
+      return [];
+  }
+}
+
+/**
+ * Max rating across a workflow's `model3DPreview` render images. The
+ * orchestrator never rates the mesh blob itself (`nsfwLevel: null`) — the
+ * chained 2D preview render carries the result's effective rating, so it must
+ * be propagated onto the `model3d` output for the client's NSFW gates
+ * (yellow-Buzz unlock, enableNsfw, siteRestricted) to apply.
+ */
+export function getModel3DPreviewNsfwLevel(
+  steps: WorkflowStep[] | null | undefined
+): NsfwLevel | undefined {
+  const previews = (steps ?? []).filter((s) => s.$type === 'model3DPreview') as Array<{
+    output?: { images?: ImageBlob[] };
+  }>;
+  if (!previews.length) return undefined;
+  return maxNsfwLevel(previews.flatMap((s) => (s.output?.images ?? []).map((i) => i?.nsfwLevel)));
+}
+
+/**
+ * Formats step outputs into normalized images array
+ */
+export function formatStepOutputs(
+  step: StepWithOutput,
+  resolvedParams?: Record<string, unknown>,
+  previewNsfwLevel?: NsfwLevel
+): { output: NormalizedWorkflowStepOutput[]; errors: string[] } {
+  const items = normalizeStepOutput(step);
+  const metadata = (step.metadata as Record<string, unknown>) ?? {};
+  const params = resolvedParams ?? ((metadata.params ?? {}) as Record<string, unknown>);
+  const seed = params.seed as number | undefined;
+  const transformations = (metadata.transformations ?? []) as Array<{
+    params?: Record<string, unknown>;
+  }>;
+
+  const output: NormalizedWorkflowStepOutput[] = items.map((item, index) => {
+    // Common fields for every output type.
+    const base = {
+      id: item.id,
+      seed: seed ? seed + index : undefined,
+      available: item.available,
+      urlExpiresAt: item.urlExpiresAt,
+      nsfwLevel: item.nsfwLevel,
+      blockedReason: item.blockedReason,
+    };
+
+    if (item.type === 'audio') {
+      return {
+        ...base,
+        type: 'audio' as const,
+        url: item.url as string,
+        duration: item.duration,
+      } satisfies NormalizedAudioOutput;
+    }
+
+    if (item.type === 'model3d') {
+      const fbx = item.fbxModel ?? undefined;
+      const thumb = item.thumbnail ?? undefined;
+
+      // Shape a single Model3D blob into a NormalizedModel3DFile. Inlined
+      // here (rather than a free helper) to keep the discriminated-union
+      // formatter readable; the body is tiny.
+      const toFile = (blob: Model3dBlob): NormalizedModel3DFile => ({
+        id: blob.id,
+        format: blob.format,
+        url: blob.url as string,
+        available: blob.available,
+        urlExpiresAt: blob.urlExpiresAt,
+      });
+      // Bundle a primary blob with its optional FBX sibling + armature
+      // sibling into a NormalizedModel3DAsset. Each top-level
+      // semantically-distinct mesh (rigged, animated, walking, running)
+      // gets one of these.
+      const toAsset = (
+        primary: Model3dBlob | null | undefined,
+        fbxBlob: Model3dBlob | null | undefined,
+        armatureBlob: Model3dBlob | null | undefined
+      ): NormalizedModel3DAsset | undefined => {
+        if (!primary) return undefined;
+        return {
+          ...toFile(primary),
+          fbx: fbxBlob ? toFile(fbxBlob) : undefined,
+          armature: armatureBlob ? toFile(armatureBlob) : undefined,
+        };
+      };
+
+      const ba = item.basicAnimations ?? undefined;
+      const walking = toAsset(ba?.walkingModel, ba?.walkingFbxModel, ba?.walkingArmatureModel);
+      const running = toAsset(ba?.runningModel, ba?.runningFbxModel, ba?.runningArmatureModel);
+
+      return {
+        ...base,
+        type: 'model3d' as const,
+        // Inherit the most severe rating from the polyGen auto-thumbnail and
+        // the chained model3DPreview render — the mesh blob itself is never
+        // rated, and without this a mature result bypasses the NSFW gates.
+        nsfwLevel: maxNsfwLevel([base.nsfwLevel, thumb?.nsfwLevel, previewNsfwLevel]),
+        url: item.url as string,
+        format: item.format,
+        // Kept for back-compat: the base FBX still surfaces in `variants[]`
+        // for older consumers (queue card download dropdown, image viewer).
+        variants: fbx ? [toFile(fbx)] : undefined,
+        thumbnailId: thumb?.id,
+        thumbnailUrl: thumb?.url,
+        thumbnailUrlExpiresAt: thumb?.urlExpiresAt,
+        thumbnailNsfwLevel: thumb?.nsfwLevel,
+        rigged: toAsset(item.riggedModel, item.riggedFbxModel, null),
+        animated: toAsset(item.animatedModel, item.animatedFbxModel, null),
+        basicAnimations: walking || running ? { walking, running } : undefined,
+      } satisfies NormalizedModel3DOutput;
+    }
+
+    // image / video: resolve width/height/aspect.
+    // For `aceStepAudio` steps that emit a VideoBlob (audio + cover image), force aspect=1
+    // because cover-image dimensions aren't meaningful as a display aspect.
+    const isAudioCoverVideo = step.$type === 'aceStepAudio' && item.type === 'video';
+
+    let width = item.width as number | null | undefined;
+    let height = item.height as number | null | undefined;
+
+    if (!isAudioCoverVideo && (!width || !height)) {
+      // Check transformations from last to first to find dimensions
+      if (transformations.length > 0) {
+        for (let i = transformations.length - 1; i >= 0; i--) {
+          const transformation = transformations[i];
+          if (!transformation.params) continue;
+
+          // Check for direct width/height first
+          const directWidth = transformation.params.width as number | undefined;
+          const directHeight = transformation.params.height as number | undefined;
+
+          if (directWidth && directHeight) {
+            width = directWidth;
+            height = directHeight;
+            break;
+          }
+
+          // If not found, check for targetDimensions
+          const targetDimensions = transformation.params.targetDimensions as
+            | { width?: number; height?: number }
+            | undefined;
+          if (targetDimensions?.width && targetDimensions?.height) {
+            width = targetDimensions.width;
+            height = targetDimensions.height;
+            break;
+          }
+        }
+      }
+
+      // Check upscaleWidth/upscaleHeight: new-format equivalent of transformation
+      // targetDimensions. Set by hires-fix workflows to represent the final output
+      // size after upscaling, which differs from the source image width/height.
+      if (!width || !height) {
+        width = params.upscaleWidth as number | undefined;
+        height = params.upscaleHeight as number | undefined;
+      }
+
+      // Check top-level targetDimensions (upscale workflows store per-image output
+      // dimensions here; use the matching index or first entry as fallback)
+      if (!width || !height) {
+        const targetDims = params.targetDimensions as
+          | Array<{ width?: number; height?: number }>
+          | undefined;
+        const dims = targetDims?.[index] ?? targetDims?.[0];
+        if (dims?.width && dims?.height) {
+          width = dims.width;
+          height = dims.height;
+        }
+      }
+
+      // Fall back to source dimensions from params (input image dims for img2img,
+      // or aspect ratio target dims for txt2img)
+      if (!width || !height) {
+        width = params.width as number | undefined;
+        height = params.height as number | undefined;
+      }
+
+      if (!width || !height) {
+        // Check params.aspectRatio first, then step.input.aspectRatio (e.g. videoGen
+        // steps where the output aspect ratio lives on the step input, not metadata params)
+        const aspectRatio = params.aspectRatio ?? step.input?.aspectRatio;
+        if (aspectRatio) {
+          // Handle both object format { value, width, height } and legacy string format "w:h"
+          if (typeof aspectRatio === 'object' && aspectRatio !== null) {
+            const ar = aspectRatio as { value?: string; width?: number; height?: number };
+            width = ar.width;
+            height = ar.height;
+          } else if (typeof aspectRatio === 'string') {
+            // "w:h" is a ratio, not pixel dims — scale so the larger side is 512
+            // so width/height are sane display values while preserving aspect.
+            const [w, h] = aspectRatio.split(':').map(Number);
+            if (w > 0 && h > 0) {
+              const scale = 512 / Math.max(w, h);
+              width = Math.round(w * scale);
+              height = Math.round(h * scale);
+            }
+          }
+        }
+
+        if (!width || !height) {
+          const sourceImage = (params.sourceImage ?? (params.images as unknown[])?.[0]) as
+            | { width?: number; height?: number }
+            | undefined;
+          if (sourceImage) {
+            width = sourceImage.width;
+            height = sourceImage.height;
+          }
+        }
+      }
+    }
+
+    if (!width || !height) {
+      width = 512;
+      height = 512;
+    }
+
+    const aspect = isAudioCoverVideo ? 1 : width / height;
+    const url = item.url && item.type === 'video' ? `${item.url}.mp4` : (item.url as string);
+
+    if (item.type === 'video') {
+      return {
+        ...base,
+        type: 'video' as const,
+        url,
+        width,
+        height,
+        aspect,
+      } satisfies NormalizedVideoOutput;
+    }
+
+    return {
+      ...base,
+      type: 'image' as const,
+      url,
+      width,
+      height,
+      aspect,
+      previewUrl: (item as ImageBlob).previewUrl,
+      previewUrlExpiresAt: (item as ImageBlob).previewUrlExpiresAt,
+    } satisfies NormalizedImageOutput;
+  });
+
+  const engine =
+    (params.engine as string | undefined) ??
+    (step as { input?: { engine?: string } }).input?.engine;
+  const errors = sanitizeStepErrors(step, engine);
+
+  return { output, errors };
+}
+
+// =============================================================================
+// Main Formatting Functions
+// =============================================================================
+
+/**
+ * Simplified step formatting that works for all step types.
+ * Uses mapDataToGraphInput to handle workflow/ecosystem/aspectRatio resolution uniformly.
+ *
+ * Output shape:
+ * - `metadata.params` = resolved params (workflow key already present in raw params)
+ * - `metadata.resources` = resolved resources (enriched)
+ *
+ * Format handling:
+ * - Legacy (transformations[]): root params/resources are the original generation
+ * - Legacy (source field): source has the original generation, root has the step's action
+ * - Current format: root params contain workflow key
+ */
+function formatStep(
+  workflowId: string,
+  step: WorkflowStep,
+  allResources: GenerationResource[],
+  workflowMetadata?: Record<string, unknown>,
+  previewNsfwLevel?: NsfwLevel
+): NormalizedStep {
+  const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+  const rawParams = (metadata.params ?? {}) as Record<string, unknown>;
+  const hasStepParams = Object.keys(rawParams).length > 0;
+  const transformations = metadata.transformations as StepMetadataTransformation[] | undefined;
+
+  // Build enriched resources from step.metadata.resources
+  const stepResources = getResourcesFromStep(step, allResources);
+
+  // Resolve step-level params/resources based on format.
+  // Legacy formats always populate step params. New format only has step params for enhancements.
+  let resolvedParams: Record<string, unknown> | undefined;
+  let resolvedResources: GenerationResourceValue[] | undefined;
+  let remixOfId: number | undefined;
+  let fromSourceLineage = false;
+
+  if (Array.isArray(transformations) && transformations.length > 0) {
+    // Legacy format (transformations[]): root params/resources are the original generation.
+    resolvedParams = rawParams;
+    resolvedResources = stepResources;
+    remixOfId = metadata.remixOfId as number | undefined;
+    fromSourceLineage = true;
+  } else if (metadata.source && typeof metadata.source === 'object') {
+    // Legacy format (source field): source has the original generation, root has step's own action.
+    const rawSource = metadata.source as Record<string, unknown>;
+    const sourceParams = (rawSource.params as Record<string, unknown>) ?? {};
+    resolvedParams = sourceParams;
+    remixOfId = (rawSource.remixOfId ?? metadata.remixOfId) as number | undefined;
+    fromSourceLineage = true;
+
+    // Enrich source resources
+    const rawSourceResources = rawSource.resources as Array<Record<string, unknown>> | undefined;
+    resolvedResources =
+      rawSourceResources && rawSourceResources.length > 0
+        ? rawSourceResources
+            .map((r) => {
+              const id = r.id as number | undefined;
+              if (!id) return null;
+              const enriched = allResources.find((ar) => ar.id === id);
+              if (!enriched) return null;
+              return asResourceValue(enriched, r.strength as number | undefined);
+            })
+            .filter((r): r is GenerationResourceValue => r !== null)
+        : stepResources;
+  } else if (hasStepParams) {
+    // Step has its own params (legacy standard gen, or enhancement with params at root).
+    // Only buildResolvedSource writes `metadata.workflow`, so it is what separates an
+    // enhancement's source snapshot from a standard gen's own params.
+    resolvedParams = rawParams;
+    resolvedResources = stepResources;
+    remixOfId = metadata.remixOfId as number | undefined;
+    fromSourceLineage = 'workflow' in metadata;
+  } else {
+    // New format: step has no params/resources (standard gen).
+    // Data lives on workflow.metadata — don't fabricate step-level data.
+    remixOfId = undefined;
+  }
+
+  // Map to graph format (workflow, ecosystem, aspectRatio resolution) if we have params.
+  // For enhancement steps with source lineage, the resolved step params ARE the original
+  // generation context (source params already carry their own workflow/ecosystem keys
+  // from the source form input). Preserve them as-is so per-output remix can read them
+  // via StepData.params. Running mapDataToGraphInput would double-resolve from
+  // resources and inject a duplicate workflow key.
+  const hasSourceLineage = 'workflow' in metadata;
+  // A partial-delta step (wildcard/snippet variant) carries only a small overlay (e.g. the
+  // substituted prompt). Pass it through raw — the client spreads it over workflow params.
+  // Don't run mapDataToGraphInput on a bare prompt delta: it would fabricate a workflow/
+  // ecosystem key from no context and pollute the delta.
+  const partialParams = (metadata as { partialParams?: boolean }).partialParams === true;
+  let finalParams: Record<string, unknown> | undefined;
+  if (resolvedParams) {
+    if (partialParams || hasSourceLineage) {
+      finalParams = removeEmpty(resolvedParams);
+    } else {
+      const mapped = mapDataToGraphInput(resolvedParams, resolvedResources ?? [], {
+        stepType: step.$type,
+      });
+      finalParams = removeEmpty({ ...resolvedParams, ...mapped });
+    }
+  }
+
+  // For dimension resolution, prefer step params per-field but fall back to workflow params
+  // when the step's params don't carry dimension fields (e.g. img2img:upscale step params
+  // are copied from the source generation and lack `images/width/height/aspectRatio`).
+  const wfParams = (workflowMetadata?.params ?? {}) as Record<string, unknown>;
+  const paramsForDimensions = { ...wfParams, ...(finalParams ?? {}) };
+
+  // Format outputs
+  const { output, errors } = formatStepOutputs(
+    step as StepWithOutput,
+    paramsForDimensions,
+    previewNsfwLevel
+  );
+
+  return {
+    $type: step.$type,
+    name: step.name,
+    status: step.status,
+    timeout: step.timeout,
+    completedAt: step.completedAt,
+    queuePosition: step.queuePosition,
+    preparation: readPreparation(step),
+    metadata: {
+      ...removeEmpty({
+        params: finalParams,
+        // An empty source snapshot must read as no-lineage, or remix prefers it and
+        // loads a blank form.
+        sourceLineage:
+          fromSourceLineage && finalParams && Object.keys(finalParams).length > 0
+            ? true
+            : undefined,
+        remixOfId,
+        // Pass both raw keys through. Client merges `output + images` for display
+        // via `BlobData.outputMeta`; client's patch builder inspects `output`
+        // directly to decide whether to emit init ops for legacy workflows
+        // (legacy = `images` populated, `output` absent — first patch must create
+        // the `output` parent path in orchestrator storage).
+        output: (metadata as any).output as NormalizedStepMetadata['output'],
+        images: metadata.images as NormalizedStepMetadata['images'],
+        suppressOutput: metadata.suppressOutput as boolean | undefined,
+        // Flag (not a pre-merge): tells the client to spread the small `params` delta over
+        // workflow params. Kept as a flag so the API payload stays minimal.
+        partialParams: partialParams && finalParams ? true : undefined,
+      }),
+      ...(resolvedResources?.length ? { resources: resolvedResources } : {}),
+    },
+    output,
+    // TEMPORARY: dual-emit under the legacy `images` key so pre-rename clients
+    // (which read `step.images`) keep rendering their queue while users refresh.
+    // Remove after the rollout window closes.
+    images: output,
+    errors: errors.length > 0 ? errors : undefined,
+  };
+}
+
+/**
+ * Simplified formatGenerationResponse.
+ */
+/**
+ * The orchestrator charges the yellow-Buzz unlock without lifting the workflow's `nsfwLevel` cap, so
+ * the unlock is allowed only when it releases something: the workflow is locked
+ * (`allowMatureContent === false`) and at least one output is rated mature and within the cap.
+ */
+export async function assertUnlockReleasesOutput({
+  token,
+  workflowId,
+}: {
+  token: string;
+  workflowId: string;
+}) {
+  const workflow = await getWorkflow({ token, path: { workflowId } });
+  if (workflow.allowMatureContent === true)
+    throw throwBadRequestError('This generation is already unlocked.');
+  // Absent reads as null, the classic API's unrestricted workflow: the queue offers the unlock only
+  // on `false` too.
+  if (workflow.allowMatureContent !== false)
+    throw throwBadRequestError('This generation has no mature restriction to unlock.');
+
+  const cap = workflow.nsfwLevel;
+  const capRefusal = () =>
+    throwBadRequestError(
+      `This generation is limited to ${cap!
+        .toUpperCase()
+        .replace('PG13', 'PG-13')}, so unlocking it would not show its mature results.`
+    );
+  if (cap === 'pg' || cap === 'pg13') throw capRefusal();
+  const matureLevels = (workflow.steps ?? [])
+    .flatMap((step) => normalizeStepOutput(step as StepWithOutput))
+    .map((item) => item.nsfwLevel)
+    .filter((level): level is NsfwLevel => !!isMature(level));
+  if (!matureLevels.length)
+    throw throwBadRequestError('Nothing in this generation needs unlocking yet.');
+  if (cap && matureLevels.every((level) => exceedsNsfwLevel(level, cap))) throw capRefusal();
+}
+
+type UnlockViewer = { domain: ColorDomain; showNsfw: boolean };
+
+/**
+ * Generation submits `allowMatureContent: false` on the green domain and for users with mature
+ * content off; an unlock there would charge yellow Buzz for outputs they cannot be shown.
+ */
+export function assertUnlockAllowed({ domain, showNsfw }: UnlockViewer) {
+  if (domain === 'green')
+    throw throwBadRequestError(
+      'Mature content cannot be unlocked on this site. Open it on civitai.red to unlock.'
+    );
+  if (!showNsfw)
+    throw throwBadRequestError(
+      'Enable mature content in your account settings to unlock this generation.'
+    );
+}
+
+/** Update a workflow and return the normalized response. */
+export async function updateWorkflow({
+  user,
+  viewer,
+  ...props
+}: WorkflowUpdateSchema & { token: string; user?: SessionUser; viewer: UnlockViewer }) {
+  if (props.allowMatureContent === true) {
+    assertUnlockAllowed(viewer);
+    await assertUnlockReleasesOutput(props);
+  }
+  const workflow = await clientUpdateWorkflow({ ...props, throwOnError: true });
+  const [formatted] = await formatGenerationResponse2([workflow], user);
+  return formatted;
+}
+
+export async function formatGenerationResponse2(
+  workflows: Workflow[],
+  user?: { id?: number; isModerator?: boolean; tier?: string }
+): Promise<NormalizedWorkflow[]> {
+  // Collect all resource IDs from all steps AND workflow metadata
+  // getResourceRefsFromStep handles both regular format and video format (AIR strings)
+  const allResourceRefs: Array<{ id: number; epoch?: number }> = [];
+  for (const workflow of workflows) {
+    // Collect from workflow.metadata.resources
+    const wfMeta = (workflow.metadata ?? {}) as Record<string, unknown>;
+    const wfResources = wfMeta.resources as ResourceData[] | undefined;
+    if (wfResources) {
+      for (const r of wfResources) {
+        // Raw-AIR resources (negative synthetic ids) have no ModelVersion row
+        // to hydrate — they render from their stored fields below.
+        if (isRawAirResource(r)) continue;
+        allResourceRefs.push({ id: r.id, epoch: r.epochDetails?.epochNumber });
+      }
+    }
+    // Collect from step resources
+    for (const step of workflow.steps ?? []) {
+      const refs = getResourceRefsFromStep(step);
+      allResourceRefs.push(...refs.map((r) => ({ id: r.id, epoch: r.epochNumber })));
+    }
+  }
+
+  // Deduplicate by (id, epoch) — not just id — so different epochs of the same version survive
+  const uniqueRefs = Array.from(
+    new Map(allResourceRefs.map((r) => [`${r.id}_${r.epoch ?? ''}`, r])).values()
+  );
+  const enrichedResources =
+    uniqueRefs.length > 0 ? await getResourceData(uniqueRefs, { user }) : [];
+
+  // Format each workflow
+  return workflows.map((workflow) => {
+    const transactions = workflow.transactions?.list ?? [];
+    // Orchestrator defaults metadata to {} — treat empty object as missing
+    const rawWfMeta = (workflow.metadata ?? undefined) as Record<string, unknown> | undefined;
+    const hasWfMeta = rawWfMeta && 'params' in rawWfMeta;
+
+    // Format steps first — needed for historic metadata fallback
+    const previewNsfwLevel = getModel3DPreviewNsfwLevel(workflow.steps);
+    const steps = (workflow.steps ?? []).map((step) =>
+      formatStep(
+        workflow.id as string,
+        step,
+        enrichedResources,
+        hasWfMeta ? rawWfMeta : undefined,
+        previewNsfwLevel
+      )
+    );
+
+    // Build workflow-level metadata
+    let normalizedWfMeta: NormalizedWorkflowMetadata | undefined;
+    if (hasWfMeta) {
+      const wfParams = (rawWfMeta.params ?? {}) as Record<string, unknown>;
+      const wfRawResources = rawWfMeta.resources as ResourceData[] | undefined;
+      const wfResources: GenerationResourceValue[] = [];
+      for (const r of wfRawResources ?? []) {
+        if (isRawAirResource(r)) {
+          wfResources.push(rawAirGenerationResource(r));
+          continue;
+        }
+        const enriched = enrichedResources.find((ar) => ar.id === r.id);
+        if (enriched) {
+          wfResources.push(asResourceValue(enriched, r.strength));
+        }
+      }
+
+      // Map params to graph format (workflow, ecosystem, aspectRatio resolution)
+      const mapped = mapDataToGraphInput(wfParams, wfResources);
+      // 🔴 THIS IS AN ALLOWLIST, NOT A SPREAD. Every key a caller sees has to be
+      // named here; `rawWfMeta` carries others that are deliberately not
+      // surfaced. That is exactly why `modelSubstitutions` needs an explicit
+      // line: the submit path persists it on the orchestrator metadata, and
+      // before #3665 this formatter dropped it again on read-back — the record
+      // round-tripped perfectly and reached no one.
+      const persistedSubstitutions = readModelSubstitutionsFromMetadata(rawWfMeta);
+      normalizedWfMeta = {
+        params: removeEmpty({ ...wfParams, ...mapped }),
+        resources: wfResources,
+        ...(rawWfMeta.remixOfId != null ? { remixOfId: rawWfMeta.remixOfId as number } : {}),
+        ...(rawWfMeta.isPrivateGeneration
+          ? { isPrivateGeneration: rawWfMeta.isPrivateGeneration as boolean }
+          : {}),
+        ...(persistedSubstitutions ? { modelSubstitutions: persistedSubstitutions } : {}),
+      };
+    } else if (steps.length > 0) {
+      // Historic workflow — no workflow-level metadata.
+      // Fall back to step metadata for remix support.
+      const rawStepMeta = ((workflow.steps ?? [])[0]?.metadata ?? {}) as Record<string, unknown>;
+      const transformations = rawStepMeta.transformations as
+        | StepMetadataTransformation[]
+        | undefined;
+
+      if (Array.isArray(transformations) && transformations.length > 0) {
+        // Legacy enhancement: last transformation is the workflow metadata
+        const lastTransform = transformations[transformations.length - 1];
+        const tParams = (lastTransform.params ?? {}) as Record<string, unknown>;
+        const tResources: GenerationResourceValue[] = [];
+        for (const r of (lastTransform.resources ?? []) as ResourceData[]) {
+          const enriched = enrichedResources.find((ar) => ar.id === r.id);
+          if (enriched) {
+            tResources.push(asResourceValue(enriched, r.strength));
+          }
+        }
+        const mapped = mapDataToGraphInput(tParams, tResources);
+        normalizedWfMeta = {
+          params: removeEmpty({ ...tParams, ...mapped }),
+          resources: tResources,
+          ...(rawStepMeta.remixOfId != null ? { remixOfId: rawStepMeta.remixOfId as number } : {}),
+        };
+      } else {
+        // Standard gen: use formatted step metadata
+        const first = steps[0].metadata;
+        if (first.params || first.resources?.length) {
+          normalizedWfMeta = {
+            params: first.params ?? {},
+            resources: first.resources ?? [],
+            ...(first.remixOfId != null ? { remixOfId: first.remixOfId } : {}),
+          };
+        }
+      }
+    }
+
+    return {
+      id: workflow.id as string,
+      status: workflow.status ?? ('unassigned' as WorkflowStatus),
+      createdAt: workflow.createdAt ? new Date(workflow.createdAt) : new Date(),
+      transactions,
+      cost: workflow.cost,
+      tags: workflow.tags ?? [],
+      allowMatureContent: workflow.allowMatureContent,
+      nsfwCap: workflow.nsfwLevel,
+      downloadPriority: readDownloadPriority(workflow),
+      duration:
+        workflow.startedAt && workflow.completedAt
+          ? Math.round(
+              new Date(workflow.completedAt).getTime() / 1000 -
+                new Date(workflow.startedAt).getTime() / 1000
+            )
+          : undefined,
+      metadata: normalizedWfMeta,
+      steps,
+    };
+  });
+}
+
+// =============================================================================
+// Query Functions
+// =============================================================================
+
+export type GeneratedImageWorkflowModel = NormalizedWorkflow;
+
+/**
+ * Simplified queryGeneratedImageWorkflows.
+ */
+// Short-TTL cache in front of the user's generated-images feed. On every
+// SignalR reconnect the client invalidates `orchestrator.queryGeneratedImages`
+// for every tab at once (see SignalsProvider.onStateChange), so a single user
+// flapping their connection — or many users reconnecting on the same wave —
+// produces a burst of identical first-page queries within milliseconds. Each
+// uncached call hits the orchestrator over HTTP and then runs the CPU-heavy
+// `formatGenerationResponse2` (resource enrichment + per-workflow mapping),
+// which is part of the aggregate per-request load that pins the API pods.
+//
+// The TTL is intentionally tiny. Live generation progress does NOT flow through
+// this route: status updates arrive via SignalR `TextToImageUpdate` ->
+// `orchestrator.statusUpdate` (a separate per-workflow endpoint) and are patched
+// into the client's query cache in place (see useGenerationSignalUpdate.ts), with
+// a 60s poll fallback. So a 3s cache on the *list* query collapses the reconnect
+// storm without delaying any live status the user actually sees. The user's own
+// new generations / deletes are applied optimistically client-side via
+// setQueryData in generationRequestHooks.ts, so they too are unaffected by this
+// server cache; the short TTL is the freshness net for anything else.
+const QUERIED_WORKFLOWS_CACHE_TTL = 3; // seconds
+
+// Builds a stable redis key per (userId, fully-resolved query params). The key
+// MUST include every param that changes the response (cursor, take, the
+// green-injected tags, sort direction, date range, excludeFailed,
+// hideMatureContent) so different pages/filters never collide. `token` is
+// deliberately excluded: it is per-session, but the response is identical for a
+// given user regardless of which session token made the request, and including
+// it would prevent a user's concurrent tabs from sharing a cache entry — the
+// exact case this cache exists to collapse. Anonymous callers (no user id) are
+// not cached.
+function getQueriedWorkflowsCacheKey({
+  userId,
+  take,
+  cursor,
+  tags,
+  ascending,
+  fromDate,
+  toDate,
+  excludeFailed,
+  hideMatureContent,
+  excludeTags,
+}: {
+  userId: number;
+  take: number;
+  cursor?: string;
+  tags: string[];
+  ascending?: boolean;
+  fromDate?: Date;
+  toDate?: Date;
+  excludeFailed?: boolean;
+  hideMatureContent: boolean;
+  excludeTags?: string[];
+}) {
+  const variant = JSON.stringify({
+    t: take,
+    c: cursor ?? null,
+    // sort tags so [a,b] and [b,a] map to the same entry
+    tags: [...tags].sort(),
+    a: ascending ?? null,
+    f: fromDate?.toISOString() ?? null,
+    to: toDate?.toISOString() ?? null,
+    ef: excludeFailed ?? null,
+    hmc: hideMatureContent,
+    ...(excludeTags?.length ? { xt: [...excludeTags].sort() } : {}),
+  });
+  return `${REDIS_KEYS.GENERATION.QUERIED_WORKFLOWS}:${userId}:${variant}` as RedisKeyTemplateCache;
+}
+
+// Per-user index set holding every cached feed-variant key for a user. Lets the
+// bust enumerate exactly this user's keys (SMEMBERS) instead of SCANning the
+// whole main cache cluster for a pattern — the latter's cost scales with total
+// keyspace, not matched keys, which is a recurring load on the very cluster this
+// cache exists to protect (the bust now fires on every submit AND every
+// delete/cancel/patch).
+function getQueriedWorkflowsIndexKey(userId: number): RedisKeyTemplateCache {
+  return `${REDIS_KEYS.GENERATION.QUERIED_WORKFLOWS}:idx:${userId}` as RedisKeyTemplateCache;
+}
+
+// The index set must outlive the cache entries it points at, otherwise a bust
+// could miss a still-live entry. fetchThroughCache writes its data key with
+// EX = ttl * 2, so the index TTL has to be at least that; we use a comfortable
+// multiple to absorb clock skew and TTL refresh races. Stale members (entries
+// that already expired) are harmless — DEL of a missing key is a no-op.
+const QUERIED_WORKFLOWS_INDEX_TTL = QUERIED_WORKFLOWS_CACHE_TTL * 4; // seconds
+
+// Records a cache-variant key in the user's index set and refreshes the set's
+// TTL. Called ONLY on a real cache miss (from inside the fetcher passed to
+// fetchThroughCache), never on a hit — a hit's hot path is a single
+// redis.packed.get and must stay that way. SADD of an existing member is a
+// no-op, and re-EXPIRE keeps the index alive as long as the user keeps missing
+// and re-fetching. Best-effort — a failure here only means a later bust may miss
+// this key, which then falls back to the short TTL. Errors are swallowed.
+async function indexQueriedWorkflowsKey(userId: number, key: RedisKeyTemplateCache) {
+  try {
+    const indexKey = getQueriedWorkflowsIndexKey(userId);
+    await redis.sAdd(indexKey, key);
+    await redis.expire(indexKey, QUERIED_WORKFLOWS_INDEX_TTL);
+  } catch {
+    // ignore — index is an optimization for the bust, not a correctness store
+  }
+}
+
+// Busts every cached feed variant for a user. Called when the user submits a new
+// generation OR mutates their workflows (delete / cancel / patch / update) so a
+// concurrent tab / immediate reconnect refetch sees the change without waiting
+// out the short TTL. Uses the per-user index set (SMEMBERS -> DEL the members ->
+// DEL the index) so there is no full-keyspace SCAN per bust. Stale members are
+// harmless: DEL of an already-expired key is a no-op. Best-effort: a bust
+// failure only means the user's other surfaces fall back to the short TTL, so
+// errors are swallowed.
+export async function bustQueriedWorkflowsCache(userId?: number) {
+  if (!userId) return;
+  try {
+    const indexKey = getQueriedWorkflowsIndexKey(userId);
+    const keys = await redis.sMembers<RedisKeyTemplateCache>(indexKey);
+    if (keys.length) await redis.del(keys);
+    await redis.del(indexKey);
+  } catch {
+    // ignore — see jsdoc above
+  }
+}
+
+// Pages read per call while every workflow on a page is excluded. A heavy app user can fill whole
+// pages with app runs; an empty first page renders "queue empty" with no loader to page on.
+const EXCLUDED_REFILL_MAX_PAGES = 5;
+
+/**
+ * `queryWorkflows` minus workflows carrying an `excludeTags` tag. The tags are also sent to the
+ * orchestrator, but it is filtered again here so the result does not depend on the orchestrator
+ * honouring them.
+ */
+async function queryWorkflowsExcluding(props: Parameters<typeof queryWorkflows>[0]) {
+  const excludeTags = props.excludeTags;
+  if (!excludeTags?.length) return queryWorkflows(props);
+  const isExcluded = (workflow: { tags?: string[] | null }) =>
+    workflow.tags?.some((tag) => excludeTags.includes(tag)) ?? false;
+
+  let cursor = props.cursor;
+  for (let page = 1; ; page++) {
+    const result = await queryWorkflows({ ...props, cursor });
+    const items = result.items.filter((workflow) => !isExcluded(workflow));
+    if (items.length || !result.nextCursor || page >= EXCLUDED_REFILL_MAX_PAGES)
+      return { nextCursor: result.nextCursor, items };
+    cursor = result.nextCursor;
+  }
+}
+
+export async function queryGeneratedImageWorkflows2({
+  user,
+  cache,
+  ...props
+}: z.output<typeof workflowQuerySchema> & {
+  token: string;
+  user?: SessionUser;
+  hideMatureContent: boolean;
+  excludeTags?: string[];
+  // Opt-in short-TTL cache. ONLY safe when `token` belongs to `user` — i.e. the
+  // self-serve feed. The moderator path (queryUserGeneratedImages) passes the
+  // *target* user's token but the *moderator's* `user`, so the data identity is
+  // the token, not user.id; caching there would key the target's feed under the
+  // moderator's id and collide across different targets. That path leaves this
+  // off and is not part of the reconnect storm anyway.
+  cache?: boolean;
+}) {
+  const fetchAndFormat = async () => {
+    // The queryGeneratedImages feed has a latency tail (slow >5s events). It splits
+    // into two awaits — the orchestrator HTTP read (`queryWorkflows`) and the
+    // resource-enrichment mapping (`formatGenerationResponse2`) — and we don't yet
+    // know which dominates. Wrap each in its own span (transparent withSpan, same
+    // pattern as the `gen:createSteps:*` spans above) to localize the tail for a
+    // follow-up optimization. Both the cached and uncached paths run through here.
+    const { nextCursor, items } = await withSpan('gen:queryGI:queryWorkflows', () =>
+      queryWorkflowsExcluding(props)
+    );
+    return {
+      items: await withSpan('gen:queryGI:format', () =>
+        formatGenerationResponse2(items as Workflow[], user)
+      ),
+      nextCursor,
+    };
+  };
+
+  // Only cache the self-serve feed of a logged-in user, AND only the first page
+  // (no cursor). The infinite feed gives every later page a distinct cursor, so
+  // caching them would bloat the per-user index set with entries no one refetches
+  // — the reconnect storm only refetches page 1. Deep pages fall straight through
+  // to the uncached fetch, exactly like the !cache / anonymous bypass below.
+  // fetchThroughCache does not cache thrown errors (the fetchFn rejection
+  // propagates without writing redis), and it single-flights concurrent misses
+  // behind a lock, so a reconnect burst that arrives before the first fetch
+  // resolves is coalesced rather than fanned out.
+  if (!cache || !user?.id || props.cursor != null) return fetchAndFormat();
+
+  const userId = user.id;
+  const cacheKey = getQueriedWorkflowsCacheKey({
+    userId,
+    take: props.take,
+    cursor: props.cursor,
+    tags: props.tags,
+    ascending: props.ascending,
+    fromDate: props.fromDate,
+    toDate: props.toDate,
+    excludeFailed: props.excludeFailed,
+    hideMatureContent: props.hideMatureContent,
+    excludeTags: props.excludeTags,
+  });
+
+  // Index the key from INSIDE the fetcher so it runs only on a real miss (the
+  // single-flight leader), never on a hit. A hit's hot path — the path this
+  // cache exists to make single-op — then does zero index ops; it is just the
+  // redis.packed.get inside fetchThroughCache. Fire-and-forget so the miss
+  // itself never blocks on the index write. (A key whose miss-time SADD failed
+  // simply won't be re-added on later hits — same best-effort semantics as
+  // before; a missed bust just falls back to the short TTL.)
+  const fetchIndexAndFormat = async () => {
+    indexQueriedWorkflowsKey(userId, cacheKey).catch(() => null);
+    return fetchAndFormat();
+  };
+
+  return fetchThroughCache(cacheKey, fetchIndexAndFormat, { ttl: QUERIED_WORKFLOWS_CACHE_TTL });
+}
+
+// =============================================================================
+// Workflow Status Update
+// =============================================================================
+
+export type WorkflowStatusUpdate = Awaited<ReturnType<typeof getWorkflowStatusUpdate>>;
+export async function getWorkflowStatusUpdate({
+  token,
+  workflowId,
+}: {
+  token: string;
+  workflowId: string;
+}) {
+  const result = await getWorkflow({ token, path: { workflowId } });
+  if (result) {
+    const wfMeta = (result.metadata ?? {}) as Record<string, unknown>;
+    const wfParams = (wfMeta.params ?? {}) as Record<string, unknown>;
+    const previewNsfwLevel = getModel3DPreviewNsfwLevel(result.steps);
+
+    return {
+      id: workflowId,
+      status: result.status!,
+      downloadPriority: readDownloadPriority(result),
+      nsfwCap: result.nsfwLevel,
+      steps: result.steps?.map((step) => {
+        const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+
+        // For dimension resolution, prefer step params (legacy format stores upscale dims there)
+        // but fall back per-field to workflow-level params. Steps with source lineage (e.g.
+        // img2img:upscale) have stepParams populated with the source generation's params, which
+        // lack `images/width/height/aspectRatio` — those live on workflow.metadata.params and
+        // must remain reachable.
+        const stepParams = (metadata.params ?? {}) as Record<string, unknown>;
+        const paramsForDimensions = { ...wfParams, ...stepParams };
+
+        // Format step outputs using the shared utility
+        const { output, errors } = formatStepOutputs(
+          step as StepWithOutput,
+          paramsForDimensions,
+          previewNsfwLevel
+        );
+
+        return {
+          name: step.name,
+          status: step.status,
+          completedAt: step.completedAt,
+          queuePosition: step.queuePosition,
+          preparation: readPreparation(step),
+          output,
+          // TEMPORARY: dual-emit under the legacy `images` key for pre-rename clients.
+          images: output,
+          errors: errors.length > 0 ? errors : undefined,
+        };
+      }),
+    };
+  }
+}
+
+/** The price of boosting, or null when the orchestrator reports no download fee. */
+export async function getWorkflowBoostCost({
+  token,
+  workflowId,
+}: {
+  token: string;
+  workflowId: string;
+}) {
+  const priced = await setWorkflowDownloadPriority({ token, workflowId, whatif: true });
+  return { cost: priced?.cost?.fixed?.downloadPriority ?? null };
+}
+
+/**
+ * Charges only at the price the user confirmed: the orchestrator's update takes no expected price,
+ * so the boost is re-priced first and refused when the price moved — or when there is nothing left
+ * to boost, which a workflow already in the high lane reports as no download fee.
+ */
+export async function boostWorkflow({
+  token,
+  workflowId,
+  expectedCost,
+  user,
+}: {
+  token: string;
+  workflowId: string;
+  expectedCost: number;
+  user?: SessionUser;
+}) {
+  const { cost } = await getWorkflowBoostCost({ token, workflowId });
+  if (cost == null || cost !== expectedCost) return { boosted: false as const, cost };
+
+  // The update's own reply is the boosted workflow — its lane, position and ETA are the orchestrator's
+  // answer for this boost, so the card never has to infer them. The charge has already gone through,
+  // so a failed read must not report it as a failure.
+  const updated = await setWorkflowDownloadPriority({ token, workflowId });
+  const workflow = await Promise.resolve(
+    updated?.steps?.length ? updated : getWorkflow({ token, path: { workflowId } })
+  )
+    .then((result) => formatGenerationResponse2([result as Workflow], user))
+    .then(([formatted]) => formatted)
+    .catch(() => null);
+  return { boosted: true as const, workflow };
+}

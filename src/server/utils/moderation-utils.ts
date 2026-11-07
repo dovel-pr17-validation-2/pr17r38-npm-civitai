@@ -1,0 +1,158 @@
+import { REDIS_SYS_KEYS, sysRedis } from '~/server/redis/client';
+import { logSysRedisFailOpen } from '~/server/redis/fail-open-log';
+import { fromJson } from '~/utils/json-helpers';
+import { logToAxiom } from '~/server/logging/client';
+
+// ⚠️ This is NOT the prompt-audit leet fold. That one lives in
+// `@civitai/mod-utils/prompt-audit/word-regex` and folds four characters; this one also
+// folds `a -> [a|@]`, so the two disagree on every term containing an `a`. The
+// divergence is longstanding and unexplained — merging them would change what one of
+// the two matches, so they are kept apart deliberately rather than by oversight.
+const wordReplace = (word: string) => {
+  return word
+    .replace(/i/g, '[i|l|1]')
+    .replace(/o/g, '[o|0]')
+    .replace(/s/g, '[s|z]')
+    .replace(/e/g, '[e|3]')
+    .replace(/a/g, '[a|@]');
+};
+
+async function adjustModWordBlocklist(word: string) {
+  const nlp = (await import('compromise')).default;
+  const doc = nlp(word);
+
+  if (doc.nouns().length > 0) {
+    const plural = nlp(word).nouns().toPlural().text();
+    return [
+      { re: new RegExp(`\\b${wordReplace(word)}\\b`, 'i'), word },
+      { re: new RegExp(`\\b${wordReplace(plural)}\\b`, 'i'), word: plural },
+    ];
+  }
+
+  if (doc.verbs().length > 0) {
+    const past = nlp(word).verbs().toPastTense().text();
+    const present = nlp(word).verbs().toPresentTense().text();
+    const gerund = nlp(word).verbs().toGerund().text();
+    // @ts-ignore
+    const participle = nlp(word).verbs().toPastParticiple().text() as string;
+
+    return [
+      { re: new RegExp(`\\b${wordReplace(word)}\\b`, 'i'), word },
+      { re: new RegExp(`\\b${wordReplace(past)}\\b`, 'i'), word: past },
+      { re: new RegExp(`\\b${wordReplace(present)}\\b`, 'i'), word: present },
+      { re: new RegExp(`\\b${wordReplace(gerund)}\\b`, 'i'), word: gerund },
+      { re: new RegExp(`\\b${wordReplace(participle)}\\b`, 'i'), word: participle },
+    ];
+  }
+
+  return [{ re: new RegExp(`\\b${wordReplace(word)}\\b`, 'i'), word }];
+}
+
+export type ModWordBlocklist = Array<{ re: RegExp; word: string }>;
+
+export async function getModWordBlocklist() {
+  const wordlists =
+    (await sysRedis
+      .hGet(REDIS_SYS_KEYS.ENTITY_MODERATION.BASE, REDIS_SYS_KEYS.ENTITY_MODERATION.KEYS.WORDLISTS)
+      .then((data) => (data ? fromJson<string[]>(data) : ([] as string[])))
+      .catch(() => [] as string[])) ?? ([] as string[]);
+
+  const blocklist = [] as Awaited<ReturnType<typeof adjustModWordBlocklist>>[];
+  for (const wordlist of wordlists) {
+    // Inner read can throw during a partial sysRedis flap even though
+    // the outer .catch above returned a populated wordlists array.
+    // Treat it the same as wordlist-not-found.
+    let words: string[] | null = null;
+    try {
+      words = await sysRedis.packed.hGet<string[]>(
+        REDIS_SYS_KEYS.ENTITY_MODERATION.WORDLISTS.WORDS,
+        wordlist
+      );
+    } catch (err) {
+      logSysRedisFailOpen('read-degraded', 'getModWordBlocklist hGet', err, { wordlist });
+    }
+    if (words) {
+      for (const word of words) {
+        blocklist.push(await adjustModWordBlocklist(word));
+      }
+    } else {
+      logToAxiom({
+        name: 'wordlists',
+        type: 'warning',
+        message: `wordlist ${wordlist} not found`,
+      }).catch();
+    }
+  }
+
+  return blocklist.flat();
+}
+
+export async function getModURLBlocklist() {
+  const urllists =
+    (await sysRedis
+      .hGet(REDIS_SYS_KEYS.ENTITY_MODERATION.BASE, REDIS_SYS_KEYS.ENTITY_MODERATION.KEYS.URLLISTS)
+      .then((data) => (data ? fromJson<string[]>(data) : ([] as string[])))
+      .catch(() => [] as string[])) ?? ([] as string[]);
+
+  const blocklist = [] as Awaited<ReturnType<typeof adjustModWordBlocklist>>[];
+  for (const urllist of urllists) {
+    // Same partial-flap concern as getModWordBlocklist above.
+    let urls: string[] | null = null;
+    try {
+      urls = await sysRedis.packed.hGet<string[]>(
+        REDIS_SYS_KEYS.ENTITY_MODERATION.WORDLISTS.URLS,
+        urllist
+      );
+    } catch (err) {
+      logSysRedisFailOpen('read-degraded', 'getModURLBlocklist hGet', err, { urllist });
+    }
+    if (urls) {
+      for (const url of urls) {
+        blocklist.push([{ re: new RegExp(`.*${url}.*`, 'i'), word: url }]);
+      }
+    } else {
+      logToAxiom({
+        name: 'wordlists',
+        type: 'warning',
+        message: `urllist ${urllist} not found`,
+      }).catch();
+    }
+  }
+
+  return blocklist.flat();
+}
+
+export async function getBlocklists() {
+  const useBlocklist =
+    (await sysRedis
+      .hGet(
+        REDIS_SYS_KEYS.ENTITY_MODERATION.BASE,
+        REDIS_SYS_KEYS.ENTITY_MODERATION.KEYS.RUN_WORDLISTS
+      )
+      .then((data) => (data ? (JSON.parse(data) as boolean) : false))
+      .catch(() => false)) ?? false;
+
+  if (useBlocklist) {
+    const modWordBlocklist = await getModWordBlocklist();
+    const modURLBlocklist = await getModURLBlocklist();
+    if (!modWordBlocklist.length && !modURLBlocklist.length) {
+      // Both lists empty: either genuinely no lists configured, OR a
+      // partial sysRedis flap let the outer toggle read succeed while
+      // every inner per-wordlist hGet failed open. Pre-PR this threw;
+      // post-PR we fail-open consistent with the inner reads. Caller
+      // (entity-moderation job) treats `use: false` as no-op rather
+      // than blowing up the job batch on transient sysRedis health.
+      logSysRedisFailOpen('read-degraded', 'getBlocklists empty', null, {
+        action: 'returning-use-false',
+      });
+      return { use: false, modWordBlocklist: [], modURLBlocklist: [] };
+    }
+    return { use: true, modWordBlocklist, modURLBlocklist };
+  } else {
+    return {
+      use: false,
+      modWordBlocklist: [] as ModWordBlocklist,
+      modURLBlocklist: [] as ModWordBlocklist,
+    };
+  }
+}

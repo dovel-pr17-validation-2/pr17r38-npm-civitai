@@ -1,0 +1,562 @@
+import {
+  Alert,
+  Badge,
+  Button,
+  Center,
+  Checkbox,
+  Divider,
+  Group,
+  Loader,
+  Modal,
+  NumberInput,
+  Paper,
+  ScrollArea,
+  Stack,
+  Switch,
+  Text,
+  Textarea,
+  TextInput,
+} from '@mantine/core';
+import { useDebouncedValue } from '@mantine/hooks';
+import { IconAlertTriangle, IconPlus, IconX } from '@tabler/icons-react';
+import { useEffect, useMemo, useState } from 'react';
+import { BuzzTransactionButton } from '~/components/Buzz/BuzzTransactionButton';
+import { useQueryBuzz } from '~/components/Buzz/useBuzz';
+import { CosmeticThumb } from '~/components/CreatorShop/CosmeticThumb';
+import { useDialogContext } from '~/components/Dialog/DialogProvider';
+import { PackCoverField } from '~/components/CreatorShop/Pack/PackCoverField';
+import { useMutateCreatorShop } from '~/components/CreatorShop/creator-shop.util';
+import type { CreatorShopManageItem } from '~/components/CreatorShop/creator-shop.util';
+import {
+  FEE_UNAVAILABLE_MESSAGE,
+  useCreatorShopFees,
+} from '~/components/CreatorShop/useCreatorShopFees';
+import { FeeSection } from '~/components/CreatorShop/Submit/FeeSection';
+import { useCFImageUpload } from '~/hooks/useCFImageUpload';
+import { stickerUsesFromCosmeticData } from '~/shared/utils/sticker-token';
+import { CosmeticShopItemStatus } from '~/shared/utils/prisma/enums';
+import {
+  PACK_MAX_MEMBERS,
+  PACK_MIN_MEMBERS,
+  RIGHTS_AFFIRMATION_STATEMENT,
+  packPriceFloor,
+  type PackMemberPricing,
+} from '~/server/schema/creator-shop.schema';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { constants } from '~/server/common/constants';
+import { numberWithCommas } from '~/utils/number-helpers';
+import { getDisplayName } from '~/utils/string-helpers';
+import { showErrorNotification } from '~/utils/notifications';
+import { trpc } from '~/utils/trpc';
+
+type Bundlable = PackMemberPricing & {
+  name: string;
+  data: unknown;
+  createdById: number | null;
+  creatorUsername: string | null;
+  acceptsBlueBuzz: boolean;
+};
+
+const memberUses = (member: Bundlable) => stickerUsesFromCosmeticData(member.data);
+
+/**
+ * A first-paint SEED, not the source of truth. `getPack` is, and the hydration
+ * effect below overwrites all four scalars with it before Save unlocks — the
+ * caller's row can be arbitrarily stale, because the query client runs at
+ * `staleTime: Infinity`.
+ */
+export type PackEditTarget = Pick<
+  CreatorShopManageItem,
+  'id' | 'title' | 'description' | 'unitAmount' | 'availableQuantity'
+>;
+
+export function CreatorShopPackModal({ item }: { item?: PackEditTarget }) {
+  const dialog = useDialogContext();
+  const currentUser = useCurrentUser();
+  const { submitPack, updatePack } = useMutateCreatorShop();
+  const { uploadToCF, files, resetFiles } = useCFImageUpload();
+  const isEdit = !!item;
+
+  const [name, setName] = useState(item?.title ?? '');
+  const [description, setDescription] = useState(item?.description ?? '');
+  const [price, setPrice] = useState<number | undefined>(item?.unitAmount);
+  const [quantity, setQuantity] = useState<number | undefined>(
+    item?.availableQuantity ?? undefined
+  );
+  const [acceptsBlueBuzz, setAcceptsBlueBuzz] = useState(false);
+  // Which account pays the submission fee — not `acceptsBlueBuzz` above, which
+  // is what buyers may pay this pack with.
+  const [buzzType, setBuzzType] = useState<'yellow' | 'green' | 'blue'>('yellow');
+  const [rightsAffirmed, setRightsAffirmed] = useState(false);
+  const [selected, setSelected] = useState<Bundlable[]>([]);
+  const [search, setSearch] = useState('');
+  const [debouncedSearch] = useDebouncedValue(search, 400);
+  const [imageId, setImageId] = useState<string | null>(null);
+  const [localUrl, setLocalUrl] = useState<string | null>(null);
+
+  const { data: existing, isLoading: loadingExisting } = trpc.creatorShop.getPack.useQuery(
+    { id: item?.id ?? 0 },
+    { enabled: !!item }
+  );
+
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => {
+    if (!existing || hydrated) return;
+    setHydrated(true);
+    setName(existing.title);
+    setDescription(existing.description ?? '');
+    setPrice(existing.unitAmount);
+    setQuantity(existing.availableQuantity ?? undefined);
+    setSelected(
+      existing.members.map((m) => ({
+        cosmeticId: m.cosmeticId,
+        type: m.type,
+        // Today's price, which is what the floor is re-checked against on save.
+        // The snapshot is what the pack charges, and would show a floor the
+        // server rejects.
+        listPrice: m.currentListPrice,
+        isOwn: m.isOwn,
+        name: m.name,
+        data: m.data,
+        // The detail endpoint reports ownership relative to the pack's lister,
+        // which is what `isOwn` already carries.
+        createdById: m.isOwn ? currentUser?.id ?? null : null,
+        creatorUsername: m.creatorUsername,
+        // From the server, not assumed: hydrating this as `true` showed the blue
+        // toggle as available on a pack the server would refuse to save.
+        acceptsBlueBuzz: m.acceptsBlueBuzz,
+      }))
+    );
+    setAcceptsBlueBuzz(!!existing.meta.acceptsBlueBuzz);
+    setImageId(existing.meta.coverUrl ?? null);
+  }, [existing, hydrated, currentUser?.id]);
+
+  const { data: bundlable, isLoading: loadingBundlable } = trpc.creatorShop.getBundlable.useQuery({
+    query: debouncedSearch || undefined,
+    limit: 40,
+  });
+
+  const selectedIds = useMemo(() => new Set(selected.map((m) => m.cosmeticId)), [selected]);
+  const options = (bundlable ?? []).filter((b) => !selectedIds.has(b.cosmeticId));
+
+  // Ownership drives both the floor and the discount, so it's computed the same
+  // way the server does rather than trusted from the picker.
+  const members: PackMemberPricing[] = selected.map((m) => ({
+    cosmeticId: m.cosmeticId,
+    type: m.type,
+    listPrice: m.listPrice,
+    isOwn: m.createdById === currentUser?.id,
+  }));
+  const floor = members.length ? packPriceFloor(members) : 0;
+  const foreignTotal = members.reduce((sum, m) => (m.isOwn ? sum : sum + m.listPrice), 0);
+  const blueBlockers = selected.filter((m) => !m.acceptsBlueBuzz);
+  const partTotal = selected.reduce((sum, m) => sum + m.listPrice, 0);
+
+  const coverTiles = useMemo(
+    () =>
+      selected
+        .map((m) => (m.data as { url?: string } | null)?.url)
+        .filter((url): url is string => !!url)
+        .slice(0, 4),
+    [selected]
+  );
+
+  // Compared against what the server returned, so a reordered picker doesn't read
+  // as an edit and a stale caller row can't make one look unchanged.
+  const contentsChanged =
+    !existing ||
+    selected.length !== existing.members.length ||
+    selected.some((m) => !existing.members.find((e) => e.cosmeticId === m.cosmeticId));
+
+  const uploading = files.some((file) => file.status === 'uploading');
+  const tooFew = selected.length < PACK_MIN_MEMBERS;
+  const tooMany = selected.length > PACK_MAX_MEMBERS;
+  const priceTooLow = (price ?? 0) < floor;
+  const packFee = useCreatorShopFees()?.pack;
+  const { data: buzz, isLoading: loadingBuzz } = useQueryBuzz(['yellow', 'green', 'blue']);
+  const yellowBalance = buzz.accounts.find((a) => a.type === 'yellow')?.balance ?? 0;
+  const greenBalance = buzz.accounts.find((a) => a.type === 'green')?.balance ?? 0;
+  const blueBalance = buzz.accounts.find((a) => a.type === 'blue')?.balance ?? 0;
+  const feeAccountBalance =
+    buzzType === 'yellow' ? yellowBalance : buzzType === 'green' ? greenBalance : blueBalance;
+  // A KNOWN shortfall only. Both the fee and the balances read as zero until they
+  // resolve, and "your balance doesn't cover the fee" said before either is known
+  // is a false claim about the creator's money — and a permanent one if the fee
+  // read fails.
+  //
+  // 🔴 Deliberately NOT a term in `canSubmit`. Disabling the button on a shortfall
+  // takes the top-up path away with it: `BuzzTransactionButton` answers a short
+  // balance by opening the purchase modal and submitting on success, and a
+  // disabled button never reaches its own onClick. The warning informs; the
+  // button still works.
+  const feeShortfall =
+    !isEdit && !loadingBuzz && packFee !== undefined && feeAccountBalance < packFee;
+  // The server refuses both outright, so without this the editor is the very
+  // thing it replaced: a form that takes what a moderator types and fails on save.
+  const awaitingPack = isEdit && !hydrated;
+  // Whether this edit touches the blue-buzz setting at all. The payload sends the
+  // field only when it did, and the server only re-checks the blockers when it
+  // did — so the client must refuse on the same condition, or it blocks a title
+  // fix the server would have accepted and makes turning blue OFF the only way
+  // out of an edit that never touched it.
+  const blueChanged = acceptsBlueBuzz !== !!existing?.meta.acceptsBlueBuzz;
+  // Archiving OVERWRITES status, so the review verdict is the only thing that
+  // tells a rejected pack from an ordinary archived one. Without it the alert
+  // tells a moderator to restore a pack whose restore the server refuses as
+  // REJECTED_IS_FINAL.
+  const wasRejected =
+    existing?.status === CosmeticShopItemStatus.Rejected ||
+    (existing?.status === CosmeticShopItemStatus.Archived && !!existing.lastReviewWasRejection);
+  const uneditableStatus = wasRejected || existing?.status === CosmeticShopItemStatus.Archived;
+  const canSubmit =
+    // An edit saves what `getPack` returned, never the caller's seed.
+    (!isEdit || hydrated) &&
+    !uneditableStatus &&
+    !!name.trim() &&
+    (isEdit || packFee !== undefined) &&
+    !tooFew &&
+    !tooMany &&
+    !priceTooLow &&
+    !uploading &&
+    (isEdit || !imageId || rightsAffirmed) &&
+    !(blueChanged && acceptsBlueBuzz && blueBlockers.length);
+
+  const handleDrop = async (dropped: File[]) => {
+    const file = dropped[0];
+    if (!file) return;
+    if (localUrl) URL.revokeObjectURL(localUrl);
+    setLocalUrl(URL.createObjectURL(file));
+    setImageId(null);
+    try {
+      // Explicit, because `uploadToCF` otherwise defaults this to `isModerator` — which
+      // let animated covers through for staff and rejected the same file for creators.
+      const uploaded = await uploadToCF(file, undefined, { allowAnimatedWebP: true });
+      setImageId(uploaded.id);
+    } catch (error) {
+      resetFiles();
+      showErrorNotification({
+        title: 'Upload failed',
+        error: error instanceof Error ? error : new Error('Could not upload your cover art'),
+      });
+    }
+  };
+
+  const handleSubmit = async () => {
+    if (!canSubmit || price == null) return;
+    const memberCosmeticIds = selected.map((m) => m.cosmeticId);
+    if (isEdit && item)
+      await updatePack.mutateAsync({
+        id: item.id,
+        name,
+        description: description || null,
+        // Both are omitted when unchanged, which is the contract the server is
+        // written against. Sent unconditionally they re-snapshot every member's
+        // `floorAmount` — the basis each member's creator is PAID on — rewrite
+        // `packMemberCount` past the guard that refuses a pack whose member has
+        // gone, and drop the pack back into review, all on an edit that touched
+        // only the title.
+        ...(price !== existing?.unitAmount ? { price } : {}),
+        ...(contentsChanged ? { memberCosmeticIds } : {}),
+        availableQuantity: quantity ?? null,
+        // Same rule as the two above. Sent unconditionally it makes the server's
+        // blue-buzz check fire on every title edit, which a member opting out
+        // since then turns into a refusal of an edit that never touched blue.
+        ...(blueChanged ? { acceptsBlueBuzz } : {}),
+        // Explicit null so clearing the cover actually clears it.
+        imageUrl: imageId ?? null,
+      });
+    else {
+      if (packFee === undefined) {
+        showErrorNotification({ title: 'Not ready', error: new Error(FEE_UNAVAILABLE_MESSAGE) });
+        return;
+      }
+      await submitPack.mutateAsync({
+        name,
+        description: description || null,
+        memberCosmeticIds,
+        price,
+        availableQuantity: quantity ?? null,
+        buzzType,
+        acceptsBlueBuzz,
+        ...(imageId ? { imageUrl: imageId } : {}),
+        // Only claimed when artwork was actually supplied.
+        rightsAffirmed: !imageId ? undefined : true,
+        quotedFee: packFee,
+      });
+    }
+    dialog.onClose();
+  };
+
+  return (
+    <Modal {...dialog} size="xl" title={isEdit ? 'Edit pack' : 'Build a pack'} radius="lg">
+      <Stack gap="md">
+        {isEdit && loadingExisting && (
+          <Center>
+            <Loader type="bars" />
+          </Center>
+        )}
+        {/* Save is gated on `hydrated`, so without this a failed load leaves a
+            filled-in form that can never be submitted and never says why. */}
+        {isEdit && !loadingExisting && !existing && (
+          <Alert color="gray" icon={<IconAlertTriangle size={18} />}>
+            Couldn&apos;t load this pack. Close and reopen to try again.
+          </Alert>
+        )}
+        <TextInput
+          label="Pack name"
+          withAsterisk
+          // Editable only once the server's values are in: hydration overwrites
+          // these, so typing before it lands is silently discarded.
+          disabled={awaitingPack}
+          value={name}
+          onChange={(e) => setName(e.currentTarget.value)}
+        />
+        <Textarea
+          label="Description"
+          autosize
+          disabled={awaitingPack}
+          minRows={2}
+          value={description ?? ''}
+          onChange={(e) => setDescription(e.currentTarget.value)}
+        />
+
+        <PackCoverField
+          localUrl={localUrl}
+          imageId={imageId}
+          uploading={uploading}
+          tiles={coverTiles}
+          maxSize={constants.mediaUpload.maxImageFileSize}
+          onDrop={handleDrop}
+          onClear={() => {
+            setImageId(null);
+            setLocalUrl(null);
+            resetFiles();
+          }}
+        />
+
+        <Divider label={`Contents (${selected.length}/${PACK_MAX_MEMBERS})`} />
+        <Stack gap={6}>
+          {selected.map((member) => (
+            <Paper key={member.cosmeticId} withBorder radius="md" p="xs">
+              <Group gap="xs" wrap="nowrap">
+                <CosmeticThumb data={member.data} name={member.name} />
+                <Stack gap={0} style={{ minWidth: 0, flex: 1 }}>
+                  <Text size="sm" fw={600} lineClamp={1}>
+                    {member.name}
+                  </Text>
+                  <Text size="xs" c="dimmed" lineClamp={1}>
+                    {getDisplayName(member.type)}
+                    {memberUses(member) != null ? ` · ${memberUses(member)} uses` : ''}
+                    {member.creatorUsername ? ` · by @${member.creatorUsername}` : ''}
+                  </Text>
+                </Stack>
+                <Text size="xs">{numberWithCommas(member.listPrice)} Buzz</Text>
+                {!member.acceptsBlueBuzz && (
+                  <Badge size="xs" color="gray" variant="light">
+                    No Blue
+                  </Badge>
+                )}
+                <Button
+                  size="compact-xs"
+                  variant="subtle"
+                  color="red"
+                  leftSection={<IconX size={14} />}
+                  // Same reason as Add below: hydration REPLACES `selected`, so a
+                  // removal made before getPack lands is silently undone.
+                  disabled={awaitingPack}
+                  onClick={() =>
+                    setSelected((cur) => cur.filter((m) => m.cosmeticId !== member.cosmeticId))
+                  }
+                >
+                  Remove
+                </Button>
+              </Group>
+            </Paper>
+          ))}
+          {tooFew && (
+            <Text size="xs" c="dimmed">
+              A pack needs at least {PACK_MIN_MEMBERS} items.
+            </Text>
+          )}
+        </Stack>
+
+        <TextInput
+          label="Add items"
+          disabled={awaitingPack}
+          placeholder="Search published cosmetics"
+          value={search}
+          onChange={(e) => setSearch(e.currentTarget.value)}
+        />
+        <ScrollArea.Autosize mah={220}>
+          <Stack gap={6}>
+            {loadingBundlable && (
+              <Center py="sm">
+                <Loader size="sm" />
+              </Center>
+            )}
+            {options.map((option) => (
+              <Paper key={option.cosmeticId} withBorder radius="md" p="xs">
+                <Group gap="xs" wrap="nowrap">
+                  <CosmeticThumb data={option.data} name={option.name} />
+                  <Stack gap={0} style={{ minWidth: 0, flex: 1 }}>
+                    <Text size="sm" lineClamp={1}>
+                      {option.name}
+                    </Text>
+                    <Text size="xs" c="dimmed" lineClamp={1}>
+                      {getDisplayName(option.type)}
+                      {option.creatorUsername ? ` · by @${option.creatorUsername}` : ''}
+                    </Text>
+                  </Stack>
+                  <Text size="xs">{numberWithCommas(option.listPrice)} Buzz</Text>
+                  <Button
+                    size="compact-xs"
+                    variant="light"
+                    leftSection={<IconPlus size={14} />}
+                    // `awaitingPack` too: hydration REPLACES `selected`, so an
+                    // item added before getPack lands disappears without a word.
+                    disabled={awaitingPack || selected.length >= PACK_MAX_MEMBERS}
+                    onClick={() => setSelected((cur) => [...cur, option as Bundlable])}
+                  >
+                    Add
+                  </Button>
+                </Group>
+              </Paper>
+            ))}
+          </Stack>
+        </ScrollArea.Autosize>
+
+        <Divider label="Pricing" />
+        <NumberInput
+          label="Pack price"
+          disabled={awaitingPack}
+          withAsterisk
+          min={floor || undefined}
+          value={price}
+          onChange={(value) => setPrice(typeof value === 'number' ? value : undefined)}
+          description={
+            members.length
+              ? `At least ${numberWithCommas(
+                  floor
+                )} Buzz. Items other creators made (${numberWithCommas(
+                  foreignTotal
+                )} Buzz) must be covered at their own price.`
+              : 'Add items to see the minimum.'
+          }
+          error={priceTooLow && price != null ? `Minimum is ${numberWithCommas(floor)} Buzz` : null}
+        />
+        {price != null && partTotal > price && (
+          <Text size="xs" c="dimmed">
+            Bought separately these cost {numberWithCommas(partTotal)} Buzz — this pack saves{' '}
+            {numberWithCommas(partTotal - price)}.
+          </Text>
+        )}
+        <NumberInput
+          label="Available quantity"
+          disabled={awaitingPack}
+          description="Leave empty for unlimited."
+          min={1}
+          value={quantity}
+          onChange={(value) => setQuantity(typeof value === 'number' ? value : undefined)}
+        />
+
+        <Switch
+          label="Accept Blue Buzz"
+          checked={acceptsBlueBuzz}
+          onChange={(e) => setAcceptsBlueBuzz(e.currentTarget.checked)}
+          // `awaitingPack` like every other control: hydration OVERWRITES this
+          // from the server, so a toggle made during the load window is discarded
+          // and — because the field is only sent when it differs from that same
+          // server value — discarded silently.
+          //
+          // Then un-tickable, never un-un-tickable. A pack saved as blue-accepting
+          // whose member later stops accepting blue hydrates this ON with blockers
+          // present, and `canSubmit` refuses that combination — so disabling it
+          // outright froze the only control that clears the refusal.
+          disabled={awaitingPack || (blueBlockers.length > 0 && !acceptsBlueBuzz)}
+        />
+        {blueBlockers.length > 0 && (
+          <Alert color="gray" icon={<IconAlertTriangle size={18} />}>
+            {/* Named rather than silently disabled: the constraint belongs to a
+                specific member, and the builder can swap it out. */}
+            This pack can&apos;t accept Blue Buzz because{' '}
+            {blueBlockers.map((m) => m.name).join(', ')} {blueBlockers.length > 1 ? 'do' : 'does'}{' '}
+            not.
+            {blueChanged && acceptsBlueBuzz && ' Turn it back off to save.'}
+          </Alert>
+        )}
+
+        {/* The affirmation covers artwork the creator supplied. A pack with no
+            cover contributes none — its members were each affirmed when they
+            were submitted. */}
+        {!isEdit && !!imageId && (
+          <Checkbox
+            checked={rightsAffirmed}
+            onChange={(e) => setRightsAffirmed(e.currentTarget.checked)}
+            label={RIGHTS_AFFIRMATION_STATEMENT}
+          />
+        )}
+
+        {!isEdit && (
+          <FeeSection
+            buzzType={buzzType}
+            onBuzzTypeChange={setBuzzType}
+            yellowBalance={yellowBalance}
+            greenBalance={greenBalance}
+            blueBalance={blueBalance}
+            feeAccountBalance={feeAccountBalance}
+            canAffordFee={!feeShortfall}
+            submissionFee={packFee}
+          />
+        )}
+
+        <Group justify="flex-end">
+          <Button variant="default" onClick={dialog.onClose}>
+            Cancel
+          </Button>
+          {isEdit ? (
+            <Button disabled={!canSubmit} loading={updatePack.isPending} onClick={handleSubmit}>
+              Save pack
+            </Button>
+          ) : (
+            // `exactAccountTypes`, not `accountTypes`: that one appends the domain
+            // currency, so a blue pick would clear its balance check on yellow and
+            // then fail the charge, which bills `buzzType` alone.
+            <BuzzTransactionButton
+              disabled={!canSubmit}
+              loading={submitPack.isPending}
+              buzzAmount={packFee ?? 0}
+              priceReplacement={packFee === undefined ? '…' : undefined}
+              exactAccountTypes={[buzzType]}
+              colorType={buzzType}
+              label="Submit pack"
+              onPerformTransaction={handleSubmit}
+            />
+          )}
+        </Group>
+        {!!existing?.unavailableCount && (
+          <Alert color="gray" icon={<IconAlertTriangle size={18} />}>
+            {/* Named rather than hidden: these are already gone from the list
+                above, so editing the contents drops them for good and takes
+                their creators' payout share with them. */}
+            {existing.unavailableCount} item
+            {existing.unavailableCount > 1 ? 's are' : ' is'} no longer available and{' '}
+            {existing.unavailableCount > 1 ? 'are' : 'is'} not shown above. Changing the contents
+            removes {existing.unavailableCount > 1 ? 'them' : 'it'} permanently.
+          </Alert>
+        )}
+        {uneditableStatus && (
+          <Alert color="gray" icon={<IconAlertTriangle size={18} />}>
+            {wasRejected
+              ? 'This pack was rejected, which is final. It cannot be edited.'
+              : 'This pack is archived. Restore it before editing.'}
+          </Alert>
+        )}
+        {existing?.status && !uneditableStatus && (
+          <Text size="xs" c="dimmed">
+            Changing the contents or the price sends this pack back through review.
+          </Text>
+        )}
+      </Stack>
+    </Modal>
+  );
+}

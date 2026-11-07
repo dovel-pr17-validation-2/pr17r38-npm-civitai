@@ -1,0 +1,545 @@
+import { Prisma } from '@prisma/client';
+import { DEFAULT_GENERATION_TRIAL_LIMIT } from '@civitai/buzz';
+import { lowerFirst } from 'lodash-es';
+import type { NextApiRequest, NextApiResponse } from 'next';
+import type { Session } from '~/types/session';
+import * as z from 'zod';
+import type { BaseModel } from '~/shared/constants/basemodel.constants';
+import { createModelFileDownloadUrl } from '~/server/common/model-helpers';
+import { isNonCommercialBaseModel, stopsCreatorEarnings } from '~/server/common/constants';
+import { dbWrite } from '~/server/db/client';
+import {
+  getShouldChargeForResources,
+  resolveCanGenerateForVersions,
+} from '~/server/services/generation/generation.service';
+import { getFeaturedModels } from '~/server/services/model.service';
+import { coverageColumn, nextCoverageEnabled } from '~/server/services/generation/coverage-source';
+import type { GenerationAlias } from '~/server/schema/model-version.schema';
+import { MixedAuthEndpoint } from '~/server/utils/endpoint-helpers';
+import { getEpochJobAndFileName, getPrimaryFile } from '~/server/utils/model-helpers';
+import { getGenerationFile } from '~/server/utils/resource-air';
+import { getBaseUrl } from '~/server/utils/url-helpers';
+import type {
+  LicensingFeeSettlementCurrency,
+  LicensingFeeType,
+  ModelType,
+  ModelHashType,
+  ModelUsageControl,
+} from '~/shared/utils/prisma/enums';
+import { Availability, ModelFileVisibility } from '~/shared/utils/prisma/enums';
+import { stringifyAIR } from '~/shared/utils/air';
+import { Flags } from '~/shared/utils/flags';
+import { UserFlag } from '~/shared/constants/user-flags.constants';
+import { isCreatorTipEligible } from '~/shared/utils/creator-tip';
+import { isEvictable } from '~/shared/constants/model-version-flags.constants';
+import { canViewPoiModel } from '~/server/utils/poi-model-visibility';
+
+export const schema = z.object({
+  // Bound to Postgres int4 (the `ModelVersion.id` column type, max 2147483647).
+  // Same overflow class as GET /api/v1/models/[id]: a bare `z.coerce.number()`
+  // accepts an out-of-range numeric string that then binds to the int4 `mv.id`
+  // in the raw query below and throws PG "value out of range for type integer"
+  // → raw 500. `.int().gt(0)` fails safeParse for out-of-range/non-positive ids
+  // → the existing 400 path fires. (The `if (!id)` guard below still covers a
+  // legitimately absent id.)
+  id: z.coerce.number().int().gt(0).lte(2147483647),
+  epoch: z.number().optional(),
+  // When supplied, the response describes that exact ModelFile (download url,
+  // hashes, size, AIR with `+<fileId>`) rather than the version's generation file.
+  modelFileId: z.coerce.number().int().positive().optional(),
+});
+
+type VersionRow = {
+  id: number;
+  versionName: string;
+  availability: Availability;
+  publishedAt: Date | null;
+  modelId: number;
+  modelName: string;
+  baseModel: BaseModel;
+  status: string;
+  type: ModelType;
+  earlyAccessEndsAt?: Date;
+  requireAuth: boolean;
+  checkPermission: boolean;
+  covered?: boolean;
+  coveredLive?: boolean;
+  isPromoted: boolean;
+  generationAlias?: GenerationAlias | null;
+  freeTrialLimit?: number;
+  minor: boolean;
+  sfwOnly: boolean;
+  usageControl: ModelUsageControl;
+  modelUserId: number;
+  poi: boolean;
+  licensingFee: number | null;
+  licensingFeeType: LicensingFeeType | null;
+  licensingFeeSettlementCurrency: LicensingFeeSettlementCurrency | null;
+  isLicensingRoot: boolean;
+  licensingSourceVersionId: number | null;
+  sourceLicensingFeeRecipientUserId: number | null;
+  sourceModelType: string | null;
+  sourceBaseModel: string | null;
+  sourceLicensingFee: number | null;
+  sourceLicensingFeeType: LicensingFeeType | null;
+  sourceLicensingFeeSettlementCurrency: LicensingFeeSettlementCurrency | null;
+  versionFlags: number;
+  userFlags: number;
+};
+type FileRow = {
+  id: number;
+  type: string;
+  visibility: string;
+  url: string;
+  metadata: FileMetadata;
+  sizeKB: number;
+  name: string;
+  hashes: Record<ModelHashType, string>;
+  replacedAt: Date | null;
+};
+
+export default MixedAuthEndpoint(async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse,
+  user: Session['user'] | undefined
+) {
+  const results = schema.safeParse(req.query);
+  if (!results.success)
+    return res.status(400).json({ error: z.prettifyError(results.error) ?? 'Invalid id' });
+
+  const { id } = results.data;
+  if (!id) return res.status(400).json({ error: 'Missing modelVersionId' });
+  const where = [Prisma.sql`mv.id = ${id}`];
+  if (!user?.isModerator)
+    where.push(Prisma.sql`(mv.status = 'Published' OR m."userId" = ${user?.id})`);
+
+  // 🔴 NO audience here. The ORCHESTRATOR reads this endpoint with no user to decide what it may
+  // load (see the coverage flag in flipt/client.ts), so deriving membership from the caller
+  // would answer `member: false` to it and refuse the expansion for everyone, members included.
+  const coverage = Prisma.raw(`"${coverageColumn(await nextCoverageEnabled())}"`);
+
+  const [modelVersion] = await dbWrite.$queryRaw<VersionRow[]>`
+    SELECT
+      mv.id,
+      mv.name as "versionName",
+      mv."modelId",
+      m.name as "modelName",
+      mv."baseModel",
+      mv.status,
+      mv.availability,
+      mv."publishedAt",
+      m.type,
+      m.minor,
+      m."sfwOnly",
+      m."userId" as "modelUserId",
+      m.poi,
+      pa."endsAt" AS "earlyAccessEndsAt",
+      mv."requireAuth",
+      mv."usageControl",
+      mv."licensingFee"::float8 AS "licensingFee",
+      mv."licensingFeeType",
+      mv."licensingFeeSettlementCurrency",
+      (lr.id IS NOT NULL) AS "isLicensingRoot",
+      mv."licensingSourceVersionId",
+      lsm."userId" AS "sourceLicensingFeeRecipientUserId",
+      lsm."type" AS "sourceModelType",
+      lsv."baseModel" AS "sourceBaseModel",
+      lsv."licensingFee"::float8 AS "sourceLicensingFee",
+      lsv."licensingFeeType" AS "sourceLicensingFeeType",
+      lsv."licensingFeeSettlementCurrency" AS "sourceLicensingFeeSettlementCurrency",
+      mv."flags" AS "versionFlags",
+      u."flags" AS "userFlags",
+      (
+        (
+            pa."entityId" IS NOT NULL
+            AND (pa."endsAt" IS NULL OR pa."endsAt" > NOW())
+            AND (pa."terms"->'generation'->>'free' IS NULL OR pa."terms"->'generation'->>'free' != 'true')
+        )
+        OR
+        (mv."availability" = 'Private')
+        OR
+        (m."availability" = 'Private')
+
+      ) AS "checkPermission",
+      -- 🔴 The column is chosen by the flag, because this is what the ORCHESTRATOR reads to decide
+      -- whether a resource can generate, and prepareResource refuses anything it believes cannot.
+      -- On the live rule paid model loading cannot load the very checkpoints it exists for --
+      -- verified 2026-09-08 on version 3040959: covered by the staged rule, not the live one, and
+      -- the estimate failed with the orchestrator's "not enabled for generation". Turning the flag
+      -- off must therefore close this surface too, or the orchestrator keeps loading community
+      -- checkpoints the site has stopped offering.
+      -- See docs/features/paid-model-loading-coverage.md.
+      -- Both columns off ONE evaluation of the view: a second scalar subquery re-runs the whole
+      -- view body (its three IN-lists, the ModelFile aggregate) against the PRIMARY pool, per
+      -- resource per submit -- measured at +58% buffers on this query.
+      gc.${coverage} AS "covered",
+      -- isGenerationEligible holds a locked ecosystem's checkpoints to the live rule.
+      gc."covered" AS "coveredLive",
+      -- Auction winners, for the orchestrator to prioritise their downloads. It does not read this yet.
+      EXISTS (
+        SELECT 1 FROM "CoveredCheckpoint" cc
+        WHERE cc.model_id = mv."modelId" AND cc.version_id = mv.id
+      ) AS "isPromoted",
+      mv."meta"->'generationAlias' AS "generationAlias",
+      (
+        CASE
+          -- A paid generation tier is a generation grant that is NOT free (its price is optional and
+          -- falls back to the download price), mirroring paidGenerationGrant().
+          WHEN pa."terms"->'generation' IS NOT NULL
+            AND COALESCE(pa."terms"->'generation'->>'free', '') <> 'true'
+        THEN
+          COALESCE(CAST(pa."terms"->'generation'->>'trialLimit' AS int), ${DEFAULT_GENERATION_TRIAL_LIMIT})::int
+        ELSE
+          NULL
+        END
+      ) AS "freeTrialLimit"
+    FROM "ModelVersion" mv
+    JOIN "Model" m ON m.id = mv."modelId"
+    JOIN "User" u ON u.id = m."userId"
+    LEFT JOIN "PaidAccess" pa ON pa."entityType" = 'ModelVersion' AND pa."entityId" = mv.id
+    LEFT JOIN "LicensingRoot" lr ON lr."modelVersionId" = mv.id
+    LEFT JOIN "ModelVersion" lsv ON lsv.id = mv."licensingSourceVersionId"
+    LEFT JOIN "Model" lsm ON lsm.id = lsv."modelId"
+    LEFT JOIN LATERAL (
+      SELECT "covered", "coveredNext" FROM "GenerationCoverage" WHERE "modelVersionId" = mv.id
+    ) gc ON TRUE
+    WHERE ${Prisma.join(where, ' AND ')}
+  `;
+  // Same answer as an unknown id, so the response does not reveal that the version exists.
+  if (!modelVersion || !canViewPoiModel(modelVersion.poi, modelVersion.modelUserId, user))
+    return res.status(404).json({ error: 'Model not found' });
+
+  const files = await dbWrite.$queryRaw<FileRow[]>`
+    SELECT 
+      mf.id, 
+      mf.type, 
+      mf.visibility, 
+      mf.url, 
+      mf.metadata, 
+      mf."sizeKB", 
+      mf.name,
+      mf."replacedAt",
+      COALESCE(
+        JSON_OBJECT_AGG(mfh.type, mfh.hash) FILTER (WHERE mfh.hash IS NOT NULL),
+        '{}'::json
+      ) as hashes
+    FROM "ModelFile" mf
+    LEFT JOIN "ModelFileHash" mfh ON mfh."fileId" = mf.id
+    WHERE mf."modelVersionId" = ${id}
+    GROUP BY mf.id, mf.type, mf.visibility, mf.url, mf.metadata, mf."sizeKB", mf.name, mf."replacedAt"
+    -- requestedFile below calls the bare getPrimaryFile, which settles a full tie by input order,
+    -- and that choice decides the epoch branch. (getGenerationFile does its own id sort.)
+    ORDER BY mf.id
+  `;
+
+  const { modelFileId } = results.data;
+
+  // Visibility gate, mirroring `getFileForModelVersion` (the download route this
+  // endpoint's `downloadUrl` points at): owners and moderators see every file of
+  // the version, everyone else only Public ones. The raw query above does NOT
+  // filter visibility, so without this the endpoint could advertise a non-public
+  // file's hash/name/size — and now that the url names that exact file, the
+  // download route would answer 404 for it.
+  //
+  // 🔴 The gate constrains ONLY the path that delegates to the download route.
+  // The training-results/epoch branch below builds `downloadUrl` from the
+  // orchestrator (`epoch.model_url`) and never touches
+  // /api/download/models/[modelVersionId], so the justification above simply
+  // does not apply to it — and a Private version's training file is non-Public
+  // by construction, so gating it would turn a working epoch url into
+  // `404 Missing model file` for every non-owner caller (including holders of an
+  // EntityAccess grant). Hence: resolve the caller's target over the UNFILTERED
+  // population first (this is exactly the pre-existing resolution), decide which
+  // url shape applies, and only then apply the gate to the download-route path.
+  const isOwner = !!user?.id && user.id === modelVersion.modelUserId;
+  const isMod = !!user?.isModerator;
+  const visibleFiles =
+    isOwner || isMod ? files : files.filter((f) => f.visibility === ModelFileVisibility.Public);
+
+  // The download route merges the requesting user's `filePreferences` into
+  // `getPrimaryFile` (see `getFileForModelVersion` in file.service.ts). Pinning
+  // the url to a `fileId` took that merge out of the loop, so the endpoint has to
+  // apply the preferences itself or a caller's format/size/fp choice is silently
+  // dropped. (The download route also merges explicit `format`/`size`/`fp`/
+  // `quantType` query params; this endpoint accepts none of those.)
+  //
+  // 🔴 …but ONLY on the download-route arm. The branch below selects which KIND
+  // of resource this response addresses — an orchestrator epoch artifact vs a
+  // civitai ModelFile — and that choice determines the AIR, a shared identifier
+  // that is logged, cached and handed to the orchestrator. It must not vary per
+  // caller: a preference answers "which variant do I want", not "which resource
+  // is this". So the branch is decided with the DEFAULT preferences and is
+  // identical for every caller; the caller's preferences are applied only once
+  // the download-route arm has been chosen. Hash/url consistency is unaffected —
+  // `targetFile` still governs both on that arm.
+  const filePreferences = { metadata: user?.filePreferences };
+
+  // `getPrimaryFile` over the unfiltered files with default preferences, deliberately — see both
+  // notes above; this only decides `useEpochUrl` and, on the epoch arm, names the training file.
+  const requestedFile = modelFileId
+    ? files.find((f) => f.id === modelFileId)
+    : getPrimaryFile(files);
+  const useEpochUrl =
+    modelVersion.availability === Availability.Private && !!requestedFile?.metadata.trainingResults;
+
+  const targetFile = useEpochUrl
+    ? requestedFile
+    : modelFileId
+    ? visibleFiles.find((f) => f.id === modelFileId)
+    : getGenerationFile(visibleFiles, filePreferences);
+  if (!targetFile) {
+    return res.status(404).json({
+      error: modelFileId
+        ? `Model file ${modelFileId} not found in version ${id}`
+        : 'Missing model file',
+    });
+  }
+
+  const baseUrl = getBaseUrl();
+  let air: string;
+  let downloadUrl: string;
+
+  // `useEpochUrl` already implies `targetFile === requestedFile` and that it
+  // carries `trainingResults`; reading the field back here is purely so the type
+  // narrows for the block below.
+  const trainingResults = useEpochUrl ? targetFile.metadata.trainingResults : undefined;
+
+  if (trainingResults) {
+    const epoch =
+      trainingResults.epochs?.find((e) => {
+        if ('epoch_number' in e) {
+          return e.epoch_number === results.data.epoch;
+        }
+
+        return e.epochNumber === results.data.epoch;
+      }) ??
+      // Non-mutating last-element read. `epochs?.pop()` would MUTATE the
+      // metadata object this handler was handed, and it is the only reader here
+      // that does; `model-version.service.ts` already expresses the same
+      // "latest epoch" selection as `epochs?.[epochs.length - 1]`. Consolidated
+      // on the non-mutating form.
+      trainingResults.epochs?.[trainingResults.epochs.length - 1];
+
+    if (!epoch) {
+      return res.status(404).json({ error: 'Missing epoch' });
+    }
+
+    downloadUrl = 'epoch_number' in epoch ? epoch.model_url : epoch.modelUrl;
+    const { jobId, fileName } = getEpochJobAndFileName(downloadUrl)!;
+
+    if (!jobId || !fileName) {
+      return res.status(404).json({ error: 'Could not get jobId or fileName' });
+    }
+
+    air = stringifyAIR({
+      ...modelVersion,
+      source: 'orchestrator',
+      modelId: jobId,
+      id: fileName,
+    });
+  } else {
+    // this does not work for things like Flux
+    // if (targetFile.type !== 'Model') return res.status(404).json({ error: 'File is not a model' });
+
+    // `fileId` is the QUERY PARAM, deliberately — not `targetFile.id`. The two
+    // agree whenever the caller supplied one (`targetFile` was looked up BY that
+    // id); when the caller omitted it the AIR simply carries no `+<fileId>`
+    // disambiguator, so it under-specifies rather than contradicting the url.
+    // Switching it to `targetFile.id` would append `+<fileId>` to the AIR of
+    // every mini response that omits the param — i.e. essentially all of them —
+    // and the AIR is a shared identifier that is logged, cached and handed to
+    // the orchestrator. That is a deliberate non-change here; see the
+    // AIR-arguments test that pins the current shape both ways.
+    air = stringifyAIR({ ...modelVersion, fileId: modelFileId, fileType: targetFile.type });
+    // Pin the url to the file this response actually describes. What this
+    // replaced was a BARE `/api/download/models/[modelVersionId]` with no query
+    // string at all (`createModelFileDownloadUrl`'s `primary` flag only
+    // SUPPRESSES the other selectors — `QS.stringify` has no `primary` key, so
+    // none was ever emitted). A bare url names no file, so
+    // /api/download/models/[modelVersionId] resolves one independently: it
+    // re-runs `getPrimaryFile` over a different population (visibility-filtered)
+    // with different preferences (the requesting user's `filePreferences`) — so
+    // on a multi-file version the url could serve a file other than the one
+    // whose hash/size/name is returned here, and any consumer verifying the hash
+    // fails.
+    downloadUrl = `${baseUrl}${createModelFileDownloadUrl({
+      versionId: modelVersion.id,
+      fileId: targetFile.id,
+    })}`;
+  }
+
+  // if req url domain contains `api.`, strip /api/ from the download url
+  if (req.headers.host?.includes('api.')) {
+    downloadUrl = downloadUrl.replace('/api/', '/').replace('civitai.com', 'api.civitai.com');
+  }
+  const { format } = targetFile.metadata;
+
+  const genStates = await resolveCanGenerateForVersions(
+    [
+      {
+        id: modelVersion.id,
+        status: modelVersion.status,
+        availability: modelVersion.availability,
+        usageControl: modelVersion.usageControl,
+        baseModel: modelVersion.baseModel,
+        covered: modelVersion.covered ?? false,
+        coveredLive: modelVersion.coveredLive ?? false,
+        modelUserId: modelVersion.modelUserId,
+        modelType: modelVersion.type,
+        flags: modelVersion.versionFlags,
+        modelVersionAlias: modelVersion.generationAlias,
+      },
+    ],
+    {
+      user: { id: user?.id, isModerator: user?.isModerator },
+      sfwOnly: false,
+      wildcardsEnabled: false,
+    }
+  );
+  const canGenerate = genStates.get(modelVersion.id)?.canGenerate ?? false;
+
+  // Check if should charge
+  const shouldChargeResult = await getShouldChargeForResources([
+    {
+      modelType: modelVersion.type,
+      modelId: modelVersion.modelId,
+      fileSizeKB: targetFile.sizeKB,
+      versionFlags: modelVersion.versionFlags,
+    },
+  ]);
+
+  const isFeatured = (await getFeaturedModels())
+    .map((fm) => fm.modelId)
+    .includes(modelVersion.modelId);
+
+  // Licensing-fee resolution (per resource). One "base/lineage" component — the
+  // fee owed to the licensor of whatever this version derives from — plus an
+  // optional "version" surcharge the creator stacks on top; each settles to its
+  // own recipient. `fees` carries the full breakdown; the orchestrator charges
+  // the sum and pays out each entry separately. The base/lineage component is
+  // resolved most-specific first:
+  //   1. this version is a LicensingRoot (a row in the LicensingRoot table) ->
+  //      its own fee IS the lineage fee, settled to itself (e.g. an ecosystem's
+  //      Turbo checkpoint charges its rate, not the base's).
+  //   2. licensingSourceVersionId set -> the chosen root's fee, settled to it
+  //      (a checkpoint built on Turbo inherits the Turbo rate).
+  //   Otherwise there is no lineage fee — a null source is NOT a fallback to a
+  //   (baseModel, modelType) default; derivatives carry an explicit parent.
+  const nonCommercial = isNonCommercialBaseModel(modelVersion.baseModel);
+  const earningsStopped = stopsCreatorEarnings(modelVersion.baseModel);
+  const isLicensingRoot =
+    !nonCommercial &&
+    modelVersion.isLicensingRoot &&
+    modelVersion.licensingFee != null &&
+    modelVersion.licensingFee > 0;
+  // The recipient's owner is part of each guard: `ModelVersion.modelId` has orphan
+  // rows in prod despite a validated FK, and a fee we cannot attribute to a user is
+  // worse than no fee — the orchestrator would stamp a null owner onto
+  // ResourceCompensation. Dropping the component degrades safely instead.
+  const hasSourceRule =
+    !nonCommercial &&
+    !isNonCommercialBaseModel(modelVersion.sourceBaseModel) &&
+    !isLicensingRoot &&
+    modelVersion.licensingSourceVersionId != null &&
+    modelVersion.sourceLicensingFee != null &&
+    modelVersion.sourceLicensingFee > 0 &&
+    modelVersion.sourceLicensingFeeRecipientUserId != null;
+  // When the lineage component already settles to this version itself (it's the
+  // root), its own fee IS that component — don't double-count it as a surcharge.
+  const isBaseRecipientItself = isLicensingRoot;
+  const hasOwnFee =
+    !nonCommercial &&
+    modelVersion.licensingFee != null &&
+    modelVersion.licensingFee > 0 &&
+    !isBaseRecipientItself;
+
+  // `recipientUserId` is the owner of `recipientModelVersionId` at request time, so
+  // payouts and the orchestrator's ResourceCompensation records follow ownership
+  // transfers instead of crediting a past owner.
+  const fees: Array<{
+    role: 'baseModel' | 'version';
+    amount: number;
+    type: string;
+    settlementCurrency: string;
+    recipientModelVersionId: number;
+    recipientUserId: number;
+  }> = [];
+  if (isLicensingRoot) {
+    fees.push({
+      role: 'baseModel',
+      amount: modelVersion.licensingFee ?? 0,
+      type: lowerFirst(modelVersion.licensingFeeType ?? 'PerImageBuzz'),
+      settlementCurrency: lowerFirst(modelVersion.licensingFeeSettlementCurrency ?? 'Buzz'),
+      recipientModelVersionId: modelVersion.id,
+      recipientUserId: modelVersion.modelUserId,
+    });
+  } else if (hasSourceRule) {
+    fees.push({
+      role: 'baseModel',
+      amount: modelVersion.sourceLicensingFee ?? 0,
+      type: lowerFirst(modelVersion.sourceLicensingFeeType ?? 'PerImageBuzz'),
+      settlementCurrency: lowerFirst(modelVersion.sourceLicensingFeeSettlementCurrency ?? 'Buzz'),
+      recipientModelVersionId: modelVersion.licensingSourceVersionId!,
+      recipientUserId: modelVersion.sourceLicensingFeeRecipientUserId!,
+    });
+  }
+  if (hasOwnFee) {
+    fees.push({
+      role: 'version',
+      amount: modelVersion.licensingFee ?? 0,
+      type: lowerFirst(modelVersion.licensingFeeType ?? 'PerImageBuzz'),
+      settlementCurrency: lowerFirst(modelVersion.licensingFeeSettlementCurrency ?? 'Buzz'),
+      recipientModelVersionId: modelVersion.id,
+      recipientUserId: modelVersion.modelUserId,
+    });
+  }
+
+  // Only a fee that is actually charged opts a version out of creator comp; a stored fee that isn't
+  // charged must not also cost the creator comp. The lineage fee (hasSourceRule) settles to a
+  // different creator, so it doesn't opt THIS one out.
+  const payoutEnabled =
+    !earningsStopped &&
+    !Flags.hasFlag(modelVersion.userFlags, UserFlag.DisablePayout) &&
+    !(isLicensingRoot || hasOwnFee);
+  // Independent of the fee: a fee creator still gets their share of the creator tip.
+  const tipsEnabled =
+    !earningsStopped &&
+    isCreatorTipEligible({
+      ownerId: modelVersion.modelUserId,
+      ownerFlags: modelVersion.userFlags,
+    });
+
+  const data = {
+    air,
+    defaultFileId: getGenerationFile(files)?.id ?? null,
+    versionName: modelVersion.versionName,
+    modelName: modelVersion.modelName,
+    userId: modelVersion.modelUserId,
+    baseModel: modelVersion.baseModel,
+    availability: modelVersion.availability,
+    publishedAt: modelVersion.publishedAt,
+    size: targetFile.sizeKB, // nullable
+    fileType: targetFile.type,
+    fileName: targetFile.name,
+    // nullable - hashes (all available hash types)
+    hashes: targetFile.hashes,
+    downloadUrls: [downloadUrl], // nullable
+    format, // nullable
+    canGenerate,
+    isFeatured,
+    isPromoted: modelVersion.isPromoted,
+    // Computed, not written to the flag, so the pin lifts by itself when the promotion ends.
+    evictable: !modelVersion.isPromoted && isEvictable(modelVersion.versionFlags),
+    requireAuth: modelVersion.requireAuth,
+    checkPermission: modelVersion.checkPermission,
+    earlyAccessEndsAt: modelVersion.checkPermission ? modelVersion.earlyAccessEndsAt : undefined,
+    freeTrialLimit: modelVersion.checkPermission ? modelVersion.freeTrialLimit : undefined,
+    additionalResourceCharge: shouldChargeResult[modelVersion.modelId],
+    minor: modelVersion.minor,
+    sfwOnly: modelVersion.sfwOnly,
+    fees,
+    payoutEnabled,
+    tipsEnabled,
+  };
+  res.status(200).json(data);
+});

@@ -1,0 +1,168 @@
+import { Text } from '@mantine/core';
+import type { MediaType } from '~/shared/utils/prisma/enums';
+import React, { SyntheticEvent, useEffect, useRef } from 'react';
+import type { EdgeUrlProps } from '~/client-utils/cf-images-utils';
+import { getInferredMediaType } from '~/client-utils/cf-images-utils';
+import { edgeMediaOptions } from '~/client-utils/edge-url';
+import { shouldAnimateByDefault } from '~/components/EdgeMedia/EdgeMedia.util';
+import type { EdgeVideoRef } from '~/components/EdgeMedia/EdgeVideo';
+import { EdgeVideo } from '~/components/EdgeMedia/EdgeVideo';
+import { useBrowsingSettings } from '~/providers/BrowserSettingsProvider';
+import type { ImageMetadata, VideoMetadata } from '~/server/schema/media.schema';
+import { EdgeImage } from '~/components/EdgeMedia/EdgeImage';
+import clsx from 'clsx';
+import styles from './EdgeMedia.module.scss';
+
+export type EdgeMediaProps = EdgeUrlProps &
+  Omit<JSX.IntrinsicElements['img'], 'src' | 'srcSet' | 'ref' | 'width' | 'height' | 'metadata'> & {
+    controls?: boolean;
+    wrapperProps?: React.ComponentPropsWithoutRef<'div'>;
+    contain?: boolean;
+    fadeIn?: boolean;
+    mediaRef?: [HTMLImageElement | null, (ref: HTMLImageElement | null) => void];
+    muted?: boolean;
+    html5Controls?: boolean;
+    onMutedChange?: (muted: boolean) => void;
+    videoRef?: React.ForwardedRef<EdgeVideoRef>;
+    metadata?: ImageMetadata | VideoMetadata | null;
+    youtubeVideoId?: string;
+    vimeoVideoId?: string;
+    thumbnailUrl?: string | null;
+    disableWebm?: boolean;
+    disablePoster?: boolean;
+    videoProps?: React.HTMLAttributes<HTMLVideoElement> &
+      React.MediaHTMLAttributes<HTMLVideoElement> & { hoverPlay?: boolean; standby?: boolean };
+    imageProps?: React.HTMLAttributes<HTMLImageElement>;
+    /** Database image ID — forwarded to EdgeImage for drag-and-drop metadata lookup */
+    imageId?: number;
+    /** Also serve a variant sized for a 2x display. Images only. See `useEdgeUrl`. */
+    hiDpi?: boolean;
+  };
+
+export function EdgeMedia({
+  src,
+  height,
+  width,
+  fit,
+  anim,
+  blur,
+  quality,
+  gravity,
+  className,
+  name,
+  type,
+  style,
+  children,
+  controls,
+  wrapperProps,
+  contain,
+  fadeIn,
+  mediaRef,
+  transcode,
+  original,
+  skip,
+  muted,
+  html5Controls,
+  onMutedChange,
+  videoRef,
+  youtubeVideoId,
+  vimeoVideoId,
+  thumbnailUrl,
+  disableWebm,
+  disablePoster,
+  videoProps,
+  imageProps,
+  optimized,
+  imageId,
+  hiDpi,
+  sourceWidth,
+  ...imgProps
+}: EdgeMediaProps) {
+  const imgRef = useRef<HTMLImageElement>(null);
+  if (fadeIn && imgRef.current?.complete) imgRef?.current?.style?.setProperty('opacity', '1');
+  useEffect(() => {
+    mediaRef?.[1](imgRef.current);
+  }, [mediaRef]);
+
+  const inferredType = getInferredMediaType(src, { name, type });
+
+  const options = edgeMediaOptions({
+    name,
+    width,
+    sourceWidth,
+    height,
+    fit,
+    blur,
+    quality,
+    gravity,
+    transcode,
+    type,
+    original,
+    skip,
+    anim,
+    optimized,
+  });
+  width = options.width;
+
+  switch (inferredType) {
+    case 'image': {
+      return (
+        <EdgeImage
+          ref={imgRef}
+          src={src}
+          options={options}
+          className={className}
+          style={style}
+          imageId={imageId}
+          hiDpi={hiDpi}
+          {...imgProps}
+          {...imageProps}
+        />
+      );
+    }
+    case 'video':
+      return (
+        <EdgeVideo
+          src={src}
+          thumbnailUrl={thumbnailUrl}
+          options={options}
+          style={{
+            ...style,
+            ['--max-width' as string]: width ? `${width}px` : undefined,
+          }}
+          className={clsx(styles.responsive, className, { [styles.fadeIn]: fadeIn })}
+          controls={controls}
+          wrapperProps={wrapperProps}
+          contain={contain}
+          fadeIn={fadeIn}
+          muted={muted}
+          html5Controls={html5Controls}
+          onMutedChange={onMutedChange}
+          ref={videoRef}
+          youtubeVideoId={youtubeVideoId}
+          vimeoVideoId={vimeoVideoId}
+          disableWebm={disableWebm}
+          disablePoster={disablePoster}
+          imageId={imageId}
+          {...videoProps}
+        />
+      );
+    default:
+      return <Text align="center">Unsupported media type</Text>;
+  }
+}
+
+export function EdgeMedia2({
+  metadata,
+  ...props
+}: Omit<EdgeMediaProps, 'type' | 'metadata'> & {
+  metadata?: MixedObject | null;
+  type: MediaType;
+}) {
+  const autoplayGifs = useBrowsingSettings((x) => x.autoplayGifs);
+  const anim =
+    props.anim ??
+    shouldAnimateByDefault({ type: props.type, metadata, forceDisabled: !autoplayGifs });
+
+  return <EdgeMedia {...props} anim={anim} />;
+}

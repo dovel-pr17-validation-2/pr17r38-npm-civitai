@@ -1,0 +1,599 @@
+import { keepPreviousData } from '@tanstack/react-query';
+import {
+  ActionIcon,
+  Badge,
+  Button,
+  Group,
+  Pagination,
+  Paper,
+  Skeleton,
+  Stack,
+  Text,
+  Title,
+  UnstyledButton,
+} from '@mantine/core';
+import { HoverCard, Popover } from '~/components/MantineOverlays';
+import {
+  IconCheck,
+  IconClock,
+  IconLoader,
+  IconPlus,
+  IconRefresh,
+  IconSearch,
+  IconWallet,
+  IconWifiOff,
+} from '@tabler/icons-react';
+import { useMemo, useRef, useState } from 'react';
+import useIsClient from '~/hooks/useIsClient';
+import { BonusBuzzContent } from '~/components/Buzz/CryptoDeposit/BonusBuzzContent';
+import { outerCardStyle } from '~/components/Buzz/CryptoDeposit/crypto-deposit.constants';
+import { CurrencyIcon } from '~/components/Currency/CurrencyIcon';
+import { DaysFromNow } from '~/components/Dates/DaysFromNow';
+import { useSignalContext } from '~/components/Signals/SignalsProvider';
+import { numberWithCommas } from '~/utils/number-helpers';
+import { getNetworkDisplayName } from '~/server/common/chain-config';
+import { useSupportedCurrencies } from '~/components/Buzz/CryptoDeposit/crypto-deposit.hooks';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { trpc } from '~/utils/trpc';
+
+export function DepositHistory() {
+  const isClient = useIsClient();
+  const currentUser = useCurrentUser();
+  const [page, setPage] = useState(1);
+  const perPage = 3;
+  const utils = trpc.useUtils();
+  const { status: signalStatus } = useSignalContext();
+
+  const { data, isLoading } = trpc.nowPayments.getDepositHistory.useQuery(
+    { page, perPage },
+    { placeholderData: keepPreviousData, staleTime: 30 * 1000, enabled: !!currentUser }
+  );
+
+  // Reuse supported currencies query (React Query deduplicates) for ticker/network display
+  const { data: currencies } = useSupportedCurrencies();
+
+  // Build a lookup: NowPayments currency code → { ticker, network, multiNetwork }
+  const currencyLookup = useMemo(() => {
+    if (!currencies) return {};
+    const lookup: Record<string, { ticker: string; network: string | null | undefined; multiNetwork: boolean }> = {};
+    for (const group of currencies) {
+      const multiNetwork = group.networks.length > 1;
+      for (const net of group.networks) {
+        lookup[net.code.toLowerCase()] = {
+          ticker: (net.ticker ?? group.ticker).toUpperCase(),
+          network: net.network,
+          multiNetwork,
+        };
+      }
+    }
+    return lookup;
+  }, [currencies]);
+
+  // Live updates are handled by the global useCryptoDepositSignal hook
+  // in SignalsRegistrar.tsx, which invalidates getDepositHistory on signal receipt.
+
+  const deposits = (data?.deposits ?? []).filter(
+    (d): d is NonNullable<typeof d> => d != null
+  );
+  const total = data?.total ?? 0;
+  const totalPages = Math.ceil(total / perPage);
+  const reconcile = useReconcileDeposits(total);
+
+  if (!isClient) return null;
+
+  if (isLoading && deposits.length === 0) {
+    return (
+      <Paper p="lg" radius="md" withBorder style={outerCardStyle}>
+        <Title order={5} mb="sm">
+          Your Recent Deposits
+        </Title>
+        <Stack gap="sm">
+          {[0, 1, 2].map((i) => (
+            <Paper
+              key={i}
+              p="sm"
+              radius="sm"
+              withBorder
+              className="bg-gray-50 dark:bg-white/[0.03] border border-gray-200 dark:border-white/10"
+            >
+              <Group justify="space-between" wrap="nowrap" align="center">
+                <Stack gap={4}>
+                  <Group gap={6}>
+                    <Skeleton height={16} width={60} radius="sm" />
+                    <Skeleton height={16} width={40} radius="sm" />
+                  </Group>
+                  <Skeleton height={12} width={100} radius="sm" />
+                </Stack>
+                <Stack gap={4} align="flex-end">
+                  <Skeleton height={20} width={70} radius="sm" />
+                  <Skeleton height={18} width={60} radius="xl" />
+                </Stack>
+              </Group>
+            </Paper>
+          ))}
+        </Stack>
+      </Paper>
+    );
+  }
+
+  if (!isLoading && deposits.length === 0 && total === 0) {
+    return (
+      <EmptyDepositState
+        signalStatus={signalStatus}
+        onRefresh={() => utils.nowPayments.getDepositHistory.invalidate()}
+        reconcile={reconcile}
+      />
+    );
+  }
+
+  return (
+    <Paper p="lg" radius="md" withBorder style={outerCardStyle}>
+      <Group justify="space-between" mb="sm">
+        <Title order={5}>Your Recent Deposits</Title>
+        <SignalStatusBadge
+          status={signalStatus}
+          onRefresh={() => utils.nowPayments.getDepositHistory.invalidate()}
+        />
+      </Group>
+      <Stack gap="sm">
+        {deposits.map((deposit) => {
+          // Only show fees once the deposit is complete (fees aren't final until then)
+          let feeUsdc: number | null = null;
+          if (deposit.status === 'finished') {
+            const hasFeeRecord = deposit.depositFee != null && deposit.serviceFee != null;
+            const totalFeeUsdc = hasFeeRecord
+              ? (deposit.depositFee ?? 0) + (deposit.serviceFee ?? 0)
+              : null;
+
+            if (totalFeeUsdc != null && totalFeeUsdc > 0) {
+              feeUsdc = totalFeeUsdc;
+            } else if (
+              !hasFeeRecord &&
+              deposit.outcomeAmount != null &&
+              deposit.amountSent != null
+            ) {
+              // Estimate fee for stablecoins
+              const currency = deposit.currencySent?.toLowerCase() ?? '';
+              const isStablecoin = currency.includes('usd');
+              if (isStablecoin && deposit.amountSent > 0) {
+                const diff = deposit.amountSent - deposit.outcomeAmount;
+                if (diff > 0) feeUsdc = diff;
+              }
+            }
+          }
+
+          const currencyInfo = currencyLookup[deposit.currencySent?.toLowerCase() ?? ''];
+          const ticker = currencyInfo?.ticker ?? deposit.currencySent?.toUpperCase() ?? '';
+          // Show network badge when the ticker exists on multiple networks (USDC, USDT, etc.)
+          const networkBadge =
+            currencyInfo?.multiNetwork && currencyInfo.network
+              ? getNetworkDisplayName(currencyInfo.network)
+              : null;
+
+          return (
+            <Paper
+              key={deposit.paymentId}
+              p="sm"
+              radius="sm"
+              withBorder
+              className="bg-gray-50 dark:bg-white/[0.03] border border-gray-200 dark:border-white/10"
+            >
+              <Group justify="space-between" wrap="nowrap" align="center">
+                {/* Left side */}
+                <Stack gap={4}>
+                  <Group gap={6} wrap="nowrap">
+                    <Text size="sm" fw={500}>
+                      {deposit.amountSent}
+                    </Text>
+                    <Text size="sm" fw={600} tt="uppercase">
+                      {ticker}
+                    </Text>
+                    {networkBadge && (
+                      <Badge size="xs" variant="light" color="gray" radius="sm">
+                        {networkBadge}
+                      </Badge>
+                    )}
+                  </Group>
+                  <Group gap="md" wrap="nowrap">
+                    {feeUsdc != null && (
+                      <FeePopover amount={feeUsdc} />
+                    )}
+                    <Group gap={4} wrap="nowrap">
+                      <IconClock size={12} className="text-dimmed" />
+                      <Text size="xs" c="dimmed">
+                        <DaysFromNow date={deposit.date} live />
+                      </Text>
+                    </Group>
+                  </Group>
+                </Stack>
+                {/* Right side: buzz + bonus + status stacked */}
+                {deposit.buzzCredited != null ? (
+                  <Stack gap={2} align="flex-end">
+                    <Group gap={4} wrap="nowrap">
+                      <CurrencyIcon currency="BUZZ" size={18} />
+                      <Text size="lg" fw={700}>
+                        {numberWithCommas(deposit.buzzCredited)}
+                      </Text>
+                      {deposit.bonusBuzz != null && deposit.bonusBuzz > 0 && (
+                        <div className="ml-1">
+                          <BonusBuzzPopover
+                            bonusBuzz={deposit.bonusBuzz}
+                            multiplier={deposit.multiplier}
+                          />
+                        </div>
+                      )}
+                    </Group>
+                    <DepositStatusBadge status={deposit.status} />
+                  </Stack>
+                ) : (
+                  <DepositStatusBadge status={deposit.status} />
+                )}
+              </Group>
+            </Paper>
+          );
+        })}
+      </Stack>
+      {totalPages > 1 && (
+        <Group justify="center" mt="md">
+          <Pagination total={totalPages} value={page} onChange={setPage} size="sm" />
+        </Group>
+      )}
+      <CheckDepositsNotice reconcile={reconcile} />
+    </Paper>
+  );
+}
+
+function EmptyDepositState({
+  signalStatus,
+  onRefresh,
+  reconcile,
+}: {
+  signalStatus: string | null;
+  onRefresh: () => void;
+  reconcile: Reconcile;
+}) {
+  return (
+    <Paper p="lg" radius="md" withBorder style={outerCardStyle}>
+      <Stack gap="sm">
+        <Group justify="space-between">
+          <Title order={5}>Your Recent Deposits</Title>
+          <SignalStatusBadge status={signalStatus} onRefresh={onRefresh} />
+        </Group>
+        <Paper
+          p="lg"
+          radius="sm"
+          withBorder
+          className="bg-gray-50 dark:bg-white/[0.03] border border-gray-200 dark:border-white/10"
+        >
+          <Group justify="center" gap="xs" py="md">
+            <IconWallet size={18} className="text-dimmed" stroke={1.5} />
+            <Text size="sm" fw={500}>
+              No deposits yet
+            </Text>
+          </Group>
+        </Paper>
+        <CheckDepositsNotice reconcile={reconcile} />
+      </Stack>
+    </Paper>
+  );
+}
+
+function SignalStatusBadge({
+  status,
+  onRefresh,
+}: {
+  status: string | null;
+  onRefresh: () => void;
+}) {
+  if (status === 'connected') {
+    return (
+      <HoverCard width={220} position="bottom-end" withArrow shadow="md" openDelay={300}>
+        <HoverCard.Target>
+          <Group gap={4} wrap="nowrap" className="cursor-help">
+            <div className="relative flex items-center justify-center">
+              <div className="absolute size-3 animate-ping rounded-full bg-green-500/40" />
+              <div className="size-2 rounded-full bg-green-500" />
+            </div>
+            <Text size="xs" c="green">
+              Live
+            </Text>
+          </Group>
+        </HoverCard.Target>
+        <HoverCard.Dropdown>
+          <Text size="xs">
+            Deposits will appear automatically as they&rsquo;re confirmed on the blockchain. No need
+            to refresh.
+          </Text>
+        </HoverCard.Dropdown>
+      </HoverCard>
+    );
+  }
+
+  // The live connection retries on its own for as long as an outage lasts (it no longer gives up
+  // and reports 'closed' after a few minutes), so the manual refresh is offered here too.
+  if (status === 'reconnecting') {
+    return (
+      <HoverCard width={220} position="bottom-end" withArrow shadow="md" openDelay={300}>
+        <HoverCard.Target>
+          <UnstyledButton onClick={onRefresh} aria-label="Refresh deposit history">
+            <Group gap={4} wrap="nowrap">
+              <IconRefresh size={14} className="text-yellow-500" />
+              <Text size="xs" c="yellow">
+                Reconnecting&hellip;
+              </Text>
+            </Group>
+          </UnstyledButton>
+        </HoverCard.Target>
+        <HoverCard.Dropdown>
+          <Text size="xs">
+            Reconnecting to live updates. Deposits are still being processed &mdash; they&rsquo;ll
+            appear once the connection is restored. Click to refresh manually in the meantime.
+          </Text>
+        </HoverCard.Dropdown>
+      </HoverCard>
+    );
+  }
+
+  return (
+    <HoverCard width={220} position="bottom-end" withArrow shadow="md" openDelay={300}>
+      <HoverCard.Target>
+        <UnstyledButton onClick={onRefresh} aria-label="Refresh deposit history">
+          <Group gap={4} wrap="nowrap">
+            <IconWifiOff size={14} className="text-red-500" />
+            <Text size="xs" c="red" td="underline">
+              Disconnected &mdash; refresh
+            </Text>
+          </Group>
+        </UnstyledButton>
+      </HoverCard.Target>
+      <HoverCard.Dropdown>
+        <Text size="xs">
+          Live updates are disconnected. Click to refresh manually, or use &ldquo;Check now&rdquo;
+          below to scan for missing deposits.
+        </Text>
+      </HoverCard.Dropdown>
+    </HoverCard>
+  );
+}
+
+function FeePopover({ amount }: { amount: number }) {
+  const display = `Fee: $${(Math.ceil(amount * 100) / 100).toFixed(2)}`;
+  return (
+    <Popover width={280} position="top" withArrow shadow="md">
+      <Popover.Target>
+        <UnstyledButton
+          className="cursor-help"
+          aria-label="Fee information"
+        >
+          <Text
+            size="xs"
+            c="dimmed"
+            className="underline decoration-dotted decoration-gray-400 dark:decoration-gray-600 underline-offset-2"
+          >
+            {display}
+          </Text>
+        </UnstyledButton>
+      </Popover.Target>
+      <Popover.Dropdown>
+        <Stack gap="xs">
+          <Text size="sm" fw={600}>
+            About fees
+          </Text>
+          <Text size="xs" c="dimmed">
+            Fees are charged by NowPayments and include two parts: a{' '}
+            <Text span fw={500} c="dimmed">
+              service fee
+            </Text>{' '}
+            (0.5% payment processing fee) and a{' '}
+            <Text span fw={500} c="dimmed">
+              network fee
+            </Text>{' '}
+            (covers the blockchain transaction and any currency conversion).
+          </Text>
+          <Text size="xs" c="dimmed">
+            For the lowest total fees, send USDC on Base — no conversion is needed so the network
+            fee is minimal. Other currencies have higher fees due to conversion and network costs.
+          </Text>
+          <Text size="xs" c="dimmed">
+            Civitai does not charge any additional fee — you receive Buzz for the full amount we
+            receive after NowPayments&rsquo; fees.
+          </Text>
+        </Stack>
+      </Popover.Dropdown>
+    </Popover>
+  );
+}
+
+function BonusBuzzPopover({
+  bonusBuzz,
+  multiplier,
+}: {
+  bonusBuzz: number;
+  multiplier: number | null | undefined;
+}) {
+  return (
+    <HoverCard
+      width={240}
+      position="top"
+      withArrow
+      shadow="md"
+      openDelay={500}
+      styles={{
+        dropdown: {
+          background: 'var(--mantine-color-yellow-light)',
+          border: 'none',
+          backdropFilter: 'blur(16px)',
+        },
+      }}
+    >
+      <HoverCard.Target>
+        <ActionIcon variant="light" color="yellow" size="xs" radius="xs" aria-label="Membership bonus details">
+          <IconPlus size={12} />
+        </ActionIcon>
+      </HoverCard.Target>
+      <HoverCard.Dropdown>
+        <BonusBuzzContent bonusBuzz={bonusBuzz} multiplier={multiplier ?? 100} />
+      </HoverCard.Dropdown>
+    </HoverCard>
+  );
+}
+
+type Reconcile = ReturnType<typeof useReconcileDeposits>;
+
+// A result describes the list as it stood when the button was pressed. Once the list
+// moves — the signal delivers the deposit, another tab reconciles — a nothing-found or
+// an error no longer describes what the user is looking at, so the notice falls back to
+// idle rather than captioning the new list with the old answer. The total is stamped in
+// onMutate, at click time, so a deposit landing mid-request cannot consume the
+// comparison and leave the wrong label up for good.
+//
+// A found-result is exempt and must stay exempt. It normally moves the list, because
+// crediting invalidates the query — so treating it as stale wipes the confirmation with
+// its own refetch, which is the bug this file exists to fix (ClickUp 868m6j63r). Not
+// always, though: reconciling a deposit already listed as Confirming credits an
+// existing row and adds none, leaving the total unchanged.
+export function isResultStale({
+  found,
+  isSuccess,
+  isError,
+  totalAtMutate,
+  total,
+}: {
+  found: boolean;
+  isSuccess: boolean;
+  isError: boolean;
+  totalAtMutate: number;
+  total: number;
+}) {
+  return !found && (isSuccess || isError) && totalAtMutate !== total;
+}
+
+// Owned by DepositHistory rather than by the notice: a successful reconcile
+// repopulates the list, which unmounts the empty-state branch. A mutation living
+// in the notice would take its own success state down with it, so the user never
+// saw that the click worked.
+function useReconcileDeposits(total: number) {
+  const utils = trpc.useUtils();
+  const totalAtMutate = useRef(total);
+  const mutation = trpc.nowPayments.reconcileMyDeposits.useMutation({
+    onMutate: () => {
+      totalAtMutate.current = total;
+    },
+    onSuccess: (data) => {
+      if (data.processed > 0) utils.nowPayments.getDepositHistory.invalidate();
+    },
+  });
+
+  const found = mutation.isSuccess && mutation.data.processed > 0;
+
+  return {
+    mutation,
+    found,
+    resultIsStale: isResultStale({
+      found,
+      isSuccess: mutation.isSuccess,
+      isError: mutation.isError,
+      totalAtMutate: totalAtMutate.current,
+      total,
+    }),
+  };
+}
+
+function CheckDepositsNotice({ reconcile }: { reconcile: Reconcile }) {
+  const { mutation, found, resultIsStale } = reconcile;
+  const showPrompt = resultIsStale || (!mutation.isSuccess && !mutation.isError);
+  const buttonLabel = mutation.isPending
+    ? 'Checking...'
+    : resultIsStale
+    ? 'Check now'
+    : mutation.isSuccess
+    ? found
+      ? `Found ${mutation.data.processed} deposit(s)!`
+      : 'No missing deposits found'
+    : mutation.isError
+    ? 'Try again in a minute'
+    : 'Check now';
+
+  return (
+    <Paper
+      p="sm"
+      radius="sm"
+      withBorder
+      mt="sm"
+      className="bg-gray-50 dark:bg-white/[0.03] border border-gray-200 dark:border-white/10"
+    >
+      <Group gap="sm" justify="space-between" align="center" wrap="wrap">
+        <Group gap="xs" wrap="nowrap" align="flex-start" className="min-w-[180px] flex-1">
+          <IconClock size={16} className="mt-0.5 shrink-0 text-yellow-500" />
+          <Stack gap={2}>
+            {showPrompt && (
+              <Text size="xs" fw={600}>
+                Missing a deposit?
+              </Text>
+            )}
+            <Text size="xs" c="dimmed" lh={1.4}>
+              Deposits can take up to 1 hour to appear depending on network congestion.
+            </Text>
+          </Stack>
+        </Group>
+        <Button
+          size="compact-sm"
+          variant="light"
+          color={found ? 'green' : undefined}
+          leftSection={<IconSearch size={14} />}
+          loading={mutation.isPending}
+          disabled={mutation.isPending}
+          onClick={() => mutation.mutate()}
+          className="shrink-0"
+        >
+          {buttonLabel}
+        </Button>
+      </Group>
+    </Paper>
+  );
+}
+
+export function DepositStatusBadge({ status }: { status: string }) {
+  if (status === 'finished') {
+    return (
+      <Badge color="green" variant="light" size="sm" leftSection={<IconCheck size={12} />}>
+        Complete
+      </Badge>
+    );
+  }
+
+  switch (status) {
+    case 'confirming':
+    case 'confirmed':
+    case 'sending':
+      return (
+        <Badge color="yellow" variant="light" size="sm" leftSection={<IconLoader size={12} />}>
+          Confirming
+        </Badge>
+      );
+    case 'waiting':
+      return (
+        <Badge color="gray" variant="light" size="sm" leftSection={<IconClock size={12} />}>
+          Waiting
+        </Badge>
+      );
+    case 'buzz_failed':
+      return (
+        <Badge color="orange" variant="light" size="sm" leftSection={<IconRefresh size={12} />}>
+          Processing
+        </Badge>
+      );
+    case 'held':
+      return (
+        <Badge color="green" variant="light" size="sm" leftSection={<IconCheck size={12} />}>
+          Credited by support
+        </Badge>
+      );
+    default:
+      return (
+        <Badge color="gray" variant="light" size="sm">
+          {status}
+        </Badge>
+      );
+  }
+}

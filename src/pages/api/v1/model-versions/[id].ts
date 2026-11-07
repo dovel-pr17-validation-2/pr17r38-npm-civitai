@@ -1,0 +1,348 @@
+import { Prisma } from '@prisma/client';
+import type { ModelHashType } from '~/shared/utils/prisma/enums';
+import { ModelFileVisibility, ModelModifier, ModelStatus } from '~/shared/utils/prisma/enums';
+import type { NextApiRequest, NextApiResponse } from 'next';
+import * as z from 'zod';
+
+import { getEdgeUrl } from '~/client-utils/edge-url';
+import { isProd } from '~/env/other';
+import { getDownloadFilename } from '~/server/services/file.service';
+import {
+  createModelFileDownloadUrl,
+  createSerializedFileDownloadUrl,
+} from '~/server/common/model-helpers';
+import { dbRead } from '~/server/db/client';
+import { loadKyselyDb } from '~/server/db/kyselyDb.lazy';
+import {
+  readModelVersionPrivacyViaKysely,
+  readModelVersionPrivacyViaPrisma,
+} from '~/server/services/hot-reads-6.reads';
+import type { ModelVersionApiReturn } from '~/server/selectors/modelVersion.selector';
+import { getImagesForModelVersion } from '~/server/services/image.service';
+import { getVaeFiles } from '~/server/services/model.service';
+import {
+  getHiddenModelVersionIds,
+  isPrivateModelVersion,
+} from '~/server/services/model-visibility.service';
+import type { PublicPaidAccessDto } from '~/server/services/paid-access.service';
+import { getPaidAccess, toPublicPaidAccessDto } from '~/server/services/paid-access.service';
+import { MixedAuthEndpoint } from '~/server/utils/endpoint-helpers';
+import { getPrimaryFile } from '~/server/utils/model-helpers';
+import { reduceToBasicFileMetadata } from '~/server/services/model-file.service';
+import type { Session } from '~/types/session';
+import { modelVersionToAir } from '~/server/utils/resource-air';
+import { safeDecodeURIComponent } from '~/utils/string-helpers';
+import { resolveModelFace, showsSfwFace } from '~/shared/utils/model-sfw-face';
+import { apiBrowsingLevel } from '~/server/utils/browsing-level';
+import { logToAxiom } from '~/server/logging/client';
+import { hasValidCreatorMembershipCached } from '~/server/services/creator-program.service';
+import {
+  anyMetricHidden,
+  getMetaMetricPrivacy,
+  getUserMetricPrivacyDefaults,
+  resolveVersionHiddenMetrics,
+} from '~/server/utils/model-metric-privacy';
+
+const hashesAsObject = (hashes: { type: ModelHashType; hash: string }[]) =>
+  hashes.reduce((acc, { type, hash }) => ({ ...acc, [type]: hash }), {});
+
+const schema = z.object({ id: z.preprocess((val) => Number(val), z.number()) });
+export default MixedAuthEndpoint(async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse,
+  user: Session['user'] | undefined
+) {
+  const results = schema.safeParse(req.query);
+  if (!results.success)
+    return res.status(400).json({ error: z.prettifyError(results.error) ?? 'Invalid id' });
+
+  const { id } = results.data;
+  if (!id) return res.status(400).json({ error: 'Missing modelVersionId' });
+  const status = user?.isModerator ? undefined : ModelStatus.Published;
+
+  const allowedBrowsingLevels = apiBrowsingLevel(req);
+
+  try {
+    const modelVersion = await dbRead.$queryRaw<
+      (ModelVersionApiReturn & { vaeId?: number | null })[]
+    >`
+      SELECT
+        mv.id,
+        mv."modelId",
+        mv.name,
+        mv."nsfwLevel",
+        mv."createdAt",
+        mv."updatedAt",
+        mv.status,
+        mv."publishedAt",
+        mv."trainedWords",
+        mv."trainingStatus",
+        mv."trainingDetails",
+        mv."baseModel",
+        mv."baseModelType",
+        mv.description,
+        (SELECT rr."resourceId" FROM "RecommendedResource" rr
+         WHERE rr."sourceId" = mv.id
+           AND rr.settings->>'isLinkedComponent' = 'true'
+           AND rr.settings->>'componentType' = 'VAE'
+         LIMIT 1) AS "vaeId",
+        mv."uploadType",
+        mv."usageControl",
+        mv."availability",
+        COALESCE(
+          (
+            SELECT json_agg(
+              json_build_object(
+                'downloadCount', m."downloadCount",
+                'ratingCount', m."ratingCount",
+                'rating', m.rating,
+                'thumbsUpCount', m."thumbsUpCount",
+                'thumbsDownCount', m."thumbsDownCount"
+              )
+            )
+            FROM "ModelVersionMetric" m
+            WHERE m."modelVersionId" = mv.id AND m.timeframe = 'AllTime'
+          ),
+          '[]'::json
+        ) as metrics,
+        COALESCE(
+          (
+            SELECT json_agg(
+              json_build_object(
+                'id', mf.id,
+                'url', mf.url,
+                'sizeKB', mf."sizeKB",
+                'name', mf.name,
+                'type', mf.type,
+                'visibility', mf.visibility,
+                'metadata', mf.metadata,
+                'pickleScanResult', mf."pickleScanResult",
+                'pickleScanMessage', mf."pickleScanMessage",
+                'virusScanResult', mf."virusScanResult",
+                'virusScanMessage', mf."virusScanMessage",
+                'scannedAt', mf."scannedAt",
+                'modelVersionId', mf."modelVersionId",
+                'hashes', COALESCE(
+                  (
+                    SELECT json_agg(
+                      json_build_object(
+                        'type', h.type,
+                        'hash', h.hash
+                      )
+                    )
+                    FROM "ModelFileHash" h
+                    WHERE h."fileId" = mf.id
+                  ),
+                  '[]'::json
+                )
+              )
+            )
+            FROM "ModelFile" mf
+            WHERE mf."modelVersionId" = mv.id
+          ),
+          '[]'::json
+        ) as files,
+        (
+          SELECT json_build_object(
+            'name', m.name,
+            'sfwName', m."sfwName",
+            'type', m.type,
+            'nsfw', m.nsfw,
+            'poi', m.poi,
+            'mode', m.mode,
+            'availability', m.availability,
+            'userId', m."userId"
+          )
+          FROM "Model" m
+          WHERE m.id = mv."modelId"
+        ) as model
+      FROM "ModelVersion" mv
+      WHERE mv.id = ${id}
+        ${status ? Prisma.sql`AND mv.status = ${status}::"ModelStatus"` : Prisma.empty}
+        AND (mv."nsfwLevel" & ${allowedBrowsingLevels}) != 0
+      LIMIT 1
+    `.then((results) => results[0] || null);
+
+    await resModelVersionDetails(req, res, modelVersion, async () => user);
+  } catch (e) {
+    const error = e as Error;
+    logToAxiom({
+      type: 'error',
+      name: 'api-model-version-details',
+      message: error.message,
+      cause: error.cause,
+      stack: error.stack,
+    });
+
+    return res.status(500).json({ error: 'Failed to fetch model version details' });
+  }
+});
+
+export async function prepareModelVersionResponse(
+  modelVersion: ModelVersionApiReturn & { vaeId?: number | null },
+  baseUrl: URL,
+  images?: AsyncReturnType<typeof getImagesForModelVersion>,
+  // `null` means known-ungated; only `undefined` self-fetches.
+  paidAccess?: PublicPaidAccessDto | null,
+  // The .com face, as the API v1 model list resolves it: for a caller served only safe levels.
+  showSfwFace = false
+) {
+  // `availability` and the owner only decide visibility; they are not part of the response.
+  const { files, model: modelRow, metrics, vaeId, availability, ...storedVersion } = modelVersion;
+  const { availability: modelAvailability, userId: ownerId, ...storedModel } = modelRow;
+  const withSfwFace = showSfwFace && storedModel.sfwName != null;
+  const model = resolveModelFace(storedModel, withSfwFace);
+  // A .com face has no per-version description; the .red one is not shown in its place.
+  const version = withSfwFace ? { ...storedVersion, description: null } : storedVersion;
+  const vae = !!vaeId ? await getVaeFiles({ vaeIds: [vaeId] }) : [];
+  files.push(...vae);
+  const castedFiles = files as Array<
+    Omit<(typeof files)[number], 'metadata'> & { metadata: FileMetadata }
+  >;
+  const primaryFile = getPrimaryFile(castedFiles);
+  if (!primaryFile) return null;
+
+  images ??= await getImagesForModelVersion({
+    modelVersionIds: [version.id],
+    include: ['meta'],
+    imagesPerVersion: 10,
+  });
+  if (paidAccess === undefined)
+    paidAccess = toPublicPaidAccessDto(
+      (await getPaidAccess('ModelVersion', [version.id]))[version.id]
+    );
+  const includeDownloadUrl = model.mode !== ModelModifier.Archived;
+  const includeImages = model.mode !== ModelModifier.TakenDown;
+
+  // Creator Controls: gate the version download count (public API — no owner/mod
+  // bypass wired here, matching buildPublicModelResponse). The base query doesn't
+  // carry meta/owner, so fetch the privacy inputs directly.
+  const { kyselyRead } = await loadKyselyDb();
+  let privacy = await readModelVersionPrivacyViaKysely(kyselyRead, version.id);
+  // `undefined` is a version whose model or user row is gone; the Prisma read throws for it.
+  if (privacy === undefined) privacy = await readModelVersionPrivacyViaPrisma(dbRead, version.id);
+  // Only resolve CP membership when something is actually hidden (version meta, model
+  // meta, or the owner's user default). When nothing is hidden, the resolver returns
+  // NONE regardless of membership, so the cached membership read can be skipped —
+  // byte-identical output. The check, when needed, is served from the read-through cache.
+  const ownerHidesAnything =
+    anyMetricHidden(getMetaMetricPrivacy(privacy?.meta)) ||
+    anyMetricHidden(getMetaMetricPrivacy(privacy?.model?.meta)) ||
+    anyMetricHidden(getUserMetricPrivacyDefaults(privacy?.model?.user?.settings));
+  const hidden = resolveVersionHiddenMetrics({
+    versionMeta: privacy?.meta,
+    modelMeta: privacy?.model?.meta,
+    userSettings: privacy?.model?.user?.settings,
+    isOwnerOrModerator: false,
+    hasValidMembership:
+      ownerHidesAnything && privacy?.model?.userId
+        ? await hasValidCreatorMembershipCached(privacy.model.userId)
+        : false,
+  });
+
+  return {
+    ...version,
+    // licensingFee is a Prisma Decimal; coerce so the public API keeps emitting a number, not a JSON string.
+    licensingFee: version.licensingFee != null ? Number(version.licensingFee) : null,
+    paidAccess,
+    air: modelVersionToAir({
+      id: version.id,
+      baseModel: version.baseModel,
+      model: { id: version.modelId, type: model.type },
+      files: castedFiles,
+    }),
+    stats: {
+      downloadCount: hidden.downloads ? null : metrics[0]?.downloadCount ?? 0,
+      thumbsUpCount: metrics[0]?.thumbsUpCount ?? 0,
+    },
+    model: { ...model, mode: model.mode == null ? undefined : model.mode },
+    files: includeDownloadUrl
+      ? castedFiles
+          .filter((file) => file.visibility === ModelFileVisibility.Public)
+          .map(({ hashes, url, visibility, metadata, modelVersionId, ...file }) => ({
+            ...file,
+            metadata: reduceToBasicFileMetadata(metadata),
+            hashes: hashesAsObject(hashes),
+            name: safeDecodeURIComponent(
+              // The stored name, so the advertised name matches the file the download route serves.
+              getDownloadFilename({
+                model: storedModel,
+                modelVersion: version,
+                file,
+                versionFiles: castedFiles,
+              })
+            ),
+            primary: primaryFile.id === file.id,
+            // Pin the URL to THIS file — see the matching note in
+            // src/pages/api/v1/models/[id].ts. Without `fileId` the download
+            // route re-resolves the file from the caller's filePreferences, so
+            // the advertised `hashes`/`sizeKB`/`name` and the bytes actually
+            // served can disagree on a multi-file version.
+            //
+            // `castedFiles` is NOT all this version's own files: the `vaeId`
+            // splice above pushes files that live on the LINKED VAE version.
+            // createSerializedFileDownloadUrl pins ONLY a file this version
+            // owns; a spliced one keeps its original discriminator URL, which
+            // the download route resolves through the linked-component
+            // fallback. See the invariant note on that helper.
+            downloadUrl: `${baseUrl.origin}${createSerializedFileDownloadUrl({
+              file: { id: file.id, modelVersionId, type: file.type, metadata },
+              hostVersionId: version.id,
+              primary: primaryFile.id === file.id,
+            })}`,
+          }))
+      : [],
+    images: includeImages
+      ? images.map(({ url, id, userId, name, modelVersionId, ...image }) => ({
+          url: getEdgeUrl(url, {
+            original: true,
+            name: id.toString(),
+            type: image.type,
+          }),
+          ...image,
+        }))
+      : [],
+    downloadUrl: includeDownloadUrl
+      ? `${baseUrl.origin}${createModelFileDownloadUrl({
+          versionId: version.id,
+          primary: true,
+        })}`
+      : undefined,
+  };
+}
+
+type Viewer = { id?: number | null; isModerator?: boolean | null } | null | undefined;
+
+/**
+ * `getViewer` is only called for a version of a flagged or Private model, so a public caller pays
+ * for no session lookup. A version the viewer may not see gets the same 404 as one that does not
+ * exist.
+ */
+export async function resModelVersionDetails(
+  req: NextApiRequest,
+  res: NextApiResponse,
+  modelVersion: ModelVersionApiReturn | null,
+  getViewer: () => Promise<Viewer>
+) {
+  const hidden =
+    !!modelVersion && (await getHiddenModelVersionIds([modelVersion], getViewer)).size > 0;
+  if (!modelVersion || hidden) return res.status(404).json({ error: 'Model not found' });
+
+  const baseUrl = new URL(
+    isProd && req.headers.host ? `https://${req.headers.host}` : 'http://localhost:3000'
+  );
+  const showSfwFace = showsSfwFace(apiBrowsingLevel(req));
+  const body = await prepareModelVersionResponse(
+    modelVersion,
+    baseUrl,
+    undefined,
+    undefined,
+    showSfwFace
+  );
+  if (!body) return res.status(404).json({ error: 'Missing model file' });
+  // Only its owner or a moderator gets here with a Private version: never let a cache keep it.
+  // Nor a response showing the .com face: it varies by region, which the shared cache doesn't key on.
+  if (isPrivateModelVersion(modelVersion) || (showSfwFace && modelVersion.model.sfwName != null))
+    res.setHeader('Cache-Control', 'private, no-store');
+  res.status(200).json(body);
+}

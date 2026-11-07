@@ -1,0 +1,420 @@
+import * as z from 'zod';
+import { isProd } from '~/env/other';
+import { env } from '~/env/server';
+import { acquireJobLock, NOOP_LOCK, type JobLock } from '~/server/jobs/job-lock';
+import { addOnDemandRunStrategiesJob } from '~/server/jobs/add-on-demand-run-strategies';
+import { announcementDismissalCleanupJob } from '~/server/jobs/announcement-dismissal-cleanup';
+import { voidOrphanedAppealsJob } from '~/server/jobs/void-orphaned-appeals';
+import {
+  appealDecisionRecordsJob,
+  appealTrainingCopyJob,
+} from '~/server/jobs/appeal-decision-records';
+import { announcementMediaCheckJob } from '~/server/jobs/announcement-media-check';
+import { scanLabelControlSampleJob } from '~/server/jobs/scan-label-control-sample';
+import { scanLabelCopyJob } from '~/server/jobs/scan-label-copy';
+import { scanLabelCopySweepJob } from '~/server/jobs/scan-label-copy-sweep';
+import { auditRemixSourcesJob } from '~/server/jobs/audit-remix-sources';
+import { blurbFanoutJob } from '~/server/jobs/blurb-fanout';
+import { botAccountDetection } from '~/server/jobs/bot-account-detection';
+import { linkedAccountReview } from '~/server/jobs/linked-account-review';
+import { relabelBuildBatchJob } from '~/server/jobs/relabel-build-batch';
+import { pushSubscriptionCleanupJob } from '~/server/jobs/push-subscription-cleanup';
+import { reactionWithdrawalDetection } from '~/server/jobs/reaction-withdrawal-detection';
+import { bluePaidAccessDetection } from '~/server/jobs/blue-buzz-paid-access-detection';
+import { creatorProgramCounterpartyReview } from '~/server/jobs/creator-program-counterparty-review';
+import { creatorProgramPrepayoutReview } from '~/server/jobs/creator-program-prepayout-review';
+import { dedupeOfficialUploadsJob } from '~/server/jobs/dedupe-official-uploads';
+import { applyContestTags } from '~/server/jobs/apply-contest-tags';
+import { postIntentClaimSweep } from '~/server/jobs/post-intent-claim-sweep';
+import { applyDiscordRoles } from '~/server/jobs/apply-discord-roles';
+import { applyTagRules } from '~/server/jobs/apply-tag-rules';
+import { applyVotedTags } from '~/server/jobs/apply-voted-tags';
+import { cacheCleanup } from '~/server/jobs/cache-cleanup';
+import { checkProcessingResourceTrainingV2 } from '~/server/jobs/check-processing-resource-training-v2';
+import { trainingCanaryJob } from '~/server/jobs/training-canary';
+import { cleanImageResources } from '~/server/jobs/clean-image-resources';
+import { clearVaultItems } from '~/server/jobs/clear-vault-items';
+import { reconcileRestrictedImages } from '~/server/jobs/reconcile-restricted-images';
+import { reconcileVaultStorage } from '~/server/jobs/reconcile-vault-storage';
+import { reconcileCollectionCollaboration } from '~/server/jobs/reconcile-collection-collaboration';
+import { contestCollectionVimeoUpload } from '~/server/jobs/collection-contest-vimeo-upload';
+import { contestCollectionYoutubeUpload } from '~/server/jobs/collection-contest-youtube-upload';
+import { collectionAiReview } from '~/server/jobs/collection-ai-review';
+import { collectionGameProcessing } from '~/server/jobs/collection-game-processing';
+import { updateCollectionItemRandomId } from '~/server/jobs/collection-item-random-id';
+import { checkImageExistence } from '~/server/jobs/confirm-image-existence';
+import { confirmMutes } from '~/server/jobs/confirm-mutes';
+import { giftMembershipArming } from '~/server/jobs/gift-membership-arming';
+import { confirmPendingBlockAttributions } from '~/server/jobs/confirm-pending-block-attributions';
+import { purgeReviewSnapshotsJob } from '~/server/jobs/purge-review-snapshots';
+import { reapDevTunnelsJob } from '~/server/jobs/reap-dev-tunnels';
+import { sweepStaleAgentReviewsJob } from '~/server/jobs/sweep-stale-agent-reviews';
+import { sweepReviewStorageJob } from '~/server/jobs/sweep-review-storage';
+import { runStorageMigrationsJob } from '~/server/jobs/run-storage-migrations';
+import { reapDeletedAppStorageJob } from '~/server/jobs/reap-deleted-app-storage';
+import { removeDeletedAccountAppDataJob } from '~/server/jobs/remove-deleted-account-app-data';
+import { reconcileNowpaymentsJob } from '~/server/jobs/reconcile-nowpayments';
+import { notifyStuckCryptoDepositsJob } from '~/server/jobs/notify-stuck-crypto-deposits';
+import { watchOpenNowpaymentsJob } from '~/server/jobs/watch-open-nowpayments';
+import { cosmeticPerceptualHashSweepJob } from '~/server/jobs/cosmetic-phash-sweep';
+import { countReviewImages } from '~/server/jobs/count-review-images';
+import { creatorProgramJobs } from '~/server/jobs/creators-program-jobs';
+import { challengeActivationJob } from '~/server/jobs/challenge-activation';
+import { challengeAutoQueueJob } from '~/server/jobs/challenge-auto-queue';
+import { challengeCompletionJob } from '~/server/jobs/challenge-completion';
+import { challengeHealthCheckJob } from '~/server/jobs/challenge-health-check';
+import { evidenceHoldExpiryAlertJob } from '~/server/jobs/evidence-hold-expiry-alert';
+import { revokeUserTokensJob } from '~/server/jobs/revoke-user-tokens';
+import { dailyChallengeJobs } from '~/server/jobs/daily-challenge-processing';
+import { gdprStripeScrubJob } from '~/server/jobs/gdpr-stripe-scrub';
+import { deleteOldTrainingData } from '~/server/jobs/delete-old-training-data';
+import { deliverAnnualSubscriptionBuzz } from '~/server/jobs/deliver-annual-sub-buzz';
+import { purgeReplacedFilesJob } from '~/server/jobs/purge-replaced-files';
+import { purgeReleasedHeldCopiesJob } from '~/server/jobs/purge-released-held-copies';
+import {
+  advanceReferralSubs,
+  expireReferralTokens,
+  settleReferralRewards,
+} from '~/server/jobs/referral-program-jobs';
+import { prepaidMembershipJobs } from '~/server/jobs/prepaid-membership-jobs';
+import { updateCreatorResourceCompensation } from '~/server/jobs/deliver-creator-compensation';
+import { settleBlockAuthorFeesJob } from '~/server/jobs/settle-block-author-fees';
+import { deliverLeaderboardCosmetics } from '~/server/jobs/deliver-leaderboard-cosmetics';
+import { deliverPurchasedCosmetics } from '~/server/jobs/deliver-purchased-cosmetics';
+import { dummyJob } from '~/server/jobs/dummy-job';
+import { entityModerationJobs } from '~/server/jobs/entity-moderation';
+import {
+  eventEngineDailyReset,
+  eventEngineLeaderboardUpdate,
+  eventPointsHatReconcile,
+  eventRosterReconcile,
+  eventTurfReconcile,
+} from '~/server/jobs/event-engine-work';
+import { handleAuctions } from '~/server/jobs/handle-auctions';
+// import { refreshImageGenerationCoverage } from '~/server/jobs/refresh-image-generation-coverage';
+import { cdnAccessReconcile, cdnAccessSync } from '~/server/jobs/cdn-access-sync';
+import { ingestImages, removeBlockedImages } from '~/server/jobs/image-ingestion';
+import { imagesCreatedEvents } from '~/server/jobs/images-created-events';
+import type { Job } from '~/server/jobs/job';
+import { createDisconnectHandler } from '~/server/jobs/job';
+import { jobQueueJobs } from '~/server/jobs/job-queue';
+import { newOrderJobs } from '~/server/jobs/new-order-jobs';
+import { placementJobs } from '~/server/jobs/placement-jobs';
+import { creatorServiceDealJobs } from '~/server/jobs/creator-service-deal-jobs';
+import { creatorServiceDealFileJobs } from '~/server/jobs/creator-service-deal-file-jobs';
+import { creatorShopWithdrawnRefundsJob } from '~/server/jobs/creator-shop-withdrawn-refunds';
+import { nextauthCleanup } from '~/server/jobs/next-auth-cleanup';
+import { syncEmailBlocklist } from '~/server/jobs/sync-email-blocklist';
+import { bountyJobs } from '~/server/jobs/prepare-bounties';
+import { leaderboardJobs } from '~/server/jobs/prepare-leaderboard';
+// import { processCreatorProgramImageGenerationRewards } from '~/server/jobs/process-creator-program-image-generation-rewards';
+import { csamJobs } from '~/server/jobs/process-csam';
+import { buildPersonalDataExportsJob } from '~/server/jobs/build-personal-data-exports';
+import { processingEngingEarlyAccess } from '~/server/jobs/process-ending-early-access';
+import { syncGeneratorLoadedResources } from '~/server/jobs/sync-generator-loaded-resources';
+import {
+  buildResourceIntentCoocJob,
+  resourceIntentCoocRetentionJob,
+} from '~/server/jobs/build-resource-intent-cooc';
+import { buildResourceIntentTagIndexJob } from '~/server/jobs/build-resource-intent-tag-index';
+import { processHuggingFaceImportsJob } from '~/server/jobs/process-huggingface-imports';
+import { archiveStudioTrainingDatasetsJob } from '~/server/jobs/archive-studio-training-datasets';
+import { storageUsageMediaJob, storageUsageNightlyJob } from '~/server/jobs/storage-usage';
+import { processRewards, rewardsDailyReset } from '~/server/jobs/process-rewards';
+import { processScheduledPublishing } from '~/server/jobs/process-scheduled-publishing';
+import { processVaultItems } from '~/server/jobs/process-vault-items';
+import { auditWildcardSetCategoriesJob } from '~/server/jobs/audit-wildcard-set-categories';
+import { clickhouseRefreshJobs } from '~/server/jobs/clickhouse-refresh-monitor';
+import { userActivityRollupJob } from '~/server/jobs/user-activity-rollup';
+import { userPopulationSnapshotJob } from '~/server/jobs/user-population-snapshot';
+import { metricReconciliationJobs } from '~/server/jobs/metric-reconciliation-audit';
+import { reconcileWildcardSetsJob } from '~/server/jobs/reconcile-wildcard-sets';
+import { pushDiscordMetadata } from '~/server/jobs/push-discord-metadata';
+import { refreshAuctionCache } from '~/server/jobs/refresh-auction-cache';
+import { refreshFeaturedCollectionsEligibility } from '~/server/jobs/refresh-featured-collections-eligibility';
+import { autoFeatureImages } from '~/server/jobs/auto-feature-images';
+import { autoFeatureHealthCheckJob } from '~/server/jobs/auto-feature-health-check';
+import { commentV3ParityJob } from '~/server/jobs/comment-v3-parity';
+import { removeOldDrafts } from '~/server/jobs/remove-old-drafts';
+import { reindexRecentScheduledImages } from '~/server/jobs/reindex-recent-scheduled-images';
+import { birthday2026IdleHatNudge } from '~/server/jobs/birthday2026-idle-hat-nudge';
+import { resetToDraftWithoutRequirements } from '~/server/jobs/reset-to-draft-without-requirements';
+import { resourceGenerationAvailability } from '~/server/jobs/resource-generation-availability';
+import { minorHashSweep } from '~/server/jobs/minor-hash-sweep';
+import { poiHashSweep } from '~/server/jobs/poi-hash-sweep';
+import { retroactiveHashBlocking } from '~/server/jobs/retroactive-hash-blocking';
+import { rewardsAdImpressions } from '~/server/jobs/rewards-ad-impressions';
+import { scanFilesFallbackJob } from '~/server/jobs/scan-files';
+import { searchIndexCleanupJob } from '~/server/jobs/search-index-cleanup';
+import { searchIndexQueueDrainJob } from '~/server/jobs/search-index-queue-drain';
+import { comFaceRecheckJob } from '~/server/jobs/com-face-recheck';
+import { searchIndexJobs } from '~/server/jobs/search-index-sync';
+import { searchIndexUserCleanupJob } from '~/server/jobs/search-index-user-cleanup';
+import { sendCollectionNotifications } from '~/server/jobs/send-collection-notifications';
+import { sendNotificationsJob } from '~/server/jobs/send-notifications';
+import { notificationCursorMonitor } from '~/server/jobs/notification-cursor-monitor';
+import { sendWebhooksJob } from '~/server/jobs/send-webhooks';
+import { tempSetMissingNsfwLevel } from '~/server/jobs/temp-set-missing-nsfw-level';
+import { retryFailedTextModeration } from '~/server/jobs/text-moderation-retry';
+import { textScanRetention } from '~/server/jobs/text-scan-retention';
+import { textScanChatWindowsJob, textScanNewUsersJob } from '~/server/jobs/text-scan-sweeps';
+import { articleIngestionReconcile } from '~/server/jobs/article-ingestion-reconcile';
+import { articleContentLinkHold } from '~/server/jobs/article-content-link-hold';
+import { metricJobs } from '~/server/jobs/update-metrics';
+import { updateModelVersionNsfwLevelsJob } from '~/server/jobs/update-model-version-nsfw-levels';
+import { updateUserScore } from '~/server/jobs/update-user-score';
+import { grantCreatorMilestones } from '~/server/jobs/grant-creator-milestones';
+import { userScoreHealthCheckJob } from '~/server/jobs/user-score-health-check';
+import { userDeletedCleanup } from '~/server/jobs/user-deleted-cleanup';
+import { removeDeletedUserImages } from '~/server/jobs/remove-deleted-user-images';
+import { removeReplacedImages } from '~/server/jobs/remove-replaced-images';
+import { retryImageStorageDeletes } from '~/server/jobs/retry-image-storage-deletes';
+import { retryUploadPromptScansJob } from '~/server/jobs/retry-upload-prompt-scans';
+import { restoreUserImages } from '~/server/jobs/restore-user-images';
+import { expireStrikesJob, processTimedUnmutesJob } from '~/server/jobs/process-strikes';
+import { processEnqueuedComicPanelsJob } from '~/server/jobs/process-enqueued-comic-panels';
+import { crucibleJobs } from '~/server/jobs/finalize-crucibles';
+import { crucibleSyncJobs } from '~/server/jobs/sync-crucible-scores';
+import { crucibleEntryAcceptedJob } from '~/server/jobs/crucible-entry-accepted';
+import { prizeAutoPayJob } from '~/server/jobs/prize-autopay';
+import { WebhookEndpoint } from '~/server/utils/endpoint-helpers';
+import { createLogger } from '~/utils/logging';
+import { booleanString } from '~/utils/zod-helpers';
+
+export const jobs: Job[] = [
+  gdprStripeScrubJob,
+  scanFilesFallbackJob,
+  processHuggingFaceImportsJob,
+  archiveStudioTrainingDatasetsJob,
+  storageUsageNightlyJob,
+  storageUsageMediaJob,
+  sendNotificationsJob,
+  notificationCursorMonitor,
+  sendWebhooksJob,
+  addOnDemandRunStrategiesJob,
+  deliverPurchasedCosmetics,
+  deliverLeaderboardCosmetics,
+  reindexRecentScheduledImages,
+  birthday2026IdleHatNudge,
+  pushDiscordMetadata,
+  applyVotedTags,
+  removeOldDrafts,
+  resetToDraftWithoutRequirements,
+  applyContestTags,
+  postIntentClaimSweep,
+  ...applyDiscordRoles,
+  userDeletedCleanup,
+  removeDeletedUserImages,
+  restoreUserImages,
+  ...leaderboardJobs,
+  ingestImages,
+  removeBlockedImages,
+  cdnAccessSync,
+  cdnAccessReconcile,
+  removeReplacedImages,
+  retryImageStorageDeletes,
+  retryUploadPromptScansJob,
+  processScheduledPublishing,
+  // refreshImageGenerationCoverage,
+  cleanImageResources,
+  deleteOldTrainingData,
+  purgeReplacedFilesJob,
+  purgeReleasedHeldCopiesJob,
+  updateCollectionItemRandomId,
+  refreshFeaturedCollectionsEligibility,
+  autoFeatureImages,
+  autoFeatureHealthCheckJob,
+  commentV3ParityJob,
+  ...metricJobs,
+  ...searchIndexJobs,
+  searchIndexUserCleanupJob,
+  searchIndexCleanupJob,
+  searchIndexQueueDrainJob,
+  comFaceRecheckJob,
+  processRewards,
+  rewardsDailyReset,
+  ...bountyJobs,
+  eventEngineDailyReset,
+  eventEngineLeaderboardUpdate,
+  eventPointsHatReconcile,
+  eventRosterReconcile,
+  eventTurfReconcile,
+  ...csamJobs,
+  buildPersonalDataExportsJob,
+  resourceGenerationAvailability,
+  cacheCleanup,
+  nextauthCleanup,
+  syncEmailBlocklist,
+  applyTagRules,
+  // processCreatorProgramImageGenerationRewards,
+  processVaultItems,
+  reconcileVaultStorage,
+  reconcileRestrictedImages,
+  reconcileCollectionCollaboration,
+  clearVaultItems,
+  reconcileWildcardSetsJob,
+  auditWildcardSetCategoriesJob,
+  ...metricReconciliationJobs,
+  ...clickhouseRefreshJobs,
+  userActivityRollupJob,
+  userPopulationSnapshotJob,
+  ...jobQueueJobs,
+  countReviewImages,
+  processingEngingEarlyAccess,
+  syncGeneratorLoadedResources,
+  buildResourceIntentCoocJob,
+  resourceIntentCoocRetentionJob,
+  buildResourceIntentTagIndexJob,
+  updateUserScore,
+  grantCreatorMilestones,
+  userScoreHealthCheckJob,
+  tempSetMissingNsfwLevel,
+  imagesCreatedEvents,
+  updateCreatorResourceCompensation,
+  settleBlockAuthorFeesJob,
+  confirmMutes,
+  botAccountDetection,
+  linkedAccountReview,
+  relabelBuildBatchJob,
+  reactionWithdrawalDetection,
+  bluePaidAccessDetection,
+  creatorProgramCounterpartyReview,
+  creatorProgramPrepayoutReview,
+  giftMembershipArming,
+  confirmPendingBlockAttributions,
+  reapDevTunnelsJob,
+  sweepStaleAgentReviewsJob,
+  cosmeticPerceptualHashSweepJob,
+  purgeReviewSnapshotsJob,
+  sweepReviewStorageJob,
+  runStorageMigrationsJob,
+  reapDeletedAppStorageJob,
+  removeDeletedAccountAppDataJob,
+  checkImageExistence,
+  rewardsAdImpressions,
+  collectionAiReview,
+  collectionGameProcessing,
+  sendCollectionNotifications,
+  checkProcessingResourceTrainingV2,
+  trainingCanaryJob,
+  ...dailyChallengeJobs,
+  challengeActivationJob,
+  challengeCompletionJob,
+  challengeAutoQueueJob,
+  challengeHealthCheckJob,
+  evidenceHoldExpiryAlertJob,
+  revokeUserTokensJob,
+  contestCollectionYoutubeUpload,
+  contestCollectionVimeoUpload,
+  dummyJob,
+  retroactiveHashBlocking,
+  minorHashSweep,
+  poiHashSweep,
+  ...creatorProgramJobs,
+  handleAuctions,
+  refreshAuctionCache,
+  ...newOrderJobs,
+  updateModelVersionNsfwLevelsJob,
+  deliverAnnualSubscriptionBuzz,
+  settleReferralRewards,
+  expireReferralTokens,
+  advanceReferralSubs,
+  ...prepaidMembershipJobs,
+  ...entityModerationJobs,
+  ...placementJobs,
+  ...creatorServiceDealJobs,
+  ...creatorServiceDealFileJobs,
+  creatorShopWithdrawnRefundsJob,
+  retryFailedTextModeration,
+  textScanRetention,
+  textScanChatWindowsJob,
+  textScanNewUsersJob,
+  articleIngestionReconcile,
+  articleContentLinkHold,
+  expireStrikesJob,
+  processTimedUnmutesJob,
+  reconcileNowpaymentsJob,
+  notifyStuckCryptoDepositsJob,
+  watchOpenNowpaymentsJob,
+  processEnqueuedComicPanelsJob,
+  auditRemixSourcesJob,
+  dedupeOfficialUploadsJob,
+  announcementDismissalCleanupJob,
+  voidOrphanedAppealsJob,
+  appealDecisionRecordsJob,
+  appealTrainingCopyJob,
+  scanLabelCopyJob,
+  scanLabelControlSampleJob,
+  scanLabelCopySweepJob,
+  announcementMediaCheckJob,
+  blurbFanoutJob,
+  ...crucibleJobs,
+  ...crucibleSyncJobs,
+  crucibleEntryAcceptedJob,
+  prizeAutoPayJob,
+  pushSubscriptionCleanupJob,
+];
+
+const log = createLogger('jobs', 'green');
+const pod = env.PODNAME;
+
+const querySchema = z.object({
+  run: z
+    .union([z.string(), z.string().array()])
+    .transform((x) => (Array.isArray(x) ? x[0] : x))
+    .optional(),
+  noCheck: booleanString().optional(),
+});
+
+export default WebhookEndpoint(async (req, res) => {
+  const { run: runJob, noCheck } = querySchema.parse(req.query);
+
+  // Get requested job
+  const job = jobs.find((x) => x.name === runJob);
+  if (!job) return res.status(404).json({ ok: false, error: 'Job not found' });
+  const { name, run, options } = job;
+
+  const lock = await acquireLock(name, options.lockExpiration, noCheck);
+  if (!lock) return res.status(200).json({ ok: true, error: 'Job already running' });
+
+  const jobStart = Date.now();
+  const axiom = req.log.with({ scope: 'job', name, pod });
+  let result: MixedObject | void;
+  try {
+    log(`${name} starting`);
+    axiom.info(`starting`);
+
+    const jobRunner = run({ req });
+
+    // Cancel the context, and release the lock UNLESS the job opted out of that release. See
+    // `createDisconnectHandler` and `JobOptions.keepLockOnDisconnect`: for a job that legitimately
+    // runs longer than the caller's client timeout, releasing here hands the freed lock straight
+    // to the caller's retry and produces two concurrent runs of the same work. Default is
+    // unchanged — cancel then release.
+    const cancelHandler = createDisconnectHandler(options, jobRunner, lock);
+
+    res.on('close', cancelHandler);
+    result = await jobRunner.result;
+    res.off('close', cancelHandler);
+    log(`${name} successful: ${((Date.now() - jobStart) / 1000).toFixed(2)}s`);
+    axiom.info('success', { duration: Date.now() - jobStart });
+    res.status(200).json({ ok: true, pod, result: result ?? null });
+  } catch (error) {
+    log(`${name} failed: ${((Date.now() - jobStart) / 1000).toFixed(2)}s`, error);
+    axiom.error(`failed`, { duration: Date.now() - jobStart, error });
+    res.status(500).json({ ok: false, pod, error, stack: (error as Error)?.stack });
+  } finally {
+    await lock.release();
+  }
+});
+
+// The prod-only gate around the shared job lock (`~/server/jobs/job-lock`), which the points
+// self-heal also takes so it can never run beside this route's run of the same job.
+async function acquireLock(
+  name: string,
+  lockExpiration: number,
+  noCheck?: boolean
+): Promise<JobLock | null> {
+  if (!isProd || name === 'prepare-leaderboard' || noCheck) return NOOP_LOCK;
+  return acquireJobLock(name, lockExpiration);
+}

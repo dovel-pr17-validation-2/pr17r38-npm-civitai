@@ -1,0 +1,102 @@
+import type { MantineColor } from '@mantine/core';
+import * as z from 'zod';
+import { paginationSchema } from '~/server/schema/base.schema';
+import { EntityType, StrikeReason, StrikeStatus } from '~/shared/utils/prisma/enums';
+
+export const strikeStatusColorScheme: Record<string, MantineColor> = {
+  Active: 'red',
+  Expired: 'gray',
+  Voided: 'yellow',
+};
+
+/**
+ * Derived from active strike POINTS, not the strike count — a single strike can carry several.
+ */
+export function accountStandingFromPoints(points: number): {
+  label: string;
+  /** No "standing" noun, for a caption that already carries it. */
+  short: string;
+  color: MantineColor;
+  good: boolean;
+} {
+  if (points === 0) return { label: 'Good standing', short: 'Good', color: 'green', good: true };
+  if (points === 1) return { label: 'Warning', short: 'Warning', color: 'yellow', good: false };
+  return { label: 'Restricted', short: 'Restricted', color: 'red', good: false };
+}
+
+/**
+ * Sanitized, user-facing label per StrikeReason. Mirrors `publicBanReasonLabel`
+ * in `banReasonDetails`: this is the only reason text emailed to the user (the
+ * free-text `UserStrike.description` is kept for in-app/Retool but never sent in
+ * the strike email). Keep these neutral and non-explicit.
+ */
+export const strikeReasonPublicLabel: Record<StrikeReason, string> = {
+  [StrikeReason.BlockedContent]: 'Content violated our Terms of Service',
+  [StrikeReason.RealisticMinorContent]: 'Content violated our Terms of Service',
+  [StrikeReason.CSAMContent]: 'Content violated our Terms of Service',
+  [StrikeReason.TOSViolation]: 'Content violated our Terms of Service',
+  [StrikeReason.HarassmentContent]: 'Community Abuse',
+  [StrikeReason.ProhibitedContent]: 'Content violated our Terms of Service',
+  [StrikeReason.ManualModAction]: 'Content violated our Terms of Service',
+  [StrikeReason.Scam]: 'Impersonating Civitai staff',
+};
+
+export const createStrikeSchema = z.object({
+  userId: z.number(),
+  reason: z.enum(StrikeReason),
+  points: z.number().min(1).max(3).default(1),
+  description: z.string().min(1).max(1000),
+  internalNotes: z.string().max(2000).optional(),
+  entityType: z.enum(EntityType).optional(),
+  entityId: z.number().optional(),
+  reportId: z.number().optional(),
+  expiresInDays: z.number().min(1).max(365).default(365),
+});
+export type CreateStrikeInput = z.infer<typeof createStrikeSchema>;
+
+export const voidStrikeSchema = z.object({
+  strikeId: z.number(),
+  voidReason: z.string().min(1).max(1000),
+});
+export type VoidStrikeInput = z.infer<typeof voidStrikeSchema>;
+
+export const getStrikesSchema = z.object({
+  ...paginationSchema.shape,
+  userId: z.number().optional(),
+  username: z.string().optional(),
+  status: z.array(z.enum(StrikeStatus)).optional(),
+  reason: z.array(z.enum(StrikeReason)).optional(),
+});
+export type GetStrikesInput = z.infer<typeof getStrikesSchema>;
+
+export const getUserStandingsSchema = z.object({
+  ...paginationSchema.shape,
+  userId: z.number().optional(),
+  username: z.string().optional(),
+  hasActiveStrikes: z.boolean().optional(),
+  isMuted: z.boolean().optional(),
+  isFlaggedForReview: z.boolean().optional(),
+  sort: z.enum(['points', 'score', 'lastStrike', 'created']).default('points'),
+  sortOrder: z.enum(['asc', 'desc']).default('desc'),
+});
+export type GetUserStandingsInput = z.infer<typeof getUserStandingsSchema>;
+
+export type UserStandingRow = {
+  id: number;
+  username: string | null;
+  createdAt: Date;
+  muted: boolean;
+  bannedAt: Date | null;
+  deletedAt: Date | null;
+  userScore: number | null;
+  flaggedForReview: boolean;
+  activeStrikeCount: number;
+  totalActivePoints: number;
+  totalStrikeCount: number;
+  lastStrikeDate: Date | null;
+};
+
+export const getMyStrikesSchema = z.object({
+  includeExpired: z.boolean().default(false),
+});
+export type GetMyStrikesInput = z.infer<typeof getMyStrikesSchema>;

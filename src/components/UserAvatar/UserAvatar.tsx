@@ -1,0 +1,353 @@
+import type {
+  AvatarProps,
+  BadgeProps,
+  IndicatorProps,
+  MantineSize,
+  MantineTheme,
+} from '@mantine/core';
+import {
+  Avatar,
+  Group,
+  Indicator,
+  Loader,
+  Paper,
+  Stack,
+  Text,
+  useComputedColorScheme,
+  useMantineTheme,
+} from '@mantine/core';
+import { IconUser } from '@tabler/icons-react';
+import { useGetEdgeUrl } from '~/client-utils/cf-images-utils';
+import { Username } from '~/components/User/Username';
+import { UserAvatarProfilePicture } from '~/components/UserAvatar/UserAvatarProfilePicture';
+import type { UserWithCosmetics } from '~/server/selectors/user.selector';
+import { getInitials } from '~/utils/string-helpers';
+import { trpc } from '~/utils/trpc';
+import { EdgeMedia } from '../EdgeMedia/EdgeMedia';
+import type { ContentDecorationCosmetic } from '~/server/selectors/cosmetic.selector';
+import {
+  hasPublicBrowsingLevel,
+  hasSafeBrowsingLevel,
+} from '~/shared/constants/browsingLevel.constants';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
+import { useViewerBrowsingLevelDebounced } from '~/components/BrowsingLevel/BrowsingLevelProvider';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { decorationFrameStyle } from '~/components/UserAvatar/decoration-frame.util';
+import { UserHoverCard } from '~/components/UserAvatar/UserHoverCard';
+import { isBlobUrl } from '~/utils/type-guards';
+import { Flags } from '~/shared/utils/flags';
+import type { AvatarShowcaseHat } from '~/components/Cosmetics/EventDecoration/AvatarHat';
+import { AvatarHat, isShowcaseHatShowing } from '~/components/Cosmetics/EventDecoration/AvatarHat';
+
+const mapAvatarTextSize: Record<MantineSize, { textSize: MantineSize; subTextSize: MantineSize }> =
+  {
+    xs: { textSize: 'xs', subTextSize: 'xs' },
+    sm: { textSize: 'sm', subTextSize: 'xs' },
+    md: { textSize: 'sm', subTextSize: 'xs' },
+    lg: { textSize: 'md', subTextSize: 'sm' },
+    xl: { textSize: 'lg', subTextSize: 'sm' },
+  };
+
+/**
+ * Gets explicit avatar size in pixels
+ */
+const getRawAvatarSize = (size: MantineSpacing) => {
+  if (typeof size === 'number') return size;
+
+  // Based off Mantine avatar sizes
+  switch (size) {
+    case 'xs':
+      return 16;
+    case 'sm':
+      return 26;
+    case 'md':
+      return 38;
+    case 'lg':
+      return 56;
+    case 'xl':
+      return 84;
+    default:
+      return 96;
+  }
+};
+
+/**
+ * Gets explicit avatar size in pixels
+ */
+const getRawAvatarRadius = (radius: MantineSpacing, theme: MantineTheme) => {
+  if (typeof radius === 'number') return radius;
+  if (radius === 'xl') return '50%';
+
+  return theme.radius[radius];
+};
+
+export function UserAvatar({
+  user,
+  withUsername,
+  subText,
+  subTextForce = false,
+  avatarProps,
+  badge,
+  size = 'sm',
+  spacing = 8,
+  linkToProfile = false,
+  textSize,
+  subTextSize,
+  includeAvatar = true,
+  radius = 'xl',
+  avatarSize,
+  userId,
+  indicatorProps,
+  badgeSize,
+  withDecorations = true,
+  withOverlay = false,
+  withHoverCard = true,
+  withShowcaseHat = false,
+  className,
+}: Props) {
+  const theme = useMantineTheme();
+  const colorScheme = useComputedColorScheme('dark');
+  const features = useFeatureFlags();
+  const currentUser = useCurrentUser();
+  // 🔴 The VIEWER's level, not the page's. A profile picture belongs to the
+  // person in the avatar, not to whatever this page happens to be about — and
+  // `ImageDetail2` sets a page override to the IMAGE's rating, so on a PG image
+  // every commenter's PG-13 avatar was suppressed for viewers who accept PG-13.
+  // Same defect as the remix gallery beside it (#4497); this is the other half.
+  // Domain and policy caps still apply, only the page override is skipped.
+  const browsingLevel = useViewerBrowsingLevelDebounced();
+
+  const { data: fallbackUser, isInitialLoading } = trpc.user.getById.useQuery(
+    { id: userId as number },
+    { enabled: !user && !!userId && userId > -1, gcTime: Infinity, staleTime: Infinity }
+  );
+
+  const avatarUser = user ?? { ...fallbackUser, cosmetics: [] };
+  const imageUrl = useGetEdgeUrl(avatarUser?.image, {
+    width: typeof avatarSize === 'number' ? avatarSize : 96,
+    optimized: true,
+  });
+
+  // If using a userId, show loading
+  if (isInitialLoading)
+    return (
+      <Group>
+        <Loader size="sm" />
+        <Text size="sm">Loading user...</Text>
+      </Group>
+    );
+  // If no user or user is civitai, return null
+  if (!avatarUser || avatarUser.id === -1) return null;
+  const userDeleted = !!avatarUser.deletedAt;
+
+  textSize ??= mapAvatarTextSize[size].textSize;
+  subTextSize ??= mapAvatarTextSize[size].subTextSize;
+
+  const imageSize = getRawAvatarSize((avatarProps?.size ?? avatarSize ?? size) as MantineSpacing);
+  const imageRadius = getRawAvatarRadius((avatarProps?.radius ?? radius) as MantineSpacing, theme);
+  const nsfwLevel = avatarUser.profilePicture?.nsfwLevel ?? 0;
+  // On the SFW site, logged-in users see PG + PG13; logged-out users see PG only.
+  const passesSfwGate = currentUser
+    ? hasSafeBrowsingLevel(nsfwLevel)
+    : hasPublicBrowsingLevel(nsfwLevel);
+  // Owners always see their own picture: while it's still pending ingestion (nsfwLevel: 0), and on
+  // the NSFW-capable site even when its rating is outside their browsing level. Blocked still hides.
+  const isOwnerPreview =
+    !!currentUser &&
+    currentUser.id === avatarUser.id &&
+    (avatarUser.profilePicture?.ingestion === 'Pending' || features.canViewNsfw);
+  const blockedProfilePicture =
+    avatarUser.profilePicture?.ingestion === 'Blocked' ||
+    (!isOwnerPreview &&
+      (!features.canViewNsfw ? !passesSfwGate : !Flags.hasFlag(browsingLevel, nsfwLevel)));
+  const avatarBgColor = colorScheme === 'dark' ? 'rgba(255,255,255,0.31)' : 'rgba(0,0,0,0.31)';
+
+  const image = avatarUser.profilePicture;
+  // A stored `blob:` url is a dead client-only handle (legacy upload bug); treat it
+  // as no picture so we fall back to user.image below instead of rendering a broken img.
+  const hasValidProfilePicture = !!image?.id && !isBlobUrl(image?.url);
+  const decoration =
+    withDecorations && avatarUser && !avatarUser.deletedAt
+      ? (avatarUser.cosmetics?.find((c) => c.cosmetic?.type === 'ProfileDecoration')
+          ?.cosmetic as Omit<ContentDecorationCosmetic, 'description' | 'obtainedAt' | 'name'>)
+      : undefined;
+
+  const showcaseHat =
+    withShowcaseHat && !userDeleted ? (avatarUser as ShowcaseUser).showcaseHat : undefined;
+
+  const content = (
+    <Group
+      className={className}
+      align="center"
+      style={
+        withOverlay
+          ? {
+              padding: '0 10px 0 0',
+              backgroundColor: 'rgba(0, 0, 0, 0.31)',
+              borderRadius: '1000px',
+            }
+          : undefined
+      }
+      gap={spacing}
+      wrap="nowrap"
+    >
+      {includeAvatar && (
+        <UserProfileLink user={avatarUser} linkToProfile={linkToProfile}>
+          <Indicator
+            {...indicatorProps}
+            position="bottom-end"
+            offset={7}
+            size={16}
+            disabled={!indicatorProps}
+            withBorder
+          >
+            {decoration && decoration.data.url && (
+              <EdgeMedia
+                src={decoration.data.url}
+                type="image"
+                name="user avatar decoration"
+                alt=""
+                width={imageSize * 2}
+                original={false}
+                style={{ ...decorationFrameStyle(decoration.data), zIndex: 1 }}
+                optimized
+              />
+            )}
+            {isShowcaseHatShowing(showcaseHat) && <AvatarHat hat={showcaseHat} size={imageSize} />}
+            {hasValidProfilePicture && !blockedProfilePicture && !userDeleted ? (
+              <Paper
+                w={imageSize}
+                h={imageSize}
+                style={{
+                  overflow: 'hidden',
+                  position: 'relative',
+                  backgroundColor: avatarBgColor,
+                  borderRadius: imageRadius,
+                }}
+              >
+                {!image || !avatarUser.id ? (
+                  <Text size={textSize}>
+                    {avatarUser.username ? (
+                      getInitials(avatarUser.username)
+                    ) : (
+                      <IconUser size={imageSize} />
+                    )}
+                  </Text>
+                ) : (
+                  <UserAvatarProfilePicture
+                    id={avatarUser.id}
+                    username={avatarUser.username}
+                    image={image}
+                    width={size === 'xl' ? 450 : undefined}
+                  />
+                )}
+              </Paper>
+            ) : (
+              <Avatar
+                src={
+                  avatarUser.image && !hasValidProfilePicture && !userDeleted ? imageUrl : undefined
+                }
+                alt={
+                  avatarUser.username && !userDeleted
+                    ? `${avatarUser.username}'s Avatar`
+                    : undefined
+                }
+                radius={radius || 'xl'}
+                size={avatarSize ?? size}
+                imageProps={{ loading: 'lazy' }}
+                style={{ backgroundColor: avatarBgColor }}
+                {...avatarProps}
+              >
+                {avatarUser.username && !userDeleted ? getInitials(avatarUser.username) : null}
+              </Avatar>
+            )}
+          </Indicator>
+        </UserProfileLink>
+      )}
+      {withUsername || subText ? (
+        <Stack gap={0} align="flex-start">
+          {withUsername && (
+            <UserProfileLink user={avatarUser} linkToProfile={linkToProfile}>
+              <Group gap={4} align="center">
+                <Username
+                  username={avatarUser.username}
+                  deletedAt={avatarUser.deletedAt}
+                  cosmetics={(avatarUser as Partial<UserWithCosmetics>).cosmetics ?? []}
+                  size={textSize}
+                  badgeSize={badgeSize}
+                />
+                {badge}
+              </Group>
+            </UserProfileLink>
+          )}
+          {subText && (typeof subText === 'string' || subTextForce) ? (
+            <Text component="div" size={subTextSize} c="dimmed" my={-2} lineClamp={1}>
+              {subText}
+            </Text>
+          ) : (
+            subText
+          )}
+        </Stack>
+      ) : null}
+    </Group>
+  );
+
+  if (!withHoverCard) return content;
+
+  return <UserHoverCard user={avatarUser}>{content}</UserHoverCard>;
+}
+
+type ShowcaseUser = { showcaseHat?: AvatarShowcaseHat | null };
+
+type Props = {
+  user?: (Partial<UserWithCosmetics> & ShowcaseUser) | null;
+  withUsername?: boolean;
+  withLink?: boolean;
+  avatarProps?: AvatarProps;
+  subText?: React.ReactNode;
+  subTextForce?: boolean;
+  size?: MantineSize;
+  spacing?: MantineSpacing;
+  badge?: React.ReactElement<BadgeProps> | null;
+  linkToProfile?: boolean;
+  textSize?: MantineSize;
+  subTextSize?: MantineSize;
+  includeAvatar?: boolean;
+  radius?: MantineSpacing;
+  avatarSize?: MantineSpacing;
+  userId?: number;
+  indicatorProps?: Omit<IndicatorProps, 'children'>;
+  badgeSize?: number;
+  withDecorations?: boolean;
+  withOverlay?: boolean;
+  withHoverCard?: boolean;
+  /**
+   * Draw the user's event showcase hat, when the payload carries one. Off by default: only the
+   * surfaces that show who someone is (profile header, creator card, roster, comments) opt in, so
+   * feed bylines stay clean. Not a size rule: comment avatars are smaller than some bylines.
+   */
+  withShowcaseHat?: boolean;
+  className?: string;
+};
+
+export const UserProfileLink = ({
+  children,
+  user,
+  linkToProfile,
+}: {
+  children: React.ReactNode;
+  user?: Partial<UserWithCosmetics> | null;
+  linkToProfile?: boolean;
+}) => {
+  if (!user || !linkToProfile || !!user.deletedAt || !user.username) return <>{children}</>;
+
+  return (
+    <Link
+      href={`/user/${user.username}`}
+      onClick={(e: React.MouseEvent<HTMLAnchorElement>) => e.stopPropagation()}
+    >
+      {children}
+    </Link>
+  );
+};

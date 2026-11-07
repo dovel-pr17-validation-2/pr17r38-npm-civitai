@@ -1,0 +1,172 @@
+import { Text, useMantineTheme } from '@mantine/core';
+import { Menu } from '~/components/MantineOverlays';
+import { IconCheck, IconChevronDown, IconSortDescending } from '@tabler/icons-react';
+import clsx from 'clsx';
+import { useState } from 'react';
+import type { FilterButtonProps } from '~/components/Buttons/FilterButton';
+import { FilterButton } from '~/components/Buttons/FilterButton';
+import { MobileMenuDrawer } from '~/components/Drawer/MobileMenuDrawer';
+import { SheetOption } from '~/components/Drawer/SheetOption';
+import { useIsMobile } from '~/hooks/useIsMobile';
+
+type SelectMenu<T extends string | number> = {
+  label: React.ReactNode;
+  options: { label: React.ReactNode; value: T }[];
+  onClick: (value: T) => void;
+  value?: T;
+  disabled?: boolean;
+  children?: React.ReactNode;
+} & Omit<FilterButtonProps, 'onClick'>;
+
+export function SelectMenu<T extends string | number>({
+  label,
+  options,
+  onClick,
+  value,
+  disabled,
+  children,
+}: SelectMenu<T>) {
+  const theme = useMantineTheme();
+
+  return (
+    <Menu withArrow disabled={disabled}>
+      <Menu.Target>
+        <div
+          className="flex cursor-pointer items-center gap-1.5"
+          style={disabled ? { opacity: 0.3, cursor: 'default', userSelect: 'none' } : {}}
+        >
+          <Text fw={700} tt="uppercase" suppressHydrationWarning>
+            {label}
+          </Text>
+          <IconChevronDown size={16} stroke={3} />
+        </div>
+      </Menu.Target>
+      <Menu.Dropdown>
+        <>
+          {options.map((option) => (
+            <Menu.Item key={option.value.toString()} onClick={() => onClick(option.value)}>
+              <Text
+                tt="uppercase"
+                ta="center"
+                c={option.value === value ? theme.primaryColor : undefined}
+                fw={option.value === value ? 700 : undefined}
+              >
+                {option.label}
+              </Text>
+            </Menu.Item>
+          ))}
+          {children}
+        </>
+      </Menu.Dropdown>
+    </Menu>
+  );
+}
+
+export function SelectMenuV2<T extends string | number>({
+  label,
+  options,
+  onClick,
+  value,
+  disabled,
+  children,
+  icon,
+  className,
+  ...buttonProps
+}: SelectMenu<T>) {
+  const theme = useMantineTheme();
+  const [opened, setOpened] = useState(false);
+  const mobile = useIsMobile({ type: 'media' });
+
+  const target = (
+    <FilterButton
+      disabled={disabled}
+      icon={icon || IconSortDescending}
+      onClick={() => setOpened((o) => !o)}
+      {...buttonProps}
+    >
+      {label}
+    </FilterButton>
+  );
+
+  if (options.length === 0) {
+    return (
+      <FilterButton
+        disabled={disabled}
+        icon={icon || IconSortDescending}
+        className={clsx('w-full', className)}
+        {...buttonProps}
+      >
+        {label}
+      </FilterButton>
+    );
+  }
+
+  if (mobile)
+    return (
+      <>
+        {target}
+        <MobileMenuDrawer
+          opened={opened}
+          onClose={() => setOpened(false)}
+          closeButtonProps={{ 'aria-label': 'Close sort menu' }}
+        >
+          <div className="flex flex-col gap-2">
+            {options.map((option) => (
+              <SheetOption
+                key={option.value.toString()}
+                role="menuitemradio"
+                selected={option.value === value}
+                onClick={() => {
+                  onClick(option.value);
+                  setOpened(false);
+                }}
+              >
+                {option.label}
+              </SheetOption>
+            ))}
+            {/* Rendered in BOTH branches: a caller's footer action disappearing on
+                touch is the half nobody tests. */}
+            {children}
+          </div>
+        </MobileMenuDrawer>
+      </>
+    );
+
+  return (
+    <Menu
+      position="bottom-end"
+      shadow="md"
+      radius={12}
+      width={256}
+      onChange={setOpened}
+      disabled={disabled}
+    >
+      <Menu.Target>{target}</Menu.Target>
+      <Menu.Dropdown p={8}>
+        <>
+          {options.map((option) => {
+            const active = option.value === value;
+
+            return (
+              <Menu.Item
+                key={option.value.toString()}
+                onClick={() => onClick(option.value)}
+                data-hovered={`${active}`}
+                rightSection={
+                  active && (
+                    <Text c={theme.primaryColor} inline>
+                      <IconCheck size={16} color="currentColor" />
+                    </Text>
+                  )
+                }
+              >
+                {option.label}
+              </Menu.Item>
+            );
+          })}
+          {children}
+        </>
+      </Menu.Dropdown>
+    </Menu>
+  );
+}

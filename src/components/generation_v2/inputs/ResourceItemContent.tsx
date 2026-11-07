@@ -1,0 +1,352 @@
+/**
+ * ResourceItemContent
+ *
+ * Shared component for displaying resource information in both
+ * ResourceSelectInput (card style) and ResourceSelectMultipleInput (list style).
+ *
+ * Handles:
+ * - Model name and version name display
+ * - Compatibility warnings (partial, incompatible)
+ * - Private resource indicator
+ * - Strength slider for LoRA/LoCon/DoRA resources
+ */
+
+import { Anchor, Badge, Group, Text, ThemeIcon } from '@mantine/core';
+import { HoverCard } from '~/components/MantineOverlays';
+import { IconAlertTriangle, IconBan, IconLock, IconShield } from '@tabler/icons-react';
+import type { ReactNode } from 'react';
+import { defaultStrength } from '~/shared/utils/resource.utils';
+import { strengthSliderBounds } from '~/shared/constants/generation.constants';
+import { useViewerBrowsingLevelDebounced } from '~/components/BrowsingLevel/BrowsingLevelProvider';
+import { EdgeMedia2 } from '~/components/EdgeMedia/EdgeMedia';
+import { SliderInput } from '~/components/generation_v2/inputs/SliderInput';
+import { useAppContext } from '~/providers/AppProvider';
+import { getResourceSfwOnlyMessage } from '~/components/SfwOnlyBadge/sfw-only.utils';
+import type { GenerationResource } from '~/shared/types/generation.types';
+import type { ResourceSelectOptions } from '~/components/ImageGeneration/GenerationForm/resource-select.types';
+import { isPreviewVisible } from '~/shared/utils/resource-preview';
+import { getModelUrl } from '~/utils/string-helpers';
+import { ExperimentalFlask } from '~/components/generation_v2/Experimental';
+import { ResourceResidencyStatus } from '~/components/ResourceLoad/ResourceResidency';
+import { PartnerDisclosureIcons } from '~/components/generation_v2/PartnerDisclosureIcons';
+
+// =============================================================================
+// Types
+// =============================================================================
+
+export interface ResourceItemContentProps {
+  /** The resource to display */
+  resource: GenerationResource;
+  /** The chosen weight; the resource's default shows until set. */
+  strengthValue?: number;
+  /** Called when strength changes */
+  onStrengthChange?: (strength: number) => void;
+  /** Whether the input is disabled */
+  disabled?: boolean;
+  /** Options for checking compatibility */
+  options?: ResourceSelectOptions;
+  /** Additional actions to render on the right side (Swap button, Remove button, etc.) */
+  actions?: ReactNode;
+  /** Whether to show the strength slider */
+  showStrength?: boolean;
+  /** Override whether the model name is rendered as a clickable link. Defaults to shouldShowModelLink(resource). */
+  showLink?: boolean;
+}
+
+export type ResourceStatus = 'compatible' | 'partial' | 'incompatible' | 'private' | 'unavailable';
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/**
+ * Check compatibility of a resource's baseModel against the options.resources config.
+ * Returns 'full' if in baseModels, 'partial' if in partialSupport, null if neither.
+ */
+export function getResourceCompatibility(
+  resourceBaseModel: string | undefined,
+  resourceType: string,
+  options?: ResourceSelectOptions
+): 'full' | 'partial' | null {
+  if (!resourceBaseModel || !options?.resources) return 'full'; // No options = assume compatible
+
+  const resourceConfig = options.resources.find((r) => r.type === resourceType);
+  if (!resourceConfig) return 'full'; // No config for this type = assume compatible
+
+  if (!resourceConfig.baseModels && !resourceConfig.partialSupport) return 'full'; // No restrictions
+  if (resourceConfig.baseModels?.includes(resourceBaseModel)) return 'full';
+  if (resourceConfig.partialSupport?.includes(resourceBaseModel)) return 'partial';
+  return null; // Not in either list = incompatible
+}
+
+/**
+ * Determine the overall status of a resource for styling and indicators.
+ *
+ * canGenerate is the definitive "can this user use this resource" flag from the server.
+ * When canGenerate is false, we check isPrivate to determine the appropriate UI message.
+ *
+ * @param resource - The resource to check
+ * @param options - Resource select options for compatibility checking
+ */
+export function getResourceStatus(
+  resource: GenerationResource,
+  options?: ResourceSelectOptions
+): ResourceStatus {
+  // canGenerate is the definitive "can this user use this resource" flag
+  // If false, determine why for appropriate UI messaging
+  if (resource.canGenerate === false) {
+    // If private and not owned, show "private" message
+    if (resource.isPrivate === true && resource.isOwnedByUser !== true) {
+      return 'private';
+    }
+    // Otherwise show "unavailable" (not covered, invalid status, etc.)
+    return 'unavailable';
+  }
+
+  // Resource can be generated - check baseModel compatibility (form-state dependent)
+  const compatibility = getResourceCompatibility(resource.baseModel, resource.model.type, options);
+  if (compatibility === null) return 'incompatible';
+  if (compatibility === 'partial') return 'partial';
+  return 'compatible';
+}
+
+/**
+ * Get CSS classes for resource container based on status.
+ */
+export function getStatusClasses(status: ResourceStatus): {
+  border?: string;
+  background?: string;
+} {
+  switch (status) {
+    case 'partial':
+      return {
+        border: 'border-yellow-5',
+        background: 'bg-yellow-1 dark:bg-yellow-9/20',
+      };
+    case 'incompatible':
+    case 'private':
+    case 'unavailable':
+      return {
+        border: 'border-red-5',
+        background: 'bg-red-1 dark:bg-red-9/20',
+      };
+    default:
+      return {};
+  }
+}
+
+/**
+ * Check if a resource is in a disabled state (cannot be used for generation).
+ * Disabled resources are: incompatible, private, or unavailable.
+ */
+export function isResourceDisabled(status: ResourceStatus): boolean {
+  return status === 'incompatible' || status === 'private' || status === 'unavailable';
+}
+
+/**
+ * Determine if a link to the model page should be shown for this resource.
+ * Show link if resource is publicly accessible OR user owns it.
+ */
+export function shouldShowModelLink(resource: GenerationResource): boolean {
+  // A negative id is a raw-AIR training epoch — there is no model page behind it.
+  if (resource.id < 0) return false;
+  return resource.isOwnedByUser === true || resource.isPrivate !== true;
+}
+
+// =============================================================================
+// Component
+// =============================================================================
+
+export function ResourceItemContent({
+  resource,
+  strengthValue,
+  onStrengthChange,
+  disabled,
+  options,
+  actions,
+  showStrength = true,
+  showLink: showLinkProp,
+}: ResourceItemContentProps) {
+  const { domain } = useAppContext();
+  const browsingLevel = useViewerBrowsingLevelDebounced();
+  const image =
+    resource.image && isPreviewVisible(resource.image.nsfwLevel, browsingLevel)
+      ? resource.image
+      : undefined;
+  const status = getResourceStatus(resource, options);
+  const isPartiallyCompatible = status === 'partial';
+  const isIncompatible = status === 'incompatible';
+  const isPrivate = status === 'private';
+  const isUnavailable = status === 'unavailable';
+  const isDisabled = isResourceDisabled(status);
+  const sfwOnlyMessage = domain.green ? undefined : getResourceSfwOnlyMessage(resource);
+  const epochDetails = resource.epochDetails;
+
+  // Don't show strength slider for disabled resources
+  const hasStrength =
+    showStrength &&
+    !isDisabled &&
+    ['LORA', 'LoCon', 'DoRA'].includes(resource.model.type) &&
+    onStrengthChange;
+  const strengthBounds = strengthSliderBounds(resource.settings?.strength);
+
+  const modelUrl = getModelUrl({
+    modelId: resource.model.id,
+    modelName: resource.model.name,
+    modelVersionId: resource.id,
+  });
+  const showLink = (showLinkProp ?? true) && shouldShowModelLink(resource);
+
+  return (
+    <>
+      <Group gap="xs" justify="space-between" wrap="nowrap">
+        {image && (
+          <div className="size-14 shrink-0 overflow-hidden rounded">
+            <EdgeMedia2
+              src={image.url}
+              type={image.type}
+              metadata={null}
+              width={450}
+              className="size-full object-cover"
+              alt={resource.model.name}
+            />
+          </div>
+        )}
+        <div className="min-w-0 flex-1">
+          {/* Model name — first line */}
+          {showLink ? (
+            <Anchor
+              href={modelUrl}
+              target="_blank"
+              size="sm"
+              fw={590}
+              className="block w-fit max-w-full truncate"
+              onClick={(e: React.MouseEvent) => e.stopPropagation()}
+            >
+              {resource.model.name}
+            </Anchor>
+          ) : (
+            <Text size="sm" fw={590} lineClamp={1} className="truncate">
+              {resource.model.name}
+            </Text>
+          )}
+          {/* Version name + warnings — second line */}
+          <Group gap={4} wrap="nowrap">
+            {resource.name &&
+              resource.model.name &&
+              resource.model.name.toLowerCase() !== resource.name.toLowerCase() && (
+                <Text size="xs" c="dimmed" className="shrink-0">
+                  ({resource.name})
+                </Text>
+              )}
+            {epochDetails?.epochNumber && (
+              <Badge size="sm" color="dark.5" variant="filled" className="shrink-0">
+                Epoch {epochDetails.epochNumber}
+              </Badge>
+            )}
+            {resource.turbo && (
+              <Badge size="sm" color="orange" variant="filled" className="shrink-0">
+                Turbo
+              </Badge>
+            )}
+            <ExperimentalFlask target={{ kind: 'modelVersion', key: resource.id }} />
+            <PartnerDisclosureIcons
+              partnerService={resource.partnerService}
+              partnerTrains={resource.partnerTrains}
+            />
+            {sfwOnlyMessage && (
+              <HoverCard position="bottom" withArrow width={200}>
+                <HoverCard.Target>
+                  <ThemeIcon size={18} color="green.5" variant="filled" className="shrink-0">
+                    <IconShield size={14} />
+                  </ThemeIcon>
+                </HoverCard.Target>
+                <HoverCard.Dropdown>
+                  <Text size="sm">{sfwOnlyMessage}</Text>
+                </HoverCard.Dropdown>
+              </HoverCard>
+            )}
+            {isPartiallyCompatible && (
+              <HoverCard position="bottom" withArrow width={200}>
+                <HoverCard.Target>
+                  <ThemeIcon size={18} color="yellow.7" variant="filled" className="shrink-0">
+                    <IconAlertTriangle size={14} />
+                  </ThemeIcon>
+                </HoverCard.Target>
+                <HoverCard.Dropdown>
+                  <Text size="sm">
+                    This resource may not be fully supported with the current base model
+                  </Text>
+                </HoverCard.Dropdown>
+              </HoverCard>
+            )}
+            {isIncompatible && (
+              <HoverCard position="bottom" withArrow width={200}>
+                <HoverCard.Target>
+                  <ThemeIcon size={18} color="red" variant="filled" className="shrink-0">
+                    <IconAlertTriangle size={14} />
+                  </ThemeIcon>
+                </HoverCard.Target>
+                <HoverCard.Dropdown>
+                  <Text size="sm">This resource is not compatible with the current base model</Text>
+                </HoverCard.Dropdown>
+              </HoverCard>
+            )}
+            {isPrivate && (
+              <HoverCard position="bottom" withArrow width={200}>
+                <HoverCard.Target>
+                  <ThemeIcon size={18} color="red" variant="filled" className="shrink-0">
+                    <IconLock size={14} />
+                  </ThemeIcon>
+                </HoverCard.Target>
+                <HoverCard.Dropdown>
+                  <Text size="sm">This resource is private. You cannot use it for generation.</Text>
+                </HoverCard.Dropdown>
+              </HoverCard>
+            )}
+            {isUnavailable && (
+              <HoverCard position="bottom" withArrow width={200}>
+                <HoverCard.Target>
+                  <ThemeIcon size={18} color="red" variant="filled" className="shrink-0">
+                    <IconBan size={14} />
+                  </ThemeIcon>
+                </HoverCard.Target>
+                <HoverCard.Dropdown>
+                  <Text size="sm">This resource is not available for generation.</Text>
+                </HoverCard.Dropdown>
+              </HoverCard>
+            )}
+          </Group>
+          {!isDisabled && (
+            <ResourceResidencyStatus
+              modelVersionId={resource.id}
+              className="w-fit shrink-0"
+              tooltipWidth={240}
+            />
+          )}
+        </div>
+        {actions && (
+          <Group gap={4} className="shrink-0">
+            {actions}
+          </Group>
+        )}
+      </Group>
+      {hasStrength && (
+        <div className="mt-2 flex w-full items-center gap-2">
+          <SliderInput
+            className="flex-1"
+            value={strengthValue ?? defaultStrength(resource)}
+            onChange={(strength) => onStrengthChange(strength)}
+            min={strengthBounds.min}
+            max={strengthBounds.max}
+            step={0.05}
+            precision={2}
+            disabled={disabled}
+            steppers
+            ariaLabel={`${resource.model.name} strength`}
+          />
+        </div>
+      )}
+    </>
+  );
+}

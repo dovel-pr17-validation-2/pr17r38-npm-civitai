@@ -1,0 +1,289 @@
+import { json, type RequestHandler } from '@sveltejs/kit';
+import { maybeCreateSessionSigner } from '@civitai/auth';
+import { TokenScope } from '@civitai/auth/token-scope';
+import { db } from '$lib/server/db/db';
+import { oauthServer } from '$lib/server/oauth/server';
+import {
+  checkClientTokenRateLimit,
+  checkOAuthRateLimit,
+  tokenOverflowExhausted,
+} from '$lib/server/oauth/rate-limit';
+import { logOAuthEvent } from '$lib/server/oauth/audit-log';
+import { logAxiomError } from '$lib/server/axiom';
+import { OriginNotAllowedError } from '$lib/server/oauth/errors';
+import {
+  ACCESS_TOKEN_TTL,
+  ACCESS_TOKEN_TYPE,
+  DEVICE_CODE_GRANT,
+  TOKEN_EXCHANGE_GRANT,
+  WORKER_TOKEN_TTL,
+} from '$lib/server/oauth/constants';
+import type { WorkerGrantRequestContext } from '$lib/server/oauth/worker-grant';
+import { consumeOidcContext } from '$lib/server/oauth/oidc-nonce';
+import { hasScope, parseScopeRequest } from '$lib/server/oauth/scope';
+import { deviceTokenGrant } from '$lib/server/oauth/device-token';
+import {
+  parseBody,
+  toOAuthRequest,
+  newOAuthResponse,
+  setWildcardCors,
+  setPublicClientCors,
+} from '$lib/server/oauth/http';
+import { getClientIp } from '$lib/server/auth/request';
+import { authenticatedConfidentialClient } from '$lib/server/oauth/client-auth';
+
+// POST /api/auth/oauth/token — authorization_code + refresh_token (+ client_credentials) grants, and the
+// worker token-exchange grant (lib/server/oauth/worker-grant.ts).
+// Ported from src/pages/api/auth/oauth/token.ts.
+//
+// OIDC id_token signer: undefined unless the hub ES256 keys are set (they always are when sessions
+// work, but mirror the main app's opt-in so discovery + issuance stay in lockstep). authorization_code
+// grants carrying UserRead also receive a signed id_token ("Sign in with Civitai").
+const idTokenSigner = maybeCreateSessionSigner();
+
+export const OPTIONS: RequestHandler = () => {
+  const headers = new Headers();
+  setWildcardCors(headers); // preflight stays permissive — we can't classify the client until the POST body
+  return new Response(null, { status: 204, headers });
+};
+
+// The client id in a Basic Authorization header, parsed as the OAuth library's `basic-auth` dependency parses it.
+function basicAuthClientId(header: string | null): string | undefined {
+  const match = /^ *(?:[Bb][Aa][Ss][Ii][Cc]) +([A-Za-z0-9._~+/-]+=*) *$/.exec(header ?? '');
+  if (!match) return undefined;
+  return /^([^:]*):(.*)$/.exec(Buffer.from(match[1], 'base64').toString())?.[1];
+}
+
+/**
+ * Whether a request over the per-IP `token` limit may go on under its client's own limit. Staff set one
+ * (`OauthClient.tokenRateLimit`) for apps Civitai runs, whose pods send every user's code exchange and
+ * refresh from one egress IP, so the per-IP limit alone would cap that app's whole user base. Only ever
+ * adds headroom on top of `token`: failed secret checks are bounded per IP by `token-overflow` (an IP that
+ * used them up is refused before checking), and the client is charged only once its secret checks out. A
+ * client with no limit set gets the per-IP limit only.
+ */
+async function tokenOverflowAllowed(
+  request: Request,
+  body: Record<string, unknown>,
+  clientIp: string | null
+): Promise<boolean> {
+  const namesSecret =
+    basicAuthClientId(request.headers.get('authorization')) !== undefined ||
+    typeof body.client_secret === 'string';
+  if (!namesSecret) return false;
+  if (await tokenOverflowExhausted(clientIp)) return false;
+  const client = await authenticatedConfidentialClient(request, body);
+  if (!client) {
+    await checkOAuthRateLimit('token-overflow', clientIp); // count the failed check
+    return false;
+  }
+  if (!client.tokenRateLimit) return false;
+  return checkClientTokenRateLimit(client.id, client.tokenRateLimit);
+}
+
+export const POST: RequestHandler = async ({ request }) => {
+  const body = await parseBody(request);
+  const clientId =
+    typeof body.client_id === 'string' && body.client_id ? body.client_id : 'unknown';
+  // Real CLIENT IP from proxy headers (not the shared ingress peer) — keyed per-client, or null →
+  // limit skipped, never one global bucket. `'unknown'` is for the audit log only, not the limiter.
+  const clientIp = getClientIp(request);
+  const ip = clientIp ?? 'unknown';
+  const origin = request.headers.get('origin') ?? undefined;
+  const isWorkerExchange = body.grant_type === TOKEN_EXCHANGE_GRANT;
+
+  // RFC 8628 §3.4: a device polls the token endpoint. The poll has its own limits (per device_code,
+  // behind a per-IP ceiling), so it goes before the `token` bucket a poll loop would otherwise drain.
+  if (body.grant_type === DEVICE_CODE_GRANT) return deviceTokenGrant(request, body);
+
+  // Rate-limit by IP before any DB work — keying on client_id would let an attacker rotate ids for a
+  // fresh bucket each request. The worker exchange has its own, larger bucket: a pool of workers can
+  // share one egress IP. Past the IP limit, a confidential client with a staff-set limit that
+  // authenticates goes on under that limit instead (see tokenOverflowAllowed).
+  if (
+    !(await checkOAuthRateLimit(isWorkerExchange ? 'worker-token' : 'token', clientIp)) &&
+    (isWorkerExchange || !(await tokenOverflowAllowed(request, body, clientIp)))
+  ) {
+    const headers = new Headers();
+    setWildcardCors(headers);
+    return json(
+      { error: 'rate_limited', error_description: 'Too many token requests' },
+      { status: 429, headers }
+    );
+  }
+
+  // The library authenticates the Basic header's client and ignores a body client_id, so a different one
+  // there would name a client that never authenticated.
+  const basicClientId = basicAuthClientId(request.headers.get('authorization'));
+  if (basicClientId !== undefined && body.client_id && body.client_id !== basicClientId) {
+    const headers = new Headers({ 'WWW-Authenticate': 'Basic realm="Service"' });
+    setWildcardCors(headers);
+    return json(
+      {
+        error: 'invalid_client',
+        error_description: 'client_id does not match the authenticated client',
+      },
+      { status: 401, headers }
+    );
+  }
+
+  // §D.x #2 — refresh grant must NOT forward a `scope` param. Scope is a bitmask-as-decimal-string; the
+  // library's string-`.includes()` subset check is meaningless for it, so dropping `scope` lets the
+  // stored scope pass through unchanged (no silent escalation or broken downgrade).
+  if (body.grant_type === 'refresh_token') delete body.scope;
+
+  // client_credentials takes `scope` from this request, and the library hands it to validateScope as the
+  // decimal bitmask string. A request may also name scopes (`ModelsRead MediaRead`), so convert it here.
+  if (body.grant_type === 'client_credentials' && body.scope) {
+    const requested = parseScopeRequest(body.scope);
+    if (!requested) {
+      const headers = new Headers();
+      setWildcardCors(headers);
+      return json(
+        { error: 'invalid_scope', error_description: 'Invalid scope value' },
+        { status: 400, headers }
+      );
+    }
+    body.scope = String(requested.scope);
+  }
+
+  // The library's token handler hard-requires `request.is('application/x-www-form-urlencoded')`, which in
+  // turn needs a body-length signal (Content-Length / Transfer-Encoding). We've already parsed the body,
+  // so guarantee both on the carrier headers — otherwise a reverse proxy that re-buffers the request and
+  // drops Content-Length would make the library reject otherwise-valid token requests with a misleading
+  // content-type error. The endpoint is form-urlencoded-only by spec, so forcing the type is correct.
+  const oauthHeaders = new Headers(request.headers);
+  oauthHeaders.set('content-type', 'application/x-www-form-urlencoded');
+  oauthHeaders.set(
+    'content-length',
+    String(Buffer.byteLength(new URLSearchParams(body).toString()))
+  );
+
+  const oauthReq = toOAuthRequest({ method: 'POST', headers: oauthHeaders, body });
+  const workerGrant: WorkerGrantRequestContext = { clientIp };
+  Object.assign(oauthReq, { workerGrant });
+  const respHeaders = new Headers({ 'Cache-Control': 'no-store', Pragma: 'no-cache' }); // RFC 6749 §5.1
+
+  try {
+    const token = await oauthServer.token(oauthReq, newOAuthResponse());
+
+    // getClient stashes the looked-up client on the request so we can drive CORS without a 2nd lookup.
+    // Fail-closed with a fallback lookup if it's missing (library wiring change) rather than defaulting
+    // to wildcard and risking a cross-origin leak of a public-client token response.
+    let attached = (
+      oauthReq as typeof oauthReq & {
+        oauthClient?: { id: string; isConfidential: boolean; allowedOrigins: string[] };
+      }
+    ).oauthClient;
+    if (!attached && clientId !== 'unknown') {
+      attached =
+        (await db
+          .selectFrom('OauthClient')
+          .select(['id', 'isConfidential', 'allowedOrigins'])
+          .where('id', '=', clientId)
+          .executeTakeFirst()) ?? undefined;
+    }
+    // §D.x #3 — only echo the request Origin when it's actually in the client's allowlist (defense in
+    // depth: getClient already throws OriginNotAllowedError on a mismatch on the success path).
+    if (
+      attached &&
+      !attached.isConfidential &&
+      origin &&
+      attached.allowedOrigins.includes(origin)
+    ) {
+      setPublicClientCors(respHeaders, origin);
+    } else {
+      setWildcardCors(respHeaders);
+    }
+
+    if (isWorkerExchange) {
+      return json(
+        {
+          access_token: token.accessToken,
+          issued_token_type: ACCESS_TOKEN_TYPE,
+          token_type: 'Bearer',
+          expires_in: WORKER_TOKEN_TTL,
+          scope: String(TokenScope.WorkerRegister),
+        },
+        { headers: respHeaders }
+      );
+    }
+
+    const grantType = body.grant_type;
+    const scopeNum = token.scope
+      ? parseInt(Array.isArray(token.scope) ? token.scope[0] : token.scope, 10)
+      : undefined;
+    logOAuthEvent({
+      type: grantType === 'refresh_token' ? 'token.refreshed' : 'token.issued',
+      userId: typeof token.user?.id === 'number' ? token.user.id : undefined,
+      clientId,
+      scope: scopeNum,
+      ip,
+    });
+
+    // OIDC id_token — only on authorization_code (not refresh), and ONLY when the client actually requested
+    // OIDC: the `openid` scope on the /authorize request (OIDC Core §3.1.2.1), or a `nonce`, which our own
+    // "Sign in with Civitai" flow sent before scope names existed. UserRead is force-added to every token,
+    // so it can't be the signal. Plain OAuth API clients get just access/refresh tokens — no signed
+    // identity assertion. The OIDC context is consumed exactly once here regardless (single-use cleanup).
+    let idToken: string | undefined;
+    if (
+      idTokenSigner &&
+      grantType === 'authorization_code' &&
+      typeof token.user?.id === 'number' &&
+      scopeNum !== undefined &&
+      hasScope(scopeNum, TokenScope.UserRead)
+    ) {
+      const code = typeof body.code === 'string' ? body.code : undefined;
+      const ctx = code ? await consumeOidcContext(code) : {};
+      if (ctx.openid || ctx.nonce) {
+        idToken = await idTokenSigner.mintIdToken({
+          sub: token.user.id,
+          aud: token.client.id,
+          nonce: ctx.nonce,
+          authTime: ctx.authTime,
+          expiresIn: token.accessTokenLifetime ?? ACCESS_TOKEN_TTL,
+        });
+      }
+    }
+
+    return json(
+      {
+        access_token: token.accessToken,
+        token_type: 'Bearer',
+        expires_in: token.accessTokenLifetime ?? ACCESS_TOKEN_TTL,
+        refresh_token: token.refreshToken,
+        scope: token.scope,
+        ...(idToken ? { id_token: idToken } : {}),
+      },
+      { headers: respHeaders }
+    );
+  } catch (err) {
+    if (err instanceof OriginNotAllowedError) {
+      logOAuthEvent({
+        type: 'origin.rejected',
+        clientId: err.clientId,
+        ip,
+        metadata: { origin: err.origin ?? null, endpoint: 'token' },
+      });
+      // No CORS on a rejected origin — the browser surfaces a network error to the offending page.
+      return json({ error: 'origin_not_allowed', error_description: err.message }, { status: 403 });
+    }
+    void logAxiomError(err, { event: '[oauth/token] handler error' });
+    setWildcardCors(respHeaders);
+    const e = err as { code?: number; statusCode?: number; name?: string; message?: string };
+    const status =
+      typeof e.statusCode === 'number' ? e.statusCode : typeof e.code === 'number' ? e.code : 500;
+    // Echo the library's spec error name + message for client-actionable 4xx (invalid_grant, invalid_client,
+    // …), but NEVER surface a raw internal error message (DB/driver/stack details) on a 5xx — return a generic
+    // description instead so an unexpected failure can't leak internals to the client.
+    const isClientError = status >= 400 && status < 500;
+    return json(
+      {
+        error: isClientError && e.name ? e.name : 'server_error',
+        error_description: isClientError && e.message ? e.message : 'Internal error',
+      },
+      { status, headers: respHeaders }
+    );
+  }
+};

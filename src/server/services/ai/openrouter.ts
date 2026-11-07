@@ -1,0 +1,465 @@
+import { OpenRouter } from '@openrouter/sdk';
+import type {
+  ChatMessageToolCall,
+  Message,
+  SystemMessage,
+  ToolDefinitionJson,
+  ToolResponseMessage,
+  UserMessage,
+} from '@openrouter/sdk/models';
+import { isProd } from '~/env/other';
+import { env } from '~/env/server';
+import { agentLog } from '~/server/freshdesk-agent/freshdesk-debug';
+import { APP_ERROR_MESSAGES } from '~/server/services/ai/provider-error';
+
+// Model aliases for easier usage
+export const AI_MODELS = {
+  // Primary models for complex tasks
+  GPT_4O: 'openai/gpt-4o',
+  GPT_4O_MINI: 'openai/gpt-4o-mini',
+  CLAUDE_SONNET: 'anthropic/claude-sonnet-4',
+  CLAUDE_HAIKU: 'anthropic/claude-3-5-haiku',
+
+  KIMI: 'moonshotai/kimi-k2.5',
+  // DEAD, not merely deprecated: this id 404s with "Grok 4.1 Fast is deprecated" on every call
+  // (verified 2026-08-26). Anything routed here fails outright — use GROK_4_3 or MIMO.
+  GROK: 'x-ai/grok-4.1-fast',
+  GROK_4_3: 'x-ai/grok-4.3',
+  GPT_5_NANO: 'openai/gpt-5-nano',
+  MIMO: 'xiaomi/mimo-v2.5',
+  STEP_FUN: 'stepfun/step-3.5-flash',
+  // Pairwise challenge judging (see challenge-judge-routes.ts). QWEN_FLASH refuses adult pairs
+  // with data_inspection_failed; GPT_5_6_LUNA is the permissive route those fall back to.
+  QWEN_FLASH: 'qwen/qwen3.7-flash',
+  GPT_5_6_LUNA: 'openai/gpt-5.6-luna',
+  // Daily-challenge fallback (see games/daily-challenge/generative-content.ts).
+  GPT_6_LUNA: 'openai/gpt-6-luna',
+  // Bounded-judgment vendor model (Choice/Score/Noul only — see services/ai/jev.ts).
+  // Numbered pin on purpose: `jev-latest` is scratch-only and must never ship here.
+  JEV: 'typesafe/jev-1.13',
+
+  // Fallback chains
+  VISION_PRIMARY: 'openai/gpt-4o',
+  VISION_FALLBACK: 'anthropic/claude-sonnet-4',
+} as const;
+
+// eslint-disable-next-line @typescript-eslint/ban-types
+export type AIModel = (typeof AI_MODELS)[keyof typeof AI_MODELS] | (string & {});
+
+// Simple message types that get converted to SDK format
+type TextContent = { type: 'text'; text: string };
+type ImageContent = { type: 'image_url'; image_url: { url: string } };
+type ContentItem = TextContent | ImageContent;
+
+export type SimpleMessage = {
+  role: 'system' | 'user' | 'assistant';
+  content: string | ContentItem[];
+};
+
+type GetJsonCompletionInput = {
+  model?: AIModel;
+  messages: SimpleMessage[];
+  temperature?: number;
+  maxTokens?: number;
+  retries?: number;
+  // Per request. The client has no timeout of its own, so a hung provider call never returns.
+  timeoutMs?: number;
+};
+
+/**
+ * `costUsd` is the vendor's OWN reported spend for the call, present only where
+ * the transport reports one — see `extractUsage` below, which is the single
+ * place that decides. Optional rather than defaulted because absent and `0` are
+ * different facts.
+ *
+ * 🔴 TWO THINGS DO NOT SEE IT, and both are deliberate for now rather than
+ * oversights:
+ *  - `sumUsage` below does not ADD it. Safe only while nothing that populates it
+ *    goes through `sumUsage` — its sole caller is the chat-only
+ *    `getJsonCompletionWithUsage` retry path. If a chat transport starts
+ *    reporting cost, `sumUsage` must learn to add it.
+ *  - `estimateBuzzCost` (`server/games/daily-challenge/generative-content.ts`)
+ *    is this repo's pricing function and prices from the hand-maintained
+ *    `MODEL_BUZZ_RATES` table, so for a model with no row it returns 0 even when
+ *    the authoritative figure is sitting in this very object. That is the exact
+ *    failure `server/services/__tests__/no-unpriced-default-model.test.ts`
+ *    records (113 challenges recorded spend 0; the vendor bill was the only
+ *    signal). Nothing routes a decisions-model call through it today, so this is
+ *    a hazard rather than a defect — but a `usage.costUsd ?? table lookup`
+ *    preference there would close the class for every transport that reports a
+ *    real figure.
+ */
+export type TokenUsage = { promptTokens: number; completionTokens: number; costUsd?: number };
+
+/**
+ * The ONE place that knows how a vendor spells token usage. Three spellings so
+ * far, and the whole point of this function is that there is one of it:
+ *
+ *  - `prompt_tokens` / `completion_tokens` — the raw OpenAI-compatible REST API,
+ *    and this codebase's cost-tracking contract.
+ *  - `promptTokens` / `completionTokens` — the OpenRouter SDK's parsed
+ *    `ChatResponse.usage`, whose zod schema remaps the wire format.
+ *  - `input_tokens` / `output_tokens` / `cost` — `POST /api/alpha/decisions`
+ *    (see `services/ai/jev.ts`). Added here rather than as a second parser in
+ *    that module: a sibling copy is how the next field lands in one of the two.
+ *    (A fourth exists upstream and has no caller yet: the SDK's
+ *    `OpenResponsesUsage` spells them `inputTokens` / `outputTokens` + `cost`.)
+ *
+ * ⚠️ READING `cost` APPLIES TO EVERY CALLER, chat paths included, and the reason that is
+ * currently inert is worth keeping written down because it is one vendor flag from false:
+ * the SDK's `chat.send` usage is a plain zod object with no `passthrough`, so it STRIPS an
+ * unknown `cost` before `extractUsage` ever sees it. OpenRouter's chat API can report one.
+ * The moment it survives the parse, `getJsonCompletionWithUsage`'s retry path starts
+ * discarding the first call's cost in `sumUsage` — see `TokenUsage` above. A caller that
+ * hands this a RAW REST payload instead of an SDK response arms the same thing today.
+ *
+ * `cost` is the vendor's OWN reported spend for the call and becomes `costUsd`.
+ * 🔴 `>= 0` and finite, because it is a money input by construction — the same
+ * guard the sibling writer of that field name applies
+ * (`src/pages/api/internal/blocks/agent-report-callback.ts`). A nonsense figure
+ * becomes "not reported" rather than a negative meter entry, and never fails the
+ * call: a bad cost must not discard a result that otherwise succeeded. Absent is
+ * not `0` — "free" and "not reported" are different facts, and whatever meters
+ * this needs to tell them apart.
+ *
+ * The parameter is deliberately `unknown`-shaped: every caller hands it a
+ * different vendor's response object, and narrowing inside beats a cast at each
+ * call site.
+ */
+export function extractUsage(resp: { usage?: unknown } | null | undefined): TokenUsage {
+  const usage = (resp?.usage ?? {}) as Record<string, unknown>;
+  const finite = (value: unknown) =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  const cost = finite(usage.cost);
+  return {
+    promptTokens:
+      finite(usage.prompt_tokens) ?? finite(usage.promptTokens) ?? finite(usage.input_tokens) ?? 0,
+    completionTokens:
+      finite(usage.completion_tokens) ??
+      finite(usage.completionTokens) ??
+      finite(usage.output_tokens) ??
+      0,
+    ...(cost !== undefined && cost >= 0 ? { costUsd: cost } : {}),
+  };
+}
+
+function sumUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  return {
+    promptTokens: a.promptTokens + b.promptTokens,
+    completionTokens: a.completionTokens + b.completionTokens,
+  };
+}
+
+export type RunAgentLoopInput = {
+  model?: AIModel;
+  system: string;
+  userMessage: string;
+  tools: ToolDefinitionJson[];
+  executeToolCall: (name: string, args: Record<string, unknown>) => Promise<string>;
+  maxTurns?: number;
+  maxTokens?: number;
+  temperature?: number;
+};
+
+export type AgentLoopResult = {
+  response: string;
+  turnsUsed: number;
+  toolCallsExecuted: number;
+  exhausted: boolean;
+};
+
+// Convert our simple message format to SDK format
+function toSDKMessage(msg: SimpleMessage): Message {
+  if (msg.role === 'system') {
+    const content =
+      typeof msg.content === 'string'
+        ? msg.content
+        : msg.content.map((c) => {
+            if (c.type === 'text') return { type: 'text' as const, text: c.text };
+            throw new Error('System messages cannot contain images');
+          });
+    return { role: 'system', content } as SystemMessage;
+  }
+
+  if (msg.role === 'user') {
+    const content =
+      typeof msg.content === 'string'
+        ? msg.content
+        : msg.content.map((c) => {
+            if (c.type === 'text') return { type: 'text' as const, text: c.text };
+            if (c.type === 'image_url')
+              return { type: 'image_url' as const, imageUrl: { url: c.image_url.url } };
+            throw new Error('Unknown content type');
+          });
+    return { role: 'user', content } as UserMessage;
+  }
+
+  // Assistant messages
+  return {
+    role: 'assistant',
+    content: typeof msg.content === 'string' ? msg.content : '',
+  };
+}
+
+type CustomOpenRouter = OpenRouter & {
+  getJsonCompletion: <T>(params: GetJsonCompletionInput) => Promise<T>;
+  // Opt-in sibling of `getJsonCompletion` for callers that need to track spend
+  // (e.g. daily-challenge cost accounting) without changing the return shape
+  // every existing `getJsonCompletion<T>()` caller depends on.
+  getJsonCompletionWithUsage: <T>(
+    params: GetJsonCompletionInput
+  ) => Promise<{ content: T; usage: TokenUsage }>;
+  // Free-TEXT sibling of getJsonCompletion — a single non-streaming completion
+  // that returns the assistant's plain text (NOT parsed as JSON). For grounded
+  // Q&A / chat turns where the reply is prose citing evidence, not a JSON object.
+  // Falls back to `message.reasoning` when a reasoning model returns null content.
+  getTextCompletion: (
+    params: GetTextCompletionInput
+  ) => Promise<{ content: string; usage: TokenUsage }>;
+  runAgentLoop: (params: RunAgentLoopInput) => Promise<AgentLoopResult>;
+};
+
+type GetTextCompletionInput = {
+  model?: AIModel;
+  messages: SimpleMessage[];
+  temperature?: number;
+  maxTokens?: number;
+  // Optional cancellation. `Promise.race` timeouts abandon the slow promise but
+  // do NOT cancel the underlying fetch; pass a signal to actually abort it.
+  signal?: AbortSignal;
+};
+
+declare global {
+  // eslint-disable-next-line no-var, vars-on-top
+  var globalOpenRouter: CustomOpenRouter | undefined;
+}
+
+function createOpenRouterClient() {
+  const client = new OpenRouter({
+    apiKey: env.OPENROUTER_API_KEY,
+  });
+
+  const customClient = client as CustomOpenRouter;
+
+  customClient.getJsonCompletionWithUsage = async <T>({
+    model = AI_MODELS.GPT_5_NANO,
+    messages,
+    temperature = 1,
+    maxTokens = 2048,
+    retries = 0,
+    timeoutMs,
+  }: GetJsonCompletionInput): Promise<{ content: T; usage: TokenUsage }> => {
+    const sdkMessages = messages.map(toSDKMessage);
+
+    const response = await client.chat.send(
+      {
+        model,
+        messages: sdkMessages,
+        temperature,
+        maxTokens,
+        responseFormat: { type: 'json_object' },
+        provider: {
+          allowFallbacks: true,
+        },
+      },
+      timeoutMs ? { timeoutMs } : undefined
+    );
+    const usage = extractUsage(response);
+
+    const content = response.choices?.[0]?.message?.content;
+    if (!content || typeof content !== 'string') {
+      if (retries > 0) {
+        const retried = await customClient.getJsonCompletionWithUsage<T>({
+          model,
+          messages,
+          temperature,
+          maxTokens,
+          retries: retries - 1,
+          timeoutMs,
+        });
+        return { content: retried.content, usage: sumUsage(usage, retried.usage) };
+      }
+      throw new Error(APP_ERROR_MESSAGES.no_content);
+    }
+
+    try {
+      // Try to parse as JSON directly
+      return { content: JSON.parse(content) as T, usage };
+    } catch {
+      // Try to extract JSON from markdown code block
+      const jsonBlockMatch = content.match(/```json\n(.*?)\n```/s)?.[1];
+      if (jsonBlockMatch) {
+        try {
+          return { content: JSON.parse(jsonBlockMatch) as T, usage };
+        } catch {
+          // Fall through to retry/error
+        }
+      }
+
+      if (retries > 0) {
+        const retried = await customClient.getJsonCompletionWithUsage<T>({
+          model,
+          messages,
+          temperature,
+          maxTokens,
+          retries: retries - 1,
+          timeoutMs,
+        });
+        return { content: retried.content, usage: sumUsage(usage, retried.usage) };
+      }
+      // Never the content: a model can be led to repeat the prompts it was sent.
+      console.error('Failed to parse JSON from completion', {
+        model,
+        length: content.length,
+        fenced: jsonBlockMatch !== undefined,
+      });
+      throw new Error(APP_ERROR_MESSAGES.json_parse);
+    }
+  };
+
+  customClient.getJsonCompletion = async <T>(params: GetJsonCompletionInput): Promise<T> => {
+    const { content } = await customClient.getJsonCompletionWithUsage<T>(params);
+    return content;
+  };
+
+  customClient.getTextCompletion = async ({
+    model = AI_MODELS.GPT_5_NANO,
+    messages,
+    temperature = 1,
+    maxTokens = 1024,
+    signal,
+  }: GetTextCompletionInput): Promise<{ content: string; usage: TokenUsage }> => {
+    const sdkMessages = messages.map(toSDKMessage);
+    const response = await client.chat.send(
+      {
+        model,
+        messages: sdkMessages,
+        temperature,
+        maxTokens,
+        provider: { allowFallbacks: true },
+      },
+      signal ? { signal } : undefined
+    );
+    const usage = extractUsage(response);
+    const message = response.choices?.[0]?.message as
+      | { content?: unknown; reasoning?: unknown }
+      | undefined;
+    const raw = message?.content ?? message?.reasoning ?? '';
+    const content = typeof raw === 'string' ? raw : String(raw ?? '');
+    return { content, usage };
+  };
+
+  customClient.runAgentLoop = async ({
+    model = AI_MODELS.CLAUDE_SONNET,
+    system,
+    userMessage,
+    tools,
+    executeToolCall,
+    maxTurns = 15,
+    maxTokens = 4096,
+    temperature = 0,
+  }: RunAgentLoopInput): Promise<AgentLoopResult> => {
+    const messages: Message[] = [
+      { role: 'system', content: system } as SystemMessage,
+      { role: 'user', content: userMessage } as UserMessage,
+    ];
+
+    let turnsUsed = 0;
+    let toolCallsExecuted = 0;
+
+    while (turnsUsed < maxTurns) {
+      turnsUsed++;
+      agentLog(`--- TURN ${turnsUsed}/${maxTurns} ---`);
+
+      const response = await client.chat.send({
+        model,
+        messages,
+        tools,
+        maxTokens,
+        temperature,
+        provider: { allowFallbacks: true },
+      });
+
+      const choice = response.choices?.[0];
+      if (!choice) throw new Error(APP_ERROR_MESSAGES.no_choice);
+
+      const assistantMessage = choice.message;
+      // Push the assistant message to conversation history
+      messages.push(assistantMessage as unknown as Message);
+
+      const toolCalls = assistantMessage.toolCalls;
+
+      agentLog('ASSISTANT', {
+        finishReason: choice.finishReason,
+        hasToolCalls: !!toolCalls?.length,
+        textPreview:
+          typeof assistantMessage.content === 'string'
+            ? assistantMessage.content.slice(0, 200)
+            : undefined,
+      });
+
+      if (choice.finishReason === 'tool_calls' && toolCalls?.length) {
+        // Execute each tool call and collect results
+        const toolResults: ToolResponseMessage[] = await Promise.all(
+          toolCalls.map(async (tc: ChatMessageToolCall) => {
+            toolCallsExecuted++;
+            let result: string;
+            try {
+              const args = JSON.parse(tc.function.arguments);
+              result = await executeToolCall(tc.function.name, args);
+            } catch (err) {
+              result = `Error: ${err instanceof Error ? err.message : String(err)}`;
+            }
+            return {
+              role: 'tool' as const,
+              content: result,
+              toolCallId: tc.id,
+            };
+          })
+        );
+
+        // Add tool results to messages
+        messages.push(...(toolResults as unknown as Message[]));
+        continue;
+      }
+
+      // finish_reason is 'stop' or 'length' — return the final text
+      const content = assistantMessage.content;
+      const finalText = typeof content === 'string' ? content : '';
+      return { response: finalText, turnsUsed, toolCallsExecuted, exhausted: false };
+    }
+
+    // Max turns exhausted — ask the model to summarize what it has so far
+    messages.push({
+      role: 'user',
+      content:
+        'You have run out of turns. Please summarize your findings so far in a concise note. Do NOT call any tools — just respond with your summary text.',
+    } as UserMessage);
+
+    const summaryResponse = await client.chat.send({
+      model,
+      messages,
+      maxTokens,
+      temperature,
+      provider: { allowFallbacks: true },
+    });
+
+    const summaryContent = summaryResponse.choices?.[0]?.message?.content;
+    const summaryText = typeof summaryContent === 'string' ? summaryContent : '';
+
+    return { response: summaryText, turnsUsed, toolCallsExecuted, exhausted: true };
+  };
+
+  return customClient;
+}
+
+export let openrouter: CustomOpenRouter | undefined;
+const shouldConnect = env.OPENROUTER_API_KEY;
+if (shouldConnect) {
+  if (isProd) {
+    openrouter = createOpenRouterClient();
+  } else {
+    if (!global.globalOpenRouter) global.globalOpenRouter = createOpenRouterClient();
+    openrouter = global.globalOpenRouter;
+  }
+}

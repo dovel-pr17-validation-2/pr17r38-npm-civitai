@@ -1,0 +1,503 @@
+// Server-side client for the Civitai buzz service (BUZZ_ENDPOINT). Owns the HTTP transport
+// (fetch + retry + status→error) and typed per-endpoint methods. Account-aware methods take
+// the app's *friendly* account types and map to the buzz API internally (see ./account-types).
+// Domain concerns (balance pre-checks, entity lookups, DB co-writes) stay in the consuming app.
+import { loadBuzzEnv, type BuzzConfig } from './env';
+import { toApiType, toApiTransaction, type BuzzAccountType } from './account-types';
+import type {
+  GetAccountTransactionsQuery,
+  GetTransactionsReportQuery,
+  GetAccountBalancesQuery,
+  GetAccountSummaryQuery,
+  GetContributorsQuery,
+  GetCounterpartiesQuery,
+  PreviewMultiTransactionQuery,
+  ListMultiTransactionsQuery,
+} from './queries';
+import type {
+  CreateMultiTransactionResponse,
+  CreateTransactionResponse,
+  CreateTransactionsResponse,
+  GetAccountBalancesResponse,
+  GetAccountSummaryResponse,
+  GetAccountTransactionsResponse,
+  GetContributorsResponse,
+  GetCounterpartiesResponse,
+  GetTransactionsReportResponse,
+  ListMultiTransactionsResponse,
+  PreviewMultiTransactionResponse,
+  RefundMultiTransactionResponse,
+  RefundTransactionResponse,
+  BuzzTransactionResponse,
+} from './responses';
+
+/** Thrown when the buzz service responds with a non-2xx status. The consuming app maps it
+ *  to its own error type via `mapError` (below) — the package stays framework-free. */
+export class BuzzApiError extends Error {
+  status: number;
+  statusText: string;
+  /**
+   * The response body of a 4xx: parsed JSON, or the raw text when it is not JSON, or undefined
+   * when there was none or it could not be read. A 409 on a refund, for one, carries the refunds
+   * that already exist, which is the only way a caller can tell which legs are still owed.
+   * Never read for a 5xx. Not part of the message, so existing callers see no change.
+   *
+   * NON-ENUMERABLE on purpose: errors are logged and returned with `JSON.stringify`, which
+   * would otherwise copy the service's ledger data into every such log line and response.
+   */
+  declare body: unknown;
+  constructor(status: number, statusText: string, body?: unknown) {
+    super(`[@civitai/buzz] request failed: ${status} ${statusText}`);
+    this.name = 'BuzzApiError';
+    this.status = status;
+    this.statusText = statusText;
+    Object.defineProperty(this, 'body', { value: body, enumerable: false });
+  }
+}
+
+/** Never throws: a body that cannot be read is reported as absent, not as a new error. */
+async function readErrorBody(response: Response): Promise<unknown> {
+  try {
+    const text = await response.text();
+    if (!text) return undefined;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+export type BuzzLogFn = (message: string, ...args: unknown[]) => void;
+
+export type CreateBuzzClientOptions = Partial<BuzzConfig> & {
+  /** Default request timeout for write calls. Absent means unbounded, as before. */
+  transactionTimeoutMs?: number;
+  /** Retry attempts on failure (default 3, matching the app's prior behaviour). */
+  retries?: number;
+  /** Debug logger (app-defined). Defaults to a no-op. */
+  log?: BuzzLogFn;
+  /** Map a BuzzApiError to the consumer's own error before it's thrown (e.g. tRPC/HTTP).
+   *  Return (or throw) the error to raise; applied once, after retries are exhausted. */
+  mapError?: (error: BuzzApiError) => unknown;
+};
+
+export type BuzzAccountResponse = { id: number; balance: number; lifetimeBalance: number };
+
+/** A transaction payload in the app's *friendly* account types; the client maps it to the API. */
+export type BuzzTransactionInput = {
+  fromAccountType?: BuzzAccountType;
+  toAccountType?: BuzzAccountType;
+} & Record<string, unknown>;
+
+/** Body for `createMultiTransaction` — friendly account types; the client maps `toAccountType`
+ *  to the API on the way out (the `fromAccountTypes` array is sent as-is, matching the service). */
+export type BuzzMultiTransactionInput = {
+  fromAccountTypes: BuzzAccountType[];
+  fromAccountId: number;
+  toAccountType?: BuzzAccountType;
+  toAccountId: number;
+  type?: number;
+  amount: number;
+  details?: Record<string, unknown> | null;
+  externalTransactionIdPrefix: string;
+  description?: string | null;
+};
+
+/** Body for `refundMultiTransaction`. */
+export type BuzzRefundMultiTransactionInput = {
+  externalTransactionIdPrefix: string;
+  description?: string;
+  details?: Record<string, unknown> | null;
+};
+
+/**
+ * Per-call overrides for a write.
+ *
+ * `timeoutMs` is opt-in and absent by default, so existing callers keep today's
+ * unbounded behaviour. A caller that holds a lock while it waits needs "this
+ * request is no longer in flight" to become true at some point; without a
+ * timeout there is no such point, and no lock TTL can be sized against it.
+ */
+export type BuzzWriteOptions = {
+  timeoutMs?: number;
+  /** Per-call retry override. `0` disables the client's internal retry entirely. */
+  retries?: number;
+  /**
+   * Which failures are worth retrying. See `isSafeToRetry`.
+   *
+   * A client-side abort does not cancel the server side, so retrying a
+   * *timeout* on a non-idempotent write puts a second request on the wire while
+   * the first may still be executing — with the same external id. A retry is
+   * right for connection-refused, where you know nothing happened; it is wrong
+   * for a timeout, where the outcome is unknown by definition.
+   *
+   * Disabling retries altogether would throw away the safe half: a rolling
+   * restart refuses connections for a few seconds, and absorbing that here costs
+   * milliseconds where a caller's own retry loop is usually far coarser.
+   */
+  shouldRetry?: (error: unknown) => boolean;
+};
+
+/**
+ * Per-call overrides for a read. Separate from `BuzzWriteOptions` rather than a widening
+ * of it: a GET is idempotent, so "retry everything" is the right default and `shouldRetry`
+ * has nothing to decide.
+ */
+export type BuzzReadOptions = {
+  timeoutMs?: number;
+  /** Per-call retry override. `0` sends the request once and rethrows. */
+  retries?: number;
+};
+
+/** Body for `refundTransaction`. */
+export type BuzzRefundTransactionInput = {
+  description?: string;
+  details?: Record<string, unknown> | null;
+};
+
+function safePredicate(predicate: (error: unknown) => boolean, error: unknown) {
+  try {
+    return predicate(error) === true;
+  } catch {
+    return false;
+  }
+}
+
+async function withRetries<T>(
+  fn: () => Promise<T>,
+  retries: number,
+  shouldRetry?: (error: unknown) => boolean
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    // Absent predicate keeps the historical behaviour: retry everything. A
+    // predicate that is present but inconclusive — returns a non-true value, or
+    // throws — must NOT retry: for a non-idempotent write, "I don't know" has to
+    // mean "don't send it again", and a throwing predicate would otherwise also
+    // replace the real failure with its own.
+    const retryable = shouldRetry ? safePredicate(shouldRetry, error) : true;
+    if (retries > 0 && retryable) return withRetries(fn, retries - 1, shouldRetry);
+    throw error;
+  }
+}
+
+/**
+ * Failures where the request provably never reached the server.
+ *
+ * An **allowlist**, deliberately. The rule is *may the server have run this?* —
+ * and a denylist of known-unsafe errors gets that backwards: every 5xx, every
+ * hang-up, and anything added later is retried by default. A 504 in particular
+ * means the *gateway* gave up, which says nothing about whether the write landed;
+ * retrying it sends a second identical write.
+ *
+ * Node's `fetch` reports a failure to connect as a `TypeError` carrying the
+ * syscall code. Those are the only cases where "nothing happened" is knowable.
+ */
+export const isSafeToRetry = (error: unknown) => {
+  const code = (error as { cause?: { code?: string } } | null)?.cause?.code;
+  return (
+    error instanceof TypeError &&
+    (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EAI_AGAIN')
+  );
+};
+
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
+
+type QueryPrimitive = string | number | boolean;
+type QueryValue = QueryPrimitive | QueryPrimitive[] | null | undefined;
+
+/** Serialize params to a query string: drops `undefined`/`null`/`''`, expands arrays into repeated
+ *  keys, and stringifies primitives. Returns `''` when nothing is set (no leading `?`). */
+function toQueryString(params: Record<string, QueryValue>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    const items = Array.isArray(value) ? value : [value];
+    for (const item of items) {
+      if (item === undefined || item === null || item === '') continue;
+      search.append(key, String(item));
+    }
+  }
+  return search.toString();
+}
+
+const withQuery = (path: string, params: Record<string, QueryValue>) => {
+  const search = toQueryString(params);
+  return search ? `${path}?${search}` : path;
+};
+
+const isoDate = (date: Date | null | undefined) => (date ? date.toISOString() : undefined);
+/** Date-only (YYYY-MM-DD, UTC) — matches the buzz report/summary endpoints. */
+const dateOnly = (date: Date | null | undefined) =>
+  date ? date.toISOString().substring(0, 10) : undefined;
+
+export type BuzzClient = ReturnType<typeof createBuzzClient>;
+
+/** Build a buzz-service client. Endpoint defaults to the package env (BUZZ_ENDPOINT),
+ *  overridable via options; resolved lazily per-request so a bare import never throws. */
+export function createBuzzClient(options: CreateBuzzClientOptions = {}) {
+  const { retries = 3, log, mapError, transactionTimeoutMs, ...envOverrides } = options;
+
+  function endpoint(): string {
+    const value = envOverrides.endpoint ?? loadBuzzEnv().endpoint;
+    if (!value) throw new Error('[@civitai/buzz] Missing BUZZ_ENDPOINT');
+    return value;
+  }
+
+  /** Low-level request. Returns parsed JSON; on a non-2xx status throws (mapped via
+   *  `mapError` when provided, else `BuzzApiError`). Retries `retries` times first.
+   *  With `opts.allow404`, a 404 resolves to `null` instead of throwing. */
+  async function request<T = unknown>(
+    urlPart: string,
+    init?: RequestInit,
+    opts?: {
+      allow404?: boolean;
+      timeoutMs?: number;
+      retries?: number;
+      shouldRetry?: (error: unknown) => boolean;
+    }
+  ): Promise<T> {
+    try {
+      return await withRetries(
+        async () => {
+          const url = `${endpoint()}${urlPart}`;
+          // Opt-in, and absent by default: existing callers keep today's unbounded
+          // behaviour exactly. A caller that needs a bound — one holding a lock, or
+          // relying on "not in flight any more" — passes its own.
+          const response = await fetch(url, {
+            ...init,
+            ...(opts?.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+          });
+          if (!response.ok) {
+            if (opts?.allow404 && response.status === 404) return null as T;
+            log?.('request failed', {
+              url,
+              status: response.status,
+              statusText: response.statusText,
+            });
+            const body =
+              response.status >= 400 && response.status < 500
+                ? await readErrorBody(response)
+                : undefined;
+            throw new BuzzApiError(response.status, response.statusText, body);
+          }
+          return (await response.json()) as T;
+        },
+        opts?.retries ?? retries,
+        opts?.shouldRetry
+      );
+    } catch (error) {
+      if (error instanceof BuzzApiError && mapError) throw mapError(error);
+      throw error;
+    }
+  }
+
+  /** Lightweight liveness check against the endpoint root. Never throws — returns
+   *  `false` on any error (incl. the `timeoutMs` abort). Bypasses retry/mapError. */
+  async function ping(timeoutMs = 1000): Promise<boolean> {
+    try {
+      const response = await fetch(endpoint(), { signal: AbortSignal.timeout(timeoutMs) });
+      return response.ok;
+    } catch (error) {
+      log?.('ping failed', error);
+      return false;
+    }
+  }
+
+  // Writes carry the configured bound; reads stay as they were. A caller holding
+  // a lock needs "this request is no longer in flight" to be true at some point,
+  // and without a timeout there is no such point for a lock TTL to be sized
+  // against.
+  function post(urlPart: string, body: unknown, opts?: BuzzWriteOptions) {
+    return request(
+      urlPart,
+      { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) },
+      {
+        timeoutMs: opts?.timeoutMs ?? transactionTimeoutMs,
+        retries: opts?.retries,
+        shouldRetry: opts?.shouldRetry,
+      }
+    );
+  }
+
+  // ---- Account reads -------------------------------------------------------
+  const getAccount = (accountId: number) => request<BuzzAccountResponse>(`/account/${accountId}`);
+
+  const getUserBuzzByAccountType = (accountId: number, accountType: BuzzAccountType) =>
+    request<BuzzAccountResponse>(`/account/${toApiType(accountType)}/${accountId}`);
+
+  const getUserAccounts = (accountId: number, accountTypes: BuzzAccountType[]) =>
+    request<Record<string, number>>(
+      `/user/${accountId}/accounts?${accountTypes
+        .map((t) => `accountType=${toApiType(t)}`)
+        .join('&')}`
+    );
+
+  const getAccountTransactions = (
+    accountId: number,
+    opts: { accountType?: BuzzAccountType; query?: GetAccountTransactionsQuery } = {}
+  ) => {
+    const q = opts.query ?? {};
+    const path = `/account/${
+      opts.accountType ? `${toApiType(opts.accountType)}/` : ''
+    }${accountId}/transactions`;
+    return request<GetAccountTransactionsResponse>(
+      withQuery(path, {
+        type: q.type,
+        cursor: isoDate(q.cursor),
+        start: isoDate(q.start),
+        end: isoDate(q.end),
+        limit: q.limit,
+        descending: q.descending,
+      })
+    );
+  };
+
+  const getUserTransactionsReport = (userId: number, query: GetTransactionsReportQuery = {}) =>
+    request<GetTransactionsReportResponse>(
+      withQuery(`/user/${userId}/transactions/report`, {
+        accountType: query.accountType ? toApiType(query.accountType) : undefined,
+        window: query.window,
+        start: dateOnly(query.start),
+        end: dateOnly(query.end),
+      })
+    );
+
+  const getAccountBalances = (query: GetAccountBalancesQuery) =>
+    request<GetAccountBalancesResponse>(
+      withQuery('/account-balances', {
+        accountId: query.accountId,
+        accountType: query.accountType.map((t) => toApiType(t)),
+      })
+    );
+
+  /** `opts` is additive and optional: callers that pass nothing keep the client's
+   *  default retry budget and the absence of a deadline they have today. */
+  const getTransactionByExternalId = (externalId: string, opts?: BuzzReadOptions) =>
+    request<BuzzTransactionResponse | null>(`/transactions/${externalId}`, undefined, {
+      allow404: true,
+      ...opts,
+    });
+
+  const getAccountSummary = (
+    accountType: BuzzAccountType,
+    opts: { accountId?: number; query?: GetAccountSummaryQuery } = {}
+  ) => {
+    const q = opts.query ?? { accountId: [] };
+    const path = `/account/${toApiType(accountType)}${
+      opts.accountId ? `/${opts.accountId}` : ''
+    }/summary`;
+    return request<GetAccountSummaryResponse>(
+      withQuery(path, {
+        descending: q.descending,
+        start: dateOnly(q.start),
+        end: dateOnly(q.end),
+        window: q.window,
+        accountId: q.accountId,
+      })
+    );
+  };
+
+  const getContributors = (
+    accountType: BuzzAccountType,
+    opts: { accountId?: number; query?: GetContributorsQuery } = {}
+  ) => {
+    const q = opts.query ?? { accountId: [] };
+    const path = `/account/${toApiType(accountType)}${
+      opts.accountId ? `/${opts.accountId}` : ''
+    }/contributors`;
+    return request<GetContributorsResponse>(
+      withQuery(path, {
+        limit: q.limit,
+        start: isoDate(q.start),
+        end: isoDate(q.end),
+        all: q.all,
+        accountId: q.accountId,
+      })
+    );
+  };
+
+  // Keeps a response generic on purpose: this endpoint's shape varies by query (a single counterparty
+  // vs movements-between-two-accounts), so a caller may assert its own view of the response.
+  const getCounterparties = <T = GetCounterpartiesResponse>(
+    accountId: number,
+    opts: { accountType?: BuzzAccountType; query?: GetCounterpartiesQuery } = {}
+  ) => {
+    const path = `/account/${
+      opts.accountType ? `${toApiType(opts.accountType)}/` : ''
+    }${accountId}/counterparties`;
+    return request<T>(
+      withQuery(path, {
+        accountId: opts.query?.accountId,
+        accountType: opts.query?.accountType ? toApiType(opts.query.accountType) : undefined,
+      })
+    );
+  };
+
+  const previewMultiTransaction = (query: PreviewMultiTransactionQuery) =>
+    request<PreviewMultiTransactionResponse>(
+      withQuery('/multi-transactions/preview', {
+        fromAccountId: query.fromAccountId,
+        amount: query.amount,
+        fromAccountTypes: query.fromAccountTypes.map((t) => toApiType(t)),
+      })
+    );
+
+  const listMultiTransactions = (query: ListMultiTransactionsQuery, opts?: BuzzReadOptions) =>
+    request<ListMultiTransactionsResponse>(
+      withQuery('/multi-transactions', {
+        externalTransactionIdPrefix: query.externalTransactionIdPrefix,
+      }),
+      undefined,
+      opts
+    );
+
+  // ---- Transaction writes --------------------------------------------------
+  const createTransaction = (transaction: BuzzTransactionInput, opts?: BuzzWriteOptions) =>
+    post('/transaction', toApiTransaction(transaction), opts) as Promise<CreateTransactionResponse>;
+
+  const createTransactions = (transactions: BuzzTransactionInput[]) =>
+    post(
+      '/transactions',
+      transactions.map((t) => toApiTransaction(t))
+    ) as Promise<CreateTransactionsResponse>;
+
+  const createMultiTransaction = (input: BuzzMultiTransactionInput, opts?: BuzzWriteOptions) =>
+    post(
+      '/multi-transactions',
+      toApiTransaction(input),
+      opts
+    ) as Promise<CreateMultiTransactionResponse>;
+
+  const refundMultiTransaction = (body: BuzzRefundMultiTransactionInput, opts?: BuzzWriteOptions) =>
+    post('/multi-transactions/refund', body, opts) as Promise<RefundMultiTransactionResponse>;
+
+  const refundTransaction = (transactionId: string, body: BuzzRefundTransactionInput = {}) =>
+    post(`/transactions/${transactionId}/refund`, body) as Promise<RefundTransactionResponse>;
+
+  return {
+    endpoint,
+    request,
+    ping,
+    getTransactionByExternalId,
+    getAccount,
+    getUserBuzzByAccountType,
+    getUserAccounts,
+    getAccountTransactions,
+    getUserTransactionsReport,
+    getAccountBalances,
+    getAccountSummary,
+    getContributors,
+    getCounterparties,
+    previewMultiTransaction,
+    listMultiTransactions,
+    createTransaction,
+    createTransactions,
+    createMultiTransaction,
+    refundMultiTransaction,
+    refundTransaction,
+  };
+}

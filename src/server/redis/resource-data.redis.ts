@@ -1,0 +1,109 @@
+import type { Availability, ModelStatus, ModelType } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+import { CacheTTL } from '~/server/common/constants';
+import { dbWrite } from '~/server/db/client';
+import { REDIS_KEYS } from '~/server/redis/client';
+import type { RecommendedSettingsSchema } from '~/server/schema/model-version.schema';
+import { createCachedArray } from '~/server/utils/cache-helpers';
+
+// eslint-disable-next-line local-rules/no-module-scope-cache -- exported and used by many callers; making it lazy is out of scope here
+export const resourceDataCache = createCachedArray({
+  key: REDIS_KEYS.GENERATION.RESOURCE_DATA,
+  cacheNotFound: false,
+  lookupFn: async (ids) => {
+    if (!ids.length) return {};
+    const dbResults = await dbWrite.$queryRaw<GenerationResourceDataModel[]>`
+      SELECT
+        mv."id",
+        mv."name",
+        mv."trainedWords",
+        mv."baseModel",
+        mv."settings",
+        mv."availability",
+        mv."clipSkip",
+        (SELECT rr."resourceId" FROM "RecommendedResource" rr
+         WHERE rr."sourceId" = mv.id
+           AND rr.settings->>'isLinkedComponent' = 'true'
+           AND rr.settings->>'componentType' = 'VAE'
+           AND EXISTS (SELECT 1 FROM "ModelFile" mf WHERE mf.id = (rr.settings->>'fileId')::int)
+         LIMIT 1) AS "vaeId",
+        mv."status",
+        mv."usageControl",
+        mv."flags",
+        mv."generatorLoaded",
+        (mv."meta"->'generationAlias'->>'versionId')::int AS "aliasId",
+        gc."covered",
+        gc."coveredNext",
+        FALSE AS "hasAccess",
+        (
+          SELECT to_json(obj)
+          FROM (
+            SELECT
+              m."id",
+              m."name",
+              m."sfwName",
+              m."type",
+              m."nsfw",
+              m."poi",
+              m."minor",
+              m."userId",
+              m."sfwOnly",
+              (SELECT u."flags" FROM "User" u WHERE u.id = m."userId") AS "userFlags"
+            FROM "Model" m
+            WHERE m.id = mv."modelId"
+          ) as obj
+        ) as model
+      FROM "ModelVersion" mv
+      LEFT JOIN "GenerationCoverage" gc ON gc."modelVersionId" = mv.id
+      WHERE mv.id IN (${Prisma.join(ids)})
+    `;
+
+    const results = dbResults.reduce<Record<number, GenerationResourceDataModel>>((acc, item) => {
+      if (['Public', 'Unsearchable'].includes(item.availability) && item.status === 'Published')
+        item.hasAccess = true;
+
+      return { ...acc, [item.id]: item };
+    }, {});
+    return results;
+  },
+  idKey: 'id',
+  // Both answers ride in the row, so a flag flip is served by the same entry instead of waiting
+  // out the TTL.
+  dontCacheFn: (data) => {
+    return !data.hasAccess || (!data.covered && !data.coveredNext);
+  },
+  ttl: CacheTTL.hour,
+});
+
+export type GenerationResourceDataModel = {
+  id: number;
+  name: string;
+  trainedWords: string[];
+  clipSkip: number | null;
+  vaeId: number | null;
+  baseModel: string;
+  settings: RecommendedSettingsSchema | null;
+  availability: Availability;
+  aliasId: number | null;
+  covered: boolean | null;
+  coveredNext: boolean | null;
+  status: ModelStatus;
+  usageControl?: string;
+  flags: number;
+  generatorLoaded: boolean;
+  hasAccess: boolean;
+  epochNumber?: number;
+  model: {
+    id: number;
+    name: string;
+    /** The .com title; resolved per viewer in `getResourceData` and never sent on. */
+    sfwName?: string | null;
+    type: ModelType;
+    nsfw: boolean;
+    poi: boolean;
+    userId: number;
+    minor?: boolean;
+    sfwOnly?: boolean;
+    userFlags?: number | null;
+  };
+};

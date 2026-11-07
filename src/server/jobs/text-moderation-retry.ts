@@ -1,0 +1,193 @@
+import { dbRead, dbWrite } from '~/server/db/client';
+import { createJob } from '~/server/jobs/job';
+import { logToAxiom } from '~/server/logging/client';
+import { getModerationAdapter } from '~/server/services/moderation-adapters';
+import {
+  TEXT_SCAN_ENTITY_GONE,
+  TEXT_SCAN_ENTITY_NOT_PUBLIC,
+} from '~/server/services/text-scan/route';
+import { limitConcurrency } from '~/server/utils/concurrency-helpers';
+import { EntityModerationStatus } from '~/shared/utils/prisma/enums';
+import { decreaseDate } from '~/utils/date-helpers';
+
+const TEXT_MODERATION_RETRY_DELAY_MINUTES = 60; // 1 hour for terminal failures
+const TEXT_MODERATION_PENDING_TIMEOUT_MINUTES = 30; // 30 min for stuck Pending rows
+const TEXT_MODERATION_RETRY_LIMIT = 9;
+const FETCH_LIMIT = 500; // max rows pulled per job tick
+const SUBMIT_CONCURRENCY = 5; // parallel orchestrator submissions
+
+export const retryFailedTextModeration = createJob(
+  'retry-failed-text-moderation',
+  '*/15 * * * *',
+  async () => {
+    const now = new Date();
+    const retryBefore = decreaseDate(now, TEXT_MODERATION_RETRY_DELAY_MINUTES, 'minutes');
+    const pendingTimeoutBefore = decreaseDate(
+      now,
+      TEXT_MODERATION_PENDING_TIMEOUT_MINUTES,
+      'minutes'
+    );
+
+    const rows = await dbRead.entityModeration.findMany({
+      where: {
+        retryCount: { lt: TEXT_MODERATION_RETRY_LIMIT },
+        OR: [
+          {
+            status: {
+              in: [
+                EntityModerationStatus.Failed,
+                EntityModerationStatus.Expired,
+                EntityModerationStatus.Canceled,
+              ],
+            },
+            updatedAt: { lte: retryBefore },
+          },
+          {
+            // Pending rows whose callback never arrived (stuck in flight)
+            status: EntityModerationStatus.Pending,
+            updatedAt: { lte: pendingTimeoutBefore },
+          },
+        ],
+      },
+      select: { id: true, entityType: true, entityId: true, status: true },
+      orderBy: { updatedAt: 'asc' },
+      take: FETCH_LIMIT,
+    });
+
+    if (!rows.length)
+      return { processed: 0, retried: 0, missing: 0, notPublic: 0, errors: 0, skipped: 0 };
+
+    // Group by entityType so we can bulk-fetch content per type
+    const byType = new Map<
+      string,
+      { id: number; entityId: number; status: EntityModerationStatus }[]
+    >();
+    for (const row of rows) {
+      const list = byType.get(row.entityType) ?? [];
+      list.push({ id: row.id, entityId: row.entityId, status: row.status });
+      byType.set(row.entityType, list);
+    }
+
+    // Drop rows whose adapter is currently dark, BEFORE anything is spent on them. A
+    // declined submit looks exactly like a failed one, so leaving them in would burn
+    // their retry budget against a feature that never ran and then exclude them from
+    // the selection permanently — including after the flag comes back on.
+    let skipped = 0;
+    for (const [entityType, items] of byType) {
+      const isEnabled = getModerationAdapter(entityType)?.isEnabled;
+      if (!isEnabled) continue;
+
+      const active: typeof items = [];
+      for (const item of items) {
+        if (await isEnabled({ entityId: item.entityId })) active.push(item);
+        else skipped++;
+      }
+
+      if (active.length) byType.set(entityType, active);
+      else byType.delete(entityType);
+    }
+
+    // Pre-increment retryCount on Pending-timeout rows. Terminal-failure rows
+    // (Failed/Expired/Canceled) had their retryCount bumped by
+    // `recordEntityModerationFailure` when the callback arrived, so they
+    // already count against the cap. Pending-timeout rows never received a
+    // callback, so without this bump they would retry indefinitely.
+    const pendingIds = [...byType.values()]
+      .flat()
+      .filter((r) => r.status === EntityModerationStatus.Pending)
+      .map((r) => r.id);
+    if (pendingIds.length) {
+      await dbWrite.entityModeration.updateMany({
+        where: { id: { in: pendingIds } },
+        data: { retryCount: { increment: 1 } },
+      });
+    }
+
+    let retried = 0;
+    let missing = 0;
+    let notPublic = 0;
+    let errors = 0;
+    const missingRowIds: number[] = [];
+    const notPublicRowIds: number[] = [];
+
+    for (const [entityType, items] of byType) {
+      const adapter = getModerationAdapter(entityType);
+      if (!adapter) {
+        // Unknown entityType — likely a row left over after an entity was
+        // removed from the adapter registry. Log loudly and skip.
+        errors += items.length;
+        await logToAxiom({
+          name: 'retry-failed-text-moderation',
+          type: 'error',
+          message: `no moderation adapter registered for entityType: ${entityType}`,
+          entityType,
+          count: items.length,
+        });
+        continue;
+      }
+
+      let contentMap: Map<number, string>;
+      try {
+        contentMap = await adapter.resolveContent(items.map((x) => x.entityId));
+      } catch (error) {
+        errors += items.length;
+        await logToAxiom({
+          name: 'retry-failed-text-moderation',
+          type: 'error',
+          message: `Bulk content resolve failed: ${(error as Error).message}`,
+          entityType,
+          count: items.length,
+        });
+        continue;
+      }
+
+      const submissions = items.map((item) => async () => {
+        const content = contentMap.get(item.entityId);
+        if (content == null) {
+          // Resolver omitted this entity: it is gone, or (for wildcards) the
+          // category is now empty. The EntityModeration row points at nothing.
+          missingRowIds.push(item.id);
+          missing++;
+          return;
+        }
+
+        try {
+          const workflow = await adapter.submit({ entityId: item.entityId, content });
+          if (workflow === TEXT_SCAN_ENTITY_GONE) {
+            missingRowIds.push(item.id);
+            missing++;
+          } else if (workflow === TEXT_SCAN_ENTITY_NOT_PUBLIC) {
+            notPublicRowIds.push(item.id);
+            notPublic++;
+          } else if (workflow?.id) retried++;
+          else errors++;
+        } catch (error) {
+          errors++;
+          await logToAxiom({
+            name: 'retry-failed-text-moderation',
+            type: 'error',
+            message: (error as Error).message,
+            entityType,
+            entityId: item.entityId,
+          });
+        }
+      });
+
+      await limitConcurrency(submissions, SUBMIT_CONCURRENCY);
+    }
+
+    if (missingRowIds.length) {
+      await dbWrite.entityModeration.deleteMany({ where: { id: { in: missingRowIds } } });
+    }
+    // Kept, not deleted: a rating floor reads the stored verdict whatever the row's status. Failed,
+    // not Pending, so the publish rescan is not deduped as already in flight; it re-arms the row.
+    if (notPublicRowIds.length) {
+      await dbWrite.entityModeration.updateMany({
+        where: { id: { in: notPublicRowIds } },
+        data: { retryCount: TEXT_MODERATION_RETRY_LIMIT, status: EntityModerationStatus.Failed },
+      });
+    }
+
+    return { processed: rows.length, retried, missing, notPublic, errors, skipped };
+  }
+);

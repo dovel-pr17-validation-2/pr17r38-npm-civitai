@@ -1,0 +1,101 @@
+import { useRouter } from 'next/router';
+import { CsamImageSelection } from '~/components/Csam/CsamImageSelection';
+import React, { useMemo, useRef } from 'react';
+import { parseLinkedImageIds } from '~/components/Csam/csam-linked-image-ids';
+import { CsamDetailsForm } from '~/components/Csam/CsamDetailsForm';
+import { CsamProvider } from '~/components/Csam/CsamProvider';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { NotFound } from '~/components/AppLayout/NotFound';
+import * as z from 'zod';
+import { Text, Card, Badge, Group } from '@mantine/core';
+import { useStepper } from '~/hooks/useStepper';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+import { trpc } from '~/utils/trpc';
+import { PageLoader } from '~/components/PageLoader/PageLoader';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
+import { Page } from '~/components/AppLayout/Page';
+
+function ReportCsamUserPage() {
+  const router = useRouter();
+  const userIds = z.coerce
+    .number()
+    .array()
+    .parse(((router.query.userId as string) ?? '').split(','));
+  const userCountRef = useRef(userIds.length);
+
+  const features = useFeatureFlags();
+  const userId = userIds[0];
+  const { imageId: imageIdParam, imageIds: imageIdsParam } = router.query;
+  const supplementalOf = z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .catch(undefined)
+    .parse(router.query.supplementalOf);
+  const imageIds = useMemo(
+    () => parseLinkedImageIds({ imageId: imageIdParam, imageIds: imageIdsParam }),
+    [imageIdParam, imageIdsParam]
+  );
+
+  const handleStepperComplete = () => {
+    if (userIds.length > 1) {
+      router.replace(`/moderator/csam/${userIds.filter((id) => id !== userId).join(',')}`);
+      stepperActions.reset();
+    } else {
+      router.replace('/moderator/csam');
+    }
+  };
+
+  const { data: user } = trpc.user.getById.useQuery({ id: userId });
+  const [currentStep, stepperActions] = useStepper(2);
+
+  if (!features.csamReports) return <NotFound />;
+  if (!user) return <PageLoader />;
+
+  const progress = userCountRef.current - userIds.length;
+
+  return (
+    <CsamProvider user={user} type="Image">
+      {userCountRef.current > 1 && (
+        <Card py={4}>
+          <Group justify="center">
+            <Badge>
+              Reporting: {progress + 1} / {userCountRef.current}
+            </Badge>
+            {user.username && (
+              <Text size="xs" align="center">
+                User:{' '}
+                <Text component={Link} c="blue.4" href={`/user/${user.username}`}>
+                  {user.username}
+                </Text>
+              </Text>
+            )}
+          </Group>
+        </Card>
+      )}
+      {currentStep === 1 && (
+        <CsamImageSelection
+          onNext={stepperActions.goToNextStep}
+          onMissing={handleStepperComplete}
+          imageIds={imageIds}
+        />
+      )}
+      {currentStep === 2 && (
+        <CsamDetailsForm
+          onPrevious={stepperActions.goToPrevStep}
+          onSuccess={handleStepperComplete}
+          userId={user.id}
+          type="Image"
+          supplementalOf={supplementalOf}
+        />
+      )}
+    </CsamProvider>
+  );
+}
+
+export const getServerSideProps = createServerSideProps({ requireModerator: true });
+
+export default Page(ReportCsamUserPage, {
+  footer: null,
+});

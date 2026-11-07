@@ -1,0 +1,193 @@
+import { Box, Center, Group, Loader, Paper, Stack, Text, UnstyledButton } from '@mantine/core';
+import { useState } from 'react';
+import { useBrowsingLevelDebounced } from '~/components/BrowsingLevel/BrowsingLevelProvider';
+import { CreatorCardV2 } from '~/components/CreatorCard/CreatorCard';
+import { EdgeMedia } from '~/components/EdgeMedia/EdgeMedia';
+import { PreviewCard } from '~/components/Modals/CardDecorationModal';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import type {
+  ContentDecorationCosmetic,
+  StickerCosmetic,
+} from '~/server/selectors/cosmetic.selector';
+import { CosmeticType } from '~/shared/utils/prisma/enums';
+import type { CosmeticGetById } from '~/types/router';
+import { trpc } from '~/utils/trpc';
+
+/**
+ * Live preview of a cosmetic (badge / nameplate / profile decoration / content
+ * decoration). Pure client component — extracted out of the
+ * `pages/moderator/cosmetic-store/cosmetics` page so client consumers (e.g.
+ * `CosmeticShopItemPreviewModal`) can render it WITHOUT importing the page
+ * module, whose `getServerSideProps` transitively pulls the tRPC appRouter (and
+ * thus server-only natives like `sharp`) into the client/test bundle.
+ */
+export const CosmeticPreview = ({
+  cosmetic,
+  hideHeader,
+}: {
+  cosmetic: Pick<CosmeticGetById, 'id' | 'data' | 'type' | 'name' | 'source' | 'description'>;
+  // Callers that supply their own heading (e.g. the review queue) hide the
+  // built-in centered "Preview" label to avoid a duplicate header.
+  hideHeader?: boolean;
+}) => {
+  const isProfileRelated =
+    cosmetic.type === CosmeticType.Badge ||
+    cosmetic.type === CosmeticType.NamePlate ||
+    cosmetic.type === CosmeticType.ProfileBackground ||
+    cosmetic.type === CosmeticType.ProfileDecoration ||
+    cosmetic.type === CosmeticType.CardDecoration;
+
+  const currentUser = useCurrentUser();
+  const { data: user } = trpc.userProfile.get.useQuery(
+    { username: currentUser ? currentUser.username : '' },
+    { enabled: !!currentUser?.username && isProfileRelated }
+  );
+  const browsingLevel = useBrowsingLevelDebounced();
+  const { data: images = [] } = trpc.cosmeticShop.getPreviewImages.useQuery(
+    {
+      browsingLevel: browsingLevel,
+    },
+    {
+      enabled: !!currentUser && cosmetic.type === CosmeticType.ContentDecoration,
+    }
+  );
+  const [activeImageIndex, setActiveImageIndex] = useState(0);
+
+  if ((!user && isProfileRelated) || (!images && !isProfileRelated)) {
+    return (
+      <Center>
+        <Loader />
+      </Center>
+    );
+  }
+
+  const userWithEquippedCosmetics = user
+    ? {
+        ...user,
+        cosmetics: user?.cosmetics?.filter((c) => !!c.equippedAt) ?? [],
+      }
+    : undefined;
+
+  const descriptionBox = cosmetic.description?.trim() ? (
+    <Paper withBorder radius="md" p="sm" w="100%" maw={450} mx="auto">
+      <Text size="sm" style={{ whiteSpace: 'pre-wrap' }}>
+        {cosmetic.description}
+      </Text>
+    </Paper>
+  ) : null;
+
+  switch (cosmetic.type) {
+    case CosmeticType.Badge:
+    case CosmeticType.ProfileDecoration:
+    case CosmeticType.NamePlate:
+    case CosmeticType.ProfileBackground:
+    case CosmeticType.CardDecoration:
+      if (!userWithEquippedCosmetics) {
+        return null;
+      }
+
+      return (
+        <Stack gap="xl" align="center">
+          {!hideHeader && (
+            <Text fw="bold" align="center">
+              Preview
+            </Text>
+          )}
+          {/* Cap the card at the profile width (450px) so profile backgrounds
+              fill it, matching how the card renders on profiles. */}
+          <CreatorCardV2
+            user={userWithEquippedCosmetics}
+            cosmeticOverwrites={[cosmetic]}
+            style={{ width: '100%', maxWidth: 450 }}
+          />
+          {descriptionBox}
+        </Stack>
+      );
+    case CosmeticType.Sticker: {
+      const stickerData = cosmetic.data as StickerCosmetic['data'];
+      if (!stickerData.url) return null;
+
+      return (
+        <Stack gap="xl" align="center">
+          {!hideHeader && (
+            <Text fw="bold" align="center">
+              Preview
+            </Text>
+          )}
+          <Group gap="lg" align="flex-end">
+            {[24, 48, 96].map((size) => (
+              <EdgeMedia
+                key={size}
+                src={stickerData.url}
+                alt={stickerData.slug ? `:${stickerData.slug}:` : cosmetic.name}
+                width={size}
+                anim={stickerData.animated}
+                optimized
+                style={{ width: size, height: size, objectFit: 'contain' }}
+              />
+            ))}
+          </Group>
+          {stickerData.slug && (
+            <Text size="sm" c="dimmed">
+              Type <b>:{stickerData.slug}:</b> to use it
+            </Text>
+          )}
+          {descriptionBox}
+        </Stack>
+      );
+    }
+    case CosmeticType.ContentDecoration:
+      if (!images.length) {
+        return null;
+      }
+
+      return (
+        <Stack>
+          <Stack gap="xl">
+            {!hideHeader && (
+              <Text fw="bold" align="center">
+                Preview
+              </Text>
+            )}
+            <Text size="sm" c="dimmed" align="center">
+              You can apply this cosmetic to any image, model, article or post you own.
+            </Text>
+          </Stack>
+          <Box mx="auto">
+            <PreviewCard
+              decoration={cosmetic as ContentDecorationCosmetic}
+              image={images[activeImageIndex]}
+            />
+          </Box>
+          <Group gap="xs" justify="center">
+            {images.map((image, index) => {
+              const isSelected = index === activeImageIndex;
+              return (
+                <UnstyledButton
+                  key={image.id}
+                  onClick={() => setActiveImageIndex(index)}
+                  style={{
+                    opacity: isSelected ? 1 : 0.5,
+                    width: 40,
+                    height: 50,
+                    borderRadius: 5,
+                    overflow: 'hidden',
+                  }}
+                >
+                  <EdgeMedia
+                    style={{ objectFit: 'cover', width: '100%', height: '100%' }}
+                    src={image.url}
+                    width={100}
+                    optimized
+                  />
+                </UnstyledButton>
+              );
+            })}
+          </Group>
+          {descriptionBox}
+        </Stack>
+      );
+    default:
+      return null;
+  }
+};

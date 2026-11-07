@@ -1,0 +1,348 @@
+import { useRouter } from 'next/router';
+import Script from 'next/script';
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import { create } from 'zustand';
+import { adUnitsLoaded } from '~/components/Ads/ads.utils';
+import { useThirdPartyConsent } from '~/components/Consent/consent.context';
+import { detectPrivacyUi } from '~/components/Consent/privacy-ui';
+import { IsClient } from '~/components/IsClient/IsClient';
+import { useSignalContext } from '~/components/Signals/SignalsProvider';
+import { env } from '~/env/client';
+import { outwardTrafficAllowed } from '~/env/local-origin';
+import { isDev } from '~/env/other';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useIsomorphicLayoutEffect } from '~/hooks/useIsomorphicLayoutEffect';
+import { useBrowsingSettings } from '~/providers/BrowserSettingsProvider';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { isBraveBrowser } from '~/utils/device-helpers';
+
+declare global {
+  interface Window {
+    __tcfapi: (...args: any[]) => void;
+    googletag: any;
+    adngin: any;
+  }
+}
+
+const adEngineLoaders = {
+  production: 'https://cdn.snigelweb.com/adengine/civitai.com/loader.js',
+  staging: 'https://staging-cdn.snigelweb.com/adengine/civitai.com/loader.js',
+};
+
+type AdEngine = keyof typeof adEngineLoaders;
+
+export const AD_ENGINE_PARAM = 'adengine';
+const AD_ENGINE_SESSION_KEY = 'civitai:adengine';
+
+/** Sticky for the tab, so the switch survives navigation and full reloads without re-appending the
+ *  param. `?adengine=production` clears it; the loader installs a global, so this is read once per
+ *  page load rather than tracked per-route — a second loader would fight the first. */
+function resolveAdEngine(): AdEngine {
+  if (typeof window === 'undefined') return 'production';
+  const requested = new URLSearchParams(window.location.search).get(AD_ENGINE_PARAM);
+  const engine: AdEngine | null =
+    requested === 'staging' || requested === 'production' ? requested : null;
+  try {
+    if (engine) sessionStorage.setItem(AD_ENGINE_SESSION_KEY, engine);
+    return (engine ?? sessionStorage.getItem(AD_ENGINE_SESSION_KEY)) === 'staging'
+      ? 'staging'
+      : 'production';
+  } catch {
+    return engine ?? 'production';
+  }
+}
+
+const AdsContext = createContext<{
+  ready: boolean;
+  consent: boolean;
+  adsBlocked?: boolean;
+  adsEnabled: boolean;
+  useDirectAds: boolean;
+  adEngine: AdEngine;
+  username?: string;
+  isMember: boolean;
+} | null>(null);
+
+export function useAdsContext() {
+  const context = useContext(AdsContext);
+  if (!context) throw new Error('missing AdsProvider');
+  return context;
+}
+
+const useAdProviderStore = create<{
+  ready: boolean;
+  adsBlocked?: boolean;
+  consent: boolean;
+  browserBlocked: boolean;
+  gateBlocked: boolean;
+  pageNsfwLevel?: number;
+}>(() => ({
+  ready: false,
+  // Tri-state: undefined = detection pending, false = confirmed serving (loader onLoad / direct-ad
+  // probe success), true = confirmed blocked (onError / probe failure). We can't know ads are
+  // blocked without attempting to load them, so while pending we render the empty reserved ad slot
+  // and hold the SupportUs fallback until a block is actually confirmed. Defaulting to true showed
+  // the fallback during the pending window — a flash for the ~95% of users who aren't blocked.
+  adsBlocked: undefined,
+  consent: true,
+  browserBlocked: false,
+  gateBlocked: false,
+}));
+
+/** Covers client-side navigation; SSR uses the `gated` prop, which lands before first paint. */
+export function useAdGate(blocked: boolean) {
+  useIsomorphicLayoutEffect(() => {
+    if (!blocked) return;
+    useAdProviderStore.setState({ gateBlocked: true });
+    return () => useAdProviderStore.setState({ gateBlocked: false });
+  }, [blocked]);
+}
+
+/**
+ * The rating of the content a page shows, sent with direct ad requests alongside the viewer's
+ * browsing level (the ad server combines the two). Set by `Gated`; a store rather than context
+ * because the adhesive footer renders outside the page tree. Layout effect, so it lands before
+ * any ad unit's first request.
+ */
+export function useSetAdPageNsfwLevel(nsfwLevel: number) {
+  useIsomorphicLayoutEffect(() => {
+    if (!nsfwLevel) return;
+    useAdProviderStore.setState({ pageNsfwLevel: nsfwLevel });
+    return () => useAdProviderStore.setState({ pageNsfwLevel: undefined });
+  }, [nsfwLevel]);
+}
+
+export function useAdPageNsfwLevel() {
+  return useAdProviderStore((state) => state.pageNsfwLevel);
+}
+
+const blockedUrls: string[] = [
+  '/collections/6503138',
+  '/collections/7514194',
+  '/collections/7514211',
+  '/moderator',
+];
+
+export function AdsProvider({
+  children,
+  gated = false,
+}: {
+  children: React.ReactNode;
+  /** From `pageProps`. `Gated` mounts below this provider, so waiting for its effect would
+   *  server-render an ad slot and flash it before hydration. */
+  gated?: boolean;
+}) {
+  const router = useRouter();
+  const ready = useAdProviderStore((state) => state.ready);
+  const adsBlocked = useAdProviderStore((state) => state.adsBlocked);
+  const consent = useAdProviderStore((state) => state.consent);
+  const browserBlocked = useAdProviderStore((state) => state.browserBlocked);
+  const gateBlocked = useAdProviderStore((state) => state.gateBlocked);
+  const currentUser = useCurrentUser();
+  const features = useFeatureFlags();
+  const { allowed: consentAllowed } = useThirdPartyConsent();
+  const [adEngine] = useState(resolveAdEngine);
+
+  // derived value from browsingMode and nsfwOverride
+  const isMember = currentUser?.isMember ?? false;
+  const allowAds = useBrowsingSettings((x) => x.allowAds);
+  // .com (isGreen) → Snigel programmatic ads. .red (isRed) → CivitaiAdUnit direct ads only.
+  // adsEnabled is domain-agnostic; useDirectAds chooses which ad system to render.
+  const useDirectAds = features.isRed;
+  // Some browsers (e.g. Brave) cosmetic-filter our ad elements even when the
+  // Snigel loader succeeds, so `onError` never fires and we can't rely on
+  // `adsBlocked` alone. Disable ads entirely when the browser is known to
+  // silently block — no Snigel script, no interleaved slots.
+  // Also gated on CIPA consent: in regions where consent is required, the Snigel
+  // loader (and the prebid/ad-tech cascade behind it) cannot fire until accepted.
+  const adsEnabled = isDev
+    ? false
+    : outwardTrafficAllowed(env.NEXT_PUBLIC_CIVITAI_LINK, env.NEXT_PUBLIC_LOCAL_ADS_ENABLED) &&
+      !browserBlocked &&
+      consentAllowed &&
+      (allowAds || !isMember) &&
+      !blockedUrls.some((url) => router.asPath.includes(url)) &&
+      !router.asPath.split('?')[0].endsWith('/edit');
+
+  function handleLoadedError() {
+    useAdProviderStore.setState({ adsBlocked: true });
+  }
+
+  function handleLoaded() {
+    useAdProviderStore.setState({ adsBlocked: false });
+  }
+
+  // For direct ads (.red), probe the ad server to detect adblockers.
+  // Snigel's onLoad/onError callbacks don't fire since the script isn't loaded.
+  useEffect(() => {
+    if (!useDirectAds || !adsEnabled) return;
+    const url = isDev ? 'http://localhost:5173' : 'https://advertising.civitai.com';
+    fetch(`${url}/api/v1/serve?placement=probe&name=footer&container=1531&browsingLevel=1`, {
+      credentials: 'include',
+    })
+      .then(() => useAdProviderStore.setState({ adsBlocked: false }))
+      .catch(() => useAdProviderStore.setState({ adsBlocked: true }));
+  }, [useDirectAds, adsEnabled]);
+
+  useEffect(() => {
+    // Shared with the web-push failure message — see `isBraveBrowser`. This used to open-code the
+    // same detection with no rejection handling, which left an unhandled rejection on any Brave
+    // build whose `isBrave()` rejects.
+    isBraveBrowser().then((isBrave) => {
+      if (isBrave) useAdProviderStore.setState({ browserBlocked: true });
+    });
+  }, []);
+
+  useEffect(() => {
+    function callback() {
+      // check for cmp consent
+      window.__tcfapi('addEventListener', 2, function (tcData: any, success: boolean) {
+        if (['tcloaded', 'useractioncomplete'].includes(tcData.eventStatus)) {
+          window.__tcfapi('removeEventListener', 2, null, tcData.listenerId);
+          // AdConsent finished asking for consent, do something that is dependend on user consent ...
+          if (!success) useAdProviderStore.setState({ consent: false });
+          else useAdProviderStore.setState({ ready: true });
+        }
+      });
+
+      window.googletag.cmd.push(function () {
+        window.googletag.pubads().addEventListener('impressionViewable', function (event: any) {
+          const slot = event.slot;
+          const adUnit = slot.getAdUnitPath()?.split('/')?.reverse()?.[0];
+          if (adUnit) dispatchEvent(new CustomEvent('civitai-ad-impression', { detail: adUnit }));
+        });
+      });
+    }
+
+    window.addEventListener('adnginLoaderReady', callback);
+    return () => {
+      window.removeEventListener('adnginLoaderReady', callback);
+    };
+  }, []);
+
+  return (
+    <AdsContext.Provider
+      value={{
+        ready,
+        adsBlocked,
+        consent,
+        // Gated here rather than on the local `adsEnabled` so the Snigel loader still mounts
+        // (it's inert without a slot, and it drives the CMP handshake that sets `ready`), and
+        // so the adhesive footer — rendered outside the page tree — is covered too.
+        adsEnabled: adsEnabled && !((gated || gateBlocked) && !useDirectAds),
+        useDirectAds,
+        adEngine,
+        username: currentUser?.username,
+        isMember,
+      }}
+    >
+      {children}
+      {adsEnabled && !useDirectAds && isDev && (
+        <Script
+          id="snigel-ads-domain-spoof"
+          data-cfasync="false"
+          type="text/javascript"
+          dangerouslySetInnerHTML={{
+            __html: `
+                // Spoofing domain to 'civitai.com' --> ONLY FOR TESTING PURPOSES.
+                // This is required when the test environment domain differs from the production domain.
+                window.addEventListener("adnginLoaderReady", function () {
+                  adngin.queue.push(function () {
+                    googletag.cmd.push(function () {
+                      googletag.pubads().set("page_url", "civitai.com");
+                    });
+                  });
+                });
+              `,
+          }}
+        />
+      )}
+      {adsEnabled && !useDirectAds && (
+        <Script
+          id="snigel-config"
+          data-cfasync="false"
+          type="text/javascript"
+          dangerouslySetInnerHTML={{
+            __html: `
+
+                window.snigelPubConf = {
+                  "adengine": {
+                    "activeAdUnits": ["incontent_1", "outstream", "side_1", "side_2", "side_3", "top", "adhesive"]
+                  }
+                }
+              `,
+          }}
+        />
+      )}
+      {adsEnabled && !useDirectAds && (
+        <Script
+          defer
+          src={adEngineLoaders[adEngine]}
+          onError={handleLoadedError}
+          onLoad={handleLoaded}
+        />
+      )}
+      {/* Client-gated: the engine is resolved from sessionStorage, which SSR can't see. */}
+      <IsClient>
+        {adEngine === 'staging' && (
+          <div className="pointer-events-none fixed bottom-2 left-2 z-50 rounded bg-red-6 px-2 py-1 text-xs font-bold uppercase text-white">
+            Snigel staging ad engine
+          </div>
+        )}
+      </IsClient>
+      {/* Cleanup old ad tags */}
+      {adsEnabled && !useDirectAds && (
+        <Script
+          id="ad-cleanup"
+          type="text/javascript"
+          dangerouslySetInnerHTML={{
+            __html: `
+                // GPT
+                window.googletag = window.googletag || {cmd: []};
+                googletag.cmd.push(function() {
+                  googletag.pubads().disableInitialLoad();
+                  googletag.pubads().enableSingleRequest();
+                  googletag.enableServices();
+                });
+
+                // adsense
+                (window.adsbygoogle = window.adsbygoogle || []).pauseAdRequests = 1
+              `,
+          }}
+        />
+      )}
+      {adsEnabled && !useDirectAds && <ImpressionTracker />}
+      {adsEnabled && !useDirectAds && <PrivacyUiDetector />}
+    </AdsContext.Provider>
+  );
+}
+
+function PrivacyUiDetector() {
+  useEffect(() => detectPrivacyUi(), []);
+  return null;
+}
+
+function ImpressionTracker() {
+  const currentUser = useCurrentUser();
+  const { worker } = useSignalContext();
+
+  useEffect(() => {
+    const listener = ((e: CustomEvent) => {
+      const adUnit = e.detail;
+      adUnitsLoaded[adUnit] = true;
+      if (worker && currentUser) {
+        worker.send('recordAdImpression', {
+          userId: currentUser.id,
+          adId: adUnit,
+        });
+      }
+    }) as EventListener;
+
+    window.addEventListener('civitai-ad-impression', listener);
+    return () => {
+      window.removeEventListener('civitai-ad-impression', listener);
+    };
+  }, [worker, currentUser]);
+
+  return null;
+}

@@ -1,0 +1,661 @@
+import {
+  Alert,
+  Anchor,
+  Box,
+  Button,
+  Card,
+  Center,
+  Container,
+  Grid,
+  Group,
+  Loader,
+  Paper,
+  Stack,
+  Text,
+  ThemeIcon,
+  Title,
+} from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import {
+  IconGift,
+  IconInfoCircle,
+  IconInfoTriangleFilled,
+  IconRotateClockwise,
+  IconExternalLink,
+} from '@tabler/icons-react';
+import { capitalize } from 'lodash-es';
+import { useRouter } from 'next/router';
+import { useEffect, useRef } from 'react';
+import * as z from 'zod';
+import { AlertWithIcon } from '~/components/AlertWithIcon/AlertWithIcon';
+import { BuzzEnvironmentAlert } from '~/components/Buzz/BuzzEnvironmentAlert';
+import { EdgeMedia } from '~/components/EdgeMedia/EdgeMedia';
+import { Meta } from '~/components/Meta/Meta';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
+import { useMutatePaddle, useSubscriptionManagementUrls } from '~/components/Paddle/util';
+import { usePaymentProvider } from '~/components/Payments/usePaymentProvider';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { StripeManageSubscriptionButton } from '~/components/Stripe/ManageSubscriptionButton';
+import { useActiveSubscription, useCanUpgrade } from '~/components/Stripe/memberships.util';
+import { shortenPlanInterval } from '~/components/Stripe/stripe.utils';
+import { SubscribeButton } from '~/components/Stripe/SubscribeButton';
+import { MembershipGiftsCard } from '~/components/Account/MembershipGiftsCard';
+import { CancelMembershipAction } from '~/components/Subscriptions/CancelMembershipAction';
+import { PlanBenefitList } from '~/components/Subscriptions/PlanBenefitList';
+import { BuzzMembershipCallout } from '~/components/Subscriptions/BuzzMembershipCallout';
+import { PrepaidTokenOverview } from '~/components/Subscriptions/PrepaidTokenOverview';
+import { ReferralCallout } from '~/components/Referrals/ReferralCallout';
+import { PurchasedCodesCard } from '~/components/Account/PurchasedCodesCard';
+import { PrepaidTimelineProgress } from '~/components/Subscriptions/PrepaidTimelineProgress';
+import { getPlanDetails } from '~/components/Subscriptions/getPlanDetails';
+import { useBuzzCurrencyConfig } from '~/components/Currency/useCurrencyConfig';
+import { useAvailableBuzz } from '~/components/Buzz/useAvailableBuzz';
+import { useServerDomains } from '~/providers/AppProvider';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import type {
+  SubscriptionProductMetadata,
+  SubscriptionMetadata,
+} from '~/server/schema/subscriptions.schema';
+import { getPrepaidTokens, getNextTokenUnlockDate } from '~/shared/utils/subscription-tokens';
+import { userTierSchema } from '~/server/schema/user.schema';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+import { dbRead } from '~/server/db/client';
+import { holdsOpenMembershipGift } from '~/server/services/membership-gift.service';
+import {
+  BUZZ_MEMBERSHIP_SUBSCRIPTION_TYPE,
+  getBuzzMembershipPrice,
+  getSubscriptionDisplayBuzzType,
+} from '~/shared/utils/buzz-membership';
+import { PaymentProvider } from '~/shared/utils/prisma/enums';
+import { numberWithCommas } from '~/utils/number-helpers';
+import { getLoginLink } from '~/utils/login-helpers';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
+import { getStripeCurrencyDisplay } from '~/utils/string-helpers';
+import { useSyncAccount } from '~/hooks/useSyncAccount';
+import { trpc } from '~/utils/trpc';
+import { booleanString } from '~/utils/zod-helpers';
+import styles from './membership.module.scss';
+
+export const getServerSideProps = createServerSideProps({
+  useSession: true,
+  resolver: async ({ session, ctx, features }) => {
+    if (!session || !session.user)
+      return {
+        redirect: {
+          destination: getLoginLink({ returnUrl: ctx.resolvedUrl }),
+          permanent: false,
+        },
+      };
+
+    // Allow users with subscriptionId OR users in memberInBadState to access the page
+    // Users in bad state need to be able to manage/cancel their subscription
+    if (!session.user.subscriptionId && !session.user.memberInBadState && !session.user.tier) {
+      // A Buzz-purchased membership sets none of those session fields, so this gate used to
+      // bounce those users to /pricing with no way to see what they'd bought.
+      const buzzMembership = await dbRead.customerSubscription.findFirst({
+        where: { userId: session.user.id, buzzType: BUZZ_MEMBERSHIP_SUBSCRIPTION_TYPE },
+        select: { id: true },
+      });
+      // A gifted membership starts from this page, so its holder has to be able to reach it.
+      const holdsGift =
+        !buzzMembership &&
+        !!features?.giftMemberships &&
+        (await holdsOpenMembershipGift({ userId: session.user.id }));
+
+      if (!buzzMembership && !holdsGift)
+        return {
+          redirect: {
+            destination: '/pricing',
+            permanent: false,
+          },
+        };
+    }
+  },
+});
+
+const querySchema = z.object({
+  tier: userTierSchema.optional(),
+  updated: booleanString().optional(),
+  downgraded: booleanString().optional(),
+  flow: z.enum(['keep-membership']).optional(),
+});
+
+export default function UserMembership() {
+  const [activeBuzzType] = useAvailableBuzz();
+  const { subscription, subscriptionLoading, subscriptionPaymentProvider, isFreeTier } =
+    useActiveSubscription({
+      checkWhenInBadState: true,
+      buzzType: activeBuzzType,
+      includeBuzzPurchase: true,
+    });
+
+  // Check for subscriptions in other buzz types
+  const otherBuzzType = activeBuzzType === 'green' ? 'yellow' : 'green';
+  const { subscription: otherSubscription, subscriptionLoading: otherSubscriptionLoading } =
+    useActiveSubscription({
+      checkWhenInBadState: true,
+      buzzType: otherBuzzType,
+    });
+
+  const isPaddle = subscriptionPaymentProvider === PaymentProvider.Paddle;
+  const isStripe = subscriptionPaymentProvider === PaymentProvider.Stripe;
+
+  const { managementUrls } = useSubscriptionManagementUrls({
+    enabled: isPaddle,
+  });
+
+  const currentUser = useCurrentUser();
+  const paymentProvider = usePaymentProvider();
+  const features = useFeatureFlags();
+  const serverDomains = useServerDomains();
+  const syncAccount = useSyncAccount();
+  const canUpgrade = useCanUpgrade();
+  const router = useRouter();
+  const { classNames: buzzClassNames, colorRgb: buzzColorRgb } =
+    useBuzzCurrencyConfig(activeBuzzType);
+  // const isCheckingPaddleSubscription = usePaddleSubscriptionRefresh();
+  const isCheckingPaddleSubscription = false; // No refreshing for now since Paddle is dead
+  const query = querySchema.safeParse(router.query);
+  const isDrowngrade = query.success ? query.data?.downgraded : false;
+  const downgradedTier = query.success ? isDrowngrade && query.data?.tier : null;
+  const isUpdate = query.success ? query.data?.updated : false;
+  const { refreshSubscription, refreshingSubscription } = useMutatePaddle();
+
+  const queryUtils = trpc.useUtils();
+  const { data: gifts } = trpc.membershipGift.getMyGifts.useQuery(undefined, {
+    enabled: !!features.giftMemberships,
+  });
+  // Someone here only for a gift has no membership yet; that is not an error to report.
+  const hereForGiftOnly = isFreeTier && !otherSubscription && !!gifts?.received.length;
+  const keepMembershipMutation = trpc.membershipGift.keepMembership.useMutation({
+    onSuccess: async (result) => {
+      if (result.kept) {
+        showSuccessNotification({
+          title: 'Membership kept',
+          message:
+            'Your membership will continue after your free months end. Renewals use a saved card.',
+        });
+        await queryUtils.subscriptions.getUserSubscription.invalidate();
+        await currentUser?.refresh();
+      } else if (result.portalUrl) {
+        // No card on file: send them to Stripe to add one
+        window.location.assign(result.portalUrl);
+      }
+    },
+    onError: (error) =>
+      showErrorNotification({
+        title: 'Unable to keep membership',
+        error: new Error(error.message),
+      }),
+  });
+
+  const keepFlowTriggered = useRef(false);
+  const keepFlowRequested = query.success && query.data.flow === 'keep-membership';
+  useEffect(() => {
+    if (!keepFlowRequested || !features.giftMemberships || keepFlowTriggered.current) return;
+    keepFlowTriggered.current = true;
+    keepMembershipMutation.mutate();
+    router.replace('/user/membership', undefined, { shallow: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keepFlowRequested, features.giftMemberships]);
+
+  const handleRedirectToOtherEnvironment = () => {
+    const targetDomain = otherBuzzType === 'green' ? serverDomains.green : serverDomains.red;
+
+    window.open(syncAccount(`//${targetDomain}/user/membership`), '_blank', 'noreferrer');
+  };
+
+  const handleRefreshSubscription = async () => {
+    try {
+      await refreshSubscription();
+      showSuccessNotification({
+        title: 'Subscription refreshed',
+        message: 'Your subscription has been successfully refreshed',
+      });
+    } catch (error: unknown) {
+      console.error('Failed to refresh subscription', error);
+      showErrorNotification({
+        title: 'Whoops!',
+        error:
+          error instanceof Error
+            ? error
+            : { message: 'An error occurred while refreshing your subscription' },
+        reason:
+          error instanceof Error
+            ? error.message
+            : 'An error occurred while refreshing your subscription',
+      });
+    }
+  };
+
+  if (subscriptionLoading || isCheckingPaddleSubscription || otherSubscriptionLoading) {
+    return (
+      <Container size="lg">
+        <Center>
+          <Loader />
+        </Center>
+      </Container>
+    );
+  }
+
+  if (!subscription) {
+    return (
+      <>
+        <Meta title="My Membership" deIndex />
+        <Container size="md">
+          <Stack gap="xl">
+            <Title>My Membership Plan</Title>
+
+            {/* Show alert if user has subscription in other environment */}
+            {otherSubscription && (
+              <BuzzEnvironmentAlert
+                buzzType={otherBuzzType}
+                onViewMembership={handleRedirectToOtherEnvironment}
+                message={`You have an active ${
+                  otherBuzzType === 'green' ? 'Green' : 'Yellow'
+                } membership`}
+              />
+            )}
+
+            <MembershipGiftsCard />
+
+            {hereForGiftOnly ? null : !isFreeTier && !otherSubscription ? (
+              <Card padding="lg" radius="md" className={styles.noSubscriptionCard}>
+                <Stack gap="md">
+                  <Group gap="md" wrap="nowrap">
+                    <ThemeIcon size="lg" color="yellow" variant="light" radius="md">
+                      <IconInfoTriangleFilled size={24} />
+                    </ThemeIcon>
+                    <div style={{ flex: 1 }}>
+                      <Text size="lg" fw={700}>
+                        No {activeBuzzType === 'green' ? 'Green' : 'Yellow'} subscription found
+                      </Text>
+                      <Text size="sm" c="dimmed">
+                        You have an active membership, but we couldn&rsquo;t find a subscription for{' '}
+                        {activeBuzzType === 'green' ? 'Green' : 'Yellow'} Buzz. Try refreshing your
+                        session in your settings.
+                      </Text>
+                    </div>
+                  </Group>
+                </Stack>
+              </Card>
+            ) : (
+              <Card padding="lg" radius="md" className={styles.noSubscriptionCard}>
+                <Stack gap="md">
+                  <Group gap="md" wrap="nowrap">
+                    <ThemeIcon size="lg" color="red" variant="light" radius="md">
+                      <IconInfoTriangleFilled size={24} />
+                    </ThemeIcon>
+                    <div style={{ flex: 1 }}>
+                      <Text size="lg" fw={700} c="red">
+                        No active subscription
+                      </Text>
+                      <Text size="sm" c="dimmed">
+                        We couldn&rsquo;t find an active{' '}
+                        {activeBuzzType === 'green' ? 'Green' : 'Yellow'} membership
+                      </Text>
+                    </div>
+                  </Group>
+
+                  <Text size="sm">
+                    If you believe this is a mistake, you may try refreshing your session in your
+                    settings.
+                  </Text>
+                </Stack>
+              </Card>
+            )}
+          </Stack>
+        </Container>
+      </>
+    );
+  }
+
+  const price = subscription.price;
+  const product = subscription.product;
+  const meta = product?.metadata as SubscriptionProductMetadata;
+  const isFree = meta?.tier === 'free';
+  const { image, benefits } = getPlanDetails(subscription.product, features);
+  const isCivitaiProvider = subscriptionPaymentProvider === PaymentProvider.Civitai;
+  const isGiftedSub = !!(
+    subscription.metadata as (SubscriptionMetadata & { membershipGiftId?: string }) | null
+  )?.membershipGiftId;
+  const showKeepMembership = features.giftMemberships && isStripe && !!subscription.cancelAt;
+  const isBuzzMembership = !!(subscription.product.metadata as SubscriptionProductMetadata)
+    ?.buzzPurchase;
+  // Buzz memberships are also on the Civitai provider but are NOT prepaid/tokenized: they
+  // carry no tokens and no redeemable code, so the prepaid UI below must skip them.
+  const isPrepaidMembership = isCivitaiProvider && !isBuzzMembership;
+  const displayBuzzType = getSubscriptionDisplayBuzzType(subscription.buzzType, activeBuzzType);
+
+  return (
+    <>
+      <Meta title="My Membership" deIndex />
+      <Container size="md">
+        <Grid>
+          <Grid.Col span={12}>
+            <Stack gap="xl">
+              <Title>My Membership Plan</Title>
+              {isBuzzMembership && (
+                <BuzzMembershipCallout
+                  tier={subscription.product.metadata.tier}
+                  expiresAt={subscription.currentPeriodEnd}
+                />
+              )}
+              <ReferralCallout variant="compact" />
+              <MembershipGiftsCard />
+              {otherSubscription && subscription && (
+                <BuzzEnvironmentAlert
+                  buzzType={otherBuzzType}
+                  onViewMembership={handleRedirectToOtherEnvironment}
+                  message={`You also have an active ${
+                    otherBuzzType === 'green' ? 'Green' : 'Yellow'
+                  } membership`}
+                  buttonText={`View ${otherBuzzType === 'green' ? 'Green' : 'Yellow'} Membership`}
+                />
+              )}
+              {/*
+              {subscriptionPaymentProvider !== paymentProvider && !isCivitaiProvider && (
+                <Alert>
+                  We are currently migrating your account info to our new payment processor, until
+                  this is completed you will be unable to upgrade your subscription. Migration is
+                  taking a bit longer than expected, but we are working hard to get it done as soon
+                  as possible.
+                </Alert>
+              )} */}
+              {isDrowngrade && downgradedTier && (
+                <Alert>
+                  You have successfully downgraded your membership to the{' '}
+                  {capitalize(downgradedTier)} tier. It may take a few seconds for your new plan to
+                  take effect. You may refresh the page to see the changes.
+                </Alert>
+              )}
+
+              <>
+                {subscriptionPaymentProvider !== paymentProvider &&
+                  subscriptionPaymentProvider !== PaymentProvider.Civitai && (
+                    <Alert>
+                      We are currently migrating your account info to our new payment processor,
+                      until this is completed you will be unable to upgrade your subscription.
+                      Migration is taking a bit longer than expected, but we are working hard to get
+                      it done as soon as possible.
+                    </Alert>
+                  )}
+                {isDrowngrade && downgradedTier && (
+                  <Alert>
+                    You have successfully downgraded your membership to the{' '}
+                    {capitalize(downgradedTier)} tier. It may take a few seconds for your new plan
+                    to take effect. You may refresh the page to see the changes.
+                  </Alert>
+                )}
+                {isUpdate && (
+                  <Alert>
+                    Your membership has been successfully updated. It may take a few minutes for
+                    your update to take effect. If you don&rsquo;t see the changes after refreshing
+                    the page in a few minutes, please contact support. Please note: Your membership
+                    bonus Buzz may take up to 1 hour to be delivered.
+                  </Alert>
+                )}
+              </>
+
+              {subscription?.isBadState && (
+                <AlertWithIcon
+                  color="red"
+                  iconColor="red"
+                  icon={<IconInfoTriangleFilled size={20} strokeWidth={2.5} />}
+                  iconSize="lg"
+                  py={11}
+                >
+                  <Stack gap="xs">
+                    <Text lh={1.2} fw={600}>
+                      Payment failed - your membership is on hold
+                    </Text>
+                    <Text lh={1.2} size="sm">
+                      Your recent payment didn&apos;t go through. Your membership benefits are
+                      currently paused until this is resolved.
+                    </Text>
+                    <Group gap="xs" mt={4}>
+                      {isStripe ? (
+                        <SubscribeButton
+                          priceId={subscription.price.id}
+                          disabled={features.disablePayments}
+                        >
+                          <Button size="xs" color="red">
+                            Update Payment Method
+                          </Button>
+                        </SubscribeButton>
+                      ) : (
+                        <Button
+                          size="xs"
+                          color="red"
+                          component="a"
+                          href={managementUrls?.updatePaymentMethod as string}
+                          target="_blank"
+                        >
+                          Update Payment Method
+                        </Button>
+                      )}
+                      <CancelMembershipAction
+                        variant="button"
+                        buttonProps={{ size: 'xs', color: 'gray', variant: 'outline' }}
+                      />
+                    </Group>
+                  </Stack>
+                </AlertWithIcon>
+              )}
+              <Paper withBorder className={styles.card}>
+                <Stack>
+                  <Group justify="space-between">
+                    <Group wrap="nowrap">
+                      {image && (
+                        <Center>
+                          <Box w={100}>
+                            <EdgeMedia src={image} />
+                          </Box>
+                        </Center>
+                      )}
+                      <Stack gap={0}>
+                        {product && (
+                          <Text fw={600} size="20px">
+                            {isFree ? 'Free' : product.name}
+                          </Text>
+                        )}
+                        {price && (
+                          <Text>
+                            {/* Never show a dollar figure for a Buzz membership: the Price row
+                                carries the cash amount purely so the Buzz cost can be derived
+                                from it, and no money changed hands. */}
+                            <Text component="span" className={styles.price}>
+                              {isBuzzMembership
+                                ? numberWithCommas(
+                                    getBuzzMembershipPrice({
+                                      unitAmount: price.unitAmount,
+                                      buzzPrice: (
+                                        subscription.product.metadata as SubscriptionProductMetadata
+                                      )?.buzzPrice,
+                                    })
+                                  )
+                                : getStripeCurrencyDisplay(price.unitAmount, price.currency)}
+                            </Text>{' '}
+                            <Text component="span" c="dimmed" size="sm">
+                              {isBuzzMembership
+                                ? `Buzz/${shortenPlanInterval(price.interval)}`
+                                : price.currency.toUpperCase() +
+                                  '/' +
+                                  shortenPlanInterval(price.interval)}
+                            </Text>
+                          </Text>
+                        )}
+                      </Stack>
+                    </Group>
+                    <Stack className="@sm:items-end">
+                      <Group gap="xs">
+                        {subscription.canceledAt && (
+                          <>
+                            {price.active && (
+                              <SubscribeButton
+                                priceId={price.id}
+                                disabled={features.disablePayments}
+                              >
+                                <Button
+                                  radius="xl"
+                                  rightSection={<IconRotateClockwise size={16} />}
+                                >
+                                  Resume
+                                </Button>
+                              </SubscribeButton>
+                            )}
+                            {!price.active && (
+                              <Tooltip
+                                maw={350}
+                                multiline
+                                label="Your old subscription price has been discontinued and cannot be restored. If you'd like to keep supporting us, consider upgrading"
+                              >
+                                <LegacyActionIcon variant="light" color="dark" size="lg">
+                                  <IconInfoCircle color="white" strokeWidth={2.5} size={26} />
+                                </LegacyActionIcon>
+                              </Tooltip>
+                            )}
+                          </>
+                        )}
+                        {canUpgrade && !subscription.isBadState && (
+                          <Button component={Link} href="/pricing" radius="xl">
+                            Upgrade
+                          </Button>
+                        )}
+                        {isStripe && !subscription.isBadState && (
+                          <StripeManageSubscriptionButton>
+                            <Button radius="xl" variant="light">
+                              Manage Payment Methods
+                            </Button>
+                          </StripeManageSubscriptionButton>
+                        )}
+                        {!subscription.cancelAt && !isCivitaiProvider && (
+                          <CancelMembershipAction
+                            variant="button"
+                            buttonProps={{ radius: 'xl', color: 'red', variant: 'outline' }}
+                          />
+                        )}
+                        {subscription.isBadState && isStripe && (
+                          <SubscribeButton
+                            priceId={subscription.price.id}
+                            disabled={features.disablePayments}
+                          >
+                            <Button radius="xl" color="red">
+                              Update Payment
+                            </Button>
+                          </SubscribeButton>
+                        )}
+                      </Group>
+                      {!subscription.cancelAt &&
+                        isPaddle &&
+                        managementUrls?.updatePaymentMethod && (
+                          <Anchor
+                            href={managementUrls?.updatePaymentMethod as string}
+                            target="_blank"
+                            size="xs"
+                          >
+                            Update payment details
+                          </Anchor>
+                        )}
+                    </Stack>
+                  </Group>
+                  {subscription.cancelAt && isGiftedSub && (
+                    <Alert color="teal" icon={<IconGift size={18} />}>
+                      This membership was gifted to you — it&rsquo;s free until{' '}
+                      {new Date(subscription.cancelAt).toLocaleDateString()}. Keep it to continue
+                      your benefits after that.
+                    </Alert>
+                  )}
+                  {subscription.cancelAt && !isGiftedSub && (
+                    <Text c="red">
+                      Your membership will be canceled on{' '}
+                      {new Date(subscription.cancelAt).toLocaleDateString()}. You will lose your
+                      benefits on that date.
+                    </Text>
+                  )}
+                  {showKeepMembership && (
+                    <Group gap="xs">
+                      <Button
+                        size="xs"
+                        radius="xl"
+                        leftSection={<IconGift size={14} />}
+                        loading={keepMembershipMutation.isPending}
+                        onClick={() => keepMembershipMutation.mutate()}
+                      >
+                        Keep my membership
+                      </Button>
+                      <Text size="xs" c="dimmed">
+                        Billing resumes after your free months end — you keep your benefits.
+                      </Text>
+                    </Group>
+                  )}
+                  {isPrepaidMembership && (
+                    <Text c="yellow">
+                      You are on a prepaid membership. Tokens unlock monthly — claim them to receive
+                      your Buzz.
+                    </Text>
+                  )}
+                </Stack>
+              </Paper>
+
+              {isPrepaidMembership && <PrepaidTimelineProgress subscription={subscription} />}
+
+              {isPrepaidMembership &&
+                (() => {
+                  const prepaidTokens = getPrepaidTokens({
+                    metadata: subscription.metadata as SubscriptionMetadata,
+                  });
+                  const nextUnlockDate = getNextTokenUnlockDate(subscription.currentPeriodStart);
+                  // Always render for Civitai members — even with 0 tokens,
+                  // the component fetches historical deliveries from the buzz service
+                  return (
+                    <PrepaidTokenOverview
+                      tokens={prepaidTokens}
+                      nextUnlockDate={nextUnlockDate}
+                      defaultExpanded
+                      subscription={subscription}
+                    />
+                  );
+                })()}
+
+              {isPrepaidMembership && <PurchasedCodesCard defaultFilter="Membership" />}
+
+              {benefits && (
+                <div
+                  style={{
+                    // @ts-ignore
+                    '--buzz-color': buzzColorRgb,
+                  }}
+                >
+                  {/* No colour word for a Buzz membership: it grants no coloured Buzz, so
+                      "Your Green membership benefits" claims something that isn't true. */}
+                  <Title order={3}>
+                    {isBuzzMembership ? (
+                      <>Your membership benefits</>
+                    ) : (
+                      <>
+                        Your{' '}
+                        <Text component="span" className="text-xl font-bold text-buzz">
+                          {activeBuzzType === 'green' ? 'Green' : 'Yellow'}
+                        </Text>{' '}
+                        membership benefits
+                      </>
+                    )}
+                  </Title>
+                  <Paper withBorder className={styles.card}>
+                    <PlanBenefitList
+                      benefits={benefits}
+                      buzzType={displayBuzzType}
+                      tier={subscription.product.metadata.tier}
+                    />
+                  </Paper>
+                </div>
+              )}
+            </Stack>
+          </Grid.Col>
+        </Grid>
+      </Container>
+    </>
+  );
+}

@@ -1,0 +1,465 @@
+import {
+  ActionIcon,
+  Badge,
+  Box,
+  Collapse,
+  Group,
+  Text,
+  ThemeIcon,
+  useComputedColorScheme,
+  useMantineTheme,
+} from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import { useDisclosure } from '@mantine/hooks';
+import { IconCategory, IconCheck, IconChevronDown, IconDownload } from '@tabler/icons-react';
+import { useMemo, useState } from 'react';
+import { DownloadButton } from '~/components/Model/ModelVersions/DownloadButton';
+import { VerifiedText } from '~/components/VerifiedText/VerifiedText';
+import { createModelFileDownloadUrl } from '~/server/common/model-helpers';
+import {
+  getPrimaryFile,
+  groupFilesByVariant,
+  resolveActiveFile,
+} from '~/server/utils/model-helpers';
+import type { ModelType } from '~/shared/utils/prisma/enums';
+import type { ModelById } from '~/types/router';
+import { getFileDescription, getFileLabel } from '~/utils/file-display-helpers';
+import { formatKBytes } from '~/utils/number-helpers';
+import { NOT_COMMERCIALLY_AVAILABLE_LABEL } from '~/server/common/constants';
+
+type FileType = ModelById['modelVersions'][number]['files'][number];
+
+interface DownloadVariantDropdownProps {
+  files: FileType[];
+  versionId: number;
+  modelType?: ModelType | null;
+  userPreferences?: UserFilePreferences;
+  canDownload: boolean;
+  downloadPrice?: number;
+  /** What buyers pay; shown to the owner, who already has access. */
+  listedPrice?: number;
+  /** The paid-access terms accept Blue Buzz — colours the price chip. */
+  acceptsBlueBuzz?: boolean;
+  isLoadingAccess?: boolean;
+  archived?: boolean;
+  /** Base model is non-commercial and the viewer has no access: keep the lock, no purchase path. */
+  notCommerciallyLocked?: boolean;
+  onPurchase?: () => void;
+  /**
+   * Optional controlled selection. When `onSelectFileId` is provided the parent
+   * owns the active-file state (so other panels, e.g. the Tensors panel, can
+   * follow the same selection). Otherwise the component manages it internally.
+   */
+  selectedFileId?: number | null;
+  onSelectFileId?: (fileId: number) => void;
+}
+
+export function DownloadVariantDropdown({
+  files,
+  versionId,
+  modelType,
+  userPreferences,
+  canDownload,
+  downloadPrice,
+  listedPrice,
+  acceptsBlueBuzz,
+  isLoadingAccess,
+  archived,
+  notCommerciallyLocked,
+  onPurchase,
+  selectedFileId: controlledFileId,
+  onSelectFileId,
+}: DownloadVariantDropdownProps) {
+  const theme = useMantineTheme();
+  const colorScheme = useComputedColorScheme('dark');
+  const [opened, { toggle }] = useDisclosure(false);
+
+  // Group files by variant
+  const groupedFiles = useMemo(() => groupFilesByVariant(files, modelType), [files, modelType]);
+
+  // Get all model files (SafeTensor + GGUF + other)
+  const modelFiles = useMemo(() => {
+    return [
+      ...groupedFiles.safeTensorVariants,
+      ...groupedFiles.ggufVariants,
+      ...groupedFiles.otherFormatVariants,
+    ];
+  }, [groupedFiles]);
+
+  // Get the best matching file based on user preferences
+  const bestMatchFile = useMemo(() => {
+    return getPrimaryFile(modelFiles, { metadata: userPreferences });
+  }, [modelFiles, userPreferences]);
+
+  // Track user's explicit selection by id only; derive the active file from
+  // the current files list so a stale id from a prior version is ignored.
+  // Supports controlled mode so a parent can share the selection with other
+  // panels (e.g. the Tensors panel) that should follow the download choice.
+  const [internalFileId, setInternalFileId] = useState<number | null>(null);
+  const isControlled = typeof onSelectFileId === 'function';
+  const selectedFileId = isControlled ? controlledFileId ?? null : internalFileId;
+  const setSelectedFileId = (fileId: number) => {
+    if (isControlled) onSelectFileId!(fileId);
+    else setInternalFileId(fileId);
+  };
+  const activeFile = resolveActiveFile(modelFiles, selectedFileId, { metadata: userPreferences });
+
+  // Calculate download URL
+  const downloadUrl = activeFile
+    ? createModelFileDownloadUrl({
+        versionId,
+        fileId: activeFile.id,
+        type: activeFile.type,
+        meta: activeFile.metadata,
+      })
+    : undefined;
+
+  const handleSelectFile = (file: FileType) => {
+    setSelectedFileId(file.id);
+  };
+
+  const handleDownloadClick = () => {
+    if (!canDownload && onPurchase && !notCommerciallyLocked) {
+      onPurchase();
+    }
+  };
+
+  const handleVariantDownload = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!canDownload) {
+      e.preventDefault();
+      if (onPurchase && !notCommerciallyLocked) onPurchase();
+    }
+  };
+
+  if (modelFiles.length === 0) {
+    return (
+      <Box p="sm">
+        <Text size="sm" c="dimmed">
+          No files available
+        </Text>
+      </Box>
+    );
+  }
+
+  // If only one file, show the file summary above a full-width download button
+  if (modelFiles.length === 1) {
+    const file = modelFiles[0];
+    return (
+      <Box>
+        <Box p="sm">
+          <FileSummaryRow file={file} />
+        </Box>
+        <Box
+          p="sm"
+          style={{
+            borderTop: `1px solid ${
+              colorScheme === 'dark' ? theme.colors.dark[4] : theme.colors.gray[3]
+            }`,
+          }}
+        >
+          <DownloadButton
+            component="a"
+            href={archived || isLoadingAccess || !canDownload ? undefined : downloadUrl}
+            onClick={handleDownloadClick}
+            canDownload={canDownload}
+            downloadPrice={downloadPrice}
+            listedPrice={listedPrice}
+            acceptsBlueBuzz={acceptsBlueBuzz}
+            disabled={archived || isLoadingAccess || notCommerciallyLocked}
+            fullWidth
+            variant="light"
+            color="blue"
+            style={{
+              backgroundColor: 'rgba(34, 139, 230, 0.15)',
+              borderColor: 'rgba(34, 139, 230, 0.3)',
+            }}
+          >
+            <Text ta="center">
+              Download <Text span>({formatKBytes(file.sizeKB)})</Text>
+            </Text>
+          </DownloadButton>
+        </Box>
+      </Box>
+    );
+  }
+
+  // Render variant rows for a format section
+  const renderFormatSection = (sectionFiles: FileType[], label: string, showBorderTop: boolean) => {
+    if (sectionFiles.length === 0) return null;
+    return (
+      <Box
+        style={
+          showBorderTop
+            ? {
+                borderTop: `1px solid ${
+                  colorScheme === 'dark' ? theme.colors.dark[5] : theme.colors.gray[2]
+                }`,
+              }
+            : undefined
+        }
+      >
+        <Text
+          size="xs"
+          fw={600}
+          c="dimmed"
+          tt="uppercase"
+          px="sm"
+          pt="sm"
+          pb={4}
+          style={{ letterSpacing: 0.5 }}
+        >
+          {label}
+        </Text>
+        {sectionFiles.map((file) => {
+          const isSelected = file.id === activeFile?.id;
+          const isBestMatch = file.id === bestMatchFile?.id;
+          const label = getFileLabel(file);
+          const description = getFileDescription(file);
+          const displayLabel = label ?? file.name;
+          const ariaLabel = [
+            displayLabel,
+            isBestMatch ? 'best match' : null,
+            description,
+            formatKBytes(file.sizeKB),
+          ]
+            .filter(Boolean)
+            .join(', ');
+          const fileDownloadUrl = createModelFileDownloadUrl({
+            versionId,
+            fileId: file.id,
+            type: file.type,
+            meta: file.metadata,
+          });
+
+          return (
+            <Box
+              key={file.id}
+              px={16}
+              py={8}
+              role="option"
+              tabIndex={0}
+              aria-selected={isSelected}
+              aria-label={ariaLabel}
+              style={{
+                backgroundColor: isSelected ? 'rgba(34, 139, 230, 0.1)' : undefined,
+                borderBottom: `1px solid ${
+                  colorScheme === 'dark' ? theme.colors.dark[6] : theme.colors.gray[1]
+                }`,
+                cursor: 'pointer',
+              }}
+              onClick={() => handleSelectFile(file)}
+              onKeyDown={(e: React.KeyboardEvent) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  handleSelectFile(file);
+                }
+              }}
+              className="hover:bg-gray-1 dark:hover:bg-dark-6/30"
+            >
+              <Group justify="space-between" wrap="nowrap">
+                <Group gap={8} wrap="nowrap">
+                  <Box w={16} miw={16} style={{ flexShrink: 0 }}>
+                    {isSelected && <IconCheck size={16} color={theme.colors.green[5]} />}
+                  </Box>
+                  <Box>
+                    <Group gap={8}>
+                      <Text size="sm">{displayLabel}</Text>
+                      {isBestMatch && (
+                        <Badge size="xs" color="green" variant="light">
+                          Best match
+                        </Badge>
+                      )}
+                    </Group>
+                    {label && (
+                      <Text
+                        size="xs"
+                        c="dimmed"
+                        truncate
+                        style={{ maxWidth: 200 }}
+                        title={file.name}
+                      >
+                        {file.name}
+                      </Text>
+                    )}
+                    {description && (
+                      <Text size="xs" c="dimmed">
+                        {description}
+                      </Text>
+                    )}
+                    <VerifiedText file={file} />
+                  </Box>
+                </Group>
+                <Group gap="xs" wrap="nowrap">
+                  <Text size="xs" c="dimmed">
+                    {formatKBytes(file.sizeKB)}
+                  </Text>
+                  <Tooltip
+                    label={
+                      canDownload
+                        ? 'Download'
+                        : notCommerciallyLocked
+                        ? NOT_COMMERCIALLY_AVAILABLE_LABEL
+                        : 'Purchase to download'
+                    }
+                  >
+                    <ActionIcon
+                      component="a"
+                      href={
+                        archived || isLoadingAccess || !canDownload ? undefined : fileDownloadUrl
+                      }
+                      onClick={handleVariantDownload}
+                      variant="light"
+                      color="gray"
+                      size={32}
+                      radius="md"
+                      disabled={archived || isLoadingAccess || notCommerciallyLocked}
+                    >
+                      <IconDownload size={16} />
+                    </ActionIcon>
+                  </Tooltip>
+                </Group>
+              </Group>
+            </Box>
+          );
+        })}
+      </Box>
+    );
+  };
+
+  // Multiple files - ComponentGroup-style dropdown
+  return (
+    <Box>
+      {/* Trigger */}
+      <Box
+        p="sm"
+        role="button"
+        tabIndex={0}
+        aria-expanded={opened}
+        aria-haspopup="listbox"
+        aria-label={`Select download variant. Currently selected: ${
+          [getFileLabel(activeFile), activeFile.metadata?.format].filter(Boolean).join(' ') ||
+          activeFile.name
+        }`}
+        style={{ cursor: 'pointer' }}
+        onClick={toggle}
+        onKeyDown={(e: React.KeyboardEvent) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            toggle();
+          }
+        }}
+        className="hover:bg-gray-1 dark:hover:bg-dark-6/50"
+      >
+        <Group justify="space-between" wrap="nowrap">
+          <FileSummaryRow file={activeFile} isBestMatch={activeFile.id === bestMatchFile?.id} />
+          <IconChevronDown
+            size={16}
+            style={{
+              transition: 'transform 200ms',
+              transform: opened ? 'rotate(180deg)' : undefined,
+              color: theme.colors.dark[2],
+            }}
+          />
+        </Group>
+      </Box>
+
+      {/* Expanded variants list */}
+      <Collapse in={opened}>
+        <Box
+          role="listbox"
+          aria-label="Download variant options"
+          style={{
+            backgroundColor: colorScheme === 'dark' ? theme.colors.dark[8] : theme.colors.gray[0],
+            borderTop: `1px solid ${
+              colorScheme === 'dark' ? theme.colors.dark[5] : theme.colors.gray[2]
+            }`,
+            maxHeight: 350,
+            overflowY: 'auto',
+          }}
+        >
+          {renderFormatSection(groupedFiles.safeTensorVariants, 'SafeTensor', false)}
+          {renderFormatSection(
+            groupedFiles.ggufVariants,
+            'GGUF (Quantized)',
+            groupedFiles.safeTensorVariants.length > 0
+          )}
+          {renderFormatSection(
+            groupedFiles.otherFormatVariants,
+            'Other Formats',
+            groupedFiles.safeTensorVariants.length > 0 || groupedFiles.ggufVariants.length > 0
+          )}
+        </Box>
+      </Collapse>
+
+      {/* Download button - always visible */}
+      <Box
+        p="sm"
+        style={{
+          borderTop: `1px solid ${
+            colorScheme === 'dark' ? theme.colors.dark[4] : theme.colors.gray[3]
+          }`,
+        }}
+      >
+        <DownloadButton
+          component="a"
+          href={
+            !activeFile || archived || isLoadingAccess || !canDownload ? undefined : downloadUrl
+          }
+          onClick={handleDownloadClick}
+          canDownload={canDownload}
+          downloadPrice={downloadPrice}
+          listedPrice={listedPrice}
+          acceptsBlueBuzz={acceptsBlueBuzz}
+          disabled={!activeFile || archived || isLoadingAccess || notCommerciallyLocked}
+          fullWidth
+          style={{
+            backgroundColor: 'rgba(34, 139, 230, 0.15)',
+            borderColor: 'rgba(34, 139, 230, 0.3)',
+          }}
+          variant="light"
+          color="blue"
+        >
+          Download Selected
+        </DownloadButton>
+      </Box>
+    </Box>
+  );
+}
+
+function FileSummaryRow({ file, isBestMatch = false }: { file: FileType; isBestMatch?: boolean }) {
+  const label = getFileLabel(file);
+  const description = getFileDescription(file);
+  const format = file.metadata?.format;
+  const titleText = [label, format].filter(Boolean).join(' ') || file.name;
+  const detailText = [description, formatKBytes(file.sizeKB)].filter(Boolean).join(' • ');
+
+  return (
+    <Group gap="sm" wrap="nowrap">
+      <ThemeIcon size={36} radius="md" color="blue" variant="light">
+        <IconCategory size={20} />
+      </ThemeIcon>
+      <Box>
+        <Group gap={8}>
+          <Text size="sm" fw={500}>
+            {titleText}
+          </Text>
+          {isBestMatch && (
+            <Badge size="xs" color="green" variant="light">
+              Best match
+            </Badge>
+          )}
+        </Group>
+        {label && (
+          <Text size="xs" c="dimmed" truncate style={{ maxWidth: 220 }} title={file.name}>
+            {file.name}
+          </Text>
+        )}
+        <Text size="xs" c="dimmed">
+          {detailText}
+        </Text>
+        <VerifiedText file={file} />
+      </Box>
+    </Group>
+  );
+}

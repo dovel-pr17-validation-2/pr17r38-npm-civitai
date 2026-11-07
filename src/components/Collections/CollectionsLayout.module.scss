@@ -1,0 +1,78 @@
+.container {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  overflow: visible;
+  transition: margin-left 500ms;
+  position: sticky;
+  top: var(--header-height, 80px);
+  align-self: flex-start;
+
+  @container (max-width: theme('screens.sm')) {
+    display: none;
+  }
+}
+
+.list {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  // Mantine gives the last Card.Section margin-bottom: -card-padding, which the 0-padding card
+  // does not cancel; the list would end 16px below the border.
+  margin-bottom: 0;
+}
+
+.listScroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.listViewport {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+}
+
+.sidebarToggle {
+  position: absolute;
+  top: 0;
+  right: -32px;
+}
+
+.content {
+  flex: 1;
+  // The NSFW/login gate renders as `absolute inset-0`. With no positioning context here it
+  // resolves against `.scroll-area` and covers the sidebar, leaving the rest of /collections
+  // unreachable; the height gives it the sidebar's column to centre in.
+  position: relative;
+  min-height: calc(100dvh - var(--header-height, 0px) - var(--footer-height, 0px) - 68px);
+}
+
+.drawerButton {
+  display: none;
+
+  @container (max-width: theme('screens.sm')) {
+    display: block;
+  }
+}
+
+.drawerHeader {
+  padding: var(--mantine-spacing-xs);
+  margin-bottom: 0;
+  box-shadow: var(--mantine-shadow-sm);
+}
+
+.filterContainer {
+  border-top: light-dark(
+    1px solid var(--mantine-color-gray-2),
+    1px solid var(--mantine-color-dark-4)
+  ) !important;
+}

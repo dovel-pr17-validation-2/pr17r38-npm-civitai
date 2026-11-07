@@ -1,0 +1,145 @@
+import { Box, Center, Group, Loader, Stack } from '@mantine/core';
+import { MetricTimeframe } from '~/shared/utils/prisma/enums';
+import { useRouter } from 'next/router';
+import React, { useState } from 'react';
+
+import { NotFound } from '~/components/AppLayout/NotFound';
+import { ArticlesInfinite } from '~/components/Article/Infinite/ArticlesInfinite';
+import { UserDraftArticles } from '~/components/Article/UserDraftArticles';
+import { useArticleQueryParams } from '~/components/Article/article.utils';
+import { SortFilter } from '~/components/Filters';
+import { MasonryContainer } from '~/components/MasonryColumns/MasonryContainer';
+import { MasonryProvider } from '~/components/MasonryColumns/MasonryProvider';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { constants } from '~/server/common/constants';
+import { ArticleSort } from '~/server/common/enums';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+import { isViewer } from '~/utils/is-viewer';
+import { trpc } from '~/utils/trpc';
+import { FeedContentToggle } from '~/components/FeedContentToggle/FeedContentToggle';
+import { ArticleFiltersDropdown } from '~/components/Article/Infinite/ArticleFiltersDropdown';
+import { ActiveTagFilter } from '~/components/Tags/ActiveTagFilter';
+import { UserProfileLayout } from '~/components/Profile/ProfileLayout2';
+import { Page } from '~/components/AppLayout/Page';
+import { getUserBannedAtByUsername } from '~/server/services/user-banned-at.service';
+
+export const getServerSideProps = createServerSideProps({
+  useSSG: true,
+  resolver: async ({ ctx, features, ssg }) => {
+    const username = ctx.query.username as string;
+    if (!features?.articles)
+      return {
+        redirect: {
+          destination: `/user/${username}`,
+          permanent: false,
+        },
+      };
+
+    const user = await getUserBannedAtByUsername(username);
+    if (user?.bannedAt)
+      return {
+        redirect: { destination: `/user/${username}`, permanent: true },
+      };
+
+    await Promise.all([
+      ssg?.userProfile.get.prefetch({ username }),
+      ssg?.userProfile.overview.prefetch({ username }),
+    ]);
+  },
+});
+
+function UserArticlesPage() {
+  const router = useRouter();
+  const username = (router.query.username as string) ?? '';
+  const { data: user, isLoading } = trpc.userProfile.get.useQuery(
+    { username },
+    { enabled: !!username }
+  );
+
+  // currently not showing any content if the username is undefined
+  if (!username) return <NotFound />;
+  if (isLoading)
+    return (
+      <Center p="xl">
+        <Loader />
+      </Center>
+    );
+  if (!user) return <NotFound />;
+
+  return <UserArticlesFeed profileUserId={user.id} />;
+}
+
+function UserArticlesFeed({ profileUserId }: { profileUserId: number }) {
+  const currentUser = useCurrentUser();
+  const {
+    replace,
+    query: { followed = undefined, ...query },
+  } = useArticleQueryParams();
+  const period = query.period ?? MetricTimeframe.AllTime;
+  const sort = query.sort ?? ArticleSort.Newest;
+  const selfView = isViewer(currentUser, profileUserId);
+
+  const [section, setSection] = useState<'published' | 'draft'>(
+    selfView ? query.section ?? 'published' : 'published'
+  );
+  const viewingPublished = section === 'published';
+
+  return (
+    <Box mt="md">
+      <MasonryProvider
+        columnWidth={constants.cardSizes.model}
+        maxColumnCount={7}
+        maxSingleColumnWidth={450}
+      >
+        <MasonryContainer p={0}>
+          <Stack gap="xs">
+            <Group gap={8} justify="space-between">
+              {selfView && (
+                <FeedContentToggle
+                  size="xs"
+                  value={section}
+                  onChange={(section) => {
+                    setSection(section as 'published' | 'draft');
+                    replace({ section: section as 'published' | 'draft' });
+                  }}
+                />
+              )}
+              {viewingPublished && <ActiveTagFilter tagIds={query.tags ?? []} />}
+              {viewingPublished && (
+                <Group gap={8} ml="auto" wrap="nowrap">
+                  <SortFilter
+                    type="articles"
+                    value={sort}
+                    onChange={(x) => replace({ sort: x as ArticleSort })}
+                  />
+                  <ArticleFiltersDropdown
+                    query={{ ...query, period, followed }}
+                    onChange={(filters) => replace(filters)}
+                    size="compact-sm"
+                  />
+                </Group>
+              )}
+            </Group>
+            {viewingPublished ? (
+              <ArticlesInfinite
+                disableStoreFilters
+                filters={{
+                  ...query,
+                  sort,
+                  period,
+                  includeDrafts: !!currentUser?.isModerator,
+                  pending: true,
+                }}
+                showEmptyCta={selfView}
+              />
+            ) : (
+              <UserDraftArticles />
+            )}
+          </Stack>
+        </MasonryContainer>
+      </MasonryProvider>
+    </Box>
+  );
+}
+
+export default Page(UserArticlesPage, { getLayout: UserProfileLayout });

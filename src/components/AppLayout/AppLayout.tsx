@@ -1,0 +1,213 @@
+import clsx from 'clsx';
+import React, { useEffect } from 'react';
+import { useRouter } from 'next/router';
+import { AppFooter } from '~/components/AppLayout/AppFooter';
+import type { RenderSearchComponentProps } from '~/components/AppLayout/AppHeader/AppHeader';
+import { AppHeader } from '~/components/AppLayout/AppHeader/AppHeader';
+import { NotFound } from '~/components/AppLayout/NotFound';
+import { SubNav2 } from '~/components/AppLayout/SubNav';
+import { PageLoader } from '~/components/PageLoader/PageLoader';
+import { ScrollArea } from '~/components/ScrollArea/ScrollArea';
+import { useScrollAreaRef } from '~/components/ScrollArea/ScrollAreaContext';
+import { Announcements } from '~/components/Announcements/Announcements';
+import type { ScrollAreaProps } from '~/components/ScrollArea/ScrollArea';
+import { AdhesiveAd } from '~/components/Ads/AdhesiveAd';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useHideOnScroll } from '~/hooks/useHideOnScroll';
+import { openReadOnlyModal } from '~/components/Dialog/triggers/read-only';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { useIsMounted } from '~/hooks/useIsMounted';
+import { ChatPortal } from '~/components/Chat/ChatPortal';
+import { NavAnnouncementSlot } from '~/components/AppLayout/NavAnnouncementSlot/NavAnnouncementSlot';
+import { VerifyEmailBanner } from '~/components/User/VerifyEmailBanner';
+import { useRegionWarning } from '~/components/RegionBlock/useRegionWarning';
+import { useRegionRedirectDetection } from '~/components/RegionBlock/useRegionRedirectDetection';
+import { useToSUpdateModal } from '~/hooks/useToSUpdateModal';
+import { useTosReacceptancePrompt } from '~/hooks/useTosReacceptancePrompt';
+
+let shownReadonly = false;
+const readonlyAlertCutoff = Date.now() - 1000 * 60 * 30; // 30 minutes
+
+/** Site-wide prompts. A layout that renders without `AppLayout` must call this itself. */
+export function useAppLayoutPrompts() {
+  const isMounted = useIsMounted();
+  const features = useFeatureFlags();
+  useRegionWarning();
+  useRegionRedirectDetection();
+  useToSUpdateModal();
+  useTosReacceptancePrompt();
+
+  useEffect(() => {
+    if (isMounted() && !features.canWrite && !shownReadonly) {
+      const lastReadOnly = Number(localStorage.getItem('lastReadOnlyNotice') ?? '0');
+      if (lastReadOnly < readonlyAlertCutoff) {
+        openReadOnlyModal();
+        localStorage.setItem('lastReadOnlyNotice', Date.now().toString());
+        shownReadonly = true;
+      }
+    }
+  }, [isMounted, features.canWrite]);
+}
+
+export function AppLayout({
+  children,
+  renderSearchComponent,
+  header = <AppHeader renderSearchComponent={renderSearchComponent} />,
+  subNav = <SubNav2 />,
+  pageNav,
+  left,
+  right,
+  scrollable = true,
+  footer = <AppFooter />,
+  loading,
+  notFound,
+  announcements,
+}: {
+  children: React.ReactNode;
+  renderSearchComponent?: (opts: RenderSearchComponentProps) => React.ReactElement;
+  subNav?: React.ReactNode | null;
+  /**
+   * The page's OWN navigation, on its own row inside the same sticky bar: beside the
+   * site tabs it reads as another one of them. Rendered bare — the row styles itself,
+   * so one that hides at a breakpoint leaves no empty bar behind.
+   */
+  pageNav?: React.ReactNode;
+  left?: React.ReactNode;
+  right?: React.ReactNode;
+  header?: React.ReactNode | null;
+  scrollable?: boolean;
+  footer?: React.ReactNode | null;
+  loading?: boolean;
+  notFound?: boolean;
+  announcements?: boolean;
+}) {
+  useAppLayoutPrompts();
+
+  return (
+    <div className="flex h-full flex-1 flex-col">
+      {header}
+      {loading ? (
+        <PageLoader />
+      ) : notFound ? (
+        <NotFound />
+      ) : (
+        <div className="flex flex-1 overflow-hidden">
+          {left}
+          <MainContent
+            subNav={subNav}
+            pageNav={pageNav}
+            scrollable={scrollable}
+            footer={footer}
+            announcements={announcements}
+          >
+            {children}
+          </MainContent>
+          {right && (
+            <aside className="scroll-area relative border-l border-gray-3 dark:border-dark-4">
+              {right}
+            </aside>
+          )}
+        </div>
+      )}
+      <ChatPortal showFooter={false} />
+      {footer && <AdhesiveFooter />}
+    </div>
+  );
+}
+
+function AdhesiveFooter() {
+  const currentUser = useCurrentUser();
+  const router = useRouter();
+
+  if (currentUser?.isPaidMember || router.asPath.includes('/moderator')) return null;
+  // Reserve the footer height up front for logged-out users (the bulk of ad
+  // traffic) so the bar doesn't shove content when it fills ~1-2s after paint.
+  return <AdhesiveAd preserveLayout={!currentUser} />;
+}
+
+export function MainContent({
+  children,
+  subNav = <SubNav2 />,
+  pageNav,
+  footer = <AppFooter />,
+  scrollable = true,
+  announcements,
+  ...props
+}: {
+  children: React.ReactNode;
+  subNav?: React.ReactNode | null;
+  pageNav?: React.ReactNode;
+  scrollable?: boolean;
+  footer?: React.ReactNode | null;
+  announcements?: boolean;
+} & ScrollAreaProps) {
+  return scrollable ? (
+    <ScrollArea {...props}>
+      <main className="min-w-0 flex-1">
+        {subNav || pageNav ? (
+          <SubNav>
+            <VerifyEmailBanner />
+            <NavAnnouncementSlot />
+            {subNav}
+            {pageNav}
+          </SubNav>
+        ) : (
+          <>
+            <VerifyEmailBanner />
+            <NavAnnouncementSlot />
+          </>
+        )}
+        {announcements && <Announcements className="mb-3" />}
+        {children}
+      </main>
+      {footer}
+    </ScrollArea>
+  ) : (
+    <div className="no-scroll group flex flex-1 flex-col overflow-hidden">
+      <main className="flex flex-1 flex-col overflow-hidden">
+        {subNav || pageNav ? (
+          <SubNav>
+            <VerifyEmailBanner />
+            <NavAnnouncementSlot />
+            {subNav}
+            {pageNav}
+          </SubNav>
+        ) : (
+          <>
+            <VerifyEmailBanner />
+            <NavAnnouncementSlot />
+          </>
+        )}
+        {children}
+      </main>
+      {footer}
+    </div>
+  );
+}
+
+export function SubNav({
+  children,
+  className,
+  visible,
+  ...props
+}: { children: React.ReactNode; visible?: boolean } & React.HTMLProps<HTMLDivElement>) {
+  // `visible` brings it back; a later scroll down can hide it again.
+  const hidden = useHideOnScroll(useScrollAreaRef(), { resetKey: visible });
+
+  return (
+    <div
+      {...props}
+      // Read by anything that pins itself below the subnav: it keeps its layout box while hidden,
+      // so a fixed offset leaves a gap once it retracts. See `useSubnavBottom`, which also has to
+      // re-measure on this element's `transitionend` — the slide outlives the scroll that caused it.
+      data-subnav=""
+      className={clsx(
+        'sticky inset-x-0 top-0 z-50 mb-3 bg-gray-1 shadow transition-transform dark:bg-dark-6',
+        className
+      )}
+      style={hidden ? { transform: 'translateY(-200%)' } : undefined}
+    >
+      {children}
+    </div>
+  );
+}

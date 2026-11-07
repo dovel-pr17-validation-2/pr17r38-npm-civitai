@@ -1,0 +1,736 @@
+import type { Prisma } from '@prisma/client';
+import { isEqual } from 'lodash-es';
+import { throwOnBlockedUserContent } from '~/server/services/blocklist.service';
+import { dbRead, dbWrite } from '~/server/db/client';
+import { TransactionType } from '~/shared/constants/buzz.constants';
+import type { BuzzSpendType } from '~/shared/constants/buzz.constants';
+import type {
+  CosmeticShopItemHistoryChange,
+  CosmeticShopItemMeta,
+} from '~/server/schema/cosmetic-shop.schema';
+import type {
+  SubmitCreatorShopPackInput,
+  UpdateCreatorShopPackInput,
+} from '~/server/schema/creator-shop.schema';
+import {
+  RIGHTS_AFFIRMATION_STATEMENT,
+  RIGHTS_AFFIRMATION_VERSION,
+  computePackAmountDue,
+  creatorCosmeticTypes,
+  isCreatorCosmeticType,
+  isConsumableCosmeticType,
+  isPackShopItem,
+  packMembersMissing,
+  packPriceFloor,
+  type PackMemberPricing,
+} from '~/server/schema/creator-shop.schema';
+import { createBuzzTransaction, refundTransaction } from '~/server/services/buzz.service';
+import { assertQuotedFee, getCreatorShopFees } from '~/server/services/creator-shop-fees.service';
+import { getCosmeticArtworkUrl } from '~/server/services/cosmetic-phash.service';
+import { lockShopItem } from '~/server/services/creator-shop-lock';
+import {
+  REJECTED_IS_FINAL,
+  appendItemHistory,
+  shopItemDisplayMeta,
+  wasLastReviewARejection,
+} from '~/server/services/creator-shop.data';
+import { stickerUsesFromCosmeticData } from '~/shared/utils/sticker-token';
+import {
+  throwBadRequestError,
+  throwConflictError,
+  throwNotFoundError,
+} from '~/server/utils/errorHandling';
+import { CosmeticShopItemStatus, CosmeticType } from '~/shared/utils/prisma/enums';
+import {
+  assertClientImageUrlsUsable,
+  assertShopArtworkKeysIssued,
+} from '~/server/services/image-url-ownership';
+
+type ResolvedMember = PackMemberPricing & {
+  name: string;
+  data: unknown;
+  createdById: number | null;
+  creatorUsername: string | null;
+  acceptsBlueBuzz: boolean;
+  /** The resolved listing's resale opt-in — see `isBundlableBy`. */
+  sellableByOthers: boolean;
+};
+
+/**
+ * Resolves the members a pack may be built from, at the price bundling them
+ * costs.
+ *
+ * A cosmetic can be reachable through several listings (resale by reference), so
+ * the price used is the **highest** Published listing — bundling must not be a
+ * way to buy someone's work at whichever listing happens to be cheapest.
+ *
+ * Delisted members are included: delisting stops individual sale while staying
+ * bundlable, which is what `listed` exists for. Archived ones are not.
+ */
+export const resolvePackMembers = async (cosmeticIds: number[]): Promise<ResolvedMember[]> => {
+  if (!cosmeticIds.length) return [];
+  const listings = await dbRead.cosmeticShopItem.findMany({
+    where: {
+      cosmeticId: { in: cosmeticIds },
+      status: CosmeticShopItemStatus.Published,
+      // See getPackMembers: a mod archive stamps the date without moving status.
+      archivedAt: null,
+    },
+    select: {
+      cosmeticId: true,
+      unitAmount: true,
+      meta: true,
+      cosmetic: {
+        select: {
+          id: true,
+          name: true,
+          type: true,
+          data: true,
+          createdById: true,
+          creator: { select: { username: true } },
+        },
+      },
+    },
+  });
+
+  const byCosmetic = new Map<number, ResolvedMember>();
+  for (const listing of listings) {
+    if (listing.cosmeticId == null || !listing.cosmetic) continue;
+    const meta = (listing.meta ?? {}) as CosmeticShopItemMeta;
+    const existing = byCosmetic.get(listing.cosmeticId);
+    const candidate: ResolvedMember = {
+      cosmeticId: listing.cosmeticId,
+      type: listing.cosmetic.type,
+      listPrice: listing.unitAmount,
+      isOwn: false,
+      name: listing.cosmetic.name,
+      data: listing.cosmetic.data,
+      createdById: listing.cosmetic.createdById,
+      creatorUsername: listing.cosmetic.creator?.username ?? null,
+      acceptsBlueBuzz: !!meta.acceptsBlueBuzz,
+      sellableByOthers: !!meta.sellableByOthers,
+    };
+    if (!existing || candidate.listPrice > existing.listPrice)
+      byCosmetic.set(listing.cosmeticId, {
+        ...candidate,
+        // One listing opting out of blue is enough to make the member unable to
+        // carry blue into a pack.
+        acceptsBlueBuzz: (existing?.acceptsBlueBuzz ?? true) && candidate.acceptsBlueBuzz,
+      });
+    else if (!candidate.acceptsBlueBuzz)
+      byCosmetic.set(listing.cosmeticId, { ...existing, acceptsBlueBuzz: false });
+  }
+
+  // Order follows the caller's list so `index` reflects what the builder chose.
+  return cosmeticIds.flatMap((id) => {
+    const member = byCosmetic.get(id);
+    return member ? [member] : [];
+  });
+};
+
+const assertMembersBundlable = (requested: number[], resolved: ResolvedMember[]) => {
+  if (resolved.length === requested.length) return;
+  const found = new Set(resolved.map((m) => m.cosmeticId));
+  const missing = requested.filter((id) => !found.has(id));
+  throw throwBadRequestError(
+    `These items can't be bundled — they have no published listing: ${missing.join(', ')}`
+  );
+};
+
+/**
+ * Bundling a sticker is an insertion path like any other, so the flag has to
+ * refuse it here. Filtering stickers out of the picker only hides them.
+ */
+const assertStickerMembersAllowed = (members: ResolvedMember[], stickersEnabled?: boolean) => {
+  if (stickersEnabled) return;
+  if (members.some((m) => m.type === CosmeticType.Sticker))
+    throw throwBadRequestError('Stickers cannot be bundled yet');
+};
+
+/**
+ * Who may bundle a member. A creator bundles their own work freely; another
+ * creator's only when its listing opted into resale (`sellableByOthers`). A pack
+ * is somebody else selling the item, so an opt-out has to block it here. An
+ * official shop section is not a resale, so it does not ask.
+ *
+ * A member with no creator is a platform cosmetic, which the resale-consent rule
+ * doesn't govern. `resolvePackMembers` already restricts to Published, non-archived
+ * listings, so those guards aren't repeated here.
+ */
+export const isBundlableBy = (
+  member: { createdById: number | null; sellableByOthers: boolean },
+  ownerId: number
+) => member.createdById == null || member.createdById === ownerId || member.sellableByOthers;
+
+/** Refuses members whose creator has not allowed others to sell them. */
+export const assertMembersResellable = (members: ResolvedMember[], ownerId: number) => {
+  const forbidden = members.filter((m) => !isBundlableBy(m, ownerId));
+  if (forbidden.length)
+    throw throwBadRequestError(
+      `These items can't be bundled — their creator hasn't allowed other creators to sell them: ${forbidden
+        .map((m) => m.name)
+        .join(', ')}`
+    );
+};
+
+const withOwnership = (members: ResolvedMember[], userId: number) =>
+  members.map((m) => ({ ...m, isOwn: m.createdById === userId }));
+
+/** Members that stop a pack from accepting Blue Buzz — named, so the builder can say which. */
+export const blueBuzzBlockers = (members: ResolvedMember[]) =>
+  members
+    .filter((m) => !m.acceptsBlueBuzz)
+    .map((m) => ({ cosmeticId: m.cosmeticId, name: m.name }));
+
+const COVER_TILE_COUNT = 4;
+const coverTilesFrom = (members: ResolvedMember[]) =>
+  members
+    .map((m) => getCosmeticArtworkUrl(m.data as Prisma.JsonValue))
+    .filter((url): url is string => !!url)
+    .slice(0, COVER_TILE_COUNT);
+
+export const buildRightsAffirmation = (userId: number) => ({
+  userId,
+  affirmedAt: new Date().toISOString(),
+  version: RIGHTS_AFFIRMATION_VERSION,
+  statement: RIGHTS_AFFIRMATION_STATEMENT,
+});
+
+export const submitCreatorShopPack = async ({
+  userId,
+  name,
+  description,
+  memberCosmeticIds,
+  price,
+  availableQuantity,
+  buzzType,
+  acceptsBlueBuzz,
+  imageUrl,
+  rightsAffirmed,
+  quotedFee,
+  stickersEnabled,
+}: SubmitCreatorShopPackInput & { userId: number; stickersEnabled?: boolean }) => {
+  // The same CosmeticShopItem.title/description columns the moderator-only upsert guards; these
+  // are the CREATOR-facing doors into them. Guarding only the moderator one would have closed
+  // the lower-risk door and left these open.
+  await throwOnBlockedUserContent([name, description], { surface: 'creatorShop' });
+
+  // Only artwork needs affirming, and only a cover is artwork the lister
+  // supplied — the members were each affirmed when they were submitted.
+  if (imageUrl && !rightsAffirmed)
+    throw throwBadRequestError('You must confirm you have the rights to sell this artwork');
+  if (imageUrl) {
+    await assertClientImageUrlsUsable({ urls: [imageUrl], userId, shopRow: {} });
+    await assertShopArtworkKeysIssued({ urls: [imageUrl], userId });
+  }
+
+  const members = withOwnership(await resolvePackMembers(memberCosmeticIds), userId);
+  assertMembersBundlable(memberCosmeticIds, members);
+  assertMembersResellable(members, userId);
+  assertStickerMembersAllowed(members, stickersEnabled);
+
+  const floor = packPriceFloor(members);
+  if (price < floor)
+    throw throwBadRequestError(
+      `This pack must be listed for at least ${floor} Buzz — every item another creator made has to be covered at its own price`
+    );
+
+  // A pack accepts blue only if every member does; requesting it when one
+  // member opted out is a mistake worth naming rather than silently dropping.
+  const blockers = blueBuzzBlockers(members);
+  if (acceptsBlueBuzz && blockers.length)
+    throw throwBadRequestError(
+      `These items don't accept Blue Buzz, so this pack can't either: ${blockers
+        .map((b) => b.name)
+        .join(', ')}`
+    );
+
+  const submissionFee = (await getCreatorShopFees()).pack;
+  assertQuotedFee(quotedFee, submissionFee);
+  const feeTx = await createBuzzTransaction({
+    fromAccountId: userId,
+    fromAccountType: buzzType as BuzzSpendType,
+    toAccountId: 0,
+    amount: submissionFee,
+    type: TransactionType.Purchase,
+    description: `Creator Shop pack submission fee - ${name}`,
+    externalTransactionId: `creator-shop-pack-submit-${userId}-${Date.now()}`,
+  });
+  const feeTxId = feeTx.transactionId;
+  if (!feeTxId) throw throwBadRequestError('Unable to charge the submission fee');
+
+  try {
+    return await dbWrite.$transaction(async (tx) => {
+      const item = await tx.cosmeticShopItem.create({
+        data: {
+          cosmeticId: null,
+          unitAmount: price,
+          title: name,
+          description: description ?? null,
+          availableQuantity: availableQuantity ?? null,
+          addedById: userId,
+          status: CosmeticShopItemStatus.PendingReview,
+          meta: {
+            purchases: 0,
+            submissionTxId: feeTxId,
+            submissionFee,
+            // `null` clears, `undefined` leaves alone — without the distinction
+            // the clear button emptied the form and saved nothing.
+            ...(imageUrl === undefined ? {} : { coverUrl: imageUrl ?? undefined }),
+            coverTiles: coverTilesFrom(members),
+            packMemberCount: members.length,
+            acceptsBlueBuzz,
+            // Only when a cover was actually supplied. The affirmation is a
+            // statement about artwork; recording one for a pack with no cover
+            // makes the review panel quote it back to a moderator as though the
+            // lister claimed rights over art they never uploaded.
+            ...(imageUrl ? { rightsAffirmation: buildRightsAffirmation(userId) } : {}),
+          } satisfies CosmeticShopItemMeta as Prisma.InputJsonValue,
+        },
+      });
+
+      await tx.cosmeticShopItemCosmetic.createMany({
+        data: members.map((m, index) => ({
+          shopItemId: item.id,
+          cosmeticId: m.cosmeticId,
+          index,
+          // Snapshot: a member's creator raising their price later must not
+          // silently re-price every pack that contains them.
+          floorAmount: m.listPrice,
+        })),
+      });
+
+      return item;
+    });
+  } catch (error) {
+    await refundTransaction(feeTxId, 'Creator Shop pack submission failed');
+    throw error;
+  }
+};
+
+export const updateCreatorShopPack = async ({
+  userId,
+  isModerator,
+  id,
+  name,
+  description,
+  price,
+  availableQuantity,
+  acceptsBlueBuzz,
+  imageUrl,
+  memberCosmeticIds,
+  stickersEnabled,
+}: UpdateCreatorShopPackInput & {
+  userId: number;
+  isModerator?: boolean;
+  stickersEnabled?: boolean;
+}) => {
+  // Primary, not the replica: the edit is refused below if the row moved since this read.
+  const existing = await dbWrite.cosmeticShopItem.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      cosmeticId: true,
+      itemDefinitionId: true,
+      addedById: true,
+      status: true,
+      meta: true,
+      unitAmount: true,
+      // Prior values, so the edit can record what it moved from.
+      title: true,
+      description: true,
+      availableQuantity: true,
+      members: { select: { cosmeticId: true }, orderBy: { index: 'asc' } },
+    },
+  });
+  if (!existing) throw throwNotFoundError('Pack not found');
+  if (!isPackShopItem(existing)) throw throwBadRequestError('This listing is not a pack');
+  if (!isModerator && existing.addedById !== userId)
+    throw throwBadRequestError('You can only manage your own shop items');
+
+  // AFTER the ownership check, deliberately. The rejection names the matched entry, so running
+  // it first turns this endpoint into a membership oracle for anyone holding another's id.
+  await throwOnBlockedUserContent([name, description], { isModerator, surface: 'creatorShop' });
+  if (existing.status === CosmeticShopItemStatus.Rejected)
+    throw throwBadRequestError(REJECTED_IS_FINAL);
+  if (existing.status === CosmeticShopItemStatus.Archived)
+    throw throwBadRequestError('Archived items cannot be edited');
+
+  const meta = (existing.meta ?? {}) as CosmeticShopItemMeta;
+  const memberIds = memberCosmeticIds ?? existing.members.map((m) => m.cosmeticId);
+  const packOwnerId = existing.addedById ?? userId;
+  if (imageUrl && imageUrl !== meta.coverUrl) {
+    await assertClientImageUrlsUsable({
+      urls: [imageUrl],
+      userId: packOwnerId,
+      shopRow: { shopItemId: existing.id },
+    });
+    await assertShopArtworkKeysIssued({
+      urls: [imageUrl],
+      userId,
+      alsoIssuedTo: isModerator ? packOwnerId : undefined,
+    });
+  }
+  const membershipSupplied = memberCosmeticIds !== undefined;
+  const repriced = price !== undefined;
+  // Re-snapshot whenever the price moves, not only when the contents do. The
+  // floor is checked against today's list prices; leaving yesterday's snapshots
+  // in place lets a lowered member price drag the pack's price down while its
+  // component still pays out the old, higher amount.
+  const reSnapshot = membershipSupplied || repriced;
+
+  // Resolved only for the edits that read it. Every consumer below — the three
+  // asserts, the floor, the blue blockers, the snapshot rows and the cover
+  // tiles — sits behind one of these two conditions, so a title-only edit was
+  // paying for a query (measured 1.1 ms, and a seq scan of every shop item)
+  // whose result nothing looked at. 🔴 Anything added below that reads
+  // `members` must extend this predicate, or it will read an empty list.
+  const needsMembers = reSnapshot || acceptsBlueBuzz !== undefined;
+  const members = needsMembers
+    ? withOwnership(await resolvePackMembers(memberIds), packOwnerId)
+    : [];
+
+  // Everything below re-validates state the edit did not necessarily touch, so
+  // each is scoped to the edit that makes it meaningful. Run unconditionally
+  // they refuse a title fix over a member's later, unrelated decision — which is
+  // the same "form that cannot save" this whole editor exists to remove.
+  //
+  // Bundlability rides `reSnapshot` rather than membership alone: a price move is
+  // re-checked against a floor that can only be summed over members that still
+  // resolve, so a missing one has to refuse there.
+  if (reSnapshot) assertMembersBundlable(memberIds, members);
+  if (membershipSupplied) {
+    // Resale consent is deliberately NOT re-checked on a price move. Revoking
+    // `sellableByOthers` is an offer withdrawn from FUTURE resellers, never a
+    // term of an existing listing — see the note on `resaleChanged` in
+    // creator-shop.service.ts.
+    assertMembersResellable(members, packOwnerId);
+    assertStickerMembersAllowed(members, stickersEnabled);
+  }
+
+  if (reSnapshot) {
+    const nextPrice = price ?? existing.unitAmount;
+    const floor = packPriceFloor(members);
+    if (nextPrice < floor)
+      throw throwBadRequestError(
+        `This pack must be listed for at least ${floor} Buzz — every item another creator made has to be covered at its own price`
+      );
+  }
+
+  const nextAcceptsBlue = acceptsBlueBuzz ?? !!meta.acceptsBlueBuzz;
+  if (membershipSupplied || acceptsBlueBuzz !== undefined) {
+    const blockers = blueBuzzBlockers(members);
+    if (nextAcceptsBlue && blockers.length)
+      throw throwBadRequestError(
+        `These items don't accept Blue Buzz, so this pack can't either: ${blockers
+          .map((b) => b.name)
+          .join(', ')}`
+      );
+  }
+
+  // Recorded like an item's edits, so moderators see them and a verdict pinned to the version they
+  // reviewed (`shopItemReviewVersion`) is refused once the pack has moved.
+  const changes: CosmeticShopItemHistoryChange[] = [];
+  const recordChange = (
+    field: string,
+    from: string | number | null | undefined,
+    to: string | number | null | undefined
+  ) => {
+    if ((from ?? null) !== (to ?? null)) changes.push({ field, from, to });
+  };
+  if (name !== undefined) recordChange('name', existing.title, name);
+  if (description !== undefined) recordChange('description', existing.description, description);
+  if (price !== undefined) recordChange('price', existing.unitAmount, price);
+  if (availableQuantity !== undefined)
+    recordChange('quantity', existing.availableQuantity, availableQuantity);
+  if (imageUrl !== undefined) recordChange('cover', meta.coverUrl, imageUrl);
+  if (membershipSupplied)
+    recordChange(
+      'members',
+      existing.members.map((m) => m.cosmeticId).join(', '),
+      memberIds.join(', ')
+    );
+  if (acceptsBlueBuzz !== undefined)
+    recordChange(
+      'acceptsBlueBuzz',
+      meta.acceptsBlueBuzz ? 'yes' : 'no',
+      nextAcceptsBlue ? 'yes' : 'no'
+    );
+
+  return dbWrite.$transaction(async (tx) => {
+    const current = await lockShopItem(tx, id);
+    if (current.status === CosmeticShopItemStatus.Rejected)
+      throw throwBadRequestError(REJECTED_IS_FINAL);
+    if (current.status === CosmeticShopItemStatus.Archived)
+      throw throwBadRequestError('Archived items cannot be edited');
+    // `changes` were measured against `existing`; recorded against a row that has moved since, an
+    // edit could change what a moderator reviewed without moving its version. A sale's `purchases`
+    // bump is carried, not compared, as on an item edit.
+    const { purchases: _purchases, ...currentMeta } = (current.meta ?? {}) as CosmeticShopItemMeta;
+    const { purchases: _readPurchases, ...readMeta } = meta;
+    if (
+      current.status !== existing.status ||
+      current.unitAmount !== existing.unitAmount ||
+      !isEqual(currentMeta, readMeta)
+    )
+      throw throwConflictError(
+        'This pack changed while you were editing it. Reload and try again.'
+      );
+    const nextMeta: CosmeticShopItemMeta = {
+      ...((current.meta ?? {}) as CosmeticShopItemMeta),
+      // `null` clears, `undefined` leaves alone — without the distinction
+      // the clear button emptied the form and saved nothing.
+      ...(imageUrl === undefined ? {} : { coverUrl: imageUrl ?? undefined }),
+      ...(membershipSupplied ? { coverTiles: coverTilesFrom(members) } : {}),
+      // Only re-baselined when the contents were actually chosen. A member
+      // Cosmetic being deleted cascades its join row away, so rewriting this
+      // on a price-only edit would quietly ratify the shrunken pack.
+      ...(membershipSupplied ? { packMemberCount: members.length } : {}),
+      acceptsBlueBuzz: nextAcceptsBlue,
+    };
+
+    if (reSnapshot) {
+      await tx.cosmeticShopItemCosmetic.deleteMany({ where: { shopItemId: id } });
+      await tx.cosmeticShopItemCosmetic.createMany({
+        data: members.map((m, index) => ({
+          shopItemId: id,
+          cosmeticId: m.cosmeticId,
+          index,
+          floorAmount: m.listPrice,
+        })),
+      });
+    }
+
+    return tx.cosmeticShopItem.update({
+      where: { id },
+      data: {
+        ...(name !== undefined ? { title: name } : {}),
+        ...(description !== undefined ? { description: description ?? null } : {}),
+        ...(price !== undefined ? { unitAmount: price } : {}),
+        ...(availableQuantity !== undefined
+          ? { availableQuantity: availableQuantity ?? null }
+          : {}),
+        // Contents or price changing sends the pack back through review, the
+        // same way an item's content edit does.
+        ...(reSnapshot ? { status: CosmeticShopItemStatus.PendingReview } : {}),
+        meta: (changes.length
+          ? appendItemHistory(nextMeta, {
+              at: new Date().toISOString(),
+              userId,
+              kind: 'edited',
+              status: reSnapshot ? CosmeticShopItemStatus.PendingReview : current.status,
+              changes,
+            })
+          : nextMeta) as Prisma.InputJsonValue,
+      },
+    });
+  });
+};
+
+/**
+ * D14 cascade: a member leaving sale delists every pack containing it.
+ *
+ * `listed = false`, not Archived — the pack creator can swap the member out and
+ * relist. D15 (no nesting) is what keeps this one level deep.
+ */
+export const delistPacksContaining = async (cosmeticId: number) => {
+  // A cosmetic can be listed more than once (resale by reference). It stays
+  // bundlable while any Published listing survives, so one listing going away
+  // is not grounds for delisting anyone's pack.
+  const stillListed = await dbRead.cosmeticShopItem.findFirst({
+    where: { cosmeticId, status: CosmeticShopItemStatus.Published, archivedAt: null },
+    select: { id: true },
+  });
+  if (stillListed) return { delisted: 0 };
+
+  const packs = await dbRead.cosmeticShopItemCosmetic.findMany({
+    where: { cosmeticId },
+    select: { shopItemId: true },
+  });
+  if (!packs.length) return { delisted: 0 };
+  const { count } = await dbWrite.cosmeticShopItem.updateMany({
+    where: { id: { in: packs.map((p) => p.shopItemId) }, listed: true },
+    data: { listed: false },
+  });
+  return { delisted: count };
+};
+
+/**
+ * A pack's contents, priced for this viewer.
+ *
+ * Contents being visible before purchase is not decoration — it is the stated
+ * mitigation for D16 (a pack may be bought regardless of what you already own).
+ */
+export const getPackDetail = async ({
+  shopItemId,
+  userId,
+  isModerator,
+}: {
+  shopItemId: number;
+  userId?: number;
+  isModerator?: boolean;
+}) => {
+  const item = await dbRead.cosmeticShopItem.findUnique({
+    where: { id: shopItemId },
+    select: {
+      id: true,
+      cosmeticId: true,
+      itemDefinitionId: true,
+      title: true,
+      description: true,
+      unitAmount: true,
+      status: true,
+      listed: true,
+      availableQuantity: true,
+      meta: true,
+      addedById: true,
+      members: { select: { cosmeticId: true, floorAmount: true }, orderBy: { index: 'asc' } },
+      // This select is its own, not the shared `cosmeticShopItemSelect`, so the
+      // row count has to be asked for here too or the pack page is the one
+      // surface left reading the drifting counter.
+      _count: { select: { purchases: true } },
+    },
+  });
+  if (!item) throw throwNotFoundError('Pack not found');
+  if (!isPackShopItem(item)) throw throwBadRequestError('This listing is not a pack');
+  // Named once: this decides both who may read a pack that is not on sale and
+  // who is answered about its review state. Two spellings of it drift apart on
+  // the first tightening.
+  const canReadPrivateState = !!isModerator || (!!userId && userId === item.addedById);
+  // Every other read path in the shop gates on Published. Without this, an id is
+  // enough to read an unreviewed or rejected pack's contents and pricing.
+  if (item.status !== CosmeticShopItemStatus.Published && !canReadPrivateState)
+    throw throwNotFoundError('Pack not found');
+
+  const packMeta = (item.meta ?? {}) as CosmeticShopItemMeta;
+
+  const snapshotByCosmetic = new Map(item.members.map((m) => [m.cosmeticId, m.floorAmount]));
+  const resolved = await resolvePackMembers(item.members.map((m) => m.cosmeticId));
+  const members = resolved.map((m) => ({
+    ...m,
+    isOwn: m.createdById === item.addedById,
+    // What the buyer is paying for this member, which is the snapshot rather
+    // than today's list price.
+    listPrice: snapshotByCosmetic.get(m.cosmeticId) ?? m.listPrice,
+  }));
+
+  // On the writer, like the purchase path: the quote gates the buy button, so a
+  // replica that hasn't caught up quotes a price above what will be charged and
+  // blocks a buyer who can afford the real one.
+  const owned = userId
+    ? await dbWrite.userCosmetic.findMany({
+        where: { userId, cosmeticId: { in: members.map((m) => m.cosmeticId) } },
+        select: { cosmeticId: true },
+      })
+    : [];
+  const ownedCosmeticIds = [...new Set(owned.map((o) => o.cosmeticId))];
+
+  // The same helper the purchase path charges with, so the quote and the charge
+  // cannot drift.
+  const { discount, perMember, selfAuthored, amountDue } = computePackAmountDue({
+    packPrice: item.unitAmount,
+    members,
+    ownedCosmeticIds,
+    buyerId: userId,
+    packCreatorId: item.addedById,
+  });
+  const discountByCosmetic = new Map(perMember.map((m) => [m.cosmeticId, m.discount]));
+
+  return {
+    id: item.id,
+    title: item.title,
+    description: item.description,
+    unitAmount: item.unitAmount,
+    status: item.status,
+    listed: item.listed,
+    availableQuantity: item.availableQuantity,
+    // Named fields, not the column, and the same list every other shop surface
+    // publishes — a second list here is a list that stops agreeing.
+    meta: shopItemDisplayMeta(packMeta, item._count.purchases),
+    // Archiving overwrites `status`, so this is the only thing that tells a
+    // rejected pack from an ordinary archived one. Derived here rather than
+    // client-side, and answered only for the two viewers whose editor asks the
+    // question — everyone else gets no answer rather than a false one.
+    lastReviewWasRejection: canReadPrivateState
+      ? wasLastReviewARejection(packMeta.history)
+      : undefined,
+    // A member the pack no longer resolves is a member that can't be sold; the
+    // purchase refuses on the same condition, so say so before they try.
+    unavailableCount: packMembersMissing(packMeta.packMemberCount, members.length),
+    // The purchase refuses the lister outright, and without this the client
+    // cannot tell them apart — it would render a priced, enabled button that
+    // always fails.
+    isPackCreator: !!userId && userId === item.addedById,
+    discount,
+    selfAuthored,
+    /** What this viewer will actually be charged. */
+    amountDue,
+    members: members.map((m) => ({
+      cosmeticId: m.cosmeticId,
+      name: m.name,
+      type: m.type,
+      data: m.data,
+      creatorUsername: m.creatorUsername,
+      isOwn: m.isOwn,
+      listPrice: m.listPrice,
+      // Today's list price, which is what an edit is re-checked against — the
+      // snapshot above is only what this pack charges.
+      currentListPrice:
+        resolved.find((r) => r.cosmeticId === m.cosmeticId)?.listPrice ?? m.listPrice,
+      acceptsBlueBuzz: m.acceptsBlueBuzz,
+      owned: ownedCosmeticIds.includes(m.cosmeticId),
+      // Owning a consumable means the purchase tops it up rather than
+      // duplicating it (D23), which is also why it earns no discount.
+      consumable: isConsumableCosmeticType(m.type),
+      // What a consumable member grants. For a sticker this is the whole offer.
+      uses: stickerUsesFromCosmeticData(m.data),
+      discount: discountByCosmetic.get(m.cosmeticId) ?? 0,
+    })),
+  };
+};
+
+/**
+ * Cosmetics this creator may bundle: their own work, plus other creators' items
+ * whose listing opted into resale. Anything a creator placed off limits
+ * (`sellableByOthers` false) is never offered, so the composer can't stage a
+ * member the save would refuse — see `isBundlableBy`.
+ */
+export const getBundlableCosmetics = async ({
+  userId,
+  query,
+  limit = 50,
+  types,
+}: {
+  userId: number;
+  query?: string;
+  limit?: number;
+  types?: CosmeticType[];
+}) => {
+  const listings = await dbRead.cosmeticShopItem.findMany({
+    where: {
+      status: CosmeticShopItemStatus.Published,
+      archivedAt: null,
+      cosmeticId: { not: null },
+      // One `cosmetic` object: two spreads onto the same key meant the type
+      // filter silently overwrote the search.
+      cosmetic: {
+        ...(query ? { name: { contains: query, mode: 'insensitive' as const } } : {}),
+        // Always bounded by what a creator may list. Without this the picker
+        // offered every published cosmetic — including NamePlates, which
+        // creators cannot make and which have no artwork to show.
+        type: {
+          in: types?.length ? types.filter(isCreatorCosmeticType) : [...creatorCosmeticTypes],
+        },
+      },
+    },
+    orderBy: { id: 'desc' },
+    take: limit * 2,
+    select: { cosmeticId: true },
+  });
+  // Filter after resolving, on the same highest-priced listing the composer and
+  // payout price against: a cosmetic listed both sellable and not must be judged
+  // by the listing the pack would actually use, not by whichever row matched.
+  const cosmeticIds = [...new Set(listings.map((l) => l.cosmeticId as number))];
+  const resolved = await resolvePackMembers(cosmeticIds);
+  return resolved.filter((m) => isBundlableBy(m, userId)).slice(0, limit);
+};

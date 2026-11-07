@@ -1,0 +1,28 @@
+.body {
+  align-items: center;
+}
+
+.labelWrapper {
+  flex: 1;
+}
+
+.contentWrap {
+  padding: var(--mantine-spacing-xs, 8px);
+  border-radius: var(--mantine-radius-sm, 4px);
+  transition: background-color 150ms ease;
+
+  &:hover {
+    background-color: light-dark(
+      var(--mantine-color-gray-0),
+      var(--mantine-color-dark-6)
+    );
+  }
+}
+
+.collectionName {
+  flex: 1;
+}
+
+.privacyIcon {
+  opacity: 0.8;
+}

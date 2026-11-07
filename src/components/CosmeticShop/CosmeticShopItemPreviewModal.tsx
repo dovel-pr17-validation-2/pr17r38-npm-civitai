@@ -1,0 +1,380 @@
+import {
+  Box,
+  Center,
+  Grid,
+  Modal,
+  Stack,
+  Text,
+  CloseButton,
+  Group,
+  Button,
+  Loader,
+  Paper,
+  UnstyledButton,
+  useMantineTheme,
+  useMatches,
+} from '@mantine/core';
+import { useState } from 'react';
+import { CosmeticType } from '~/shared/utils/prisma/enums';
+import { useRouter } from 'next/router';
+import { BuzzTransactionButton } from '~/components/Buzz/BuzzTransactionButton';
+import { useAvailableBuzz } from '~/components/Buzz/useAvailableBuzz';
+import type { PayWithOption } from '~/components/CosmeticShop/PayWithSelector';
+import { PayWithSelector } from '~/components/CosmeticShop/PayWithSelector';
+import type { BuzzSpendType } from '~/shared/constants/buzz.constants';
+import { useMutateCosmeticShop } from '~/components/CosmeticShop/cosmetic-shop.util';
+import {
+  useEquipProfileDecoration,
+  useQueryStickerBalances,
+  useQueryUserCosmetics,
+} from '~/components/Cosmetics/cosmetics.util';
+import { useDialogContext } from '~/components/Dialog/DialogProvider';
+import { dialogStore } from '~/components/Dialog/dialogStore';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { CosmeticPreview } from '~/components/CosmeticShop/CosmeticPreview';
+import type { CosmeticShopItemGetById } from '~/types/router';
+import {
+  CIVITAI_SHOP_ATTRIBUTION,
+  cosmeticShopItemMeta,
+} from '~/server/schema/cosmetic-shop.schema';
+import { computeCreatorShopSplit } from '~/server/schema/creator-shop.schema';
+import { showSuccessNotification } from '~/utils/notifications';
+import { numberWithCommas } from '~/utils/number-helpers';
+import { getDisplayName } from '~/utils/string-helpers';
+import { IconAlertTriangleFilled } from '@tabler/icons-react';
+import dayjs from '~/shared/utils/dayjs';
+import { NotificationToggle } from '~/components/Notifications/NotificationToggle';
+import { CosmeticSample } from '~/components/Shop/CosmeticSample';
+import { stickerPurchaseTerms } from '~/components/Sticker/sticker.util';
+import { canPurchaseShopCosmetic } from '~/components/CosmeticShop/shop-item-purchasable';
+import { stickerSurfaceLabels } from '~/shared/utils/sticker-token';
+
+const { charged, free } = stickerSurfaceLabels();
+const stickerSurfaceCopy = [...charged, ...free].join(' and ');
+
+type Props = { shopItem: CosmeticShopItemGetById; viaShopUserId?: number };
+
+export const CosmeticShopItemPurchaseCompleteModal = ({
+  shopItem,
+  userCosmetic,
+}: Props & { userCosmetic: { cosmeticId: number; claimKey: string } }) => {
+  const dialog = useDialogContext();
+  // Packs never reach this modal — ShopItem routes them to their own, which is
+  // why the assertion is safe rather than optimistic.
+  const cosmetic = shopItem.cosmetic as NonNullable<CosmeticShopItemGetById['cosmetic']>;
+  const theme = useMantineTheme();
+  const currentUser = useCurrentUser();
+  const { equip, isLoading } = useEquipProfileDecoration();
+  const router = useRouter();
+
+  const handleApplyDecoration = async () => {
+    if (cosmetic.type === CosmeticType.Sticker) {
+      // Owned, not equipped — the button here just acknowledges the purchase.
+    } else if (cosmetic.type === CosmeticType.ContentDecoration && currentUser?.username) {
+      router.push(`/user/${currentUser.username}`);
+    } else {
+      // Apply now...
+      await equip({
+        id: userCosmetic.cosmeticId,
+      });
+
+      showSuccessNotification({
+        message: 'Your cosmetic has been applied to your profile!',
+      });
+    }
+
+    dialog.onClose();
+  };
+
+  return (
+    <Modal {...dialog} size="md" withCloseButton={false} radius="lg">
+      <Stack gap="xl" px="md">
+        <Group justify="space-between">
+          <Text className="text-black dark:text-white">You got a shiny new thing!</Text>
+          <CloseButton onClick={dialog.onClose} />
+        </Group>
+
+        <Box p="lg" className="bg-gray-0 dark:bg-dark-8" style={{ borderRadius: theme.radius.lg }}>
+          <CosmeticPreview cosmetic={cosmetic} />
+        </Box>
+
+        <Stack gap={4}>
+          {cosmetic.type === CosmeticType.Sticker && (
+            <Text size="xs" c="dimmed" align="center">
+              Type <b>:{(cosmetic.data as { slug?: string } | null)?.slug}:</b> or pick it from the
+              sticker button in {stickerSurfaceCopy}.
+            </Text>
+          )}
+          {cosmetic.type === CosmeticType.ContentDecoration && (
+            <Text size="xs" c="dimmed" align="center">
+              This decoration is now available to apply to your content. You can select which piece
+              to apply it on from your profile.
+            </Text>
+          )}
+          <Button radius="xl" mx="auto" onClick={handleApplyDecoration} loading={isLoading}>
+            {cosmetic.type === CosmeticType.ContentDecoration
+              ? 'Go to my profile'
+              : cosmetic.type === CosmeticType.Sticker
+              ? 'Done'
+              : 'Apply now'}
+          </Button>
+          <NotificationToggle type="cosmetic-shop-item-added-to-section">
+            {({ onToggle, isEnabled }) =>
+              isEnabled ? null : (
+                <Group>
+                  <Text size="xs" align="center">
+                    Do not miss out on new items in the shop!
+                    <UnstyledButton onClick={onToggle}>
+                      <Text size="xs" component="span" c="blue">
+                        Click here to Enable notifications
+                      </Text>
+                    </UnstyledButton>
+                  </Text>
+                </Group>
+              )
+            }
+          </NotificationToggle>
+        </Stack>
+      </Stack>
+    </Modal>
+  );
+};
+
+export const CosmeticShopItemPreviewModal = ({ shopItem, viaShopUserId }: Props) => {
+  const dialog = useDialogContext();
+  // See CosmeticShopItemPurchaseCompleteModal: packs have their own modal.
+  const cosmetic = shopItem.cosmetic as NonNullable<CosmeticShopItemGetById['cosmetic']>;
+  const { purchaseShopItem, purchasingShopItem } = useMutateCosmeticShop();
+  // Same breakpoint as the Grid below: the columns sit side by side from `md`.
+  const isTwoColumn = useMatches({ base: false, md: true });
+  const { data: userCosmetics, isLoading } = useQueryUserCosmetics();
+  const { equip, isLoading: isEquipping } = useEquipProfileDecoration();
+  const router = useRouter();
+  const currentUser = useCurrentUser();
+  const isSticker = cosmetic.type === CosmeticType.Sticker;
+  const { data: stickerBalances, isLoading: isLoadingBalances } = useQueryStickerBalances({
+    enabled: isSticker,
+  });
+  const hasCosmetic = Object.values(userCosmetics ?? {})
+    .flat()
+    .some(({ id }) => id === cosmetic.id);
+  // The same hat can be bought repeatedly, one holding per copy.
+  const ownedHatCopies =
+    cosmetic.type === CosmeticType.ContentDecoration
+      ? (userCosmetics?.contentDecorations ?? []).filter(({ id }) => id === cosmetic.id).length
+      : 0;
+  const canPurchase = canPurchaseShopCosmetic({
+    type: cosmetic.type,
+    owned: hasCosmetic,
+    stickerRemaining: stickerBalances?.find((b) => b.cosmeticId === cosmetic.id)?.remaining,
+  });
+  const isAvailable =
+    (shopItem.availableQuantity === null || shopItem.availableQuantity > 0) &&
+    (shopItem.availableFrom === null || dayjs(shopItem.availableFrom).isBefore(dayjs()));
+
+  // Resold items carry the seller share so the buyer sees who earns what.
+  const parsedMeta = cosmeticShopItemMeta.safeParse(shopItem.meta);
+  const resaleShare = parsedMeta.success ? parsedMeta.data.sellerShare : undefined;
+
+  // Blue-accepting items let the buyer choose how to pay: the domain color
+  // (default), or blue first with the rest in the domain color.
+  const acceptsBlue = parsedMeta.success && !!parsedMeta.data.acceptsBlueBuzz;
+  const [domainType] = useAvailableBuzz();
+  const [payWith, setPayWith] = useState<PayWithOption>('default');
+  const accountTypes: BuzzSpendType[] =
+    !acceptsBlue || payWith === 'default' ? [domainType] : ['blue', domainType];
+  // The split note only shows for cross-creator resale — not on the official
+  // Civitai shop, and not when buying the creator's own item on their own
+  // storefront (the creator keeps the full pool there).
+  const isOwnShopListing = viaShopUserId != null && viaShopUserId === cosmetic.creator?.id;
+  const isResale =
+    viaShopUserId != null &&
+    viaShopUserId !== CIVITAI_SHOP_ATTRIBUTION &&
+    resaleShare != null &&
+    !isOwnShopListing;
+  const { sellerAmount: resellerAmount, creatorAmount } = computeCreatorShopSplit(
+    shopItem.unitAmount,
+    resaleShare ?? 0
+  );
+  const stickerTerms =
+    cosmetic.type === CosmeticType.Sticker ? stickerPurchaseTerms(cosmetic.data) : null;
+
+  const handlePurchaseShopItem = async () => {
+    try {
+      const userCosmetic = await purchaseShopItem({
+        shopItemId: shopItem.id,
+        viaShopUserId,
+        payWith: acceptsBlue ? payWith : undefined,
+      });
+
+      showSuccessNotification({
+        message: 'Your purchase has been completed and your cosmetic is now available to equip',
+      });
+      dialog.onClose();
+      // The mutation also serves packs, which return a grant summary rather than
+      // a single holding. This modal is only ever reached for a single item.
+      if (userCosmetic && 'claimKey' in userCosmetic)
+        dialogStore.trigger({
+          component: CosmeticShopItemPurchaseCompleteModal,
+          props: { shopItem, userCosmetic },
+        });
+    } catch (error) {
+      // Do nothing, handled within the hook
+    }
+  };
+
+  const handleEquipDecoration = async () => {
+    await equip({
+      id: cosmetic.id,
+    });
+
+    showSuccessNotification({
+      message: 'Your cosmetic has been applied to your profile!',
+    });
+
+    dialog.onClose();
+  };
+
+  return (
+    <Modal {...dialog} size="xl" withCloseButton={false} radius="lg" classNames={{ body: 'p-0' }}>
+      <Grid classNames={{ inner: 'my-0' }}>
+        <Grid.Col span={{ base: 12, md: 5 }} p="lg" pb={0}>
+          <Stack gap="lg" px="md" h="100%">
+            <Group justify="space-between" wrap="nowrap">
+              <Text className="text-black dark:text-white" size="sm">
+                {getDisplayName(cosmetic.type)}
+              </Text>
+              <CloseButton className="show-mobile" onClick={dialog.onClose} />
+            </Group>
+            <Center my="auto" h={250}>
+              <CosmeticSample cosmetic={cosmetic} size="lg" />
+            </Center>
+            {/* Side by side, a tall preview image makes the modal taller than the
+                viewport: pinning this block to the modal's bottom edge keeps the price
+                and Purchase button on screen. Stacked, it already sits above the preview,
+                and pinned it would cover the header's close button on a short screen. */}
+            <Stack
+              gap="lg"
+              mt="auto"
+              pb="lg"
+              className={isTwoColumn ? 'sticky bottom-0 z-10' : undefined}
+              bg="var(--mantine-color-body)"
+            >
+              <Text className="text-black dark:text-white" fw="bold" size="lg">
+                {shopItem.title}
+              </Text>
+              {/* A sticker is sold by the use, so how many you get is the offer —
+                without it the price has nothing to be judged against. */}
+              {stickerTerms && (
+                <Text size="sm" c="dimmed">
+                  {stickerTerms.usesLabel}
+                  {stickerTerms.extraUseLabel ? ` · ${stickerTerms.extraUseLabel}` : ''}
+                </Text>
+              )}
+              {(isLoading || (isSticker && isLoadingBalances)) && (
+                <Center>
+                  <Loader type="bars" />
+                </Center>
+              )}
+              {!isLoading && !(isSticker && isLoadingBalances) && (
+                <>
+                  {isResale && (
+                    <Paper withBorder radius="md" p="sm">
+                      <Text size="xs" c="dimmed" mb={4}>
+                        You&apos;re buying from a reseller — this sale splits:
+                      </Text>
+                      <Group justify="space-between">
+                        <Text size="xs">Reseller earns</Text>
+                        <Text size="xs" fw={600}>
+                          {numberWithCommas(resellerAmount)} Buzz
+                        </Text>
+                      </Group>
+                      <Group justify="space-between">
+                        <Text size="xs">Original creator earns</Text>
+                        <Text size="xs" fw={600}>
+                          {numberWithCommas(creatorAmount)} Buzz
+                        </Text>
+                      </Group>
+                    </Paper>
+                  )}
+                  {canPurchase ? (
+                    <Stack gap={6}>
+                      {ownedHatCopies > 0 && (
+                        <Text size="sm" align="center" c="dimmed">
+                          You own {ownedHatCopies} of these. Buying another lets you wear it on one
+                          more piece of content.
+                        </Text>
+                      )}
+                      {acceptsBlue && isAvailable && (
+                        <PayWithSelector
+                          value={payWith}
+                          onChange={setPayWith}
+                          domainType={domainType}
+                        />
+                      )}
+                      <BuzzTransactionButton
+                        disabled={purchasingShopItem || !isAvailable}
+                        loading={purchasingShopItem}
+                        buzzAmount={shopItem.unitAmount}
+                        radius="xl"
+                        onPerformTransaction={handlePurchaseShopItem}
+                        label="Purchase"
+                        accountTypes={accountTypes}
+                        showTypePct={acceptsBlue && payWith === 'blue-first'}
+                      />
+                      {ownedHatCopies > 0 && currentUser?.username && (
+                        <Button
+                          variant="default"
+                          radius="xl"
+                          onClick={() => {
+                            router.push(`/user/${currentUser.username}`);
+                            dialog.onClose();
+                          }}
+                        >
+                          Place on my content
+                        </Button>
+                      )}
+                    </Stack>
+                  ) : cosmetic.type === CosmeticType.Sticker ? (
+                    <Text size="sm" align="center" c="dimmed">
+                      You already own this sticker — it&apos;s in your sticker picker.
+                    </Text>
+                  ) : (
+                    <Stack gap={4}>
+                      <Button radius="xl" onClick={handleEquipDecoration} loading={isEquipping}>
+                        Equip now
+                      </Button>
+                      <Text size="sm" align="center" c="dimmed">
+                        You already own this cosmetic
+                      </Text>
+                    </Stack>
+                  )}
+                </>
+              )}
+              {cosmetic.type === CosmeticType.ContentDecoration && (
+                <Group gap="xs" wrap="nowrap">
+                  <Text c="yellow">
+                    <IconAlertTriangleFilled />
+                  </Text>
+
+                  <Text size="xs" c="yellow" lh={1.3}>
+                    This cosmetic is an <u>equippable</u>. It can only be applied to <u>one</u>{' '}
+                    piece of content at a time.
+                  </Text>
+                </Group>
+              )}
+            </Stack>
+          </Stack>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, md: 7 }} p="lg" className="  bg-gray-0 dark:bg-dark-8">
+          <Stack gap={0} h={0} align="flex-end" className="hide-mobile">
+            <CloseButton onClick={dialog.onClose} />
+          </Stack>
+          <Stack px="md" h="100%" justify="center">
+            <CosmeticPreview cosmetic={cosmetic} />
+          </Stack>
+        </Grid.Col>
+      </Grid>
+    </Modal>
+  );
+};

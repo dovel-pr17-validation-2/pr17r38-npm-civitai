@@ -1,0 +1,140 @@
+import type { NextApiRequest, NextApiResponse } from 'next';
+import * as z from 'zod';
+
+import { env } from '~/env/server';
+import { getApiAuthSession } from '~/server/auth/api-auth-session';
+import { getDownloadUrl } from '~/utils/delivery-worker';
+import { getLoginLink } from '~/utils/login-helpers';
+import { getFileWithPermission } from '~/server/services/file.service';
+import { Tracker } from '~/server/clickhouse/client';
+import { handleLogError, isClientAbortError } from '~/server/utils/errorHandling';
+import { PublicEndpoint } from '~/server/utils/endpoint-helpers';
+import { getDownloadBlocklistValue } from '~/server/services/download-blocklist.service';
+import { getTrustedClientIp, parseIpBlocklist, parseUserBlocklist } from '~/server/utils/client-ip';
+
+const schema = z.object({
+  fileId: z.preprocess((val) => Number(val), z.number()),
+});
+
+const forbidden = (req: NextApiRequest, res: NextApiResponse) => {
+  res.status(403);
+  if (req.headers['content-type'] === 'application/json') return res.json({ error: 'Forbidden' });
+  else return res.send('Forbidden');
+};
+
+const notFound = (req: NextApiRequest, res: NextApiResponse, message = 'Not Found') => {
+  res.status(404);
+  if (req.headers['content-type'] === 'application/json') return res.json({ error: message });
+  else return res.send(message);
+};
+
+export default PublicEndpoint(
+  async function downloadAttachment(req: NextApiRequest, res: NextApiResponse) {
+    // Per-user, permission-gated redirect to a short-lived signed file URL —
+    // never cache it. PublicEndpoint's `public, s-maxage` default would leak
+    // one user's signed redirect to others and keep serving a removed file from
+    // edge after the origin returns 404. Override with no-store.
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+
+    // Get ip so that we can block exploits we catch. Derived via getTrustedClientIp
+    // (edge-attested or transport peer only) — an enforcement control must not key
+    // on an address the caller supplies. Do not swap this for an inline resolver.
+    //
+    // Operator note before you add an entry to `ip-blacklist`: a request that did
+    // not transit the Cloudflare edge is attributed to the transport peer, so
+    // where that peer is a shared hop, listing its address blocks all such
+    // traffic to every download route at once rather than one abuser. See
+    // `parseIpBlocklist`.
+    const ip = getTrustedClientIp(req);
+    const ipBlacklist = parseIpBlocklist(await getDownloadBlocklistValue('ip-blacklist'));
+    if (ip && ipBlacklist.includes(ip)) return forbidden(req, res);
+
+    const session = await getApiAuthSession({ req, res }, { whenBanned: 'anonymous' });
+    if (!!session?.user) {
+      const userBlacklist = parseUserBlocklist(await getDownloadBlocklistValue('user-blacklist'));
+      if (userBlacklist.includes(session.user.id.toString())) return forbidden(req, res);
+    }
+
+    const queryResults = schema.safeParse(req.query);
+    if (!queryResults.success)
+      return res
+        .status(400)
+        .json({ error: z.prettifyError(queryResults.error) ?? 'Invalid fileId' });
+
+    const { fileId } = queryResults.data;
+
+    const file = await getFileWithPermission({
+      fileId,
+      userId: session?.user?.id,
+      isModerator: session?.user?.isModerator,
+    });
+
+    if (!file) return notFound(req, res, 'File not found');
+
+    // Handle unauthenticated downloads
+    const userId = session?.user?.id;
+    if (!env.UNAUTHENTICATED_DOWNLOAD && !userId) {
+      if (req.headers['content-type'] === 'application/json')
+        return res.status(401).json({ error: 'Unauthorized' });
+      else return res.redirect(getLoginLink({ reason: 'download-auth', returnUrl: req.url }));
+    }
+
+    // TODO.articles: Track download
+    // try {
+    //   const now = new Date();
+    //   await dbWrite.userActivity.create({
+    //     data: {
+    //       userId,
+    //       activity: UserActivityType.OtherDownload,
+    //       createdAt: now,
+    //       details: {
+    //         fileId: fileId,
+    //         // Just so we can catch exploits
+    //         ...(!userId
+    //           ? {
+    //               ip,
+    //               userAgent: req.headers['user-agent'],
+    //             }
+    //           : {}), // You'll notice we don't include this for authed users...
+    //       },
+    //     },
+    //   });
+
+    //   const tracker = new Tracker(req, res);
+    //   await tracker.userActivity({
+    //     type: 'Download',
+    //     modelId: file.model.id,
+    //     modelVersionId: file.id,
+    //     nsfw: file.model.nsfw,
+    //     time: now,
+    //   });
+
+    // } catch (error) {
+    //   return res.status(500).json({ error: 'Invalid database operation', cause: error });
+    // }
+
+    try {
+      // Use delivery worker directly — File table records are not synced to
+      // the storage resolver's file_locations table (which only tracks ModelFile).
+      // Using resolveDownloadUrl here would cause the storage resolver to match
+      // against a ModelFile with the same ID, serving the wrong file content.
+      const { url } = await getDownloadUrl(file.url, file.name);
+
+      const tracker = new Tracker(req, res, session);
+      tracker
+        .file({ type: 'Download', entityId: file.entityId, entityType: file.entityType })
+        .catch(handleLogError);
+
+      res.redirect(url);
+    } catch (err: unknown) {
+      if (isClientAbortError(err)) {
+        if (!res.headersSent) res.status(499).end();
+        return;
+      }
+      const error = err as Error;
+      console.error(`Error downloading file: ${file.url} - ${error.message}`);
+      return res.status(500).json({ error: 'Error downloading file' });
+    }
+  },
+  ['GET']
+);

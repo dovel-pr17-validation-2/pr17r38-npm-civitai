@@ -1,0 +1,1638 @@
+import {
+  Accordion,
+  Alert,
+  Badge,
+  Button,
+  Checkbox,
+  Divider,
+  Group,
+  Loader,
+  Notification,
+  Paper,
+  SegmentedControl,
+  Stack,
+  Switch,
+  Text,
+  Title,
+} from '@mantine/core';
+import { useDebouncedValue } from '@mantine/hooks';
+import { openConfirmModal } from '@mantine/modals';
+import { showNotification } from '@mantine/notifications';
+import {
+  IconAlertTriangle,
+  IconConfetti,
+  IconCopy,
+  IconPlus,
+  IconRepeat,
+  IconX,
+} from '@tabler/icons-react';
+import type { TRPCClientErrorBase } from '@trpc/client';
+import type { TRPCDefaultErrorShape } from '@trpc/server';
+import clsx from 'clsx';
+import dayjs from '~/shared/utils/dayjs';
+import { capitalize, isEqual } from 'lodash-es';
+import { useRouter } from 'next/router';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { AlertWithIcon } from '~/components/AlertWithIcon/AlertWithIcon';
+import { useBuzzTransaction } from '~/components/Buzz/buzz.utils';
+import { useQueryBuzz } from '~/components/Buzz/useBuzz';
+import { CurrencyBadge } from '~/components/Currency/CurrencyBadge';
+import { CurrencyIcon } from '~/components/Currency/CurrencyIcon';
+import { useBuzzCurrencyConfig } from '~/components/Currency/useCurrencyConfig';
+import { useSelectedBuzzType, BuzzTypeSelector } from '~/components/Generation/footer-parts';
+import { DescriptionTable } from '~/components/DescriptionTable/DescriptionTable';
+import { DismissibleAlert } from '~/components/DismissibleAlert/DismissibleAlert';
+import { InfoPopover } from '~/components/InfoPopover/InfoPopover';
+import { goBack, minsToHours } from '~/components/Training/Form/TrainingCommon';
+import { BaseModelWarningAlert } from '~/components/Model/BaseModelWarningAlert/BaseModelWarningAlert';
+import { getBaseModelWarning } from '~/shared/constants/base-model-warnings.constants';
+import {
+  blockedCustomModels,
+  isClassicTrainerRetired,
+} from '~/shared/constants/training.constants';
+import {
+  type NumberTrainingSettingsType,
+  trainingSettings,
+} from '~/components/Training/Form/TrainingParams';
+import { AdvancedSettings } from '~/components/Training/Form/TrainingSubmitAdvancedSettings';
+import { ModelSelect } from '~/components/Training/Form/TrainingSubmitModelSelect';
+import { useTrainingServiceStatus } from '~/components/Training/training.utils';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { useServerDomains } from '~/providers/AppProvider';
+import { useSyncAccount } from '~/hooks/useSyncAccount';
+import type { BaseModel } from '~/shared/constants/basemodel.constants';
+import type { ModelFileCreateInput } from '~/server/schema/model-file.schema';
+import type {
+  ModelVersionUpsertInput,
+  TrainingDetailsBaseModelList,
+  TrainingDetailsObj,
+} from '~/server/schema/model-version.schema';
+import {
+  audioSampleOverrideSchema,
+  yue2SampleOverrideSchema,
+} from '~/server/schema/model-version.schema';
+import type { ImageTrainingRouterWhatIfSchema } from '~/server/schema/orchestrator/training.schema';
+import { Currency, ModelUploadType, TrainingStatus } from '~/shared/utils/prisma/enums';
+import {
+  buildContinuationRunUpdate,
+  defaultRun,
+  defaultRunAudio,
+  defaultRunVideo,
+  getDefaultTrainingStateFor,
+  trainingStore,
+  useTrainingImageStore,
+} from '~/store/training.store';
+import type { TrainingModelData } from '~/types/router';
+import { ORCHESTRATION_FEEDBACK_AREA } from '~/shared/constants/feedback.constants';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
+import { abbreviateNumber, numberWithCommas } from '~/utils/number-helpers';
+import {
+  baseTypePrefersCaptions,
+  formatTrainingValidationError,
+  getTrainingFields,
+  getAiToolkitEcosystem,
+  getAiToolkitModelVariant,
+  isInvalidRapid,
+  isInvalidAiToolkit,
+  isSamplePromptsRequired,
+  isValidRapid,
+  rapidEta,
+  type TrainingBaseModelType,
+  trainingModelInfo,
+} from '~/utils/training';
+import { trpc } from '~/utils/trpc';
+import {
+  fetchTrainingDataCaptions,
+  buildSamplePromptsFromCaptions,
+} from '~/components/Training/Form/trainingSamplePrompts';
+import { isDefined } from '~/utils/type-guards';
+import { useAvailableBuzz } from '~/components/Buzz/useAvailableBuzz';
+
+const maxRuns = 5;
+
+export const TrainingFormSubmit = ({ model }: { model: NonNullable<TrainingModelData> }) => {
+  const thisModelVersion = model.modelVersions[0];
+  const thisTrainingDetails = thisModelVersion.trainingDetails as TrainingDetailsObj | undefined;
+  const thisFile = thisModelVersion.files[0];
+  const thisMetadata = thisFile?.metadata as FileMetadata | null;
+  const thisNumImages = thisMetadata?.numImages;
+  const thisMediaType = thisTrainingDetails?.mediaType ?? 'image';
+  const availableBuzzTypes = useAvailableBuzz(['blue']);
+  const { selectedType, availableTypes, setBuzzType } = useSelectedBuzzType();
+  const {
+    data: { accounts: buzzAccounts },
+    isLoading: isBuzzLoading,
+  } = useQueryBuzz(availableTypes);
+  const { color: buzzColor } = useBuzzCurrencyConfig(selectedType);
+  const features = useFeatureFlags();
+  const serverDomains = useServerDomains();
+  const syncAccount = useSyncAccount();
+  const yellowOnGreen = features.isGreen && selectedType === 'yellow';
+
+  const { addRun, removeRun, updateRun } = trainingStore;
+  const { runs, imageList, initialImageList } = useTrainingImageStore(
+    (state) => state[model.id] ?? { ...getDefaultTrainingStateFor(thisMediaType) }
+  );
+
+  const [selectedRunIndex, setSelectedRunIndex] = useState<number>(0);
+  const fallbackRun =
+    thisMediaType === 'audio'
+      ? defaultRunAudio
+      : thisMediaType === 'video'
+      ? defaultRunVideo
+      : defaultRun;
+  const selectedRun = runs[selectedRunIndex] ?? fallbackRun;
+
+  // "Train Further": the continuation config (base model, AI-Toolkit engine, steps, and the
+  // source-epoch reference) is seeded into the in-memory store by the "Train Further" button,
+  // but that store doesn't survive a reload / deep-link straight into Step 3. Everything the
+  // re-seed needs is persisted on the version, so rebuild the run from it once per mount.
+  // Without this, a reloaded continuation kept the default SDXL base — and because the base
+  // selector is hidden for continuations, the user couldn't fix it (ClickUp 868k47a7x).
+  const continueFromEpoch = thisTrainingDetails?.continueFromEpoch;
+  const hydratedContinueFrom = useRef(false);
+  useEffect(() => {
+    if (hydratedContinueFrom.current) return;
+    if (!features.trainingStepsPricing || !continueFromEpoch) return;
+    hydratedContinueFrom.current = true;
+
+    const persistedBase = thisTrainingDetails?.baseModel;
+    // The store was rebuilt from defaults (reload / deep-link) when the run still holds the
+    // media-type default base and no custom model. In that case re-seed the whole
+    // continuation run from the version; otherwise the in-session seed is intact and we only
+    // need to make sure the continueFrom AIR is present.
+    const storeAtDefault = selectedRun.base === fallbackRun.base && !selectedRun.customModel;
+    if (storeAtDefault && persistedBase) {
+      updateRun(
+        model.id,
+        thisMediaType,
+        selectedRun.id,
+        buildContinuationRunUpdate({
+          base: persistedBase,
+          baseType: (thisTrainingDetails?.baseModelType ?? 'sd15') as TrainingBaseModelType,
+          continueFromAir: continueFromEpoch.air,
+          samplePrompts: thisTrainingDetails?.samplePrompts,
+          negativePrompt: thisTrainingDetails?.negativePrompt,
+        })
+      );
+    } else if (selectedRun.params.continueFrom !== continueFromEpoch.air) {
+      updateRun(model.id, thisMediaType, selectedRun.id, {
+        params: { continueFrom: continueFromEpoch.air },
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [continueFromEpoch]);
+
+  // Sample prompts live only in the in-memory store, so landing on Step 3 directly
+  // (refresh / deep-link, without passing through Step 2) leaves them empty. Re-seed them
+  // once per mount when the current run has none:
+  //  1. Prefer prompts already persisted on the version (a previously submitted/resumed run).
+  //  2. Otherwise pull the captions straight from the training-data zip and prefill from them
+  //     — the same source Step 2 would have used, just fetched on demand here.
+  const hydratedSamplePrompts = useRef(false);
+  useEffect(() => {
+    if (hydratedSamplePrompts.current) return;
+    const runEmpty = selectedRun.samplePrompts.every((p) => !p || p.trim() === '');
+    if (!runEmpty) return;
+
+    const persisted = thisTrainingDetails?.samplePrompts ?? [];
+    if (persisted.some((p) => p && p.trim().length > 0)) {
+      hydratedSamplePrompts.current = true;
+      updateRun(model.id, thisMediaType, selectedRun.id, {
+        samplePrompts: persisted,
+        ...(thisTrainingDetails?.samplesOverrides?.length && {
+          samplesOverrides: thisTrainingDetails.samplesOverrides,
+        }),
+        ...(thisTrainingDetails?.negativePrompt && {
+          negativePrompt: thisTrainingDetails.negativePrompt,
+        }),
+      });
+      return;
+    }
+
+    // No persisted prompts (fresh draft). If the image list is already in memory the
+    // AdvancedSettings prefill will handle it; only fetch the zip when it isn't.
+    if (imageList.length > 0 || !thisFile) return;
+    hydratedSamplePrompts.current = true;
+    fetchTrainingDataCaptions(thisModelVersion.id)
+      .then((captions) => {
+        if (!captions.length) return;
+        // Re-check by run id (not array index): the user may have started typing — or the
+        // runs list may have been reordered — while the zip downloaded.
+        const current = useTrainingImageStore
+          .getState()
+          [model.id]?.runs?.find((r) => r.id === selectedRun.id);
+        if (current && current.samplePrompts.some((p) => p && p.trim().length > 0)) return;
+        const { prompts, overrides } = buildSamplePromptsFromCaptions(captions, thisMediaType);
+        updateRun(model.id, thisMediaType, selectedRun.id, {
+          samplePrompts: prompts,
+          ...(thisMediaType === 'audio' && { samplesOverrides: overrides }),
+        });
+      })
+      .catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // "Train Further" continuation: the base model, engine, and steps are inherited from the
+  // source LoRA and can't be changed, so we hide those sections on the review page.
+  const isContinuation = !!continueFromEpoch || !!selectedRun.params.continueFrom;
+
+  const allLabeled =
+    thisMediaType === 'video' || thisMediaType === 'audio'
+      ? (thisMetadata?.numCaptions ?? 0) >= (thisNumImages ?? 0)
+      : true;
+
+  const [multiMode, setMultiMode] = useState(runs.length > 1);
+  const [awaitInvalidate, setAwaitInvalidate] = useState<boolean>(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  // State lags a burst of clicks, and the confirm modal's onConfirm closes over a stale render,
+  // so only a ref can stop the same version being submitted (and charged) twice.
+  const submitLockRef = useRef(false);
+  const [acknowledgedBases, setAcknowledgedBases] = useState<string[]>([]);
+
+  const baseModelNameFor = (base: string) =>
+    trainingModelInfo[base as TrainingDetailsBaseModelList]?.baseModel;
+  const selectedRunBaseModel = baseModelNameFor(selectedRun.base);
+  const selectedRunWarning = getBaseModelWarning(selectedRunBaseModel);
+  const unacknowledgedRun = runs.find(
+    (r) => !!getBaseModelWarning(baseModelNameFor(r.base)) && !acknowledgedBases.includes(r.base)
+  );
+
+  const status = useTrainingServiceStatus();
+  const blockedModels = status.blockedModels ?? blockedCustomModels;
+
+  const router = useRouter();
+  const queryUtils = trpc.useUtils();
+  const currentUser = useCurrentUser();
+  const { conditionalPerformTransaction } = useBuzzTransaction({
+    message: (requiredBalance) =>
+      `You don't have enough funds to train this model. Required Buzz: ${numberWithCommas(
+        requiredBalance
+      )}. Buy or earn more Buzz to complete the training process.`,
+    performTransactionOnPurchase: false,
+    purchaseSuccessMessage: (purchasedBalance) => (
+      <Stack>
+        <Text>Thank you for your purchase!</Text>
+        <Text>
+          We have added <CurrencyBadge currency={Currency.BUZZ} unitAmount={purchasedBalance} /> to
+          your account. You can now continue the training process.
+        </Text>
+      </Stack>
+    ),
+    accountTypes: availableBuzzTypes,
+  });
+
+  const thisStep = 3;
+  let finishedRuns = 0;
+
+  const formBaseModel = selectedRun.base;
+
+  const targetStepsSetting = trainingSettings.find((ts) => ts.name === 'targetSteps') as
+    | NumberTrainingSettingsType
+    | undefined;
+  const override =
+    targetStepsSetting?.overrides?.[formBaseModel]?.all ??
+    targetStepsSetting?.overrides?.[formBaseModel]?.[selectedRun.params.engine];
+  const maxSteps = override?.max ?? targetStepsSetting?.max ?? 10000;
+
+  const hasIssue = runs.some((r) => r.hasIssue);
+  const totalBuzzCost = hasIssue ? -1 : runs.map((r) => r.buzzCost).reduce((s, a) => s + a, 0);
+  const totalLicenseFee = hasIssue
+    ? 0
+    : runs.map((r) => r.licenseFee ?? 0).reduce((s, a) => s + a, 0);
+
+  // Check if user has insufficient buzz of the selected type
+  const selectedBalance = buzzAccounts.find((a) => a.type === selectedType)?.balance ?? 0;
+  const clientInsufficientBuzz =
+    !isBuzzLoading && totalBuzzCost > 0 && selectedBalance < totalBuzzCost;
+
+  // Find an alternative buzz type that has enough balance
+  const alternativeType = clientInsufficientBuzz
+    ? availableTypes.find((t) => {
+        if (t === selectedType) return false;
+        const balance = buzzAccounts.find((a) => a.type === t)?.balance ?? 0;
+        return balance >= totalBuzzCost;
+      })
+    : undefined;
+
+  const whatIfData = useMemo(() => {
+    const baseData = {
+      model: getTrainingFields.getModel(formBaseModel),
+      priority: getTrainingFields.getPriority(selectedRun.highPriority),
+      engine: getTrainingFields.getEngine(selectedRun.params.engine),
+      trainingDataImagesCount: thisNumImages ?? 1,
+      // Include the run's sample prompts so the estimate reflects the per-resource
+      // license fee, which the orchestrator only prices when samples are generated.
+      samplePrompts: selectedRun.samplePrompts,
+    };
+
+    // Transform parameters for AI Toolkit
+    if (selectedRun.params.engine === 'ai-toolkit') {
+      const ecosystem = getAiToolkitEcosystem(formBaseModel, selectedRun.baseType);
+      const modelVariant = getAiToolkitModelVariant(formBaseModel as TrainingDetailsBaseModelList);
+
+      if (!ecosystem) {
+        console.error('Failed to determine ecosystem for AI Toolkit whatIf query');
+        return null;
+      }
+
+      // Transform lrScheduler: 'cosine_with_restarts' -> 'cosine' (AI Toolkit doesn't support restarts)
+      let lrScheduler = selectedRun.params.lrScheduler;
+      if (lrScheduler === 'cosine_with_restarts') {
+        lrScheduler = 'cosine';
+      }
+
+      // Transform optimizerType: 'AdamW8Bit' -> 'adamw8bit', 'Prodigy' -> 'prodigy', etc.
+      const optimizerTypeMap: Record<string, string> = {
+        AdamW8Bit: 'adamw8bit',
+        Adafactor: 'adafactor',
+        Prodigy: 'prodigy',
+        Automagic: 'automagic',
+      };
+      const optimizerType =
+        optimizerTypeMap[selectedRun.params.optimizerType] ||
+        selectedRun.params.optimizerType.toLowerCase();
+
+      const retData: ImageTrainingRouterWhatIfSchema = {
+        ...baseData,
+        samplesOverrides: selectedRun.samplesOverrides,
+        ecosystem,
+        ...(modelVariant && { modelVariant }),
+        epochs: selectedRun.params.maxTrainEpochs,
+        resolution: selectedRun.params.resolution,
+        lr: selectedRun.params.unetLR,
+        textEncoderLr: selectedRun.params.textEncoderLR || null,
+        trainTextEncoder: !!selectedRun.params.textEncoderLR,
+        lrScheduler: lrScheduler as any,
+        optimizerType: optimizerType as any,
+        networkDim: selectedRun.params.networkDim,
+        networkAlpha: selectedRun.params.networkAlpha,
+        noiseOffset: selectedRun.params.noiseOffset || null,
+        minSnrGamma: selectedRun.params.minSnrGamma || null,
+        flipAugmentation: selectedRun.params.flipAugmentation || false,
+        shuffleTokens: selectedRun.params.shuffleCaption,
+        keepTokens: selectedRun.params.keepTokens,
+        // Steps-based pricing: send `steps` (primary length knob, drives pricing) +
+        // `batchSize` + sample params. Without the flag, send `numRepeats` only and let
+        // the orchestrator keep the legacy flat per-epoch pricing (epochs without steps).
+        // `continueFrom` is omitted from the quote (it doesn't affect step pricing and
+        // needs a server-side presigned URL).
+        ...(features.trainingStepsPricing
+          ? {
+              steps: selectedRun.params.targetSteps,
+              batchSize: selectedRun.params.trainBatchSize,
+              sampleCfgScale: selectedRun.params.sampleCfgScale,
+              sampleStrength: selectedRun.params.sampleStrength,
+            }
+          : { numRepeats: selectedRun.params.numRepeats }),
+      } as any;
+      return retData;
+    }
+
+    // Kohya-style parameters for other engines
+    const retData: ImageTrainingRouterWhatIfSchema = {
+      model: baseData.model,
+      priority: baseData.priority,
+      engine: baseData.engine as any, // Type assertion for discriminated union
+      trainingDataImagesCount: baseData.trainingDataImagesCount,
+      samplePrompts: baseData.samplePrompts,
+      resolution: selectedRun.params.resolution,
+      trainBatchSize: selectedRun.params.trainBatchSize,
+      maxTrainEpochs: selectedRun.params.maxTrainEpochs,
+      numRepeats: selectedRun.params.numRepeats ?? 200,
+    };
+    return retData;
+  }, [
+    formBaseModel,
+    selectedRun.highPriority,
+    selectedRun.baseType,
+    selectedRun.params.engine,
+    selectedRun.samplePrompts,
+    selectedRun.samplesOverrides,
+    thisNumImages,
+    selectedRun.params.resolution,
+    selectedRun.params.trainBatchSize,
+    selectedRun.params.maxTrainEpochs,
+    selectedRun.params.numRepeats,
+    selectedRun.params.unetLR,
+    selectedRun.params.textEncoderLR,
+    selectedRun.params.lrScheduler,
+    selectedRun.params.optimizerType,
+    selectedRun.params.networkDim,
+    selectedRun.params.networkAlpha,
+    selectedRun.params.noiseOffset,
+    selectedRun.params.minSnrGamma,
+    selectedRun.params.flipAugmentation,
+    selectedRun.params.shuffleCaption,
+    selectedRun.params.keepTokens,
+    selectedRun.params.targetSteps,
+    selectedRun.params.sampleCfgScale,
+    selectedRun.params.sampleStrength,
+    features.trainingStepsPricing,
+  ]);
+
+  const [debounced] = useDebouncedValue(whatIfData, 100);
+
+  const dryRunResult = trpc.orchestrator.createTrainingWhatif.useQuery(debounced!, {
+    enabled: !!debounced,
+  });
+
+  useEffect(() => {
+    if (dryRunResult.isLoading) return;
+
+    if (dryRunResult.error) {
+      if (!selectedRun.hasIssue) {
+        updateRun(model.id, thisMediaType, selectedRun.id, { hasIssue: true, buzzCost: -1 });
+        showErrorNotification({
+          title: 'Error computing cost',
+          error: new Error(dryRunResult.error.message),
+          autoClose: false,
+        });
+      }
+      return;
+    }
+
+    const cost = dryRunResult.data?.cost;
+    const licenseFee = dryRunResult.data?.licenseFee ?? 0;
+    if (!isDefined(cost) || cost < 0) {
+      if (!selectedRun.hasIssue) {
+        updateRun(model.id, thisMediaType, selectedRun.id, {
+          hasIssue: true,
+          buzzCost: -1,
+          licenseFee: 0,
+        });
+        showErrorNotification({
+          title: 'Error computing cost',
+          error: new Error(
+            'There was an issue computing the cost for these settings. Please change your settings or contact us if this persists.'
+          ),
+          autoClose: false,
+        });
+      }
+    } else if (cost !== selectedRun.buzzCost || licenseFee !== selectedRun.licenseFee) {
+      updateRun(model.id, thisMediaType, selectedRun.id, {
+        hasIssue: false,
+        buzzCost: cost,
+        licenseFee,
+      });
+    }
+  }, [
+    dryRunResult.data?.cost,
+    dryRunResult.data?.licenseFee,
+    dryRunResult.error,
+    dryRunResult.isLoading,
+    runs.length,
+    selectedRun.hasIssue,
+    selectedRun.buzzCost,
+    selectedRun.licenseFee,
+    model.id,
+    thisMediaType,
+    selectedRun.id,
+    updateRun,
+  ]);
+
+  const upsertVersionMutation = trpc.modelVersion.upsert.useMutation();
+  const deleteVersionMutation = trpc.modelVersion.delete.useMutation();
+  const createFileMutation = trpc.modelFile.create.useMutation();
+
+  const doTraining = trpc.orchestrator.createTraining.useMutation();
+
+  const releaseSubmit = () => {
+    submitLockRef.current = false;
+    setAwaitInvalidate(false);
+  };
+
+  const doTrainingMut = async (modelVersionId: number, idx: number, runId: number) => {
+    try {
+      await doTraining.mutateAsync({ modelVersionId, buzzType: selectedType });
+
+      finishedRuns++;
+
+      // TODO update notification instead
+      showSuccessNotification({
+        message: `Submitted ${finishedRuns}/${runs.length} runs...`,
+      });
+
+      // TODO re-enable this, but for now it messes with the length
+      // removeRun(model.id, runId);
+
+      if (finishedRuns === runs.length) {
+        showSuccessNotification({
+          title: 'Successfully submitted for training!',
+          message: 'You will be emailed when training is complete.',
+        });
+        // TODO make this a setInfiniteData, too much work right now
+        await queryUtils.model.getMyTrainingModels.invalidate();
+        await queryUtils.model.getAvailableTrainingModels.invalidate();
+
+        await router.replace(userTrainingDashboardURL);
+        releaseSubmit();
+      }
+    } catch (e) {
+      const error = e as TRPCClientErrorBase<TRPCDefaultErrorShape>;
+      showErrorNotification({
+        title: `Failed to submit run #${idx + 1} for training`,
+        error: new Error(error.message),
+        reason: error.message ?? 'An unexpected error occurred. Please try again later.',
+        autoClose: false,
+        report: { area: ORCHESTRATION_FEEDBACK_AREA },
+      });
+
+      if (idx > 0) {
+        await deleteVersionMutation.mutateAsync({ id: modelVersionId });
+      }
+
+      finishedRuns++;
+      if (finishedRuns === runs.length) {
+        releaseSubmit();
+      }
+    }
+  };
+
+  const userTrainingDashboardURL = `/user/${currentUser?.username}/models?section=training`;
+
+  const handleSubmit = () => {
+    if (submitLockRef.current) return;
+
+    // TODO [bw] we should probably disallow people to get to the training wizard at all when it's not pending
+    if (thisModelVersion.trainingStatus !== TrainingStatus.Pending) {
+      showNotification({
+        message: 'Model was already submitted for training.',
+      });
+      router.replace(userTrainingDashboardURL).then();
+      return;
+    }
+
+    if (!thisFile) {
+      showErrorNotification({
+        error: new Error('Missing file data, please reupload your files.'),
+        autoClose: false,
+      });
+      return;
+    }
+
+    if (runs.length > maxRuns) {
+      showErrorNotification({
+        error: new Error(`Too many runs selected (max of ${maxRuns})`),
+        autoClose: false,
+      });
+      return;
+    }
+
+    for (const r of runs) {
+      if (!r.base) {
+        showErrorNotification({
+          error: new Error('A base model must be chosen.'),
+          autoClose: false,
+        });
+        return;
+      }
+
+      if (blockedModels.includes(r.base)) {
+        showErrorNotification({
+          error: new Error('This model has been blocked from training - please try another one.'),
+          autoClose: false,
+        });
+        return;
+      }
+
+      const warning = getBaseModelWarning(baseModelNameFor(r.base));
+      if (warning && !acknowledgedBases.includes(r.base)) {
+        showErrorNotification({
+          error: new Error(warning.acknowledgement),
+          title: "Please confirm you understand this base model's limits",
+          autoClose: false,
+        });
+        return;
+      }
+
+      if (r.baseType === 'chroma' && (!r.negativePrompt || !r.negativePrompt.trim())) {
+        showErrorNotification({
+          error: new Error('A negative prompt is required for Chroma training.'),
+          autoClose: false,
+        });
+        return;
+      }
+
+      if (isSamplePromptsRequired(r.baseType, r.params.engine)) {
+        const numPromptsNeeded = 1;
+        const filledPrompts = r.samplePrompts.filter((p) => p && p.trim().length > 0);
+
+        if (filledPrompts.length < numPromptsNeeded) {
+          showErrorNotification({
+            error: new Error(
+              `This model requires at least ${numPromptsNeeded} sample prompt(s) to train.`
+            ),
+            title: 'Sample prompts required',
+            autoClose: false,
+          });
+          return;
+        }
+      }
+
+      if (r.samplesOverrides && r.samplesOverrides.length > 0) {
+        const badIndex = r.samplesOverrides.findIndex(
+          (o) =>
+            !(
+              r.baseType === 'yue2' ? yue2SampleOverrideSchema : audioSampleOverrideSchema
+            ).safeParse(o).success
+        );
+        if (badIndex !== -1) {
+          showErrorNotification({
+            error: new Error(
+              `Sample override #${
+                badIndex + 1
+              } has invalid values. Check the highlighted fields in Advanced Settings.`
+            ),
+            title: 'Invalid sample overrides',
+            autoClose: false,
+          });
+          return;
+        }
+      }
+
+      if (r.params.targetSteps > maxSteps) {
+        showErrorNotification({
+          error: new Error(
+            `Steps are beyond the maximum (${numberWithCommas(
+              maxSteps
+            )}). Please lower Epochs or Num Repeats, or increase Train Batch Size.`
+          ),
+          title: 'Too many steps',
+          autoClose: false,
+        });
+        return;
+      }
+
+      // specific check for batch
+      if (
+        ['flux', 'sd35'].includes(r.baseType) &&
+        r.params.engine === 'kohya' &&
+        r.params.trainBatchSize > 2 &&
+        r.params.resolution > 512
+      ) {
+        showErrorNotification({
+          error: new Error(
+            `Due to hardware constraints, batch sizes >2 are not supported for resolutions >512. Please lower the batch size (this will affect steps) or decrease the resolution.`
+          ),
+          title: 'Batch size too high',
+          autoClose: false,
+        });
+        return;
+      }
+    }
+
+    const performTransaction = () => {
+      if (submitLockRef.current) return;
+      submitLockRef.current = true;
+      setConfirmOpen(true);
+      let confirmed = false;
+
+      return openConfirmModal({
+        title: 'Confirm Buzz Transaction',
+        children: (
+          <Stack pt="md">
+            <Group>
+              <Text span inline>
+                {`The total cost for ${
+                  runs.length > 1 ? 'these training runs' : 'this training run'
+                } is: `}
+              </Text>
+              <Group gap={2}>
+                <CurrencyIcon currency={Currency.BUZZ} size={12} />
+                <Text span inline>
+                  {totalBuzzCost.toLocaleString()}
+                </Text>
+              </Group>
+            </Group>
+            {totalLicenseFee > 0 && (
+              <Text size="sm" c="dimmed">
+                Includes {(totalBuzzCost - totalLicenseFee).toLocaleString()} Buzz training +{' '}
+                {totalLicenseFee.toLocaleString()} Buzz license fee (a fee set by the base
+                model&apos;s creator).
+              </Text>
+            )}
+            {features.trainingStepsPricing &&
+              runs.some((r) => r.params.continueFrom) &&
+              continueFromEpoch && (
+                <Text size="sm" c="dimmed">
+                  This training continues from Epoch #{continueFromEpoch.epochNumber}
+                  {continueFromEpoch.sourceVersionName
+                    ? ` of ${continueFromEpoch.sourceVersionName}`
+                    : ''}{' '}
+                  instead of starting from the base model.
+                </Text>
+              )}
+            <Text mt="md">Proceed?</Text>
+          </Stack>
+        ),
+        labels: { cancel: 'Cancel', confirm: 'Confirm' },
+        centered: true,
+        onConfirm: () => {
+          if (confirmed) return;
+          confirmed = true;
+          handleConfirm();
+        },
+        onClose: () => {
+          setConfirmOpen(false);
+          if (!confirmed) submitLockRef.current = false;
+        },
+      });
+    };
+
+    conditionalPerformTransaction(totalBuzzCost, performTransaction);
+  };
+
+  const handleConfirm = () => {
+    // Guard against submitting with stale/unsaved training data
+    if (imageList.length > 0 && !isEqual(imageList, initialImageList)) {
+      showErrorNotification({
+        error: new Error(
+          'Your training data has unsaved changes. Please go back to Step 2 and save your images before submitting.'
+        ),
+        title: 'Unsaved training data',
+        autoClose: false,
+      });
+      releaseSubmit();
+      return;
+    }
+
+    setAwaitInvalidate(true);
+    finishedRuns = 0;
+
+    runs.forEach(async (run, idx) => {
+      const {
+        base: runBase,
+        baseType: runBaseType,
+        params,
+        customModel,
+        samplePrompts,
+        samplesOverrides,
+        negativePrompt,
+        staging,
+        highPriority,
+      } = run;
+      const { optimizerArgs, ...paramData } = params;
+
+      // Continuations MUST train on the exact base model of the source LoRA. The base selector
+      // is hidden for them, so the store value can't be trusted (a cleared/stale store would
+      // otherwise submit the default SDXL base). Pin base/baseType to the source version's
+      // persisted values — everything downstream (ecosystem, the AIR the server resolves, the
+      // output baseModel column, persisted trainingDetails) is derived from these, so this makes
+      // a base mismatch structurally impossible (ClickUp 868k47a7x).
+      const isContinuationRun = !!paramData.continueFrom && paramData.engine === 'ai-toolkit';
+      const base =
+        isContinuationRun && thisTrainingDetails?.baseModel
+          ? thisTrainingDetails.baseModel
+          : runBase;
+      const baseType =
+        isContinuationRun && thisTrainingDetails?.baseModelType
+          ? thisTrainingDetails.baseModelType
+          : runBaseType;
+
+      if (isInvalidRapid(baseType, paramData.engine)) {
+        showErrorNotification({
+          error: new Error('Cannot use Rapid Training with a non-flux base model.'),
+          title: `Parameter error`,
+          autoClose: false,
+        });
+        // TODO ideally, mark this as errored and don't leave the screen
+        finishedRuns++;
+        if (finishedRuns === runs.length) releaseSubmit();
+        return;
+      }
+
+      if (isInvalidAiToolkit(baseType, paramData.engine)) {
+        showErrorNotification({
+          error: new Error('AI Toolkit training is not supported for this model.'),
+          title: `Parameter error`,
+          autoClose: false,
+        });
+        finishedRuns++;
+        if (finishedRuns === runs.length) releaseSubmit();
+        return;
+      }
+
+      // Transform params for AI Toolkit if needed.
+      // continueFrom / sample params are AI Toolkit-only: strip them from every other
+      // engine so they never persist into kohya/rapid/musubi trainingDetails (the run
+      // state can carry them, e.g. after switching engines on a continued training).
+      const {
+        continueFrom: _continueFrom,
+        sampleCfgScale: _sampleCfgScale,
+        sampleStrength: _sampleStrength,
+        saveEvery: _saveEvery,
+        ...legacyEngineParams
+      } = paramData;
+      let finalParams: any = legacyEngineParams;
+      if (paramData.engine === 'ai-toolkit') {
+        const ecosystem = getAiToolkitEcosystem(base, baseType);
+        const modelVariant = getAiToolkitModelVariant(base as TrainingDetailsBaseModelList);
+
+        if (!ecosystem) {
+          showErrorNotification({
+            error: new Error('Failed to determine ecosystem for AI Toolkit training.'),
+            title: `Parameter error`,
+            autoClose: false,
+          });
+          finishedRuns++;
+          if (finishedRuns === runs.length) releaseSubmit();
+          return;
+        }
+
+        // Transform lrScheduler
+        let lrScheduler = paramData.lrScheduler;
+        if (lrScheduler === 'cosine_with_restarts') {
+          lrScheduler = 'cosine';
+        }
+
+        // Transform optimizerType
+        const optimizerTypeMap: Record<string, string> = {
+          AdamW8Bit: 'adamw8bit',
+          Adafactor: 'adafactor',
+          Prodigy: 'prodigy',
+        };
+        const optimizerType =
+          optimizerTypeMap[paramData.optimizerType] || paramData.optimizerType.toLowerCase();
+
+        finalParams = {
+          engine: 'ai-toolkit',
+          ecosystem,
+          ...(modelVariant && { modelVariant }),
+          epochs: paramData.maxTrainEpochs,
+          resolution: paramData.resolution,
+          lr: paramData.unetLR,
+          textEncoderLr: paramData.textEncoderLR || null,
+          trainTextEncoder: !!paramData.textEncoderLR,
+          lrScheduler: lrScheduler as any,
+          optimizerType: optimizerType as any,
+          networkDim: paramData.networkDim,
+          networkAlpha: paramData.networkAlpha,
+          noiseOffset: paramData.noiseOffset || null,
+          minSnrGamma: paramData.minSnrGamma || null,
+          flipAugmentation: paramData.flipAugmentation || false,
+          shuffleTokens: paramData.shuffleCaption,
+          keepTokens: paramData.keepTokens,
+          // Steps-based pricing: persist steps/batchSize/sample params + continueFrom so the
+          // orchestrator bills per-step. Without the flag, keep numRepeats (legacy flat pricing).
+          ...(features.trainingStepsPricing
+            ? {
+                steps: paramData.targetSteps,
+                batchSize: paramData.trainBatchSize,
+                sampleCfgScale: paramData.sampleCfgScale,
+                sampleStrength: paramData.sampleStrength,
+                ...(paramData.continueFrom && { continueFrom: paramData.continueFrom }),
+              }
+            : { numRepeats: paramData.numRepeats }),
+        };
+      }
+
+      const baseModelConvert: BaseModel =
+        (customModel?.baseModel as BaseModel | undefined) ??
+        trainingModelInfo[base as TrainingDetailsBaseModelList]?.baseModel ??
+        'SD 1.5';
+
+      // TODO there is a bug here where if >1 fails and then get resubmitted, the idx will be 0
+      //  and thus overwrites the first version...
+
+      // update the first one since it exists, or create for others
+      const versionMutateData: ModelVersionUpsertInput = {
+        ...(idx === 0 && { id: thisModelVersion.id }),
+        // Continued trainings keep their "(from epoch N)" name instead of the V1 rename
+        // so the source epoch stays visible in version lists.
+        name:
+          features.trainingStepsPricing && idx === 0 && paramData.continueFrom
+            ? thisModelVersion.name
+            : `V${idx + 1}`,
+        modelId: model.id,
+        baseModel: baseModelConvert,
+        trainedWords: thisModelVersion.trainedWords ?? [],
+        // ---
+        epochs: paramData.maxTrainEpochs,
+        steps: paramData.targetSteps,
+        clipSkip: paramData.clipSkip || undefined,
+        trainingDetails: {
+          ...((thisModelVersion.trainingDetails as TrainingDetailsObj) ?? {}),
+          baseModel: base,
+          baseModelType: baseType,
+          params: finalParams, // Store in the native format (Kohya or AI Toolkit)
+          samplePrompts,
+          ...(samplesOverrides && samplesOverrides.length > 0 && { samplesOverrides }),
+          ...(negativePrompt && { negativePrompt }),
+          staging,
+          highPriority,
+          // Keep the source-epoch label honest: only persist it when this run actually
+          // continues (flag on, continueFrom set, AND the engine that supports it).
+          continueFromEpoch:
+            features.trainingStepsPricing &&
+            paramData.continueFrom &&
+            paramData.engine === 'ai-toolkit'
+              ? (thisModelVersion.trainingDetails as TrainingDetailsObj | undefined)
+                  ?.continueFromEpoch
+              : undefined,
+        },
+        uploadType: ModelUploadType.Trained,
+      };
+
+      try {
+        const response = await upsertVersionMutation.mutateAsync(versionMutateData);
+        const newVersionId = response.id;
+
+        if (idx === 0) {
+          await doTrainingMut(newVersionId, idx, run.id);
+        } else {
+          try {
+            const fileMutateData: ModelFileCreateInput = {
+              name: `${newVersionId}_training_data.zip`,
+              url: thisFile.url,
+              sizeKB: thisFile.sizeKB,
+              type: 'Training Data',
+              modelVersionId: newVersionId,
+              visibility: thisFile.visibility,
+              metadata: thisMetadata!,
+            };
+
+            const fileResponse = await createFileMutation.mutateAsync(fileMutateData);
+            const fileModelVersionId = fileResponse.modelVersion.id;
+
+            await doTrainingMut(fileModelVersionId, idx, run.id);
+          } catch (e) {
+            const error = e as TRPCClientErrorBase<TRPCDefaultErrorShape>;
+            const formatted = formatTrainingValidationError(error.message);
+            showErrorNotification({
+              error: formatted ?? new Error(error.message),
+              title: `Failed to create model file for run #${idx + 1}`,
+              autoClose: false,
+            });
+            // TODO ideally, mark this as errored and don't leave the screen
+            finishedRuns++;
+            if (finishedRuns === runs.length) releaseSubmit();
+          }
+        }
+      } catch (e) {
+        const error = e as TRPCClientErrorBase<TRPCDefaultErrorShape>;
+        const formatted = formatTrainingValidationError(error.message);
+        showErrorNotification({
+          error: formatted ?? new Error(error.message),
+          title: `Failed to save model version info for run #${idx + 1}`,
+          autoClose: false,
+        });
+        // TODO ideally, mark this as errored and don't leave the screen
+        finishedRuns++;
+        if (finishedRuns === runs.length) releaseSubmit();
+      }
+    });
+  };
+
+  // HARD CODED FOR THIS RUN:
+  const discountEndDate = dayjs().month(9).year(2024).endOf('month');
+
+  return (
+    <Stack>
+      {/* {discountInfo.amt !== 0 && ( */}
+      {discountEndDate.isAfter(dayjs()) && (
+        <DismissibleAlert
+          id={`training-discount`}
+          icon={<IconConfetti />}
+          color="pink"
+          content={
+            <Text>
+              Flux-Dev Rapid is currently <b>25%</b> off! (Ends on{' '}
+              {discountEndDate.toDate().toLocaleDateString('en-us', {
+                weekday: 'long',
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+              })}
+              )
+            </Text>
+          }
+        />
+      )}
+      {/* )} */}
+      {!isContinuation && (
+        <Accordion
+          variant="separated"
+          defaultValue={'model-details'}
+          classNames={{
+            content: 'p-0',
+            item: 'overflow-hidden shadow-sm border-gray-3 dark:border-dark-4',
+            control: 'p-2',
+          }}
+        >
+          <Accordion.Item value="model-details">
+            <Accordion.Control>Model Details</Accordion.Control>
+            <Accordion.Panel>
+              <DescriptionTable
+                labelWidth="150px"
+                items={[
+                  { label: 'Name', value: model.name },
+                  { label: 'Type', value: thisTrainingDetails?.type ?? '(unknown)' },
+                  {
+                    label: 'Files',
+                    value: thisNumImages || 0,
+                  },
+                  {
+                    label: 'Labels',
+                    value: thisMetadata?.numCaptions || 0,
+                  },
+                  {
+                    label: 'Label Type',
+                    value: capitalize(thisMetadata?.labelType ?? 'tag'),
+                  },
+                ]}
+              />
+            </Accordion.Panel>
+          </Accordion.Item>
+        </Accordion>
+      )}
+
+      {/* Multi-training doesn't apply when continuing from an existing epoch — that flow
+          extends a single specific run, so hide the toggle and the runs editor. */}
+      {!isContinuation && (
+        <Switch
+          label={
+            <Group gap={4}>
+              <InfoPopover size="xs" iconProps={{ size: 16 }}>
+                Submit up to {maxRuns} training runs at once.
+                <br />
+                You can use different base models and/or parameters, all trained on the same
+                dataset. Each will be created as their own version.
+              </InfoPopover>
+              <Text inherit>Show Multi Training</Text>
+            </Group>
+          }
+          labelPosition="left"
+          checked={multiMode}
+          mt="md"
+          disabled={runs.length > 1}
+          onChange={(event) => setMultiMode(event.currentTarget.checked)}
+        />
+      )}
+
+      <Stack
+        className={clsx(
+          'sticky top-0 z-10 mb-[-5px] bg-white pb-[5px] dark:bg-dark-7',
+          (!multiMode || isContinuation) && 'hidden'
+        )}
+      >
+        <Group mt="md" justify="space-between" wrap="nowrap">
+          <Title order={5}>Training Runs</Title>
+          <Group gap="xs" ml="sm">
+            <Button
+              color="green"
+              variant="light"
+              size="compact-sm"
+              leftSection={<IconPlus size={16} />}
+              disabled={runs.length >= maxRuns}
+              onClick={() => {
+                addRun(model.id, thisMediaType);
+                setSelectedRunIndex(runs.length);
+              }}
+              classNames={{ section: 'mr-2' }}
+            >
+              Add
+            </Button>
+            <Button
+              color="cyan"
+              variant="light"
+              size="compact-sm"
+              leftSection={<IconCopy size={16} />}
+              disabled={runs.length >= maxRuns}
+              onClick={() => {
+                addRun(model.id, thisMediaType, selectedRun);
+                setSelectedRunIndex(runs.length);
+              }}
+              classNames={{ section: 'mr-2' }}
+            >
+              Duplicate
+            </Button>
+            <Button
+              color="red"
+              variant="light"
+              size="compact-sm"
+              leftSection={<IconX size={16} />}
+              disabled={runs.length <= 1}
+              onClick={() => {
+                removeRun(model.id, thisMediaType, selectedRun.id);
+                setSelectedRunIndex(0);
+              }}
+              classNames={{ section: 'mr-2' }}
+            >
+              Remove
+            </Button>
+          </Group>
+        </Group>
+
+        <SegmentedControl
+          className="overflow-auto"
+          data={runs.map((run, idx) => ({
+            label: `Run #${idx + 1} (${
+              !!run.customModel
+                ? 'Custom'
+                : trainingModelInfo[run.base as TrainingDetailsBaseModelList]?.pretty ?? 'Unknown'
+            })`,
+            // value: run.id.toString(),
+            value: idx.toString(),
+          }))}
+          value={selectedRunIndex.toString()}
+          onChange={(value) => {
+            // const run = runs.find((r) => r.id === Number(value));
+            setSelectedRunIndex(Number(value));
+          }}
+        />
+
+        <Divider />
+      </Stack>
+
+      {!isContinuation ? (
+        <ModelSelect
+          selectedRun={selectedRun}
+          modelId={model.id}
+          mediaType={thisMediaType}
+          numImages={thisNumImages}
+        />
+      ) : (
+        // Continuations inherit the source LoRA's base model (the selector is hidden), so show
+        // it read-only — otherwise there's no way to tell what's being trained on.
+        <Paper p="sm" radius="md" withBorder mt="sm">
+          <Group justify="space-between" wrap="nowrap" gap="sm">
+            <Stack gap={2}>
+              <Text size="xs" c="dimmed" tt="uppercase" fw={700}>
+                Base model
+              </Text>
+              <Text fw={600}>
+                {selectedRun.base in trainingModelInfo
+                  ? trainingModelInfo[selectedRun.base as TrainingDetailsBaseModelList]?.pretty ??
+                    selectedRun.base
+                  : selectedRun.base}
+              </Text>
+            </Stack>
+            <Badge color="violet" variant="light" leftSection={<IconRepeat size={14} />}>
+              Inherited from source LoRA
+            </Badge>
+          </Group>
+        </Paper>
+      )}
+
+      {selectedRunWarning && (
+        <Stack gap="xs" mt="sm">
+          <BaseModelWarningAlert baseModel={selectedRunBaseModel} />
+          <Checkbox
+            checked={acknowledgedBases.includes(selectedRun.base)}
+            onChange={(event) => {
+              const checked = event.currentTarget.checked;
+              setAcknowledgedBases((prev) =>
+                checked
+                  ? [...prev, selectedRun.base]
+                  : prev.filter((base) => base !== selectedRun.base)
+              );
+            }}
+            label={selectedRunWarning.acknowledgement}
+          />
+        </Stack>
+      )}
+
+      {runs.some((r) => r.params.engine === 'kohya') && (
+        <AlertWithIcon
+          icon={<IconAlertTriangle size={16} />}
+          iconColor="yellow"
+          radius={0}
+          size="md"
+          color="yellow"
+          mt="sm"
+        >
+          <Stack gap={4}>
+            <Text fw={600}>Kohya is no longer actively maintained</Text>
+            <Text>
+              Kohya training is no longer actively maintained and may become less stable over time.
+              We do not recommend using Kohya for new model training. For a more reliable and
+              actively maintained training experience, we recommend AI-Toolkit instead.
+            </Text>
+          </Stack>
+        </AlertWithIcon>
+      )}
+
+      {baseTypePrefersCaptions(selectedRun.baseType) &&
+        thisMetadata?.labelType !== 'caption' &&
+        (thisMetadata?.numCaptions ?? 0) > 0 && (
+          <AlertWithIcon
+            icon={<IconAlertTriangle size={16} />}
+            iconColor="yellow"
+            radius={0}
+            size="md"
+            color="yellow"
+            mt="sm"
+          >
+            <Group gap="sm" justify="space-between" wrap="nowrap">
+              <Text>
+                You have &quot;tagged&quot; files, but{' '}
+                {selectedRun.base in trainingModelInfo ? (
+                  <Badge color="red">
+                    {trainingModelInfo[selectedRun.base as TrainingDetailsBaseModelList]?.pretty ??
+                      'this model'}
+                  </Badge>
+                ) : (
+                  'this model'
+                )}{' '}
+                works best with &quot;captions&quot;.
+              </Text>
+              <Button onClick={() => goBack(model.id, thisStep)}>Go back and fix</Button>
+            </Group>
+          </AlertWithIcon>
+        )}
+
+      {!baseTypePrefersCaptions(selectedRun.baseType) &&
+        thisMetadata?.labelType !== 'tag' &&
+        (thisMetadata?.numCaptions ?? 0) > 0 && (
+          <AlertWithIcon
+            icon={<IconAlertTriangle size={16} />}
+            iconColor="yellow"
+            radius={0}
+            size="md"
+            color="yellow"
+            mt="sm"
+          >
+            <Group gap="sm" justify="space-between" wrap="nowrap">
+              <Text>
+                You have &quot;captioned&quot; files, but{' '}
+                {selectedRun.base in trainingModelInfo ? (
+                  <Badge color="violet">
+                    {trainingModelInfo[selectedRun.base as TrainingDetailsBaseModelList]?.pretty ??
+                      'this model'}
+                  </Badge>
+                ) : (
+                  'this model'
+                )}{' '}
+                works best with &quot;tags&quot;.
+              </Text>
+              <Button onClick={() => goBack(model.id, thisStep)}>Go back and fix</Button>
+            </Group>
+          </AlertWithIcon>
+        )}
+
+      {!allLabeled && (
+        <AlertWithIcon
+          icon={<IconAlertTriangle size={16} />}
+          iconColor="yellow"
+          radius={0}
+          size="md"
+          color="yellow"
+          mt="sm"
+        >
+          <Group gap="sm" justify="space-between" wrap="nowrap">
+            <Text>
+              {thisMediaType === 'audio' ? 'Audio' : 'Video'} training requires that all files are
+              labeled.
+            </Text>
+            <Button onClick={() => goBack(model.id, thisStep)}>Go back and fix</Button>
+          </Group>
+        </AlertWithIcon>
+      )}
+
+      {selectedRun.baseType === 'zimage' && (
+        <AlertWithIcon
+          icon={<IconAlertTriangle size={16} />}
+          iconColor="yellow"
+          radius={0}
+          size="md"
+          color="yellow"
+          mt="sm"
+        >
+          <Group gap="sm" justify="space-between" wrap="nowrap">
+            <Text>
+              Z&ndash;Image training is experimental, and we&apos;re still fine-tuning things behind
+              the scenes{' '}
+            </Text>
+          </Group>
+        </AlertWithIcon>
+      )}
+
+      {formBaseModel && (
+        <>
+          {features.trainingStepsPricing && !!selectedRun.params.continueFrom && (
+            <AlertWithIcon
+              icon={<IconRepeat size={16} />}
+              color="violet"
+              iconColor="violet"
+              size="md"
+              mt="sm"
+            >
+              {/* No "remove" action here: a "Train Further" version exists solely to continue
+                  from this epoch, and its base model is inherited from the source. Detaching the
+                  continuation would leave the run in a broken half-state, so it's fixed. */}
+              <Text>
+                Continuing training from{' '}
+                <Text span fw={700}>
+                  {continueFromEpoch && continueFromEpoch.air === selectedRun.params.continueFrom
+                    ? `Epoch #${continueFromEpoch.epochNumber}${
+                        continueFromEpoch.sourceVersionName
+                          ? ` of ${continueFromEpoch.sourceVersionName}`
+                          : ''
+                      }`
+                    : selectedRun.params.continueFrom.split('/').pop()}
+                </Text>
+                {' — '}this run picks up from that checkpoint, trained on{' '}
+                <Text span fw={700}>
+                  {selectedRun.base in trainingModelInfo
+                    ? trainingModelInfo[selectedRun.base as TrainingDetailsBaseModelList]?.pretty ??
+                      selectedRun.base
+                    : selectedRun.base}
+                </Text>
+                .
+                {selectedRun.params.engine !== 'ai-toolkit' && (
+                  <Text span c="yellow.7" fw={600}>
+                    {' '}
+                    This requires the AI Toolkit engine and will be ignored with the current engine.
+                  </Text>
+                )}
+              </Text>
+            </AlertWithIcon>
+          )}
+          <AdvancedSettings
+            modelId={model.id}
+            mediaType={thisMediaType}
+            selectedRun={selectedRun}
+            maxSteps={maxSteps}
+            numImages={thisNumImages}
+          />
+
+          {(!isValidRapid(selectedRun.baseType, selectedRun.params.engine) ||
+            currentUser?.isModerator) && (
+            <Group mt="lg">
+              {!isValidRapid(selectedRun.baseType, selectedRun.params.engine) && (
+                <Switch
+                  label={
+                    <Group gap={4} wrap="nowrap">
+                      <InfoPopover size="xs" iconProps={{ size: 16 }}>
+                        Jump to the front of the training queue and ensure that your training run is
+                        uninterrupted.
+                      </InfoPopover>
+                      <Text inherit>High Priority</Text>
+                    </Group>
+                  }
+                  labelPosition="left"
+                  checked={selectedRun.highPriority}
+                  onChange={(event) =>
+                    updateRun(model.id, thisMediaType, selectedRun.id, {
+                      highPriority: event.currentTarget.checked,
+                    })
+                  }
+                />
+              )}
+              {currentUser?.isModerator && (
+                <Switch
+                  label="Test Mode"
+                  labelPosition="left"
+                  checked={selectedRun.staging}
+                  onChange={(event) =>
+                    updateRun(model.id, thisMediaType, selectedRun.id, {
+                      staging: event.currentTarget.checked,
+                    })
+                  }
+                />
+              )}
+            </Group>
+          )}
+          <Paper
+            shadow="xs"
+            radius="sm"
+            mt="md"
+            w="fit-content"
+            px="md"
+            py="xs"
+            className="self-end bg-gray-0 dark:bg-dark-6"
+          >
+            <Group gap="sm">
+              {(dryRunResult.isLoading || isDefined(dryRunResult.data?.precedingJobs)) && (
+                <>
+                  <Badge>
+                    <Group gap={4} wrap="nowrap">
+                      <Text inherit>Queue</Text>
+                      <InfoPopover size="xs" iconProps={{ size: 16 }} withinPortal>
+                        <Text size="sm">How many jobs are in the queue before you</Text>
+                      </InfoPopover>
+                    </Group>
+                  </Badge>
+
+                  {dryRunResult.isLoading ? (
+                    <Loader size="sm" />
+                  ) : (
+                    <Text>{dryRunResult.data?.precedingJobs}</Text>
+                  )}
+
+                  <Divider orientation="vertical" />
+                </>
+              )}
+
+              {selectedRun.params.engine !== 'ai-toolkit' && (
+                <>
+                  <Badge>
+                    <Group gap={4} wrap="nowrap">
+                      <Text inherit>ETA</Text>
+                      <InfoPopover size="xs" iconProps={{ size: 16 }} withinPortal>
+                        <Text size="sm">How long your job is expected to run</Text>
+                      </InfoPopover>
+                    </Group>
+                  </Badge>
+
+                  {isValidRapid(selectedRun.baseType, selectedRun.params.engine) ? (
+                    <Text>{minsToHours(rapidEta)}</Text>
+                  ) : dryRunResult.isLoading ? (
+                    <Loader size="sm" />
+                  ) : (
+                    <Text>
+                      {!isDefined(dryRunResult.data?.eta)
+                        ? 'Unknown'
+                        : dryRunResult.data?.eta > 20000
+                        ? 'Forever'
+                        : minsToHours(dryRunResult.data?.eta)}
+                    </Text>
+                  )}
+
+                  <Divider orientation="vertical" />
+                </>
+              )}
+
+              {dryRunResult.isLoading ? (
+                <>
+                  <Badge>Cost</Badge>
+                  <Loader size="sm" />
+                </>
+              ) : !isDefined(dryRunResult.data?.cost) || selectedRun.hasIssue ? (
+                <>
+                  <Badge>Cost</Badge>
+                  <Text>Error</Text>
+                </>
+              ) : selectedRun.licenseFee > 0 ? (
+                <>
+                  <Badge>Training</Badge>
+                  <CurrencyBadge
+                    currency={Currency.BUZZ}
+                    unitAmount={dryRunResult.data.cost - selectedRun.licenseFee}
+                    displayCurrency={false}
+                  />
+
+                  <Divider orientation="vertical" />
+
+                  <Badge>
+                    <Group gap={4} wrap="nowrap">
+                      <Text inherit>License fee</Text>
+                      <InfoPopover size="xs" iconProps={{ size: 16 }} withinPortal>
+                        <Text size="sm">
+                          A licensing fee set by the base model&apos;s creator, charged on top of
+                          the training cost.
+                        </Text>
+                      </InfoPopover>
+                    </Group>
+                  </Badge>
+                  <CurrencyBadge
+                    currency={Currency.BUZZ}
+                    unitAmount={selectedRun.licenseFee}
+                    displayCurrency={false}
+                  />
+
+                  <Divider orientation="vertical" />
+
+                  <Badge>Total</Badge>
+                  <CurrencyBadge
+                    currency={Currency.BUZZ}
+                    unitAmount={dryRunResult.data.cost}
+                    displayCurrency={false}
+                  />
+                </>
+              ) : (
+                <>
+                  <Badge>Cost</Badge>
+                  <CurrencyBadge
+                    currency={Currency.BUZZ}
+                    unitAmount={dryRunResult.data.cost}
+                    displayCurrency={false}
+                  />
+                </>
+              )}
+            </Group>
+          </Paper>
+        </>
+      )}
+
+      <Divider mt="md" />
+
+      {yellowOnGreen ? (
+        <Alert color="yellow" mt="md" className="rounded-md">
+          <Text
+            size="sm"
+            fw={700}
+            c="var(--mantine-color-yellow-light-color)"
+            className="flex items-center gap-1.5"
+          >
+            <IconAlertTriangle size={16} />
+            Yellow Buzz can&apos;t be used on Civitai.com
+          </Text>
+          <Text size="xs" mt={4}>
+            Yellow Buzz is unrestricted. However, Civitai.com only allows safe for work content
+            creation. To train with your Yellow Buzz, go to Civitai.red.
+          </Text>
+          <div className="mt-3 flex items-center gap-3">
+            <Button
+              component="a"
+              href={syncAccount(`//${serverDomains.red}${router.asPath}`)}
+              onClick={(e: React.MouseEvent<HTMLAnchorElement>) => {
+                e.preventDefault();
+                window.open(
+                  syncAccount(`//${serverDomains.red}${router.asPath}`),
+                  '_blank',
+                  'noopener,noreferrer'
+                );
+              }}
+              target="_blank"
+              rel="noreferrer nofollow"
+              variant="filled"
+              className="flex-1"
+            >
+              Go to Civitai.red
+            </Button>
+            <Text
+              size="xs"
+              fw={700}
+              className="cursor-pointer hover:underline"
+              style={{ opacity: 0.6 }}
+              onClick={() => setBuzzType('green')}
+            >
+              Switch to Green Buzz
+            </Text>
+          </div>
+        </Alert>
+      ) : clientInsufficientBuzz ? (
+        <Notification
+          icon={<IconAlertTriangle size={18} />}
+          color="yellow"
+          className="whitespace-pre-wrap rounded-md bg-yellow-8/20"
+          withCloseButton={false}
+          mt="md"
+        >
+          <div className="flex w-full items-center justify-between gap-2">
+            <Text size="sm">
+              Not enough {selectedType.charAt(0).toUpperCase() + selectedType.slice(1)} Buzz (
+              {abbreviateNumber(selectedBalance)}/{abbreviateNumber(totalBuzzCost)}).
+              {!alternativeType && (
+                <>
+                  {' '}
+                  <Text span c="blue.4" component="a" href="/purchase/buzz" target="_blank">
+                    Get more Buzz
+                  </Text>
+                </>
+              )}
+            </Text>
+            {alternativeType && (
+              <Button
+                variant="light"
+                color="yellow"
+                radius="xl"
+                size="compact-sm"
+                onClick={() => setBuzzType(alternativeType)}
+              >
+                Switch to {alternativeType.charAt(0).toUpperCase() + alternativeType.slice(1)} Buzz
+              </Button>
+            )}
+          </div>
+        </Notification>
+      ) : null}
+
+      <Group mt="lg" justify="flex-end">
+        <Button variant="default" onClick={() => goBack(model.id, thisStep)}>
+          Back
+        </Button>
+        <Button.Group className="flex h-[36px] [&>*]:h-full">
+          <Button
+            loading={awaitInvalidate || dryRunResult.isLoading}
+            disabled={
+              blockedModels.includes(formBaseModel ?? '') ||
+              !!unacknowledgedRun ||
+              !status.available ||
+              isClassicTrainerRetired() ||
+              !allLabeled ||
+              awaitInvalidate ||
+              confirmOpen ||
+              dryRunResult.isLoading ||
+              clientInsufficientBuzz ||
+              hasIssue ||
+              yellowOnGreen
+            }
+            color={buzzColor}
+            onClick={handleSubmit}
+          >
+            {`Submit${runs.length > 1 ? ` (${runs.length} runs)` : ''}`}
+          </Button>
+          <BuzzTypeSelector
+            cost={totalBuzzCost}
+            loading={dryRunResult.isLoading}
+            error={hasIssue}
+            onRetry={() => dryRunResult.refetch()}
+          />
+        </Button.Group>
+      </Group>
+    </Stack>
+  );
+};

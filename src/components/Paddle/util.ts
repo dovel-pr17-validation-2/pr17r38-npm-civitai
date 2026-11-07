@@ -1,0 +1,133 @@
+import { useEffect, useState } from 'react';
+import { useActiveSubscription } from '~/components/Stripe/memberships.util';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import type { GetByIdStringInput } from '~/server/schema/base.schema';
+import type {
+  TransactionWithSubscriptionCreateInput,
+  UpdateSubscriptionInputSchema,
+} from '~/server/schema/paddle.schema';
+import { trpc } from '~/utils/trpc';
+
+export const useMutatePaddle = () => {
+  const queryUtils = trpc.useUtils();
+  const processCompleteBuzzTransactionMutation =
+    trpc.paddle.processCompleteBuzzTransaction.useMutation();
+  const updateSubscriptionMutation = trpc.paddle.updateSubscription.useMutation();
+  const cancelSubscriptionMutation = trpc.paddle.cancelSubscription.useMutation();
+  const purchaseBuzzWithSubscription = trpc.paddle.purchaseBuzzWithSubscription.useMutation();
+  const getOrCreateCustomerIdMutation = trpc.paddle.getOrCreateCustomer.useMutation();
+  const refreshSubscriptionMutation = trpc.paddle.refreshSubscription.useMutation({
+    onSuccess: async () => {
+      await queryUtils.subscriptions.getUserSubscription.invalidate();
+    },
+  });
+
+  const handleProcessCompleteBuzzTransaction = (data: GetByIdStringInput) => {
+    return processCompleteBuzzTransactionMutation.mutateAsync(data);
+  };
+
+  const handleUpdateSubscription = (
+    data: UpdateSubscriptionInputSchema,
+    opts: Parameters<typeof updateSubscriptionMutation.mutateAsync>[1]
+  ) => {
+    return updateSubscriptionMutation.mutateAsync(data, opts);
+  };
+
+  const handleCancelSubscriptionMutation = (
+    opts: Parameters<typeof cancelSubscriptionMutation.mutateAsync>[1]
+  ) => {
+    return cancelSubscriptionMutation.mutateAsync(undefined, opts);
+  };
+
+  const handlePurchaseBuzzWithSubscription = (data: TransactionWithSubscriptionCreateInput) => {
+    return purchaseBuzzWithSubscription.mutateAsync(data);
+  };
+
+  const handleGetOrCreateCustomer = () => {
+    return getOrCreateCustomerIdMutation.mutateAsync();
+  };
+
+  const handleRefreshSubscription = () => {
+    return refreshSubscriptionMutation.mutateAsync();
+  };
+
+  return {
+    processCompleteBuzzTransaction: handleProcessCompleteBuzzTransaction,
+    processingCompleteBuzzTransaction: processCompleteBuzzTransactionMutation.isPending,
+    updateSubscription: handleUpdateSubscription,
+    updatingSubscription: updateSubscriptionMutation.isPending,
+    cancelSubscription: handleCancelSubscriptionMutation,
+    cancelingSubscription: cancelSubscriptionMutation.isPending,
+    purchaseBuzzWithSubscription: handlePurchaseBuzzWithSubscription,
+    purchasingBuzzWithSubscription: purchaseBuzzWithSubscription.isPending,
+    getOrCreateCustomer: handleGetOrCreateCustomer,
+    gettingOrCreateCustomer: getOrCreateCustomerIdMutation.isPending,
+    refreshSubscription: handleRefreshSubscription,
+    refreshingSubscription: refreshSubscriptionMutation.isPending,
+  };
+};
+
+export const useSubscriptionManagementUrls = (data: { enabled?: boolean } = { enabled: true }) => {
+  const currentUser = useCurrentUser();
+  const { data: managementUrls, ...rest } = trpc.paddle.getManagementUrls.useQuery(undefined, {
+    enabled: !!currentUser && data?.enabled,
+    trpc: { context: { skipBatch: true } },
+  });
+
+  return {
+    managementUrls,
+    ...rest,
+  };
+};
+
+export const useHasPaddleSubscription = () => {
+  const currentUser = useCurrentUser();
+
+  const {
+    data: hasPaddleSubscription,
+    isLoading,
+    isInitialLoading,
+  } = trpc.paddle.hasSubscription.useQuery(undefined, {
+    enabled: false,
+  });
+
+  return {
+    hasPaddleSubscription,
+    isLoading,
+    isInitialLoading,
+  };
+};
+
+export const usePaddleSubscriptionRefresh = () => {
+  const currentUser = useCurrentUser();
+  const { refreshSubscription, refreshingSubscription } = useMutatePaddle();
+  const { hasPaddleSubscription, isLoading: loadingPaddleSubscriptionStatus } =
+    useHasPaddleSubscription();
+  // Avoids getting stuck in a loop
+  const [refreshed, setRefreshed] = useState(false);
+
+  const { subscription, subscriptionLoading } = useActiveSubscription({
+    checkWhenInBadState: true,
+  });
+
+  const isLoading =
+    currentUser &&
+    (refreshingSubscription || loadingPaddleSubscriptionStatus || subscriptionLoading);
+
+  const handleRefresh = async () => {
+    await refreshSubscription();
+    setRefreshed(true);
+  };
+
+  useEffect(() => {
+    if (isLoading || refreshed) {
+      return;
+    }
+
+    if (!subscription && hasPaddleSubscription) {
+      handleRefresh();
+    }
+  }, [hasPaddleSubscription, subscription, refreshSubscription, isLoading, refreshed]);
+
+  return isLoading;
+};

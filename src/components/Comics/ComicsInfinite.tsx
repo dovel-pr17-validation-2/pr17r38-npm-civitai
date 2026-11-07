@@ -1,0 +1,98 @@
+import { Center, Loader, LoadingOverlay } from '@mantine/core';
+import { useDebouncedValue } from '@mantine/hooks';
+import { isEqual } from 'lodash-es';
+import { useEffect } from 'react';
+import { ComicCard } from '~/components/Cards/ComicCard';
+import { EndOfFeed } from '~/components/EndOfFeed/EndOfFeed';
+import { InViewLoader } from '~/components/InView/InViewLoader';
+import { MasonryGridVirtual } from '~/components/MasonryColumns/MasonryGridVirtual';
+import { NoContent } from '~/components/NoContent/NoContent';
+import { useApplyHiddenPreferences } from '~/components/HiddenPreferences/useApplyHiddenPreferences';
+import { useBrowsingLevelDebounced } from '~/components/BrowsingLevel/BrowsingLevelProvider';
+import type { ComicGenre } from '~/shared/utils/prisma/enums';
+import { trpc } from '~/utils/trpc';
+
+type ComicFilters = {
+  genre?: string;
+  sort?: string;
+  period?: string;
+  followed?: boolean;
+  followedComics?: boolean;
+};
+
+export function ComicsInfinite({ filters: filterOverrides = {}, showEof = false }: Props) {
+  const [debouncedFilters, cancel] = useDebouncedValue(filterOverrides, 500);
+  // Fetch at the SAME resolved level the client filter re-applies below
+  // (`useApplyHiddenPreferences` uses `useBrowsingLevelDebounced` internally).
+  // The raw saved `browsingSettings.browsingLevel` skips the domain cap, so on
+  // the green domain the server returned a wider set than the filter would keep,
+  // gutting the feed. Mirrors ModelsInfinite (ImagesInfinite additionally narrows
+  // to PG via `capToPublic`/`includePG13`; comics has no PG-13 opt-in).
+  const browsingLevel = useBrowsingLevelDebounced();
+
+  const { data, fetchNextPage, hasNextPage, isRefetching, isFetching } =
+    trpc.comics.getPublicProjects.useInfiniteQuery(
+      {
+        limit: 20,
+        genre: debouncedFilters.genre as ComicGenre | undefined,
+        sort: (debouncedFilters.sort as 'Newest' | 'MostFollowed' | 'MostChapters') || 'Newest',
+        period: debouncedFilters.period as
+          | 'Day'
+          | 'Week'
+          | 'Month'
+          | 'Year'
+          | 'AllTime'
+          | undefined,
+        followed: debouncedFilters.followed,
+        followedComics: debouncedFilters.followedComics,
+        browsingLevel,
+      },
+      { getNextPageParam: (lastPage) => lastPage.nextCursor }
+    );
+
+  useEffect(() => {
+    if (isEqual(filterOverrides, debouncedFilters)) cancel();
+  }, [cancel, debouncedFilters, filterOverrides]);
+
+  const rawItems = data?.pages.flatMap((page) => page.items) ?? [];
+  const { items } = useApplyHiddenPreferences({ type: 'comics', data: rawItems });
+
+  return (
+    <>
+      {!items.length && isFetching ? (
+        <Center p="xl">
+          <Loader size="xl" />
+        </Center>
+      ) : !!items.length ? (
+        <div style={{ position: 'relative' }}>
+          <LoadingOverlay visible={isRefetching ?? false} zIndex={9} />
+          <MasonryGridVirtual
+            data={items}
+            render={ComicCard}
+            itemId={(x) => x.id}
+            empty={<NoContent />}
+          />
+          {hasNextPage && (
+            <InViewLoader
+              loadFn={fetchNextPage}
+              loadCondition={!isFetching}
+              style={{ gridColumn: '1/-1' }}
+            >
+              <Center p="xl" style={{ height: 36 }} mt="md">
+                <Loader />
+              </Center>
+            </InViewLoader>
+          )}
+          {!hasNextPage && showEof && <EndOfFeed />}
+        </div>
+      ) : (
+        <NoContent />
+      )}
+    </>
+  );
+}
+
+type Props = {
+  filters?: ComicFilters;
+  showEof?: boolean;
+};

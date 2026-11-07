@@ -1,0 +1,382 @@
+/**
+ * ResourceSelectInput
+ *
+ * A form input component for selecting a single resource (model version).
+ * Uses the ResourceDataProvider to batch-fetch resource data.
+ *
+ * Value format: ResourceSelectValue (hydrated object with id, strength, baseModel, etc.)
+ *
+ * The input accepts minimal values (just { id }) and hydrates them with full resource data
+ * when fetched. This allows URL params to pass just an id while handlers get full context.
+ *
+ * When `versions` prop is provided, displays a version selector (segmented control) for
+ * switching between model versions (e.g., Flux Dev/Schnell, Wan 2.1/2.2).
+ */
+
+import { ChoiceGroup } from '~/libs/form/components/ChoiceGroup';
+import { useGeneratorLayout } from '~/hooks/useMobileGenerator';
+import React, { useEffect, useMemo } from 'react';
+import type { InputWrapperProps } from '@mantine/core';
+import { Button, Input } from '@mantine/core';
+import { IconPlus, IconRotate, IconTrash } from '@tabler/icons-react';
+import clsx from 'clsx';
+import { clampStrength } from '~/shared/constants/generation.constants';
+import { asResourceValue, defaultStrength } from '~/shared/utils/resource.utils';
+import { openResourceSelectModal } from '~/components/Dialog/triggers/resource-select';
+import type {
+  ResourceSelectOptions,
+  ResourceSelectSource,
+} from '~/components/ImageGeneration/GenerationForm/resource-select.types';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { useResourceDataContext, useResourceData } from './ResourceDataProvider';
+import {
+  ResourceItemContent,
+  getResourceStatus,
+  getStatusClasses,
+  isResourceDisabled,
+} from './ResourceItemContent';
+import { ExperimentalFlask } from '~/components/generation_v2/Experimental';
+import { SheetSelect } from '~/components/generation_v2/inputs/SheetSelect';
+
+/** Past this many versions the buttons get too narrow to read on a phone, so they become a select. */
+const MAX_VERSION_BUTTONS = 3;
+import {
+  needsHydration,
+  resolveResourceOptions,
+  ResourceCardSkeleton,
+  type ResourceData,
+  type ResourceSelectValue,
+  type PartialResourceValue,
+} from './resource-select.utils';
+
+// Re-export types for consumers
+export type { ResourceSelectValue, PartialResourceValue } from './resource-select.utils';
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/** Version option for the version selector */
+export interface VersionOption {
+  label: string;
+  value: number;
+  /** Optional baseModel override (for backwards compatibility with hardcoded values) */
+  baseModel?: string;
+}
+
+export interface ResourceSelectInputProps extends Omit<InputWrapperProps, 'children' | 'onChange'> {
+  /** Value can be a full GenerationResource or partial with just { id } for hydration */
+  value?: PartialResourceValue;
+  onChange?: (value: PartialResourceValue | undefined) => void;
+  /** Label for the button when no resource is selected */
+  buttonLabel?: React.ReactNode;
+  /** Title for the resource selection modal */
+  modalTitle?: React.ReactNode;
+  /** Options for filtering available resources */
+  options?: ResourceSelectOptions;
+  /** Whether to allow removing the selected resource */
+  allowRemove?: boolean;
+  /** Whether to allow swapping the selected resource (set to false to lock the resource) */
+  allowSwap?: boolean;
+  /** No border or radius on the card: it fills a container that draws its own. */
+  flush?: boolean;
+  /** Source context for resource selection */
+  selectSource?: ResourceSelectSource;
+  /** Whether the input is disabled */
+  disabled?: boolean;
+  /** Resource type to filter by (e.g., 'LORA', 'Checkpoint') */
+  resourceType?: 'Checkpoint' | 'LORA' | 'VAE' | 'TextualInversion';
+  /** Callback to revert to default model (shown when resource is disabled) */
+  onRevertToDefault?: () => void;
+  /**
+   * Version options for models with multiple versions (e.g., Flux Dev/Schnell, Wan 2.1/2.2).
+   * When provided and the current value's ID matches one of the versions, a segmented
+   * control is shown to switch between versions.
+   */
+  versions?: VersionOption[];
+}
+
+// =============================================================================
+// Resource Card (displays selected resource)
+// =============================================================================
+
+interface ResourceCardProps {
+  resource: ResourceData;
+  value: ResourceSelectValue;
+  onChange?: (value: ResourceSelectValue) => void;
+  onSwap: () => void;
+  onRemove?: () => void;
+  onRevertToDefault?: () => void;
+  disabled?: boolean;
+  allowSwap?: boolean;
+  options?: ResourceSelectOptions;
+  flush?: boolean;
+}
+
+function ResourceCard({
+  resource,
+  value,
+  onChange,
+  onSwap,
+  onRemove,
+  onRevertToDefault,
+  disabled,
+  allowSwap = true,
+  options,
+  flush,
+}: ResourceCardProps) {
+  const status = getResourceStatus(resource, options);
+  const statusClasses = getStatusClasses(status);
+  const resourceIsDisabled = isResourceDisabled(status);
+  // Flush in the model card, its buttons sit on the card without a fill of their own.
+  const buttonVariant = flush ? 'subtle' : 'light';
+
+  return (
+    <div
+      className={clsx(
+        !flush && 'rounded-lg border border-solid',
+        !flush && (statusClasses.border ?? 'border-[var(--mantine-color-default-border)]'),
+        statusClasses.background ?? 'bg-[var(--mantine-color-body)]',
+        'p-2'
+      )}
+    >
+      <ResourceItemContent
+        resource={resource}
+        strengthValue={value.strength ?? defaultStrength(resource)}
+        onStrengthChange={
+          // Don't allow strength changes for disabled resources
+          onChange && !resourceIsDisabled
+            ? (strength) => onChange({ ...value, strength })
+            : undefined
+        }
+        disabled={disabled}
+        options={options}
+        actions={
+          <>
+            {/* Show Use Substitute button when resource has an available substitute */}
+            {resourceIsDisabled && resource.substitute?.canGenerate && onChange && (
+              <Button
+                variant={buttonVariant}
+                color="blue"
+                radius="xl"
+                size="compact-xs"
+                onClick={() => {
+                  const substitute = resource.substitute!;
+                  onChange({
+                    ...value,
+                    ...substitute,
+                    strength: clampStrength(value.strength, substitute.settings.strength),
+                  });
+                }}
+                leftSection={<IconRotate size={14} />}
+              >
+                Use Substitute
+              </Button>
+            )}
+            {/* Show Revert to Default button when resource is disabled and no substitute */}
+            {resourceIsDisabled && !resource.substitute?.canGenerate && onRevertToDefault && (
+              <Button
+                variant={buttonVariant}
+                radius="xl"
+                size="compact-xs"
+                onClick={onRevertToDefault}
+                leftSection={<IconRotate size={14} />}
+              >
+                Default
+              </Button>
+            )}
+            {/* Show Swap button (even for disabled resources so user can swap to compatible one) */}
+            {allowSwap && (
+              <Button
+                variant={buttonVariant}
+                radius="xl"
+                size="compact-xs"
+                onClick={onSwap}
+                disabled={disabled}
+              >
+                Swap
+              </Button>
+            )}
+            {onRemove && (
+              <LegacyActionIcon
+                aria-label="Remove resource"
+                size="sm"
+                variant="subtle"
+                color="red"
+                onClick={onRemove}
+                disabled={disabled}
+              >
+                <IconTrash size={16} />
+              </LegacyActionIcon>
+            )}
+          </>
+        }
+      />
+    </div>
+  );
+}
+
+// =============================================================================
+// Component
+// =============================================================================
+
+export function ResourceSelectInput({
+  value,
+  onChange,
+  buttonLabel = 'Add Resource',
+  modalTitle,
+  options = {},
+  allowRemove = true,
+  allowSwap = true,
+  flush,
+  selectSource = 'generation',
+  disabled,
+  resourceType,
+  onRevertToDefault,
+  versions,
+  ...inputWrapperProps
+}: ResourceSelectInputProps) {
+  // On a phone the version is always a dropdown, one row instead of a row of chips.
+  const mobile = useGeneratorLayout() === 'mobile';
+  const { registerResourceId, unregisterResourceId, getResourceData } = useResourceDataContext();
+
+  // Fetch resource data for display (registration handled by form provider)
+  // If value is already hydrated, use it directly; otherwise fetch via provider
+  const { data: fetchedData, isLoading } = useResourceData(value?.id);
+
+  // Use fetched data for display info, but preserve form value's strength
+  const resourceData =
+    fetchedData ?? (value && !needsHydration(value) ? (value as ResourceData) : undefined);
+
+  // Build options from resourceType if provided
+  const resolvedOptions = resolveResourceOptions(options, resourceType);
+
+  // Register all version IDs for pre-fetching so baseModel data is available when switching
+  const versionIds = useMemo(() => versions?.map((v) => v.value) ?? [], [versions]);
+  useEffect(() => {
+    if (versionIds.length === 0) return;
+    versionIds.forEach(registerResourceId);
+    return () => {
+      versionIds.forEach(unregisterResourceId);
+    };
+  }, [versionIds, registerResourceId, unregisterResourceId]);
+
+  // Check if current value is one of the versions (show version selector)
+  const showVersionSelector = value?.id !== undefined && versionIds.includes(value.id);
+
+  // Handle version selection from segmented control
+  const handleVersionChange = (stringId: string) => {
+    const numericId = Number(stringId);
+    const versionResourceData = getResourceData(numericId);
+    onChange?.(versionResourceData && asResourceValue(versionResourceData));
+  };
+
+  const handleOpenResourceSearch = () => {
+    openResourceSelectModal({
+      title: modalTitle ?? buttonLabel,
+      onSelect: (resource) => {
+        // Store the full GenerationResource
+        onChange?.(resource);
+      },
+      options: resolvedOptions,
+      selectSource,
+    });
+  };
+
+  const handleRemove = () => {
+    onChange?.(undefined);
+  };
+
+  // Render empty state
+  if (!value) {
+    return (
+      <Input.Wrapper {...inputWrapperProps}>
+        <Button
+          variant={flush ? 'subtle' : 'light'}
+          leftSection={<IconPlus size={18} />}
+          fullWidth
+          onClick={handleOpenResourceSearch}
+          disabled={disabled}
+        >
+          {buttonLabel}
+        </Button>
+      </Input.Wrapper>
+    );
+  }
+
+  // Render loading state when fetching data or waiting for hydration
+  if (!resourceData) {
+    return (
+      <Input.Wrapper {...inputWrapperProps}>
+        <ResourceCardSkeleton />
+      </Input.Wrapper>
+    );
+  }
+
+  // Render selected resource
+  // Use resourceData as the canonical value, with strength from form state
+  const displayValue: ResourceSelectValue = asResourceValue(resourceData, value.strength);
+
+  return (
+    <Input.Wrapper {...inputWrapperProps}>
+      <ResourceCard
+        resource={resourceData}
+        value={displayValue}
+        onChange={onChange}
+        onSwap={handleOpenResourceSearch}
+        onRemove={allowRemove ? handleRemove : undefined}
+        onRevertToDefault={onRevertToDefault}
+        disabled={disabled}
+        allowSwap={allowSwap}
+        options={options}
+        flush={flush}
+      />
+      {/* Version selector for models with multiple versions */}
+      {showVersionSelector && versions && (
+        <div className="mt-1">
+          {versions.length > MAX_VERSION_BUTTONS || mobile ? (
+            <SheetSelect
+              aria-label="Version"
+              sheetTitle="Version"
+              value={value?.id?.toString() ?? null}
+              onChange={(next) => next && handleVersionChange(next)}
+              allowDeselect={false}
+              data={versions.map(({ label, value: versionValue }) => ({
+                label,
+                value: versionValue.toString(),
+              }))}
+              renderOption={({ option }) => (
+                <span className="inline-flex items-center gap-1">
+                  {option.label}
+                  <ExperimentalFlask
+                    target={{ kind: 'modelVersion', key: Number(option.value) }}
+                    size={14}
+                  />
+                </span>
+              )}
+            />
+          ) : (
+            <ChoiceGroup
+              value={value?.id?.toString() ?? ''}
+              onChange={handleVersionChange}
+              data={versions.map(({ label, value: versionValue }) => ({
+                // Marked per option, so which version is experimental is legible
+                // before switching to it — not only once it's selected.
+                label: (
+                  <span className="inline-flex items-center gap-1">
+                    {label}
+                    <ExperimentalFlask
+                      target={{ kind: 'modelVersion', key: versionValue }}
+                      size={14}
+                    />
+                  </span>
+                ),
+                value: versionValue.toString(),
+              }))}
+            />
+          )}
+        </div>
+      )}
+    </Input.Wrapper>
+  );
+}

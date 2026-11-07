@@ -1,0 +1,324 @@
+import { Prisma } from '@prisma/client';
+import dayjs from '~/shared/utils/dayjs';
+import { chunk, uniq } from 'lodash-es';
+import { SearchIndexUpdateQueueAction } from '~/server/common/enums';
+import { dbRead, dbWrite } from '~/server/db/client';
+import { bustContestCollectionItemsCache } from '~/server/services/contest-collection-items.cache';
+import {
+  collectionsSearchIndex,
+  imagesMetricsSearchIndex,
+  imagesSearchIndex,
+} from '~/server/search-index';
+import {
+  getNsfwLevelRelatedEntities,
+  updateCollectionsNsfwLevels,
+  updateNsfwLevels,
+} from '~/server/services/nsfwLevels.service';
+import { accountHoldSql } from '~/server/services/legal-hold.service';
+import { limitConcurrency, Limiter } from '~/server/utils/concurrency-helpers';
+import { EntityType, JobQueueType } from '~/shared/utils/prisma/enums';
+// TEMP: unused while collection enqueue is disabled below. REVERT.
+// import { enqueueJobs } from '~/server/services/job-queue.service';
+import { createJob } from './job';
+import { logToAxiom } from '~/server/logging/client';
+import { queueImageSearchIndexUpdate } from '~/server/services/image.service';
+
+const jobQueueMap = {
+  [EntityType.Image]: 'imageIds',
+  [EntityType.Post]: 'postIds',
+  [EntityType.Article]: 'articleIds',
+  [EntityType.Bounty]: 'bountyIds',
+  [EntityType.BountyEntry]: 'bountyEntryIds',
+  [EntityType.Collection]: 'collectionIds',
+  [EntityType.Model]: 'modelIds',
+  [EntityType.ModelVersion]: 'modelVersionIds',
+  [EntityType.Comment]: 'commentIds', // unused
+  [EntityType.CommentV2]: 'commentV2Ids', // unused
+  [EntityType.CommentV3]: 'commentV3Ids', // unused
+  [EntityType.User]: 'userIds', // unused
+  [EntityType.UserProfile]: 'userProfileIds', // unused
+  [EntityType.ResourceReview]: 'resourceReviewIds', // unused
+  [EntityType.ChatMessage]: 'chatMessageIds', // unused
+  [EntityType.Model3D]: 'model3dIds',
+  [EntityType.Storyline]: 'storylineIds', // unused
+} as const;
+type JobQueueMap = typeof jobQueueMap;
+type JobQueueIds = {
+  [K in JobQueueMap[keyof JobQueueMap]]: number[];
+};
+
+export function reduceJobQueueToIds(jobs: { entityId: number; entityType: EntityType }[]) {
+  const jobIds: Partial<JobQueueIds> = {};
+  for (const key in jobQueueMap) {
+    jobIds[jobQueueMap[key as keyof JobQueueMap]] = [];
+  }
+  for (const job of jobs) {
+    const key = jobQueueMap[job.entityType];
+    if (!jobIds[key]) jobIds[key] = [];
+    jobIds[key]!.push(job.entityId);
+  }
+  return jobIds as JobQueueIds;
+}
+
+async function deleteJobQueueItems(
+  entityIds: number[],
+  entityType: EntityType,
+  type: JobQueueType
+) {
+  if (!entityIds) return;
+  await Limiter().process(entityIds, (entityIds) =>
+    dbWrite.jobQueue.deleteMany({ where: { type, entityType, entityId: { in: entityIds } } })
+  );
+}
+
+// Bounds how much of a backlog one run pulls in. The job runs every minute and
+// deletes only what it processed, so the remainder drains across later runs.
+const UPDATE_NSFW_LEVEL_BATCH_SIZE = 10000;
+
+const updateNsfwLevelJob = createJob('update-nsfw-levels', '*/1 * * * *', async (e) => {
+  // const [lastRun, setLastRun] = await getJobDate('update-nsfw-levels');
+  // const now = new Date();
+  try {
+    const jobQueue = await dbRead.jobQueue.findMany({
+      where: { type: JobQueueType.UpdateNsfwLevel, entityType: { not: EntityType.Collection } },
+      orderBy: { createdAt: 'asc' },
+      take: UPDATE_NSFW_LEVEL_BATCH_SIZE,
+    });
+
+    const jobQueueIds = reduceJobQueueToIds(jobQueue);
+    const relatedEntities = await getNsfwLevelRelatedEntities(jobQueueIds);
+
+    await queueImageSearchIndexUpdate({
+      ids: jobQueueIds.imageIds,
+      action: SearchIndexUpdateQueueAction.Update,
+    });
+
+    const postIds = uniq([...jobQueueIds.postIds, ...relatedEntities.postIds]);
+    const articleIds = uniq([...jobQueueIds.articleIds, ...relatedEntities.articleIds]);
+    const bountyIds = uniq([...jobQueueIds.bountyIds, ...relatedEntities.bountyIds]);
+    const bountyEntryIds = uniq([...jobQueueIds.bountyEntryIds, ...relatedEntities.bountyEntryIds]);
+    const modelVersionIds = uniq([
+      ...jobQueueIds.modelVersionIds,
+      ...relatedEntities.modelVersionIds,
+    ]);
+    const modelIds = uniq([...jobQueueIds.modelIds, ...relatedEntities.modelIds]);
+
+    // TEMP: collection discovery/enqueue disabled to drain the stuck Image/Post
+    // backlog locally without the 708k-collection fan-out failing the run. REVERT.
+    // const collectionIds = uniq([
+    //   ...jobQueueIds.collectionIds,
+    //   ...relatedEntities.collectionIds,
+    // ]);
+
+    // if (collectionIds.length > 0) {
+    //   await enqueueJobs(
+    //     collectionIds.map((entityId) => ({
+    //       entityId,
+    //       entityType: EntityType.Collection,
+    //       type: JobQueueType.UpdateNsfwLevel,
+    //     }))
+    //   );
+    // }
+
+    const comicProjectIds = relatedEntities.comicProjectIds;
+    const model3dIds = uniq([...jobQueueIds.model3dIds, ...relatedEntities.model3dIds]);
+
+    await updateNsfwLevels({
+      postIds,
+      articleIds,
+      bountyIds,
+      bountyEntryIds,
+      modelVersionIds,
+      modelIds,
+      collectionIds: [], // Collections processed by separate job
+      comicProjectIds,
+      model3dIds,
+    });
+
+    const tuple: [entityIds: number[], entityType: EntityType, type: JobQueueType][] = [
+      [jobQueueIds.imageIds, EntityType.Image, JobQueueType.UpdateNsfwLevel],
+      [jobQueueIds.postIds, EntityType.Post, JobQueueType.UpdateNsfwLevel],
+      [jobQueueIds.articleIds, EntityType.Article, JobQueueType.UpdateNsfwLevel],
+      [jobQueueIds.modelIds, EntityType.Model, JobQueueType.UpdateNsfwLevel],
+      [jobQueueIds.modelVersionIds, EntityType.ModelVersion, JobQueueType.UpdateNsfwLevel],
+      [jobQueueIds.bountyIds, EntityType.Bounty, JobQueueType.UpdateNsfwLevel],
+      [jobQueueIds.bountyEntryIds, EntityType.BountyEntry, JobQueueType.UpdateNsfwLevel],
+      [jobQueueIds.model3dIds, EntityType.Model3D, JobQueueType.UpdateNsfwLevel],
+    ];
+    await Promise.all(tuple.map((args) => deleteJobQueueItems(...args)));
+  } catch (e: any) {
+    console.log(e);
+    logToAxiom({ type: 'error', name: 'update-nsfw-levels', message: e.message });
+    throw e;
+  }
+
+  // await dbWrite.jobQueue.deleteMany({
+  //   where: {
+  //     createdAt: { lt: now },
+  //     type: JobQueueType.UpdateNsfwLevel,
+  //     entityType: { not: EntityType.Collection },
+  //   },
+  // });
+});
+
+const updateNsfwLevelsCollectionsJob = createJob(
+  'update-nsfw-levels-collections',
+  '*/10 * * * *', // Reduced frequency to every 10 minutes
+  async (e) => {
+    try {
+      // Process smaller batches more frequently to avoid timeouts
+      const jobQueue = await dbRead.jobQueue.findMany({
+        where: {
+          type: JobQueueType.UpdateNsfwLevel,
+          entityType: EntityType.Collection,
+        },
+        take: 500, // Limit total items per run
+        orderBy: { createdAt: 'asc' }, // Process oldest items first
+      });
+
+      if (!jobQueue.length) return;
+
+      const collectionIds = jobQueue.map((x) => x.entityId);
+
+      // Smaller batch size for more granular processing
+      await Limiter({ batchSize: 20, limit: 3 }).process(collectionIds, async (batchIds) => {
+        try {
+          // Every id in the batch, not just the ones `updateCollectionsNsfwLevels`
+          // returns — it returns only collections whose level actually moved
+          // (`AND c."nsfwLevel" != c2."nsfwLevel"`), which removing an item rarely does.
+          // The queue row is the signal that membership changed; the level change is a
+          // rare side effect of it, and gating on it left documents stale.
+          //
+          // Ahead of the recompute, not after it: the recompute is two EXISTS
+          // subqueries over five LEFT JOINs per collection and collections of ~191k
+          // items exist, so it can time out — and a batch that fails deterministically
+          // would otherwise never tell the index about any of its 20 collections. On
+          // retry the duplicate costs nothing; the queue is a Redis set.
+          await collectionsSearchIndex.queueUpdate(
+            batchIds.map((id) => ({ id, action: SearchIndexUpdateQueueAction.Update }))
+          );
+
+          await updateCollectionsNsfwLevels(batchIds);
+
+          await dbWrite.jobQueue.deleteMany({
+            where: {
+              type: JobQueueType.UpdateNsfwLevel,
+              entityType: EntityType.Collection,
+              entityId: { in: batchIds },
+            },
+          });
+        } catch (error: any) {
+          logToAxiom({
+            type: 'error',
+            name: 'update-nsfw-levels-collections-batch',
+            message: error.message,
+            data: { batchIds, batchSize: batchIds.length },
+          });
+          // Continue processing other batches even if one fails
+          console.error('Failed to update collection batch:', batchIds, error);
+        }
+      });
+    } catch (error: any) {
+      logToAxiom({
+        type: 'error',
+        name: 'update-nsfw-levels-collections',
+        message: error.message,
+      });
+      throw error;
+    }
+  }
+);
+
+const batchSize = 1000;
+const handleJobQueueCleanup = createJob('job-queue-cleanup', '*/1 * * * *', async (e) => {
+  const now = new Date();
+  const jobQueue = await dbRead.jobQueue.findMany({
+    where: { type: JobQueueType.CleanUp },
+  });
+
+  const jobQueueIds = reduceJobQueueToIds(jobQueue);
+  const relatedEntities = await getNsfwLevelRelatedEntities(jobQueueIds);
+
+  //handle cleanup
+  const cleanupImages = () =>
+    chunk(jobQueueIds.imageIds, batchSize).map((ids) => async () => {
+      await dbWrite.imageConnection.deleteMany({ where: { imageId: { in: ids } } });
+      await dbWrite.collectionItem.deleteMany({ where: { imageId: { in: ids } } });
+      await bustContestCollectionItemsCache(ids);
+    });
+  const cleanupPosts = () =>
+    chunk(jobQueueIds.postIds, batchSize).map((ids) => async () => {
+      await dbWrite.collectionItem.deleteMany({ where: { postId: { in: ids } } });
+    });
+  const cleanupArticles = () =>
+    chunk(jobQueueIds.articleIds, batchSize).map((ids) => async () => {
+      await dbWrite.collectionItem.deleteMany({ where: { articleId: { in: ids } } });
+    });
+  const cleanupModels = () =>
+    chunk(jobQueueIds.modelIds, batchSize).map((ids) => async () => {
+      await dbWrite.collectionItem.deleteMany({ where: { modelId: { in: ids } } });
+    });
+
+  const tasks = [cleanupImages(), cleanupPosts(), cleanupArticles(), cleanupModels()].flat();
+  await limitConcurrency(tasks, 5);
+
+  await updateNsfwLevels(relatedEntities);
+
+  await dbWrite.jobQueue.deleteMany({
+    where: { createdAt: { lt: now }, type: JobQueueType.CleanUp },
+  });
+});
+
+const handleJobQueueCleanIfEmpty = createJob(
+  'job-queue-clean-if-empty',
+  '0 */1 * * *',
+  async () => {
+    const cutoff = dayjs().subtract(1, 'day').toDate();
+    const jobQueue = await dbRead.jobQueue.findMany({
+      where: { type: JobQueueType.CleanIfEmpty, createdAt: { lt: cutoff } },
+    });
+
+    const jobQueueIds = reduceJobQueueToIds(jobQueue);
+
+    //handle cleanup
+    const cleanupPosts = () =>
+      chunk(jobQueueIds.postIds, batchSize).map((ids) => async () => {
+        if (!ids.length) return;
+        // Delete posts that have no images, but preserve the empty anchor post of a published
+        // version — deleting it cascades to auto-unpublishing the version (reason 'no-posts'),
+        // stranding the creator. Keeping the shell lets them re-add showcase images. A storyline
+        // chapter's post is kept for the same reason: deleting it leaves the chapter without content.
+        await dbWrite.$executeRaw`
+          WITH doomed AS (
+            SELECT p.id FROM "Post" p
+            WHERE p.id IN (${Prisma.join(ids)})
+              AND NOT EXISTS (SELECT 1 FROM "Image" WHERE "postId" = p.id)
+              AND NOT EXISTS (
+                SELECT 1 FROM "ModelVersion" mv
+                JOIN "Model" m ON m.id = mv."modelId"
+                WHERE mv.id = p."modelVersionId"
+                  AND p."userId" = m."userId"
+                  AND mv.status = 'Published'::"ModelStatus"
+              )
+              AND NOT EXISTS (SELECT 1 FROM "StorylineChapter" sc WHERE sc."postId" = p.id)
+              AND NOT ${accountHoldSql(Prisma.raw('p."userId"'), true)}
+          )
+          DELETE FROM "Post" WHERE id IN (SELECT id FROM doomed)
+        `;
+      });
+
+    const tasks = [cleanupPosts()].flat();
+    await limitConcurrency(tasks, 5);
+
+    await dbWrite.jobQueue.deleteMany({
+      where: { type: JobQueueType.CleanIfEmpty, createdAt: { lt: cutoff } },
+    });
+  }
+);
+
+export const jobQueueJobs = [
+  updateNsfwLevelJob,
+  handleJobQueueCleanup,
+  handleJobQueueCleanIfEmpty,
+  updateNsfwLevelsCollectionsJob,
+];

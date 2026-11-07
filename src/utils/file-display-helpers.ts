@@ -1,0 +1,346 @@
+/**
+ * Helper functions for displaying model file information
+ * Used by DownloadVariantDropdown, RequiredComponentsSection, and file upload UI
+ */
+
+import type { ModelFileType } from '~/server/common/constants';
+import { constants } from '~/server/common/constants';
+import type { ModelType } from '~/shared/utils/prisma/enums';
+import {
+  filenamize,
+  getDisplayName,
+  getFileExtension,
+  replaceInsensitive,
+} from '~/utils/string-helpers';
+
+/**
+ * Metadata shape expected for file display functions
+ */
+interface FileMetadata {
+  fp?: string | null;
+  quantType?: string | null;
+  format?: string | null;
+  size?: string | null;
+}
+
+/**
+ * ComfyUI-friendly display labels for model file types.
+ * Maps internal type values to user-facing names aligned with ComfyUI subfolder conventions.
+ */
+export const comfyFileTypeLabels: Record<string, string> = {
+  'Text Encoder': 'Text Encoder',
+  'Vision Encoder': 'Vision Encoder',
+  UNet: 'UNet',
+  'Diffusion Model': 'Diffusion Model',
+  CLIPVision: 'CLIP Vision',
+  Workflow: 'Workflow',
+  Upscaler: 'Upscale Model',
+  'Enhancement LoRA': 'Enhancement LoRA',
+};
+
+/**
+ * File types that are still honored on existing files but are no longer offered
+ * when picking a type. 'Pruned Model' encodes the SD1-era full/pruned split,
+ * which SD 1.x expresses through the file's `size` metadata instead.
+ */
+const retiredFileTypes: readonly ModelFileType[] = ['Pruned Model'];
+
+/**
+ * Filter which ModelFileType options are valid for a given file extension.
+ * Used by file upload UI and merge versions modal.
+ */
+export function filterFileTypeByExtension(value: ModelFileType, fileName: string) {
+  if (retiredFileTypes.includes(value)) return false;
+  const extension = getFileExtension(fileName);
+  switch (extension) {
+    case 'ckpt':
+    case 'safetensors':
+    case 'sft':
+    case 'pt':
+    case 'gguf':
+    case 'onnx':
+    case 'bin':
+      return [
+        'Model',
+        'Negative',
+        'VAE',
+        'UNet',
+        'Diffusion Model',
+        'CLIPVision',
+        'ControlNet',
+        'Upscaler',
+        'Text Encoder',
+        'Vision Encoder',
+        'Enhancement LoRA',
+        'Other',
+      ].includes(value);
+    case 'zip':
+      return ['Training Data', 'Archive', 'Model', 'Workflow', 'Other'].includes(value);
+    case 'yml':
+    case 'yaml':
+    case 'json':
+    case 'txt':
+      return ['Config', 'Text Encoder', 'Workflow', 'Other'].includes(value);
+    default:
+      return true;
+  }
+}
+
+/**
+ * File-type options for a filename, with display labels. `currentType` stays selectable even
+ * when not otherwise offered, so an existing file never renders as a blank Select.
+ */
+export function getModelFileTypeOptions(
+  fileName: string,
+  {
+    types = constants.modelFileTypes,
+    currentType,
+    modelType,
+  }: {
+    types?: readonly ModelFileType[];
+    currentType?: ModelFileType | null;
+    modelType?: ModelType | null;
+  } = {}
+) {
+  return types
+    .filter((type) => type === currentType || filterFileTypeByExtension(type, fileName))
+    .map((type) => ({
+      value: type,
+      label:
+        comfyFileTypeLabels[type] ?? getDisplayName(type === 'Model' ? modelType ?? type : type),
+    }));
+}
+
+/**
+ * Minimal file shape for display functions
+ */
+export interface FileForDisplay {
+  type?: string | null;
+  metadata?: FileMetadata | null;
+}
+
+/**
+ * File types specific enough to serve as a fallback label when metadata lacks
+ * precision/quant/size info. Plain "Model" and "Other" are excluded — they
+ * carry no differentiating information.
+ */
+const SPECIFIC_FALLBACK_TYPES = new Set([
+  'Pruned Model',
+  'VAE',
+  'UNet',
+  'Diffusion Model',
+  'CLIPVision',
+  'ControlNet',
+  'Upscaler',
+  'Text Encoder',
+  'Vision Encoder',
+  'Workflow',
+  'Archive',
+  'Config',
+  'Training Data',
+  'Negative',
+]);
+
+/**
+ * Sentinel quant type meaning "not quantized". Removing it from the DB-managed quantTypes list
+ * makes the Precision field unreachable for GGUF uploads — see docs/features/model-file-options.md.
+ */
+export const UNQUANTIZED_QUANT_TYPE = 'None';
+
+/** Renders the `None` sentinel as a word rather than as a missing value. */
+export function formatQuantType(quantType: string): string {
+  return quantType === UNQUANTIZED_QUANT_TYPE ? 'Unquantized' : quantType;
+}
+
+/**
+ * Get a short label for a file variant (e.g., "fp16", "Q4_K_M", "Pruned").
+ * Returns null when no meaningful label can be derived — callers should skip rendering.
+ */
+export function getFileLabel(file: FileForDisplay): string | null {
+  const { fp, quantType, format, size } = file.metadata ?? {};
+
+  // For GGUF files, show quant type
+  if (format === 'GGUF' && quantType && quantType !== UNQUANTIZED_QUANT_TYPE) {
+    return quantType;
+  }
+
+  // For SafeTensor and others, show fp precision
+  if (fp) {
+    return fp;
+  }
+
+  if (format === 'GGUF' && quantType === UNQUANTIZED_QUANT_TYPE) {
+    return formatQuantType(quantType);
+  }
+
+  // Fallback to size
+  if (size) {
+    return size === 'pruned' ? 'Pruned' : 'Full';
+  }
+
+  // Fall back to a specific ModelFileType ("Pruned Model" → "Pruned", "VAE", "Archive", etc.)
+  if (file.type && SPECIFIC_FALLBACK_TYPES.has(file.type)) {
+    return file.type === 'Pruned Model' ? 'Pruned' : file.type;
+  }
+
+  return null;
+}
+
+const fpDescriptions: Record<string, string> = {
+  fp32: 'Full precision, largest file',
+  fp16: 'Half precision, best balance',
+  bf16: 'BF16, good balance',
+  mxfp8: 'Block-scaled 8-bit, near-FP16 quality',
+  fp8_mixed: 'Mixed FP8, sensitive layers kept at higher precision',
+  fp8_scaled: 'Scaled 8-bit, better quality than plain FP8',
+  fp8: '8-bit, smaller file',
+  int8: '8-bit integer, smaller file',
+  nf4: '4-bit normalized',
+  nvfp4: 'NVFP4 4-bit, Blackwell-optimized',
+  int4: '4-bit integer, smallest',
+};
+
+const quantDescriptions: Record<string, string> = {
+  Q8_0: '8-bit GGUF, highest quality',
+  Q6_K: '6-bit GGUF, high quality',
+  Q5_K_M: '5-bit GGUF, balanced',
+  Q4_K_XL: '4-bit dynamic GGUF, better quality than Q4_K_M',
+  Q4_K_M: '4-bit GGUF, smaller file',
+  Q4_K_S: '4-bit small GGUF',
+  IQ4_KS: '4-bit imatrix GGUF, small',
+  Q3_K_XL: '3-bit dynamic GGUF, better quality than Q3_K_L',
+  Q3_K_M: '3-bit GGUF, compact',
+  IQ3_M: '3-bit imatrix GGUF, medium',
+  IQ3_S: '3-bit imatrix GGUF, small',
+  Q2_K_XL: '2-bit dynamic GGUF, better quality than Q2_K',
+  Q2_K: '2-bit GGUF, smallest',
+  TQ2_0: '2-bit ternary GGUF, extremely small',
+  TQ1_0: '1.7-bit ternary GGUF, smallest',
+};
+
+/**
+ * Get a human-readable description for a file variant.
+ * Returns empty string when nothing meaningful can be derived — callers should skip rendering.
+ */
+export function getFileDescription(file: FileForDisplay): string {
+  const { fp, quantType, format, size } = file.metadata ?? {};
+
+  const parts: string[] = [];
+
+  if (format === 'GGUF') {
+    if (quantType === UNQUANTIZED_QUANT_TYPE) {
+      parts.push(fp ? `Unquantized GGUF, ${fp} precision` : 'Unquantized GGUF');
+    } else if (quantType) {
+      parts.push(quantDescriptions[quantType] ?? `${quantType} quantization`);
+    }
+  } else if (fp) {
+    parts.push(fpDescriptions[fp] ?? `${fp} precision`);
+  }
+
+  if (size === 'pruned') {
+    parts.push(parts.length ? '(pruned)' : 'Pruned model');
+  }
+
+  return parts.join(' ');
+}
+
+/**
+ * Source-of-truth mapping of which ModelFileTypes count as "primary" per ModelType.
+ * Consumed by:
+ *  - The file uploader dropzone (FilesProvider) to decide which types are offered in the primary section.
+ *  - The download-variant grouper (groupFilesByVariant) to decide which files surface in the
+ *    primary download card vs. the optional/components sections.
+ *
+ * For model types that don't ship a traditional weights file, archive and config files ARE the
+ * main download.
+ */
+export const primaryFileTypesByModelType: Record<ModelType, readonly ModelFileType[]> = {
+  Checkpoint: ['Model', 'Pruned Model', 'UNet', 'Diffusion Model'],
+  LORA: ['Model', 'Pruned Model'],
+  DoRA: ['Model', 'Pruned Model'],
+  LoCon: ['Model', 'Pruned Model'],
+  TextualInversion: ['Model', 'Negative'],
+  Hypernetwork: ['Model'],
+  AestheticGradient: ['Model'],
+  Controlnet: ['Model'],
+  MotionModule: ['Model'],
+  Detection: ['Model'],
+  Upscaler: ['Model'],
+  VAE: ['Model'],
+  TextEncoder: ['Model'],
+  UNet: ['Model'],
+  CLIPVision: ['Model'],
+  VisionLanguage: ['Model', 'Pruned Model'],
+  CLIP: ['Text Encoder', 'Vision Encoder'],
+  LLM: ['Model', 'Pruned Model'],
+  Poses: ['Archive', 'Config'],
+  Wildcards: ['Archive', 'Config'],
+  Workflows: ['Archive', 'Config'],
+  ComfyWorkflows: ['Archive', 'Config'],
+  Other: ['Archive', 'Config', 'Model'],
+};
+
+/**
+ * File types that contain the actual model weights for a Checkpoint-style version.
+ * Use this when filtering for "the main weights file" — e.g. coverage gates,
+ * primary-file scoring, hash-based resource lookups. Also used as the fallback
+ * for getPrimaryFileTypes() when the ModelType is unknown. Includes newer
+ * 'Diffusion Model' / 'UNet' types used by Flux / Wan / ZImage / Anima / Ernie
+ * checkpoints.
+ */
+export const primaryModelFileTypes: readonly ModelFileType[] = [
+  'Model',
+  'Pruned Model',
+  'Diffusion Model',
+  'UNet',
+];
+
+/** Returns the primary ModelFileType allow-list for a given ModelType. */
+export function getPrimaryFileTypes(modelType?: ModelType | null): readonly ModelFileType[] {
+  if (!modelType) return primaryModelFileTypes;
+  return primaryFileTypesByModelType[modelType] ?? primaryModelFileTypes;
+}
+
+/**
+ * Default download name for a trainer import, whose stored name is the opaque training
+ * job id. Falls back to that stored name when `filenamize` leaves nothing of the model
+ * name — opaque-but-unique beats a version name that collides across a whole catalogue.
+ */
+export function getTrainedFileDefaultName({
+  modelName,
+  versionName,
+  fileName,
+}: {
+  modelName: string;
+  versionName: string;
+  fileName: string;
+}) {
+  const model = filenamize(modelName);
+  if (!model) return fileName;
+
+  const version = filenamize(replaceInsensitive(versionName, model, ''));
+  const base = version && version !== model ? `${model}_${version}` : model;
+  return `${base}.${getFileExtension(fileName) || 'safetensors'}`;
+}
+
+/**
+ * A name the creator typed wins, then one they saved on an earlier pass, then the
+ * computed default. Writing that default over a saved name is what this ordering stops.
+ */
+export function resolveTrainedFileName({
+  editedName,
+  overrideName,
+  modelName,
+  versionName,
+  fileName,
+}: {
+  editedName: string | null;
+  overrideName: string | null | undefined;
+  modelName: string;
+  versionName: string;
+  fileName: string;
+}) {
+  return (
+    editedName ?? overrideName ?? getTrainedFileDefaultName({ modelName, versionName, fileName })
+  );
+}

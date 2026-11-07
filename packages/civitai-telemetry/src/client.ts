@@ -1,0 +1,847 @@
+import type {
+  Counter,
+  Gauge,
+  Histogram,
+  HistogramConfiguration,
+  Metric,
+  Registry,
+} from 'prom-client';
+import client from 'prom-client';
+
+export const PROM_PREFIX = 'civitai_app_';
+
+// ---------------------------------------------------------------------------
+// Cross-graph shared registry (for instrumentation-time metrics)
+// ---------------------------------------------------------------------------
+// Next.js compiles instrumentation.ts into a SEPARATE webpack bundle from the API-route/pages
+// bundle, and prom-client is NOT in serverExternalPackages, so each bundle gets its own
+// `client.register` (globalRegistry). A metric created/mutated from the instrumentation graph lands
+// in that graph's registry, while /metrics (an API route) scrapes the request graph's registry — so
+// the two never meet (the metric appears registered-but-never-exported). Fix: pin ONE Registry on
+// globalThis (the real V8 global, shared across all webpack bundles in one Node process — the same
+// mechanism the pgGaugeInitialized guards rely on). Any metric created in either graph registers
+// here, and /metrics merges it into the scrape. (See the eventloop-longtask metrics bug, PR #2451.)
+//
+// An earlier version of this comment cited "the pgGaugeInitialized guards" as the precedent for
+// pinning on globalThis. Those guards did pin a FLAG on globalThis — but the registry they guarded
+// was still per-graph, so the flag let the first graph claim the registration and silently deny it
+// to the graph that is actually scraped. Every metric behind them emitted 0 series in production
+// for months. A globalThis flag is only safe when what it guards is ALSO globalThis-shared;
+// registerInstrumentationMetric below is safe because it dedupes against the shared registry
+// itself, rather than against a flag standing in for it.
+declare global {
+  // eslint-disable-next-line no-var
+  var __civitaiInstrumentationRegistry: Registry | undefined;
+}
+
+export const instrumentationRegistry: Registry =
+  globalThis.__civitaiInstrumentationRegistry ??
+  (globalThis.__civitaiInstrumentationRegistry = new client.Registry());
+
+/**
+ * Get-or-create a metric in the cross-graph shared `instrumentationRegistry`, idempotently. The
+ * metric is created via `factory`, which MUST construct it with `registers: [instrumentationRegistry]`
+ * so it lands in the shared registry. Because both webpack graphs eval this module-level code against
+ * the SAME globalThis-pinned registry, the second graph (and HMR re-evals) would otherwise throw
+ * "already registered" inside the constructor — so we short-circuit to the existing instance first.
+ */
+export function registerInstrumentationMetric<M extends Metric<string>>(
+  name: string,
+  factory: () => M
+): M {
+  const existing = instrumentationRegistry.getSingleMetric(name);
+  if (existing) return existing as unknown as M;
+  return factory();
+}
+
+export function registerCounter({ name, help }: { name: string; help: string }) {
+  // Do this to deal with HMR in nextjs
+  try {
+    return new client.Counter({ name: PROM_PREFIX + name, help });
+  } catch (e) {
+    return client.register.getSingleMetric(PROM_PREFIX + name) as Counter<string>;
+  }
+}
+
+export function registerCounterWithLabels<T extends string>({
+  name,
+  help,
+  labelNames,
+}: {
+  name: string;
+  help: string;
+  labelNames: readonly T[];
+}) {
+  // Do this to deal with HMR in nextjs
+  try {
+    return new client.Counter({ name: PROM_PREFIX + name, help, labelNames });
+  } catch (e) {
+    return client.register.getSingleMetric(PROM_PREFIX + name) as Counter<T>;
+  }
+}
+
+export function registerGauge({ name, help }: { name: string; help: string }) {
+  // Do this to deal with HMR in nextjs
+  try {
+    return new client.Gauge({ name: PROM_PREFIX + name, help });
+  } catch (e) {
+    return client.register.getSingleMetric(PROM_PREFIX + name) as Gauge<string>;
+  }
+}
+
+export function registerGaugeWithLabels<T extends string>({
+  name,
+  help,
+  labelNames,
+}: {
+  name: string;
+  help: string;
+  labelNames: readonly T[];
+}) {
+  // Do this to deal with HMR in nextjs
+  try {
+    return new client.Gauge({ name: PROM_PREFIX + name, help, labelNames });
+  } catch (e) {
+    return client.register.getSingleMetric(PROM_PREFIX + name) as Gauge<T>;
+  }
+}
+
+export function registerHistogram<T extends string = string>({
+  name,
+  help,
+  labelNames,
+  buckets,
+  prefix = PROM_PREFIX,
+}: {
+  name: string;
+  help: string;
+  labelNames?: readonly T[];
+  buckets?: readonly number[];
+  prefix?: string;
+}) {
+  // Do this to deal with HMR in nextjs
+  const fullName = prefix + name;
+  try {
+    // Only set labelNames/buckets when provided. Passing `undefined` for either
+    // overrides prom-client's own defaults (labelNames -> [], buckets -> the
+    // default set) via Object.assign, and an undefined labelNames makes the
+    // Histogram constructor throw AFTER it has already self-registered — leaving
+    // a bucketless zombie in the registry that the catch below then hands back,
+    // so a later .observe() dies on `undefined.length` in findBound.
+    const config: HistogramConfiguration<T> = { name: fullName, help };
+    if (labelNames) config.labelNames = [...labelNames];
+    if (buckets) config.buckets = [...buckets];
+    return new client.Histogram(config);
+  } catch (e) {
+    return client.register.getSingleMetric(fullName) as Histogram<T>;
+  }
+}
+
+// Auth counters
+export const missingSignedAtCounter = registerCounter({
+  name: 'missing_signed_at_total',
+  help: 'Missing Signed At',
+});
+
+// Account counters
+export const newUserCounter = registerCounter({
+  name: 'new_user_total',
+  help: 'New user created',
+});
+export const loginCounter = registerCounter({
+  name: 'login_total',
+  help: 'User logged in',
+});
+
+// Onboarding counters
+export const onboardingCompletedCounter = registerCounter({
+  name: 'onboarding_completed_total',
+  help: 'User completed onboarding',
+});
+export const onboardingErrorCounter = registerCounter({
+  name: 'onboarding_error_total',
+  help: 'User onboarding error',
+});
+
+// Content counters
+export const leakingContentCounter = registerCounter({
+  name: 'leaking_content_total',
+  help: 'Inappropriate content that was reported in safe feeds',
+});
+
+// Vault counters
+export const vaultItemProcessedCounter = registerCounter({
+  name: 'vault_item_processed_total',
+  help: 'Vault item processed',
+});
+export const vaultItemFailedCounter = registerCounter({
+  name: 'vault_item_failed_total',
+  help: 'Vault item failed',
+});
+
+// Reward counters
+export const rewardGivenCounter = registerCounter({
+  name: 'reward_given_total',
+  help: 'Reward given',
+});
+export const rewardFailedCounter = registerCounter({
+  name: 'reward_failed_total',
+  help: 'Reward failed',
+});
+export const rewardConfigReadFailedCounter = registerCounter({
+  name: 'reward_config_read_failed_total',
+  help: 'Runtime reward-config read failed; rewards ran on the last good config',
+});
+
+export const clavataCounter = registerCounter({
+  name: 'clavata_req_total',
+  help: 'Clavata requests',
+});
+
+// Cache metrics
+export const cacheHitCounter = registerCounterWithLabels({
+  name: 'cache_hit_total',
+  help: 'Cache hits by cache name and type',
+  labelNames: ['cache_name', 'cache_type'] as const,
+});
+
+export const cacheMissCounter = registerCounterWithLabels({
+  name: 'cache_miss_total',
+  help: 'Cache misses by cache name and type',
+  labelNames: ['cache_name', 'cache_type'] as const,
+});
+
+export const cacheRevalidateCounter = registerCounterWithLabels({
+  name: 'cache_revalidate_total',
+  help: 'Cache revalidations (stale-while-revalidate) by cache name and type',
+  labelNames: ['cache_name', 'cache_type'] as const,
+});
+
+// tRPC per-procedure latency — wall-clock duration of the full middleware chain +
+// resolver, labeled by procedure path. Used to rank heavy-pool isolation
+// candidates by P99 x rate (the criterion behind the image-feed cutover). Bucket
+// layout is trimmed for cardinality (see the buckets note below) while keeping
+// resolution around typical p95/p99.
+//
+// ⚠️ HIGH CARDINALITY: `path` is a fixed enum of ~870 procedure names (NOT ~93 —
+// that's the router count), so this emits ~870 x (buckets+sum+count) series PER
+// POD. It is gated OPT-IN behind TRPC_PROCEDURE_METRICS (see trpc.ts) so only the
+// pools we point it at (api-primary, api-heavy) pay the cost. Buckets kept lean.
+export const trpcProcedureDuration = registerHistogram({
+  name: 'trpc_procedure_duration_seconds',
+  help: 'tRPC procedure wall-clock duration (full chain + resolver) by path',
+  labelNames: ['path'] as const,
+  // Trimmed 7→6 explicit boundaries (le 8→7 incl. +Inf, ~12% fewer _bucket
+  // series) to cut Prometheus cardinality on this high-`path` histogram while
+  // keeping boundaries near typical p95/p99. Dropped only the 50ms floor; the
+  // 30s tail boundary is retained so _bucket-based p99 can still resolve the
+  // 10–30s range (the parked-handler / slow-procedure diagnostic band).
+  buckets: [0.1, 0.5, 1, 2.5, 10, 30],
+});
+
+// Web-client READ-capability saturation for the superjson → devalue serializer
+// migration. Incremented per web tRPC procedure, bucketed by whether the request's
+// reported `x-client-version` belongs to a build that can decode the union
+// serializer (Phase-1-capable). LOW cardinality by construction: a single boolean
+// label (`phase1_capable` = 'true' | 'false') — NOT the raw version string. The
+// Phase-2 write-flip go/no-go reads the saturation ratio:
+//   rate(...{phase1_capable="true"}) / rate(...) — the fraction of live web traffic
+//   that can safely decode a devalue response.
+export const trpcClientReadCapabilityRequests = registerCounterWithLabels({
+  name: 'trpc_client_read_capability_requests_total',
+  help: 'Web tRPC procedures bucketed by client union-decode (Phase-1) capability',
+  labelNames: ['phase1_capable'] as const,
+});
+
+// Image feed metrics
+export const imagesFeedWithoutIndexCounter = registerCounter({
+  name: 'images_feed_without_index_total',
+  help: 'Number of times getInfiniteImagesHandler is called with useIndex=false or undefined',
+});
+
+// Creator compensation metrics
+export const creatorCompCreatorsPaidCounter = registerCounterWithLabels({
+  name: 'creator_comp_creators_paid_total',
+  help: 'Total number of creators who received compensation',
+  labelNames: ['account_type'] as const,
+});
+
+export const creatorCompAmountPaidCounter = registerCounterWithLabels({
+  name: 'creator_comp_amount_paid_total',
+  help: 'Total buzz amount paid to creators',
+  labelNames: ['account_type'] as const,
+});
+
+export const generationTipCreatorsPaidCounter = registerCounterWithLabels({
+  name: 'generation_tip_creators_paid_total',
+  help: 'Total number of creators who received generation tips',
+  labelNames: ['account_type'] as const,
+});
+
+export const generationTipAmountPaidCounter = registerCounterWithLabels({
+  name: 'generation_tip_amount_paid_total',
+  help: 'Total buzz amount paid to creators as generation tips',
+  labelNames: ['account_type'] as const,
+});
+
+// License fee payout metrics
+export const licenseFeeCreatorsPaidCounter = registerCounterWithLabels({
+  name: 'license_fee_creators_paid_total',
+  help: 'Total number of creators who received license fee payouts',
+  labelNames: ['account_type'] as const,
+});
+
+export const licenseFeeAmountPaidCounter = registerCounterWithLabels({
+  name: 'license_fee_amount_paid_total',
+  help: 'Total amount paid to creators for license fees',
+  labelNames: ['account_type'] as const,
+});
+
+// User update tracking metrics
+export const userUpdateCounter = registerCounterWithLabels({
+  name: 'user_update_total',
+  help: 'Total number of user table updates by location',
+  labelNames: ['location'] as const,
+});
+
+// CDC replication lag fallback metrics
+export const dbReadFallbackCounter = registerCounterWithLabels({
+  name: 'dbread_fallback_total',
+  help: 'Number of times a dbRead query fell back to dbWrite due to CDC replication lag',
+  labelNames: ['entity', 'caller'] as const,
+});
+
+// App Blocks buzz attribution — one row per buzz purchase originating inside a block.
+export const blockBuzzAttributionWriteCounter = registerCounterWithLabels({
+  name: 'block_buzz_attribution_total',
+  help: 'Block buzz attribution rows written',
+  labelNames: ['provider', 'scope', 'status'] as const,
+});
+
+// App Blocks buzz-SPEND attribution (one row per block-initiated spend).
+export const blockSpendAttributionWriteCounter = registerCounterWithLabels({
+  name: 'block_spend_attribution_total',
+  help: 'Block buzz spend attribution rows written',
+  labelNames: ['status'] as const,
+});
+
+// App Blocks PER-GENERATION AUTHOR FEE — DARK. These three count what the fee
+// WOULD be; slice 1 charges nobody and stores nothing, so this counter trio is
+// the only record that the computation ran, and the only way to size the
+// settlement slice from real traffic before anyone is billed.
+//
+// `coarse_type` is the COARSE generation key (`blockGenerationCoarseType`) or
+// the literal `unknown` — bounded by the step/recipe registries, so the label is
+// low-cardinality by construction and cannot be widened by traffic.
+// `outcome` is which leg governed (`flat` / `pct` / `none`), or one of two
+// counted SKIPS:
+//   `base-unavailable`  the orchestrator surfaced no `WorkflowCost.base` to
+//                       compute against — the RECOVERABLE blind spot.
+//   `price-is-cap`      `WorkflowCost.variable` was true, i.e. the price is a
+//                       CAP that may settle lower (a post-billed step charged
+//                       up front at its maximum and refunded down). No fee is
+//                       computed on one: a percentage of a number the viewer is
+//                       partly refunded is a fee on money they did not spend.
+//                       Kept SEPARATE from `base-unavailable` on purpose — that
+//                       one is a denominator the slice-2 sizing read divides by,
+//                       and a cap-priced generation would not have charged even
+//                       with a base in hand.
+// The `flag-disabled` skip is NOT here: it emits no counter at all by design and
+// is visible only as the Axiom `authorFeeSkipped` field.
+// 🔴 HYPHEN, not underscore, and this is the ONLY place in the repo that
+// enumerates the value set — so it is what an operator writing the slice-2
+// sizing join reads. Each skip is deliberately the SAME string as the Axiom
+// `authorFeeSkipped` field (`BLOCK_AUTHOR_FEE_BASE_UNAVAILABLE` /
+// `BLOCK_AUTHOR_FEE_PRICE_IS_CAP` in
+// `~/server/services/blocks/author-fee`), because that join is the whole point:
+// querying `outcome="base_unavailable"` returns an empty series, which reads as
+// "no generation lacked a base" rather than "you spelled the label wrong".
+export const blockAuthorFeeObservedCounter = registerCounterWithLabels({
+  name: 'block_author_fee_observed_total',
+  // 🔴 "dark — no money moves" until 2026-09-25, when `app-blocks-author-fee-enabled`
+  // was flipped to true. This counter still sits on the SIZING path
+  // (`observeBlockAuthorFee`, spend attribution) and still moves no money itself —
+  // but it is no longer observing a feature that charges nobody, so the old
+  // wording now reads as an assurance about the FEE rather than about this
+  // counter's own position. The charge rail's own counters are below.
+  help: 'App Blocks per-generation author-fee computations observed on the sizing path, by coarse generation type and governing leg',
+  labelNames: ['coarse_type', 'outcome'] as const,
+});
+
+// Sum of the fee that WOULD have been charged. Divide by the base counter below
+// for the realized effective rate per coarse type; on its own it is the Buzz
+// volume slice 2 would have to settle.
+export const blockAuthorFeeBuzzCounter = registerCounterWithLabels({
+  name: 'block_author_fee_buzz_total',
+  // 🔴 "would have charged (dark)" until 2026-09-25. This is still the SIZING
+  // figure — what the fee computes to on the attribution path — and is NOT what
+  // viewers were debited.
+  //
+  // 🔴 THERE IS NO PROMETHEUS SERIES FOR BUZZ ACTUALLY DEBITED, and an earlier
+  // revision of this comment pointed at `block_author_fee_charged_buzz_total`,
+  // which does not exist: it was proposed in this same change and then deleted
+  // for duplicating an authoritative record. The authorities for money are the
+  // Buzz ledger (`TransactionType.AppAuthorFee`, keyed by `blockAuthorFeeChargeKey`
+  // — plus `Fee` + `description LIKE 'App author fee%'` for rows written before
+  // that member existed, which are NOT back-filled, so a type-only ledger query
+  // under-counts the rail's history) and the `block_author_fee_accrual` table. This
+  // series differs from both by every skip arm and by the reserve clamp, so quoting
+  // it as revenue overstates it.
+  help: 'Buzz the App Blocks per-generation author fee computes to on the sizing path (NOT what was debited), by coarse generation type',
+  labelNames: ['coarse_type'] as const,
+});
+
+// The denominator: sum of `WorkflowCost.base` the fee was computed against.
+// NOT the workflow total — that already carries licensing fees and tips.
+export const blockAuthorFeeBaseBuzzCounter = registerCounterWithLabels({
+  name: 'block_author_fee_base_buzz_total',
+  help: 'Base generation Buzz the App Blocks author fee was computed against, by coarse generation type',
+  labelNames: ['coarse_type'] as const,
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The CHARGE rail. The three counters above are a SIZING instrument on the spend
+// -attribution path (`observeBlockAuthorFee`); none of them sits on the path that
+// actually debits a viewer, so before these existed the live fee was unmeasured
+// in Prometheus on BOTH sides — quoted and charged alike.
+//
+// 🔴 WHY A COUNTER AND NOT A LOG, on the quote side specifically. The estimate
+// surface is UNBOUNDED — `estimateWorkflow` is a bare `publicProcedure` with no
+// rate limit, driven per-keystroke by third-party block code — which is why
+// `suppressQuoteLogs` exists and why every per-call log write on that path is
+// deliberately off. A counter is O(1) per call whatever the volume, so it buys
+// the visibility back without re-creating the write amplification the
+// suppression removed.
+
+/**
+ * Every `quoteBlockAuthorFee` outcome, including the DISCLOSURE-ONLY calls whose
+ * logs are suppressed. `surface` separates the unbounded estimate path from the
+ * submit-time quote that actually gates and reserves, because their call volumes
+ * differ by an unknown factor and summing them hides that.
+ *
+ * 🔴 `coarse_type` HERE MEANS "NOT DERIVABLE", AND ON `blockAuthorFeeObservedCounter`
+ * IT MEANS "NOT YET COMPUTED". THE TWO COUNTERS DISAGREE — DO NOT JOIN THEM ON IT.
+ *
+ * This counter derives the label from the generation type ARGUMENT, so every arm
+ * carries the real type whenever one can be resolved — `flag-disabled`,
+ * `price-is-cap` and `base-unavailable` included. `unknown` here means the type
+ * itself did not resolve. `blockAuthorFeeObservedCounter` still reads its label
+ * off the COMPUTATION, so it emits `unknown` on its pre-computation arms even
+ * when the type was perfectly well known.
+ *
+ * ⚠️ An earlier revision of this paragraph asserted the opposite — that the two
+ * followed the same convention — and added "it is not a spelling to fix", which
+ * would have steered the next reader away from exactly this divergence. It was
+ * true when written and falsified by a later commit of the same PR, which is the
+ * one shape no delta round can see.
+ *
+ * THE CONCRETE HAZARD: joining the two series on `coarse_type` silently drops
+ * cap-priced and base-unavailable traffic, because the observed side buckets it
+ * under `unknown` while this side buckets it under the real type. Nothing errors.
+ * Reconcile on `outcome` instead, or widen the observed counter to match.
+ */
+export const blockAuthorFeeQuotedCounter = registerCounterWithLabels({
+  name: 'block_author_fee_quoted_total',
+  help: 'App Blocks author-fee quotes, by coarse generation type (unknown = the type did not resolve), outcome and surface (disclosure = the unbounded estimate path, gating = the submit-time quote)',
+  labelNames: ['coarse_type', 'outcome', 'surface'] as const,
+});
+
+/** Every `chargeBlockAuthorFee` outcome — `charged`, or the skip/failure reason. */
+export const blockAuthorFeeChargedCounter = registerCounterWithLabels({
+  name: 'block_author_fee_charged_total',
+  help: 'App Blocks author-fee charge attempts, by coarse generation type and outcome (charged, or the skip/failure reason)',
+  labelNames: ['coarse_type', 'outcome'] as const,
+});
+
+// App Blocks MEMBERSHIP / subscription attribution (one row per paid invoice of a
+// block-initiated membership purchase).
+export const blockSubscriptionAttributionWriteCounter = registerCounterWithLabels({
+  name: 'block_subscription_attribution_total',
+  help: 'Block membership/subscription attribution rows written',
+  labelNames: ['provider', 'status', 'billing_reason'] as const,
+});
+
+// createCachedArray cluster-read fail-open (PR #2611): degraded-fetch + ids sent to origin, by cache name.
+export const cacheFailOpenDegradedCounter = registerCounterWithLabels({
+  name: 'cache_failopen_degraded_total',
+  help: 'createCachedArray cluster-read fail-open: degraded-fetch calls by cache name',
+  labelNames: ['cache_name'] as const,
+});
+export const cacheFailOpenOriginFetchCounter = registerCounterWithLabels({
+  name: 'cache_failopen_origin_fetch_total',
+  help: 'createCachedArray fail-open: ids sent to origin (lookupFn) by cache name — deduped DB load',
+  labelNames: ['cache_name'] as const,
+});
+// Separate counter, not a cache_type on cache_miss_total: these ids are also counted there, so a
+// cache_type would be summed into hit-ratio totals twice.
+export const cacheMissWouldJoinCounter = registerCounterWithLabels({
+  name: 'cache_miss_would_join_total',
+  help: 'createCachedArray miss-fill lookups that per-process coalescing (the PR #5488 join rule) would have joined instead of running, by cache name. Measurement only; cross-process duplicates are not counted',
+  labelNames: ['cache_name'] as const,
+});
+
+// ClickHouse TRANSPORT-error fail-soft counter. Incremented when an INSTRUMENTED call site
+// degrades on a TRANSIENT ClickHouse connection/transport failure (socket hang up / Code 279 /
+// Code 210 — see isClickHouseConnectionError) instead of 500-ing the request. The `path` label
+// names where it happened.
+//
+// 🔴 OPT-IN PER CALL SITE, NOT A PROPERTY OF THE PREDICATE. A site that swallows or re-maps a
+// CH transient off isClickHouseConnectionError WITHOUT incrementing this is invisible here —
+// `src/server/games/new-order/utils.ts` is one such site today — so the total UNDER-reports
+// CH-transient degradation. Read a rate as "at least this much", and add the increment when
+// you instrument a site.
+//
+// A query/schema error (UNKNOWN_TABLE etc.) is never counted, because every increment sits behind
+// isClickHouseConnectionError, which excludes query/schema faults — those still throw and 500.
+// A SUSTAINED nonzero rate is a ClickHouse transport problem at those sites that no longer shows
+// up as a 500. It does not on its own localise the fault to ClickHouse Cloud: the predicate keys
+// on the syscall code, not on which dependency raised it, and the `image-feed` site catches
+// around a call that also reaches Meilisearch — a Meili transport error that the preceding
+// `isTransientMeiliError` branch did not already claim would land here. Confirm against
+// ClickHouse-side signals before calling a spike a ClickHouse outage.
+export const clickhouseFailSoftCounter = registerCounterWithLabels({
+  // registerCounterWithLabels prepends PROM_PREFIX — a name carrying it emits
+  // `civitai_app_civitai_app_…`.
+  name: 'clickhouse_failsoft_total',
+  help: 'Transient transport errors degraded (swallowed or re-mapped to 503) instead of 500-ing, by INSTRUMENTED path — opt-in, so an undercount. An error object carrying a transport syscall code counts here whatever raised it (image-feed also reaches Meilisearch), so confirm against ClickHouse-side signals before calling a spike a ClickHouse outage.',
+  labelNames: ['path'] as const,
+});
+
+// Redis per-command instrumentation — read by @civitai/redis via the globalThis bridge the app's
+// prom shim publishes (see src/server/prom/client.ts). inflight gauge + duration histogram.
+export const redisCommandsInflight = registerGaugeWithLabels({
+  name: 'redis_commands_inflight',
+  help: 'In-flight node-redis commands by client (cluster vs sys); climbs toward the queue ceiling during a half-open stall',
+  labelNames: ['client'] as const,
+});
+export const redisCommandDuration = registerHistogram({
+  name: 'redis_command_duration_seconds',
+  help: 'node-redis command wall-clock duration by client; the long tail (~30s bucket) is the half-open command-queue park',
+  labelNames: ['client'] as const,
+  // Up to 30s to capture the parked-command tail that maps onto the Traefik 30s ceiling → 504.
+  buckets: [0.001, 0.005, 0.025, 0.1, 0.5, 1, 2, 5, 10, 30],
+});
+
+// Duration of the brotli codec on the opt-in compressed `redis.packed` paths, by `op`
+// (compress | decompress) and `cache_name`.
+//
+// 🔴 WHAT A SAMPLE CONTAINS, because the name says "codec" and the number is wider than that. The
+// clock starts before the promisified call is enqueued and stops at the `await` CONTINUATION on the
+// JS thread, so a sample is threadpool queue wait + codec work + whatever event-loop delay sits
+// between the completion landing and the continuation running. Measured: a 50 ms main-thread block
+// held while a decompress is in flight yields a 50.79 ms sample — event-loop delay is absorbed ~1:1.
+// And the floor is dispatch, not codec: a 1-byte payload (no real codec work) round-trips in ~11 µs
+// p50 on one machine and ~22 µs on another, against a typical ~25-36 µs decompress — i.e. roughly
+// half or more of a typical sample is the hand-off, not brotli. Read the low buckets accordingly.
+//
+// WHY A SEPARATE HISTOGRAM. Two existing signals both LOOK like they cover this and neither does:
+//   - CPU profiles: the codec is `promisify(zlib.brotli*)`, i.e. it runs on the libuv threadpool.
+//     Threadpool work carries no JS stack, so no `brotli*` frame is ever sampled — a profile search
+//     returns zero, which reads as "the codec is free" rather than "the profiler cannot see it".
+//   - redis_command_duration_seconds: that observation closes when the redis round trip closes,
+//     while compress happens before the write and decompress after the read. Worse, it moves the
+//     WRONG WAY — a compressed payload is smaller on the wire, so turning compression on makes that
+//     histogram improve while adding codec cost it structurally cannot observe.
+// So this is the only signal that can answer "what does compression cost us".
+//
+// `cache_name` is the cache PREFIX (e.g. `packed:caches:image-meta`). It is chosen so cardinality
+// stays bounded by the small set of caches that opt into `compress`; callers with no bounded name
+// report 'unknown'.
+//
+// HOW FAR THE JOIN TO CACHE TRAFFIC GOES — it holds for ONE of the two consumers, so do not plan a
+// dashboard on it without checking which:
+//   - createCachedArray / createCachedObject DO join: the builder passes its `key` as this label
+//     AND passes the same `key` as `cache_name` to cacheHitCounter/cacheMissCounter, so the two
+//     label values are equal by construction.
+//   - fetchThroughCache does NOT join: it emits no hit/miss counters at all, so there is no
+//     cache-traffic series carrying this `cache_name` to join against. (The nearest counter a
+//     reader might reach for — the tensor-metadata in-process LRU — labels itself
+//     'tensor-metadata-full', a different value naming a different cache.) The label still earns
+//     its place there by separating one cache's codec cost from another's; it is simply not a join
+//     key today.
+//
+// BUCKETS — seconds, and the floor has to be MICROseconds, cut against measured values rather
+// than against a guess at the order of magnitude. Two earlier floors were both wrong, in the same
+// direction, for the same reason: they were placed at or just under where typical samples land,
+// which is precisely where a first edge must NOT be. Everything at or below the first edge is
+// indistinguishable — `histogram_quantile` cannot see inside bucket one — so a floor sitting in
+// the middle of the population reports a stable, plausible number that barely moves whatever the
+// codec does. 0.0005 was ~19x the typical decompress. 0.00002 (20us) looked far safer and was
+// still inside the population: measured over 48 real image-meta values pulled off the live cache
+// and timed through this exact `promisify(zlib.brotli*)` shape, 38.5% of decompress samples landed
+// AT OR BELOW 20us.
+//
+// What the measurements say, and what each end of the list is cut to:
+//   - DISPATCH FLOOR. A 1-byte payload through the same async shape costs p50 17.7us / p90 38.6us
+//     / p99 140.9us. That is threadpool round trip, not codec work, and nothing can be faster than
+//     it. So the first edge belongs BELOW it: 5us, chosen so bucket one means "impossibly fast —
+//     something is wrong with the instrument", not "typical".
+//   - DECOMPRESS, the overwhelming majority of samples by count: p50 21.9-30.2us, p90 41.9-66.2us,
+//     p99 182.7us. The 10-70us band therefore carries the readable quantiles and gets the finest
+//     edges in the list (1.33x-1.67x steps).
+//   - COMPRESS at q6: p50 111.6us, p90 216.3us, p99 3.8ms. The 100-250us band gets the same
+//     treatment; the ms decade covers its p99.
+//   - LARGE VALUES. tensor-metadata's ~335 KB blob is ~36 ms to compress in the worst case
+//     measured. Rare, but it is the tail the metric exists to show, so the list runs past it.
+// (Those are per-value codec timings and nothing else — no rate, no volume, is implied by them.)
+// ⚠️ Changing these edges resets every series' history — settle them before this ships.
+//
+// Exported so the resolution invariant can be checked mechanically rather than by eye. The guard
+// in ./__tests__/packed-codec-buckets.test.ts does NOT read this constant for its verdict — it
+// observes a sample and reads the `le` set back off the REGISTERED histogram, so editing `buckets:`
+// below without editing this list (or the reverse) fails. It pins four properties: the first edge
+// is below the measured dispatch floor, the measured common case is not swallowed by the first
+// bucket, the large-blob tail is covered, and the ORDERED SEQUENCE OF ADJACENT RATIOS is exactly
+// the one written out here. That last one is deliberately an equality and not a bound — see the
+// comment on EXPECTED_EDGE_RATIOS in that file for why a bound is the wrong shape of guard.
+export const PACKED_CODEC_DURATION_BUCKETS = [
+  // 5us -> 250us: the dispatch floor and the decompress/compress bulk, at 1.33x-2x.
+  0.000005, 0.00001, 0.000015, 0.00002, 0.00003, 0.00005, 0.000075, 0.0001, 0.00015, 0.00025,
+  // 0.5ms -> 1s: the compress p99 (~3.8ms), the ~36ms large-blob tail, and headroom above it,
+  // at the usual 1-2-5 decade steps.
+  0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1,
+] as const;
+
+export const packedCodecDuration = registerHistogram({
+  name: 'packed_codec_duration_seconds',
+  help: 'Brotli codec duration for compressed redis.packed values, by op and cache_name. Wall clock as the CALLER sees it, NOT CPU time: the clock stops at the await continuation on the JS thread, so a sample is libuv threadpool QUEUE WAIT + codec work + EVENT-LOOP DELAY before the completion is delivered (a blocked JS thread inflates it ~1:1 — a 50ms block measured 50.79ms). The threadpool round-trip floor is p50 17.7us / p90 38.6us even for a 1-byte payload, so the lowest buckets are dispatch overhead rather than codec time and the first edge (5us) sits below that floor deliberately: a sample in bucket one means the instrument, not the codec. A rise means the codec PATH got slower; it does NOT on its own mean brotli got more expensive. Invisible to CPU profiles (the codec runs off the JS stack) and not covered by redis_command_duration_seconds, which stops at the round trip.',
+  labelNames: ['op', 'cache_name'] as const,
+  buckets: [...PACKED_CODEC_DURATION_BUCKETS],
+});
+
+// SELF-HEAL reconnect counter. Incremented once each time an inflight-leak self-heal watchdog forces
+// a full client reconnect. Healthy pods never touch this; a nonzero rate flags a pod that hit the
+// binary-wedge state and was auto-recovered (vs needing a human rolling-restart). `client`
+// distinguishes which node-redis client healed: 'cluster' = the cache cluster client, 'sys' = the
+// sysRedis Sentinel client (incident 2026-07-03). `trigger` distinguishes the watchdog path:
+// 'deadline' = the sawtooth-immune deadline-hit-rate trigger (cluster only), 'inflight' = the
+// sustained-inflight breach (both clients). (See @civitai/redis cluster-selfheal / sys-inflight.)
+export const redisSelfHealReconnectCounter = registerCounterWithLabels({
+  name: 'redis_selfheal_reconnect_total',
+  help: 'Forced node-redis client reconnects by the inflight-leak self-heal watchdog, by client (cluster|sys) and trigger',
+  labelNames: ['trigger', 'client'] as const,
+});
+
+// The self-heal watchdog's OWN observation of the wedge: the deadline-hit trigger's in-process input
+// over its sliding window, sampled + published each watchdog tick — cluster command SLOW-SETTLES
+// (vs REDIS_CLUSTER_SELFHEAL_DEADLINE_HIT_THRESHOLD), or sys backstop timeouts with no success in
+// the window (vs REDIS_SYS_SELFHEAL_TIMEOUT_THRESHOLD). This is DISTINCT from
+// redis_command_duration_seconds — it is exactly what the watchdog evaluates, so a rising series that
+// crosses the threshold is the leading indicator of an imminent self-heal reconnect. Added after
+// the 2026-07-06 fleet wedge, where the watchdog's own signal was invisible and the trigger 0-fired.
+export const redisSelfHealDeadlineHitsWindow = registerGaugeWithLabels({
+  name: 'redis_selfheal_deadline_hits_window',
+  help: "The self-heal watchdog's in-process count over its sliding window, by client (cluster: slow settles; sys: command timeouts, 0 while any sys command succeeded in the window); the deadline-hit trigger fires when this crosses the threshold",
+  labelNames: ['client'] as const,
+});
+
+// Cluster ROUTING retry-after-rediscover counter (the topology-churn 500 wave). Incremented when a cluster
+// `_execute` hit a TRANSIENT pre-dispatch routing throw and the guard retried after a rediscover. `result`
+// ∈ recovered|exhausted: a rising `recovered` series during a rolling update / failover confirms the fix
+// converted a fleet-wide 500 wave into a transparent retry; `exhausted` means the slot map stayed
+// inconsistent past the bounded retries and the original error re-threw. (See @civitai/redis cluster-routing-retry.)
+export const redisRoutingRetryCounter = registerCounterWithLabels({
+  name: 'redis_routing_retry_total',
+  help: 'Cluster commands that hit a transient routing throw and were retried after a rediscover (recovered) or exhausted retries (exhausted, original error re-thrown)',
+  labelNames: ['result'] as const,
+});
+
+// sysRedis Sentinel observability. Uses the `civitai_sysredis_*` metric prefix (NOT civitai_app_*)
+// to match the dashboard naming, so it needs its own registrar.
+const SYSREDIS_PREFIX = 'civitai_sysredis_';
+function registerSysredisCounter<T extends string>({
+  name,
+  help,
+  labelNames,
+}: {
+  name: string;
+  help: string;
+  labelNames: readonly T[];
+}) {
+  // HMR-safe registration (see registerCounterWithLabels).
+  try {
+    return new client.Counter({ name: SYSREDIS_PREFIX + name, help, labelNames });
+  } catch {
+    return client.register.getSingleMetric(SYSREDIS_PREFIX + name) as Counter<T>;
+  }
+}
+
+export const sysredisSentinelTopologyChangesCounter = registerSysredisCounter({
+  name: 'sentinel_topology_changes_total',
+  help: 'sysRedis sentinel topology-change events (failover, sentinel-set change, etc.)',
+  labelNames: ['type', 'host', 'deployment'] as const,
+});
+export const sysredisSentinelClientErrorsCounter = registerSysredisCounter({
+  name: 'sentinel_client_errors_total',
+  help: 'sysRedis sentinel sub-client errors (per-pod TCP/protocol errors against masters/replicas)',
+  labelNames: ['type', 'host', 'deployment'] as const,
+});
+
+// App Blocks KV datastore (op ∈ get|set|delete|list|getQuota; outcome ∈ ok|unauthorized|…).
+//
+// 🔴 These four names are PREFIX-RELATIVE — do NOT re-add `app_blocks_`. The helpers prepend
+// PROM_PREFIX, so a declared `app_blocks_*` stutters into `civitai_app_app_blocks_*`, which is
+// what shipped. Exposed: `civitai_app_block_storage_{ops_total,quota_exceeded_total,
+// user_quota_untracked_total,latency_seconds}`, in the `civitai_app_block_*` family the rest of
+// App Blocks already uses. Pinned by `__tests__/app-block-storage-metric-names.test.ts`.
+// Seeded to 0 by `src/server/prom/app-block-storage.metrics.ts`.
+export const appStorageOpsCounter = registerCounterWithLabels({
+  name: 'block_storage_ops_total',
+  help: 'App Blocks KV datastore tRPC operations',
+  labelNames: ['op', 'outcome'] as const,
+});
+
+// App Blocks KV writes refused by a storage ceiling. `ceiling` says WHICH one,
+// because the two want opposite responses and used to be indistinguishable here:
+// `ceiling="app"` is the 50MB / 1M-row per-APP budget — rare, shared by every
+// user of the app, and needs an operator; `ceiling="user"` is the per-USER
+// sub-budget beneath it — routine, self-inflicted, self-recoverable, and not an
+// ops signal. Alert on the first; the second belongs on a dashboard. A query that
+// sums without the label keeps its previous meaning (both ceilings combined).
+//
+// 🔴 NOT named `scope`. In this codebase `scope: '<literal>'` inside a router file
+// means an App Blocks PERMISSION scope (`apps:storage:write`, …), and
+// `analytics-bucket-labels.drift.test.ts` greps exactly that spelling out of
+// apps.router.ts to gate the analytics Scopes card. A Prometheus label keyed
+// `scope` there is picked up as a permission scope and pollutes that guard —
+// measured, it added "app" and "user" to its expected set. `quota_scope` would
+// not have helped either: the guard's regex has no word boundary, so it matches
+// the `scope: '…'` tail inside it. `ceiling` is both collision-free and the more
+// accurate word for what the label distinguishes.
+export const appStorageQuotaExceededCounter = registerCounterWithLabels({
+  name: 'block_storage_quota_exceeded_total',
+  help: 'App Blocks KV writes rejected by a storage ceiling (ceiling=app: the per-app budget; ceiling=user: the per-user sub-budget)',
+  labelNames: ['app_block_id', 'ceiling'] as const,
+});
+
+// App Blocks KV writes served against a schema that has no `user_quota` relation
+// yet, i.e. writes on which the per-USER sub-budget was NOT enforced.
+//
+// `user_quota` is created by AppStorageProvisioner.provision, whose only callers
+// are new-version approval and a manual admin backfill endpoint — nothing
+// schedules either, so an app provisioned before the table existed keeps serving
+// writes with the sub-budget inert, indefinitely and by default. The set path
+// falls back rather than failing closed (refusing writes for want of a counter
+// that does not exist turns a missing upgrade into an outage), which means the
+// inert state is silent by construction unless something counts it.
+//
+// 🔴 It is deliberately its OWN series and not an `outcome` on
+// civitai_app_block_storage_ops_total. A state visible only as some other series
+// changing shape is not alertable — the same argument countStorageFault makes
+// about faults being visible solely as the `ok` series falling to zero. This is
+// the series to read for "some app has been running unmetered for N days".
+//
+// 🔴 It is a COUNTER, so it never "goes back to zero" once the backfill lands —
+// this comment claimed that and it was false. prom-client counters are monotonic
+// for the process lifetime and accumulated children keep their values; what
+// stops moving is `increase()`/`rate()` over a window with no new writes. Read
+// the window, not the series total.
+export const appStorageUserQuotaUntrackedCounter = registerCounterWithLabels({
+  name: 'block_storage_user_quota_untracked_total',
+  help: 'App Blocks KV writes served without a per-user quota relation (sub-budget not enforced; app needs the storage backfill)',
+  labelNames: ['app_block_id'] as const,
+});
+
+export const appStorageLatencyHistogram = registerHistogram({
+  name: 'block_storage_latency_seconds',
+  help: 'App Blocks KV procedure latency',
+  labelNames: ['op'] as const,
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
+});
+
+// App Blocks SHARED (cross-user) storage. Separate from the KV pair, not a `storage` label on it:
+// a shared write can wait on external moderation, so the histogram needs buckets past 2.5s and a
+// histogram has one bucket set; the op and outcome domains also differ. No per-app, per-key or
+// per-user label: the number of apps is unbounded. Exposed names are pinned by
+// `__tests__/app-block-storage-metric-names.test.ts`.
+export const appSharedStorageOpsCounter = registerCounterWithLabels({
+  name: 'block_shared_storage_ops_total',
+  help: 'App Blocks shared storage operations by op and outcome',
+  labelNames: ['op', 'outcome'] as const,
+});
+
+export const appSharedStorageLatencyHistogram = registerHistogram({
+  name: 'block_shared_storage_latency_seconds',
+  help: 'App Blocks shared storage operation latency, including moderation and rate-limit checks',
+  labelNames: ['op'] as const,
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+});
+
+// Image ingestion / scan pipeline. The image-ingestion path (submit → scanner →
+// webhook write-back → cron drain) previously had ZERO Prometheus coverage; these
+// give per-lane submission volume, webhook-outcome split, cron throughput, and (via
+// collect()-based gauges in src/server/prom/client.ts) the working-state backlog.
+export const imageScanWebhookCounter = registerCounterWithLabels({
+  name: 'image_scan_webhook_total',
+  help: 'Image scan-result webhook callbacks by outcome',
+  labelNames: ['result'] as const,
+});
+
+export const imageScanSubmittedCounter = registerCounterWithLabels({
+  name: 'image_scan_submitted_total',
+  help: 'ingestImage() scan submissions by lane (new = wdTagging+mediaRating | imageScanning | unknown = rejected before the lane was resolved) and result (success|failed|rejected = url off the ingestion allowlist, never submitted)',
+  labelNames: ['lane', 'result'] as const,
+});
+
+export const imageIngestCronCounter = registerCounterWithLabels({
+  name: 'image_ingest_cron_total',
+  help: 'ingest-images cron per-bucket image counts (sent lanes, waitingForRetry, staleRemoved)',
+  labelNames: ['bucket'] as const,
+});
+
+export const imageIngestCronQueueDepth = registerGauge({
+  name: 'image_ingest_cron_queue_depth',
+  help: 'ImageScan JobQueue depth read by the ingest-images cron on its most recent run',
+});
+
+// Fleet-wide cron job health (createJob in src/server/jobs/job.ts). Makes a
+// dead/erroring cron — e.g. ingest-images — visible: job_errors_total spikes and
+// the duration histogram flatlines when a job stops running.
+export const jobDurationHistogram = registerHistogram({
+  name: 'job_duration_seconds',
+  help: 'Cron job wall-clock run duration by job name',
+  labelNames: ['job'] as const,
+  buckets: [0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300],
+});
+export const jobErrorsCounter = registerCounterWithLabels({
+  name: 'job_errors_total',
+  help: 'Cron job runs that threw, by job name',
+  labelNames: ['job'] as const,
+});
+
+// Job names already seeded in THIS module instance. `Histogram.zero()` overwrites the
+// series rather than merging into it, so a second call for a name that has since been
+// observed would silently wipe that job's buckets. Seeding is once-per-name by
+// construction today (createJob runs at each job module's top level), but the failure
+// mode is invisible in the data, so it is closed here rather than assumed away.
+const seededJobs = new Set<string>();
+
+/**
+ * Seed both cron metrics' series for `job` at zero.
+ *
+ * 🔴 WHY THIS EXISTS: a prom-client metric declared with `labelNames` emits NO series at
+ * all for a label value it has never observed. So before a job's first completed run —
+ * and, for the error counter, before its first FAILURE — neither series appears in the
+ * /metrics response, and the two metrics above cannot answer the question they were added
+ * to answer. Their own help text promises that a dead cron shows up as a flatlined
+ * duration histogram next to a live `job_errors_total`; without seeding, a cron that is
+ * dead, a cron that has not run since this pod started, and a cron that was deleted from
+ * the codebase are all the SAME observation — an absent series. `absent()` and `rate()`
+ * alerts written against them are unreliable for the same reason, and a healthy zero is
+ * indistinguishable from an instrument that was never wired up.
+ *
+ * Seeding at job-construction time makes every `createJob` job an observable zero from the
+ * moment its module is loaded, so absence once again means "no such job".
+ *
+ * This mirrors the seeding the /metrics route already does for its own counters, and the
+ * same reasoning is written out at each of those call sites.
+ */
+export function seedJobMetrics(job: string) {
+  if (seededJobs.has(job)) return;
+  seededJobs.add(job);
+  jobDurationHistogram.zero({ job });
+  jobErrorsCounter.inc({ job }, 0);
+}
+
+// NOTE: the DB pool-depth gauges live in the app (src/server/prom/client.ts) — they
+// compose the db pools + these prom helpers, which is app-level glue, not infra.

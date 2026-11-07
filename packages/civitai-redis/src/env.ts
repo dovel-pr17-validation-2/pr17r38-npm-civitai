@@ -1,0 +1,296 @@
+// Package-owned env schema for @civitai/redis. Mirrors the redis slice of the app's
+// server-schema.ts so any app validates the same vars the same way on deployment.
+import * as z from 'zod';
+
+// Exported for unit tests (validates the sentinel superRefine + the HA defaults without the
+// memoized loadRedisEnv singleton). Not part of the package's public API surface (index.ts).
+export const redisEnvSchema = z
+  .object({
+    REDIS_URL: z.url(),
+    REDIS_SYS_URL: z.url(),
+    REDIS_TIMEOUT: z.preprocess((x) => (x ? parseInt(String(x)) : 5000), z.number().optional()),
+    REDIS_CLUSTER: z.preprocess((x) => x === 'true', z.boolean().default(false)),
+    // Comma-separated list of cluster node URLs for redundant discovery
+    REDIS_CLUSTER_NODES: z.string().optional(),
+    // Topology refresh interval in ms (default 30s)
+    REDIS_CLUSTER_REFRESH_INTERVAL: z.coerce.number().default(30000),
+    // Re-read the cluster slot map when a node's connection fails (throttled to 1/s per process),
+    // so the client follows a node that changed address. ON by default; only the literal string
+    // 'false' disables it, which restores the plain reconnect backoff (no rediscover).
+    REDIS_CLUSTER_ERROR_REDISCOVER_ENABLED: z.preprocess(
+      (x) => x !== 'false',
+      z.boolean().default(true)
+    ),
+    // Read a multi-key packed mGet with one pipelined write per owning master instead of one
+    // routed GET per key (see ./cluster-pipelined-get). ON by default; only the literal string
+    // 'false' disables it, which restores the per-key GETs.
+    REDIS_CLUSTER_BATCHED_GET_ENABLED: z.preprocess(
+      (x) => x !== 'false',
+      z.boolean().default(true)
+    ),
+    // sysRedis HA (Phase 1): when REDIS_SYS_SENTINELS is set the system client is built
+    // via Sentinel discovery instead of the single REDIS_SYS_URL connection. Comma-separated
+    // host:port list, e.g. "<sentinel-service>.<namespace>.svc.cluster.local:26379".
+    REDIS_SYS_SENTINELS: z.string().optional(),
+    // Required whenever REDIS_SYS_SENTINELS is set (cluster uses "sysmaster") — see superRefine.
+    REDIS_SYS_SENTINEL_NAME: z.string().optional(),
+    // Only set if sentinel-auth is enabled (not initially).
+    REDIS_SYS_SENTINEL_PASSWORD: z.string().optional(),
+    // Socket-level inactivity guard (node-redis -> net.Socket.setTimeout). On a SILENT
+    // half-open the idle timer tears the dead socket down in ~this many ms instead of
+    // ~30s OS TCP keepalive (the 504-cascade structural fix). Cluster (cache) client.
+    REDIS_SOCKET_TIMEOUT_MS: z.coerce.number().default(10000),
+    // System client socketTimeout — default 0 (disabled): a blanket aggressive teardown
+    // on the flaky single-replica sysRedis caused a reconnect storm (#2556/#2586 wedge).
+    REDIS_SYS_SOCKET_TIMEOUT_MS: z.coerce.number().default(0),
+    // System client reply-queue cap: with socketTimeout disabled, bounds heap growth on a
+    // silent half-open by fast-failing new commands (fail-open callers catch it). 0 = off.
+    // Also enforced as an IN-FLIGHT cap in the package's own command wrapper (callers still
+    // waiting for a reply), because on the Sentinel path commands wait inside RedisSentinel (for a
+    // master / a rediscovery) before they ever reach a node client's queue, where node-redis's own
+    // cap would see them. See instrumentCommands for what it does and does not bound.
+    REDIS_SYS_COMMANDS_QUEUE_MAX_LENGTH: z.coerce.number().default(10000),
+    // Sys client per-command wall-clock backstop (a promise race — it never touches the socket,
+    // unlike the socketTimeout reverted in #2586). Bounds callers awaiting a sys WRITE or any
+    // command the app's 2s withSysReadDeadline does not wrap. MUST stay above
+    // REDIS_SYS_SELFHEAL_SUSTAINED_MS (see superRefine). 0 = off.
+    REDIS_SYS_COMMAND_TIMEOUT_MS: z.coerce.number().default(30000),
+    // Keepalive PING interval. Kept comfortably below the socketTimeout — client.ts clamps
+    // it to min(this, socketTimeout/2) so a healthy idle socket never spuriously fires.
+    REDIS_PING_INTERVAL_MS: z.coerce.number().default(5000),
+    // Cluster-only per-command wall-clock backstop BENEATH REDIS_SOCKET_TIMEOUT_MS: a ~0.5%
+    // minority of cluster `_execute` promises never settle and park the SSR handler ~125s.
+    // Racing against a rejecting deadline guarantees the command settles. 0 = off.
+    REDIS_CLUSTER_COMMAND_TIMEOUT_MS: z.coerce.number().default(15000),
+    // ── CLUSTER SELF-HEAL WATCHDOG (FIX #1/#2/#3) ──────────────────────────────────────
+    // Master kill-switch. ON by default (a forced reconnect is the only thing that clears the
+    // inflight-leak wedge short of a pod restart). Cluster client ONLY — the single-node
+    // sysRedis client is never reconnected by this watchdog.
+    REDIS_CLUSTER_SELFHEAL_ENABLED: z.preprocess(
+      // default true; only the literal string 'false' disables it
+      (x) => x !== 'false',
+      z.boolean().default(true)
+    ),
+    // Inflight count strictly above which a pod is considered potentially wedged (50 matches
+    // the binary-wedge observation: healthy ~0, wedged jumps past 50).
+    REDIS_CLUSTER_SELFHEAL_INFLIGHT_THRESHOLD: z.coerce.number().default(50),
+    // Inflight must stay ABOVE the threshold continuously for this long before a reconnect.
+    REDIS_CLUSTER_SELFHEAL_SUSTAINED_MS: z.coerce.number().default(20000),
+    // Minimum time between two self-heal reconnects (at most one per cooldown).
+    REDIS_CLUSTER_SELFHEAL_COOLDOWN_MS: z.coerce.number().default(60000),
+    // How often the watchdog samples inflight (cheap one-gauge read).
+    REDIS_CLUSTER_SELFHEAL_CHECK_INTERVAL_MS: z.coerce.number().default(1000),
+    // DEADLINE-HIT / SLOW-SETTLE TRIGGER (the sawtooth-immune self-heal signal): N cluster command
+    // SLOW-SETTLES within the window force a reconnect. <= 0 disables this trigger.
+    REDIS_CLUSTER_SELFHEAL_DEADLINE_HIT_THRESHOLD: z.coerce.number().default(10),
+    REDIS_CLUSTER_SELFHEAL_DEADLINE_HIT_WINDOW_MS: z.coerce.number().default(20000),
+    // A cluster command whose OBSERVED settle duration reaches this many ms counts as a wedge hit
+    // (recordClusterCommandSettle, wired from instrumentCommands' done() — the SAME settle-time
+    // observation as redis_command_duration_seconds). 2026-07-06: the trigger used to key off
+    // withCommandDeadline's onTimeout (deadline REAP), which never fires when slow commands settle
+    // on their own past the deadline (~29s tail), so the ring stayed empty and self-heal 0-fired.
+    // Set BELOW the command deadline (15s) so an early wedge trips before the reaper and so it works
+    // even if the deadline reaper is disabled. Healthy p99 ≈ 23ms, so 10s is ~400× p99 — a one-off
+    // slow command is far below the N-in-window threshold. <= 0 disables slow-settle recording.
+    REDIS_CLUSTER_SELFHEAL_SLOW_COMMAND_MS: z.coerce.number().default(10000),
+    // PER-POD RECONNECT JITTER (fleet-stampede brake): wait a random [0, this) before the actual
+    // reconnect so a synchronized fleet event doesn't stampede the cluster. WIDENED to 3s (was 1s)
+    // for the settle-time trigger: it fires on a BROADER envelope than the old reaper-only signal —
+    // any cluster command completing >= REDIS_CLUSTER_SELFHEAL_SLOW_COMMAND_MS (10s), not just those
+    // reaped at the 15s deadline. So a genuine >10s cluster event can trip ~100 pods on nearly the
+    // same tick; 1s was too thin to de-correlate that many destroy()+connect()s against an already-
+    // degraded cluster. 3s spreads them out while still keeping a single-pod heal well inside the
+    // ~60s kubelet readiness-shed window. Env-tunable (3–5s reasonable).
+    REDIS_CLUSTER_SELFHEAL_RECONNECT_JITTER_MS: z.coerce.number().default(3000),
+    // ── SYS (SENTINEL) SELF-HEAL WATCHDOG ──────────────────────────────────────────────
+    // The exact mirror of the cluster self-heal, for the OTHER node-redis client — the sysRedis
+    // Sentinel HA client. WHY (incident 2026-07-03): a sentinel flap orphaned in-flight commands
+    // on the RedisSentinel client (inflight 7,000–253,000 per pod on ~11 pods), hung every request
+    // touching sysRedis, and did NOT self-heal until the pods were manually deleted. Two triggers:
+    // SUSTAINED-INFLIGHT (the incident signature: inflight climbs monotonically) and the
+    // TIMEOUT-RATE trigger below (a wedge on a low-traffic app, whose inflight never gets near the
+    // threshold). ON by default (a forced reconnect is the only thing that clears the wedge short
+    // of a pod restart); REDIS_SYS_SELFHEAL_ENABLED=false is the single-flip revert of both.
+    REDIS_SYS_SELFHEAL_ENABLED: z.preprocess(
+      // default true; only the literal string 'false' disables it (mirrors the cluster flag)
+      (x) => x !== 'false',
+      z.boolean().default(true)
+    ),
+    // Inflight count strictly above which the sys client is considered wedged. Healthy sys inflight
+    // is single-digit; the incident wedge was 7,000+ — 500 is a huge margin below any real wedge
+    // yet far above any legitimate burst.
+    REDIS_SYS_SELFHEAL_INFLIGHT_THRESHOLD: z.coerce.number().default(500),
+    // Inflight must stay ABOVE the threshold continuously for this long before a reconnect.
+    REDIS_SYS_SELFHEAL_SUSTAINED_MS: z.coerce.number().default(20000),
+    // Minimum time between two sys self-heal reconnects (at most one per cooldown).
+    REDIS_SYS_SELFHEAL_COOLDOWN_MS: z.coerce.number().default(60000),
+    // How often the watchdog samples inflight (cheap one-counter read).
+    REDIS_SYS_SELFHEAL_CHECK_INTERVAL_MS: z.coerce.number().default(1000),
+    // PER-POD RECONNECT JITTER (fleet-stampede brake): wait a random [0, this) before the actual
+    // sentinel reconnect so a synchronized fleet flap doesn't stampede the sentinel/master at once.
+    // WIDER default than the cluster's (4s vs 1s): with the sustained-inflight trigger, a sysRedis
+    // MASTER that's slow-but-alive would make ~100 pods all breach the same 20s window and, at 1s
+    // jitter, reconnect within a 1s spread → a thundering herd on the already-degraded
+    // master/sentinel every cooldown. 4s spreads it. Applies to both sys triggers. Env-tunable.
+    REDIS_SYS_SELFHEAL_RECONNECT_JITTER_MS: z.coerce.number().default(4000),
+    // TIMEOUT-RATE TRIGGER (2026-10-18): reconnect when at least THRESHOLD sys commands hit the
+    // REDIS_SYS_COMMAND_TIMEOUT_MS backstop within WINDOW_MS AND no sys command succeeded in that
+    // window. The in-flight trigger above cannot see a wedge on a low-traffic app (see
+    // ./sys-timeouts). The
+    // "no success" condition is the false-positive guard — a healthy client that times out the odd
+    // slow command keeps completing everything else. 10 in 60s: a wedge on an app sending a sys
+    // command every 6s or more often trips it; a 60s window with no success at all is already far
+    // outside healthy behaviour. Before the first success (process start, or after a heal) there is
+    // no success to wait out, so it can fire (outside the cooldown) once THRESHOLD commands have timed
+    // out (./sys-timeouts). Shares the cooldown and jitter above. Inert when the
+    // backstop is off (REDIS_SYS_COMMAND_TIMEOUT_MS=0). THRESHOLD <= 0 disables this trigger only.
+    REDIS_SYS_SELFHEAL_TIMEOUT_THRESHOLD: z.coerce.number().default(10),
+    REDIS_SYS_SELFHEAL_TIMEOUT_WINDOW_MS: z.coerce.number().default(60000),
+    // ── CLUSTER ROUTING RETRY-AFTER-REDISCOVER (the topology-churn 500 wave) ────────────
+    // ON by default; REDIS_CLUSTER_ROUTING_RETRY_ENABLED=false is a single-flip kill-switch
+    // that restores today's exact behavior (one attempt, throw on a routing error).
+    REDIS_CLUSTER_ROUTING_RETRY_ENABLED: z.preprocess(
+      // default true; only the literal string 'false' disables it (mirrors the SELFHEAL flag)
+      (x) => x !== 'false',
+      z.boolean().default(true)
+    ),
+    // Max RETRIES after the initial attempt. The transient window is ~1–2 min cluster-wide but
+    // any single pod's command only needs the map to settle for ITS slot — 2 retries with the
+    // bounded backoff below covers the measured settle time.
+    REDIS_CLUSTER_ROUTING_RETRY_MAX: z.coerce.number().default(2),
+    // Backoff before the 1st / 2nd retry (ms). This IS the settle window: the rediscover between
+    // attempts is a best-effort FIRE-AND-FORGET nudge (triggerTopologyRediscovery returns undefined,
+    // not awaited to completion), so it's this backoff — not the rediscover call — that gives the
+    // in-flight, single-flighted slot-map refresh a beat to land before the retry. 50ms then 150ms.
+    REDIS_CLUSTER_ROUTING_RETRY_BACKOFF_MS: z.coerce.number().default(50),
+    REDIS_CLUSTER_ROUTING_RETRY_BACKOFF_MAX_MS: z.coerce.number().default(150),
+    // Used only to derive a hostname for the failover feature-flag context
+    NEXTAUTH_URL: z.string().optional(),
+    FLIPT_DEPLOYMENT_ID: z.string().optional(),
+  })
+  .superRefine((env, ctx) => {
+    // node-redis's createSentinel requires the master group name; refuse to start with
+    // REDIS_SYS_SENTINELS set but REDIS_SYS_SENTINEL_NAME missing. The non-sentinel path
+    // (REDIS_SYS_URL only) is unaffected.
+    if (env.REDIS_SYS_SENTINELS && !env.REDIS_SYS_SENTINEL_NAME) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['REDIS_SYS_SENTINEL_NAME'],
+        message:
+          'REDIS_SYS_SENTINEL_NAME is required when REDIS_SYS_SENTINELS is set (cluster uses "sysmaster")',
+      });
+    }
+    // Self-heal invariant: the slow-settle threshold MUST stay BELOW the per-command deadline
+    // reaper. When the reaper is active at T and a command orphans, the deadline reaps it at ~T, so
+    // done() observes ~T; if the slow threshold S >= T, that reaped orphan is NOT recorded (T < S)
+    // and the self-heal goes BLIND to the exact deadline-park wedge this trigger exists to catch
+    // (2026-07-06). Only enforced when BOTH are active (>0): the reaper can be disabled (T=0) — the
+    // settle-time signal still works without it — and slow-settle recording can be disabled (S=0).
+    // Sys self-heal invariants, for the in-flight trigger: in-flight count staying above
+    // REDIS_SYS_SELFHEAL_INFLIGHT_THRESHOLD for REDIS_SYS_SELFHEAL_SUSTAINED_MS. A per-command
+    // backstop at or under that window reaps the parked commands before it fills, so inflight
+    // sawtooths and the watchdog never fires (the cluster watchdog went blind exactly this way);
+    // an in-flight cap at or under the threshold keeps inflight from ever crossing it.
+    if (env.REDIS_SYS_SELFHEAL_ENABLED) {
+      const sysDeadlineMs = env.REDIS_SYS_COMMAND_TIMEOUT_MS;
+      const sustainedMs = env.REDIS_SYS_SELFHEAL_SUSTAINED_MS;
+      if (sysDeadlineMs > 0 && sysDeadlineMs <= sustainedMs) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['REDIS_SYS_COMMAND_TIMEOUT_MS'],
+          message:
+            `REDIS_SYS_COMMAND_TIMEOUT_MS (${sysDeadlineMs}) must be > REDIS_SYS_SELFHEAL_SUSTAINED_MS ` +
+            `(${sustainedMs}): a shorter backstop drains sys inflight before the sustained window ` +
+            `fills, so the sys self-heal's in-flight trigger can never fire.`,
+        });
+      }
+      const cap = env.REDIS_SYS_COMMANDS_QUEUE_MAX_LENGTH;
+      const threshold = env.REDIS_SYS_SELFHEAL_INFLIGHT_THRESHOLD;
+      if (cap > 0 && cap <= threshold) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['REDIS_SYS_COMMANDS_QUEUE_MAX_LENGTH'],
+          message:
+            `REDIS_SYS_COMMANDS_QUEUE_MAX_LENGTH (${cap}) must be > REDIS_SYS_SELFHEAL_INFLIGHT_THRESHOLD ` +
+            `(${threshold}): the in-flight cap would keep sys inflight at or under the threshold, ` +
+            `so the sys self-heal's in-flight trigger can never fire.`,
+        });
+      }
+    }
+    const reaperMs = env.REDIS_CLUSTER_COMMAND_TIMEOUT_MS;
+    const slowMs = env.REDIS_CLUSTER_SELFHEAL_SLOW_COMMAND_MS;
+    if (reaperMs > 0 && slowMs > 0 && slowMs >= reaperMs) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['REDIS_CLUSTER_SELFHEAL_SLOW_COMMAND_MS'],
+        message:
+          `REDIS_CLUSTER_SELFHEAL_SLOW_COMMAND_MS (${slowMs}) must be < REDIS_CLUSTER_COMMAND_TIMEOUT_MS ` +
+          `(${reaperMs}): the slow-settle self-heal threshold has to stay below the deadline reaper, ` +
+          `else deadline-reaped orphans settle at ~${reaperMs}ms < ${slowMs}ms and never record a hit ` +
+          `→ the cluster self-heal goes blind to the deadline-park wedge.`,
+      });
+    }
+  });
+
+// Normalized, env-derived defaults. The factory accepts a Partial<RedisConfig> to
+// override any of these per call.
+function buildEnv() {
+  const parsed = redisEnvSchema.safeParse(process.env);
+  if (!parsed.success) {
+    throw new Error(
+      '[@civitai/redis] Invalid environment variables:\n' + z.prettifyError(parsed.error)
+    );
+  }
+  return {
+    url: parsed.data.REDIS_URL,
+    sysUrl: parsed.data.REDIS_SYS_URL,
+    timeout: parsed.data.REDIS_TIMEOUT,
+    cluster: parsed.data.REDIS_CLUSTER,
+    clusterNodes: parsed.data.REDIS_CLUSTER_NODES,
+    clusterRefreshInterval: parsed.data.REDIS_CLUSTER_REFRESH_INTERVAL,
+    clusterErrorRediscoverEnabled: parsed.data.REDIS_CLUSTER_ERROR_REDISCOVER_ENABLED,
+    clusterBatchedGetEnabled: parsed.data.REDIS_CLUSTER_BATCHED_GET_ENABLED,
+    sysSentinels: parsed.data.REDIS_SYS_SENTINELS,
+    sysSentinelName: parsed.data.REDIS_SYS_SENTINEL_NAME,
+    sysSentinelPassword: parsed.data.REDIS_SYS_SENTINEL_PASSWORD,
+    socketTimeoutMs: parsed.data.REDIS_SOCKET_TIMEOUT_MS,
+    sysSocketTimeoutMs: parsed.data.REDIS_SYS_SOCKET_TIMEOUT_MS,
+    sysCommandsQueueMaxLength: parsed.data.REDIS_SYS_COMMANDS_QUEUE_MAX_LENGTH,
+    sysCommandTimeoutMs: parsed.data.REDIS_SYS_COMMAND_TIMEOUT_MS,
+    pingIntervalMs: parsed.data.REDIS_PING_INTERVAL_MS,
+    clusterCommandTimeoutMs: parsed.data.REDIS_CLUSTER_COMMAND_TIMEOUT_MS,
+    clusterSelfHealEnabled: parsed.data.REDIS_CLUSTER_SELFHEAL_ENABLED,
+    clusterSelfHealInflightThreshold: parsed.data.REDIS_CLUSTER_SELFHEAL_INFLIGHT_THRESHOLD,
+    clusterSelfHealSustainedMs: parsed.data.REDIS_CLUSTER_SELFHEAL_SUSTAINED_MS,
+    clusterSelfHealCooldownMs: parsed.data.REDIS_CLUSTER_SELFHEAL_COOLDOWN_MS,
+    clusterSelfHealCheckIntervalMs: parsed.data.REDIS_CLUSTER_SELFHEAL_CHECK_INTERVAL_MS,
+    clusterSelfHealDeadlineHitThreshold: parsed.data.REDIS_CLUSTER_SELFHEAL_DEADLINE_HIT_THRESHOLD,
+    clusterSelfHealDeadlineHitWindowMs: parsed.data.REDIS_CLUSTER_SELFHEAL_DEADLINE_HIT_WINDOW_MS,
+    clusterSelfHealSlowCommandMs: parsed.data.REDIS_CLUSTER_SELFHEAL_SLOW_COMMAND_MS,
+    clusterSelfHealReconnectJitterMs: parsed.data.REDIS_CLUSTER_SELFHEAL_RECONNECT_JITTER_MS,
+    sysSelfHealEnabled: parsed.data.REDIS_SYS_SELFHEAL_ENABLED,
+    sysSelfHealInflightThreshold: parsed.data.REDIS_SYS_SELFHEAL_INFLIGHT_THRESHOLD,
+    sysSelfHealSustainedMs: parsed.data.REDIS_SYS_SELFHEAL_SUSTAINED_MS,
+    sysSelfHealCooldownMs: parsed.data.REDIS_SYS_SELFHEAL_COOLDOWN_MS,
+    sysSelfHealCheckIntervalMs: parsed.data.REDIS_SYS_SELFHEAL_CHECK_INTERVAL_MS,
+    sysSelfHealReconnectJitterMs: parsed.data.REDIS_SYS_SELFHEAL_RECONNECT_JITTER_MS,
+    sysSelfHealTimeoutThreshold: parsed.data.REDIS_SYS_SELFHEAL_TIMEOUT_THRESHOLD,
+    sysSelfHealTimeoutWindowMs: parsed.data.REDIS_SYS_SELFHEAL_TIMEOUT_WINDOW_MS,
+    clusterRoutingRetryEnabled: parsed.data.REDIS_CLUSTER_ROUTING_RETRY_ENABLED,
+    clusterRoutingRetryMax: parsed.data.REDIS_CLUSTER_ROUTING_RETRY_MAX,
+    clusterRoutingRetryBackoffMs: parsed.data.REDIS_CLUSTER_ROUTING_RETRY_BACKOFF_MS,
+    clusterRoutingRetryBackoffMaxMs: parsed.data.REDIS_CLUSTER_ROUTING_RETRY_BACKOFF_MAX_MS,
+    nextAuthUrl: parsed.data.NEXTAUTH_URL,
+    fliptDeploymentId: parsed.data.FLIPT_DEPLOYMENT_ID,
+  };
+}
+
+export type RedisConfig = ReturnType<typeof buildEnv>;
+
+// Lazy + memoized: importing this module never touches process.env. Validation runs only
+// when the factory calls loadRedisEnv(), so a bare import (build, script, test) never
+// throws. Parsed once, then cached.
+let _env: RedisConfig | undefined;
+export function loadRedisEnv(): RedisConfig {
+  return (_env ??= buildEnv());
+}

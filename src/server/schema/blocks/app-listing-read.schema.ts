@@ -1,0 +1,738 @@
+import * as z from 'zod';
+
+import { MARKETPLACE_CATEGORIES } from '~/server/services/blocks/marketplace-categories.constants';
+import { APP_LISTING_STATUSES } from '~/server/services/blocks/app-listing-status.constants';
+import type { RestrictedListingAudience } from '~/shared/utils/app-listing-visibility';
+import { HIDDEN_APP_SLUG_MAX } from '~/shared/utils/my-apps-hidden';
+import {
+  LISTING_FORKS_PAGE_DEFAULT,
+  LISTING_FORKS_PAGE_MAX,
+} from '~/shared/constants/app-fork.constants';
+
+/**
+ * App Store Listings (W13) — P2a UNIFIED STORE READ PATH schemas + public DTOs.
+ *
+ * These back the NEW `appListings.listAvailable` / `appListings.getAppDetail`
+ * read procs that serve the unified `/apps` store over BOTH kinds (`onsite`
+ * AppBlocks + `offsite` external/connect apps) from the durable `AppListing`
+ * record. They MIRROR the existing AppBlock read path
+ * (`blocks.listAvailable` / `blocks.getAppDetail` +
+ * `subscription.schema.ts::AvailableBlock` / `PublicAppDetail`) so the two can't
+ * drift, but read `AppListing` rather than `AppBlock`.
+ *
+ * DARK / parallel-run: nothing here is on the LIVE `/apps` surface yet (that
+ * still reads the AppBlock path). The new procs live ALONGSIDE it behind the
+ * SAME mod-segmented App Blocks flag; the UI switch + cutover are later PRs.
+ *
+ * SECURITY: every DTO below is a PUBLIC-FIELD ALLOWLIST (like `AvailableBlock` /
+ * `PublicBlockManifest`). Internal fields (trustTier, raw iframe.src, OAuth
+ * secrets, owner PII beyond the public creator chip, DB status) are NEVER shaped
+ * in — a field can only leak if it is added here on purpose.
+ */
+
+// ---------------------------------------------------------------------------
+// Inputs.
+// ---------------------------------------------------------------------------
+
+/** Kind filter for the unified store: everything, on-site only, or off-site only. */
+export const listingKindFilterSchema = z.enum(['all', 'onsite', 'offsite']);
+export type ListingKindFilter = z.infer<typeof listingKindFilterSchema>;
+
+/**
+ * Store sort options:
+ *   - `top-rated` (DEFAULT) — Bayesian-shrinkage on the recommend proportion
+ *     (up / (up+down)) DESC; a few-review 100%-recommend app can't outrank a
+ *     many-review 90% app, and 0-review apps sit mid-pack at the global mean
+ *     recommend rate (mirrors the AppBlock `rating` sort, on a proportion
+ *     instead of a 1..5 average). Ties fall back to the `popular` key (plays, or
+ *     installs for an off-site app), then install_count, then id — most apps have
+ *     no reviews yet, so this tie-break is what orders most of the store.
+ *   - `popular`  — plays (open_count) DESC, then install_count DESC, then id (from
+ *     the AppListingMetric rollup). Plays, because that is the count the store card
+ *     shows. An off-site listing has no play count, so it ranks by installs in the
+ *     plays position (see `listingPopularSortKey`).
+ *   - `newest`   — created_at DESC.
+ *   - `name`     — name ASC (case-insensitive).
+ */
+export const listingSortSchema = z.enum(['top-rated', 'popular', 'newest', 'name']);
+export type ListingSort = z.infer<typeof listingSortSchema>;
+
+/**
+ * Upper bound on the opaque keyset cursor. Sized for the `name` sort key (64 characters,
+ * up to 4 UTF-8 bytes each) plus id and pinned mean, base64url-encoded; lowering it stops
+ * pagination on pages ending in a long non-ASCII title.
+ */
+export const LISTING_CURSOR_MAX = 512;
+
+export const listAppListingsSchema = z.object({
+  kind: listingKindFilterSchema.default('all'),
+  // Category filter validated against the single-source taxonomy const (shared
+  // with the AppBlock path) so adding a category needs no schema migration.
+  category: z.enum(MARKETPLACE_CATEGORIES).optional(),
+  sort: listingSortSchema.default('top-rated'),
+  // Opaque keyset cursor (base64url) — see app-listing.service encode/decode.
+  cursor: z.string().max(LISTING_CURSOR_MAX).optional(),
+  limit: z.number().int().min(1).max(50).default(20),
+  /**
+   * Opt in to sub-listing cards (`SubListingCard`) in `items`; also needs the
+   * `app-store-sub-listings` flag. Only the `/apps` store grid asks.
+   */
+  includeSubListings: z.boolean().optional(),
+});
+export type ListAppListingsInput = z.infer<typeof listAppListingsSchema>;
+
+/**
+ * REST-query variant of {@link listAppListingsSchema} for the public
+ * `GET /api/v1/apps` endpoint. Identical filter axes + bounds, but `limit`
+ * arrives as a STRING query param, so it is coerced (empty/absent → the default)
+ * and the parse output is exactly a {@link ListAppListingsInput} — the same
+ * object the listing service consumes. A factory (not a const) so the endpoint
+ * gets a fresh schema without pulling the whole read-schema module's eval graph
+ * at import time. NOTE: the store service supports no free-text search or slot
+ * filter, so neither is accepted here (they would be inert).
+ */
+export function getAppListingsListQuery() {
+  return z.object({
+    kind: listingKindFilterSchema.default('all'),
+    category: z.enum(MARKETPLACE_CATEGORIES).optional(),
+    sort: listingSortSchema.default('top-rated'),
+    cursor: z.string().max(LISTING_CURSOR_MAX).optional(),
+    limit: z
+      .preprocess(
+        (v) => (v === undefined || v === null || v === '' ? undefined : Number(v)),
+        z.number().int().min(1).max(50)
+      )
+      .default(20),
+  });
+}
+
+/**
+ * W13 POST-APPROVAL MOD MANAGEMENT — the moderator all-status listings read.
+ *
+ * Backs `appListings.listAllListingsForModeration` (moderatorProcedure): unlike
+ * the public `listAvailable` (approved-only, public allowlist), this returns
+ * listings across EVERY lifecycle status for the mod management table. All filters
+ * are optional (omitted = the whole store); `search` matches name OR slug
+ * server-side (case-insensitive). Keyset-paginated by the ULID `id` (a stable
+ * total order), bounded `limit` ≤ 50 (mirrors `listListingReportsSchema`).
+ */
+export const listAllListingsForModerationSchema = z.object({
+  // Full AppListing lifecycle set (draft|pending|approved|rejected|removed).
+  status: z.enum(APP_LISTING_STATUSES).optional(),
+  kind: z.enum(['onsite', 'offsite']).optional(),
+  // Server-side name/slug substring filter (bounded; trimmed in the service).
+  search: z.string().max(200).optional(),
+  // Opaque keyset cursor = the last row's `id` (bounded, same as the sibling
+  // mod-read queues). A tampered value just yields a different/empty page.
+  cursor: z.string().min(1).max(64).optional(),
+  limit: z.number().int().min(1).max(50).default(25),
+});
+export type ListAllListingsForModerationInput = z.infer<typeof listAllListingsForModerationSchema>;
+
+/** Detail lookup by EXACTLY ONE of slug or id (approved listings only). */
+export const getAppListingDetailSchema = z
+  .object({
+    slug: z.string().min(1).max(64).optional(),
+    id: z.string().min(1).max(64).optional(),
+  })
+  .refine((d) => (d.slug ? 1 : 0) + (d.id ? 1 : 0) === 1, {
+    message: 'Provide exactly one of `slug` or `id`',
+  });
+export type GetAppListingDetailInput = z.infer<typeof getAppListingDetailSchema>;
+
+/**
+ * `appListings.hideMyApp` / `unhideMyApp` — "Remove from My apps" (and its Undo) by listing
+ * SLUG, the one handle every home tile has. Same bound as the detail lookup's slug. Trimmed so
+ * a padded slug cannot store a second key for the same app.
+ */
+export const myAppsHideInputSchema = z.object({
+  slug: z.string().trim().min(1).max(HIDDEN_APP_SLUG_MAX),
+});
+export type MyAppsHideInput = z.infer<typeof myAppsHideInputSchema>;
+
+// ---------------------------------------------------------------------------
+// Public DTOs (allowlist projections).
+// ---------------------------------------------------------------------------
+
+export type ListingKind = 'onsite' | 'offsite';
+
+/**
+ * Public creator chip — id/username/image ONLY (the standard public-user
+ * projection subset). No email/PII. `null` only if the owner row vanished.
+ */
+export type ListingCreatorChip = {
+  id: number;
+  username: string | null;
+  image: string | null;
+};
+
+/**
+ * Recommend rollup, read from the `AppListingMetric` rollup (P5-populated).
+ * `recommendPct` is `null` when there are no reviews yet (metric row absent OR
+ * zero counts) so the UI can render "no reviews yet" instead of "0%".
+ */
+export type ListingRecommendRollup = {
+  recommendedCount: number;
+  notRecommendedCount: number;
+  /** up / (up+down) in [0,1], or null when there are no reviews yet. */
+  recommendPct: number | null;
+};
+
+/** Kind-specific card fields (discriminated by the card's `kind`). */
+export type ListingCardKindData =
+  | {
+      kind: 'onsite';
+      /** Backing AppBlock id (the runtime), or null for a native off-site row. */
+      appBlockId: string | null;
+      /** True when the app declares a launch page (Open CTA) vs a model-slot install (Install CTA). */
+      hasPage: boolean;
+      /**
+       * Already-public standalone block origin (no token/scope) — IDENTICAL in
+       * name + type to the detail projection's `liveUrl`, so a client can link an
+       * onsite app straight from the list card without an N+1 detail fetch. An
+       * onsite card only appears once its backing block has deployed (the same
+       * deploy-gate the detail read applies), so this origin is always live.
+       */
+      liveUrl: string;
+    }
+  | {
+      kind: 'offsite';
+      /**
+       * External destination (Visit CTA), https-guarded; null when the listing
+       * has none. 🔴 This is the ONLY off-site field on a card — the card DTO
+       * deliberately carries no `connectClientId`, so nothing downstream of it
+       * can re-derive a sub-kind.
+       */
+      externalUrl: string | null;
+    };
+
+/** One store card over EITHER kind (the unified `/apps` grid). */
+export type ListingCard = {
+  id: string;
+  slug: string;
+  kind: ListingKind;
+  name: string;
+  tagline: string | null;
+  category: string | null;
+  contentRating: string | null;
+  iconUrl: string | null;
+  /** Cover image, or the first screenshot as a fallback, or null. */
+  coverUrl: string | null;
+  creator: ListingCreatorChip | null;
+  recommend: ListingRecommendRollup;
+  /** Total reviews reflected in the recommend rollup (recommended + not). */
+  reviewCount: number;
+  /**
+   * AUTHOR-DECLARED "this app is in beta" flag — renders a small badge on the card.
+   *
+   * 🔴 ALLOWLIST JUSTIFICATION. A boolean the author chose to publish about their own app,
+   * carrying no information about anyone else and gating nothing. It affects no ranking,
+   * no curation and no CTA — it is a label.
+   *
+   * 🔴 THE FLAG IS ON THE CARD, THE MESSAGE IS NOT, and the asymmetry is the same one
+   * `sourceRepoUrl` makes for the opposite reason. A grid of store cards is a
+   * low-attention surface with no room for a sentence; the badge is the whole signal a
+   * card can carry honestly. `betaMessage` appears on the DETAIL page, where there is
+   * room to read it. The exact-key-set assertions in `app-listing.service.test.ts` pin
+   * both halves.
+   *
+   * `false` while the MANUAL-APPLY migration is outstanding — see `projectListingCard`.
+   */
+  isBeta: boolean;
+  /**
+   * MODERATOR-SET "Official" flag: the app is made by the Civitai team. Renders a badge.
+   * A provenance claim no author input can set (`app-listing-official.service.ts`).
+   *
+   * Every server projection emits it (`false` also while the manual-apply migration is
+   * outstanding). Optional in the TYPE only so hand-built fixtures and the client-side review
+   * preview need not name it; absent reads as not official.
+   *
+   * Not served by the public REST `GET /api/v1/apps` — its handler strips it, because adding a
+   * field changes a hand-documented contract (`withoutUndocumentedRestFields`).
+   */
+  isOfficial?: boolean;
+  /**
+   * Play count from the `AppListingMetric` rollup (`open_count`) — how many times
+   * the app was OPENED — or `null` when the number is structurally unmeasurable.
+   *
+   * 🔴 ALLOWLIST JUSTIFICATION — AND IT IS **NOT** THE SAME ARGUMENT AS
+   * `ListingDetail.installCount`. An earlier draft of this comment called it "the exact
+   * same argument, one step weaker and still sufficient", which flattered it on an axis
+   * it never named. What the two DO share: both are aggregates over the whole audience,
+   * so neither identifies a user, neither reveals WHO opened or installed the app or
+   * WHEN, and neither gates anything. Two real deltas, both in the exposing direction:
+   *
+   *   1. The raw count is a new public fact; only the relative ordering was already
+   *      public, through the `popular` sort (`open_count` first, see
+   *      `listAppListingsSchema`).
+   *   2. BULK-ENUMERABLE BY AN ANONYMOUS CALLER, because this is a CARD field while
+   *      `installCount` is DETAIL-only. The card DTO is the body of `GET /api/v1/apps`
+   *      — a public, anon-capable REST list returning up to 50 cards per page — so an
+   *      unauthenticated client can page the play count of the ENTIRE approved catalog
+   *      cheaply. `installCount` costs one `GET /api/v1/apps/<slug>` per app.
+   *
+   * 🔴 BOTH DELTAS WERE RAISED AND ACCEPTED DELIBERATELY (round-1 audit of this PR).
+   * The reasoning, recorded so the next reviewer does not have to re-open a settled
+   * question: printing a play count on a public store card WAS the decision, so bulk
+   * readability is a CONSEQUENCE of it rather than a separate one — and the `popular`
+   * sort already makes relative ordering by usage publicly inferable, so the catalog's
+   * usage shape is not newly disclosed in kind. It is the store analogue of the public
+   * play/view counts every other content type on the platform already renders, and
+   * that is the intent: a store card should be able to say how used an app is.
+   *
+   * This paragraph exists to hand the next reader the ACCURATE comparison rather than
+   * the flattering one. If the exposure ever needs revisiting, delta 2 is the axis.
+   *
+   * 🔴 `null` IS NOT `0`, AND THE DIFFERENCE IS A TRUTH CLAIM RATHER THAN A STYLE ONE.
+   * An OFF-SITE listing's CTA is a plain `target="_blank"` anchor to a third party, so
+   * no on-platform request follows the click and there is nothing trustworthy to count.
+   * Its play count is ABSENT, not zero — the renderer omits the stat entirely for
+   * `null`, whereas a `0` would render as "nobody has ever used this app", a false
+   * statement about an app we simply cannot measure. `app_listing_metrics.open_count`
+   * is `Int NOT NULL DEFAULT 0`, so an off-site row DOES carry a literal `0` in the
+   * column; `projectListingCard` discriminates on `kind` precisely so that column value
+   * never reaches this field.
+   *
+   * 🔴 The mirror is equally load-bearing: an ON-SITE listing nobody has opened yet is a
+   * genuine `0` and must stay `0`. A missing metric row means "no plays recorded yet",
+   * which is 0 — the same COALESCE-to-0 reading `installCount` documents.
+   *
+   * ✅ THE RENDERER EXISTS AND THE ROLLUP FEEDS IT — a re-derivation, because the
+   * sentence that used to close this block ("Reads `0` for every on-site listing until
+   * the rollup that populates `open_count` ships and the events feeding it exist") was
+   * true when written and is now false in both halves. `6ff42aed42` records the
+   * App_Open events and `f9f81dcfb5` derives `open_count` from them; the store card
+   * (`AppListingCard` → `getPlayCountLabel`) is what turns the `null` above into an
+   * omitted stat and a number into "N plays". The `null`-vs-`0` distinction this block
+   * describes is therefore live behaviour, not a forward promise.
+   *
+   * ⚠️ Still NOT claimed: that the rollup has already covered any particular listing
+   * in any particular environment. That is a fact about a scheduled job. A listing the
+   * job has not yet reached reads a `0` that is correct by the rule above and stale in
+   * substance; the count is derived all-time on each run, so it self-corrects rather
+   * than needing a backfill.
+   */
+  openCount: number | null;
+  /**
+   * Last time the listing row changed (`app_listings.updated_at`), ISO-8601 — the card's
+   * "Updated 3 days ago" line. The same public value `ListingDetail.updatedAt` already
+   * carries for every approved listing, so this adds no fact.
+   *
+   * OPTIONAL because not every card producer has a listing row: the moderator preview
+   * card is built from a publish request, which has no `updated_at`, and leaves it out
+   * rather than stand in another date. The card renders no date when it is absent.
+   */
+  updatedAt?: string;
+  /**
+   * The listing's RESTRICTED audience as THIS VIEWER may know it, for the store badge
+   * ("Testers only" / "Moderators only" / "Unlisted") — or `null`, which renders nothing.
+   *
+   * 🔴 ALLOWLIST JUSTIFICATION — A DERIVED, VIEWER-SCOPED VALUE, NOT THE `visibility`
+   * COLUMN. The raw level is an owner-only setting (see `ListingVisibilityMenuModal`), so it
+   * is never projected. This is set only for the owner, a moderator, or a viewer whose cohort
+   * the level already admits — `restrictedAudienceForViewer` is the one rule. `null` covers
+   * unset, `public`, the manual-apply column being absent, and "this viewer is not told".
+   *
+   * Not served by the public REST `GET /api/v1/apps` — its handler strips it (the field is
+   * always `null` there, and adding it would change a documented contract for nothing).
+   */
+  restrictedAudience: RestrictedListingAudience | null;
+  kindData: ListingCardKindData;
+};
+
+/**
+ * One store card for a SUB-LISTING: an item a parent app placed in the store. Public-field
+ * allowlist like `ListingCard`. `kind` and `category` are the parent's, so the grid's filters
+ * and client-side search treat it like any other card; `contentRating` is the stricter of
+ * parent and item. `runHref` is built server-side: under the parent's run route, or, for an
+ * off-site parent (`external`), from the parent's moderator-set link template. There is no
+ * author-supplied URL.
+ *
+ * Only the tRPC store grid returns these (behind the `app-store-sub-listings` flag). The
+ * public REST catalog never does.
+ */
+export type SubListingCard = {
+  cardType: 'sub-listing';
+  id: string;
+  name: string;
+  tagline: string | null;
+  kind: ListingKind;
+  category: string | null;
+  contentRating: string | null;
+  /** The item image when it is cleared for this viewer, else the parent's cover. */
+  coverUrl: string | null;
+  /** The item's author. */
+  creator: ListingCreatorChip;
+  parent: { id: string; slug: string; name: string; iconUrl: string | null };
+  runHref: string;
+  /** `runHref` leaves Civitai: open it in a new tab, whether or not the viewer can open pages. */
+  external?: true;
+};
+
+export type StoreGridItem = ListingCard | SubListingCard;
+
+/**
+ * Drop the viewer-scoped fields from a store DTO before it crosses the public REST boundary.
+ *
+ * `GET /api/v1/apps` and `/api/v1/apps/{slug}` are a hand-documented published contract and
+ * always read as an anonymous, floor-`public` viewer, so `restrictedAudience` is `null` there
+ * by construction. Serving a key that can only ever be `null` would change the documented
+ * response shape for nothing, so both handlers strip it.
+ */
+export function withoutViewerScopedFields<T extends { restrictedAudience: unknown }>(
+  dto: T
+): Omit<T, 'restrictedAudience'> {
+  const { restrictedAudience: _viewerScoped, ...rest } = dto;
+  return rest;
+}
+
+/**
+ * The store DTO exactly as the public REST `GET /api/v1/apps` and `/api/v1/apps/{slug}` serve
+ * it: {@link withoutViewerScopedFields}, and without `isOfficial`, which the tRPC store renders
+ * but the hand-documented REST contract does not list. Adding it there is a contract change
+ * that needs its docs page updated in the same piece of work, so it stays out until then.
+ */
+export function withoutUndocumentedRestFields<
+  T extends { restrictedAudience: unknown; isOfficial?: boolean }
+>(dto: T): Omit<T, 'restrictedAudience' | 'isOfficial'> {
+  const { restrictedAudience: _viewerScoped, isOfficial: _undocumented, ...rest } = dto;
+  return rest;
+}
+
+export type ListingGalleryScreenshot = {
+  url: string;
+  caption: string | null;
+};
+
+/** Kind-specific action data on the detail page. */
+export type ListingDetailKindData =
+  | {
+      kind: 'onsite';
+      appBlockId: string | null;
+      hasPage: boolean;
+      /** Already-public standalone block origin (no token/scope). */
+      liveUrl: string;
+    }
+  | {
+      kind: 'offsite';
+      externalUrl: string | null;
+      /**
+       * Public OAuth client_id (NOT a secret) when this listing has an OAuth app
+       * connected; null otherwise.
+       *
+       * 🔴 This is a CAPABILITY flag, not a kind discriminator. Off-site listings
+       * used to fork into a `connect` / `external-link` sub-kind derived from
+       * exactly this field, and the store rendered two different KIND labels off
+       * it. That fork is gone — every off-site listing is one thing. What survives
+       * is the capability question "does this app connect to your Civitai
+       * account?", which two surfaces legitimately still ask (the account-access
+       * disclosure in `AppListingDetailBody` and the no-destination fallback in
+       * `getDetailPrimaryAction`). Read it for THAT; never to re-derive a kind.
+       */
+      connectClientId: string | null;
+    };
+
+/** Full public detail for one approved listing (card fields + gallery + body). */
+export type ListingDetail = {
+  id: string;
+  /**
+   * Integer surrogate key (`app_listings.serial_id`): comments key on it, because the store `id`
+   * is a TEXT ULID. Public and non-sensitive (an opaque row number, like the numeric ids already
+   * exposed for images/models/posts).
+   */
+  serialId: number;
+  slug: string;
+  kind: ListingKind;
+  name: string;
+  tagline: string | null;
+  description: string | null;
+  category: string | null;
+  contentRating: string | null;
+  iconUrl: string | null;
+  coverUrl: string | null;
+  creator: ListingCreatorChip | null;
+  /**
+   * PUBLIC BYLINE — the app's ACCEPTED collaborators who have opted IN to display
+   * (`AppCollaborator.status = 'accepted' AND displayed = true`). Same
+   * `{id, username, image}` allowlist as `creator`.
+   *
+   * 🔴 A PENDING OR REJECTED INVITE MUST NEVER APPEAR HERE. Otherwise an owner could
+   * attach any stranger's name and avatar to their listing just by inviting them.
+   * Empty for a listing with no backing AppBlock, and empty until the manual-apply
+   * collaborator migration lands.
+   */
+  collaborators: ListingCreatorChip[];
+  recommend: ListingRecommendRollup;
+  reviewCount: number;
+  /**
+   * Last time the listing row itself changed (`app_listings.updated_at`), as an ISO-8601
+   * string.
+   *
+   * 🔴 ALLOWLIST JUSTIFICATION. Non-sensitive, and the direct analogue of the model
+   * detail page's `Updated: <date>` meta line (`Model.updatedAt`, rendered publicly for
+   * every model). It reveals only that an approved, publicly-listed app was edited — the
+   * same fact the store's `newest` sort already exposes for `created_at`. It carries no
+   * information about WHO edited it or WHAT changed.
+   *
+   * A STRING, not a `Date`: this DTO is also served by the public REST
+   * `GET /api/v1/apps/...` path, which has no tRPC transformer, so a JSON-safe scalar is
+   * the only shape both transports agree on.
+   */
+  updatedAt: string;
+  /**
+   * Install count from the `AppListingMetric` rollup (`install_count`).
+   *
+   * 🔴 ALLOWLIST JUSTIFICATION. It is an aggregate over the whole install base — it
+   * identifies no user — and it is the store's `popular` sort tie-break (see
+   * `listAppListingsSchema`). The detail page shows it as "Installs" for an OFF-SITE
+   * listing, which has no play count; an on-site listing shows PLAYS
+   * ({@link ListingDetail.openCount}) instead — see `listingUsageStat`.
+   *
+   * `0` when the metric row is absent (a listing nobody has installed yet), matching how
+   * the ranking SQL reads it (`COALESCE(m.install_count, 0)`).
+   */
+  installCount: number;
+  /**
+   * Play count — the SAME value as {@link ListingCard.openCount}, from the same
+   * `cardOpenCount` projection: a number for an on-site listing, `null` for an off-site
+   * one (unmeasurable). The detail page shows this, labelled "Plays", so the page and the
+   * store card never show two different usage numbers for one app.
+   *
+   * 🔴 ALLOWLIST JUSTIFICATION: already public on every store card, so this adds no fact.
+   */
+  openCount: number | null;
+  /**
+   * PUBLIC SOURCE-REPOSITORY link ("this app is open source"), or null.
+   *
+   * 🔴 ALLOWLIST JUSTIFICATION. It is a link the AUTHOR chose to publish about their
+   * own app, host-restricted to github.com / gitlab.com / codeberg.org and normalised
+   * to `https://<host>/<owner>/<repo>` by `validateRepositoryUrl` — so it can carry no
+   * credentials, no port, no query string, no deep path and no host outside that set.
+   * It reveals nothing the author has not deliberately made public, and it is
+   * moderator-gated on both kinds (manifest-governed + re-reviewed on approve for
+   * on-site; a MATERIAL patch field routing through a shadow revision for off-site).
+   *
+   * 🔴 DETAIL-ONLY, and the asymmetry with `tagline`/`category` is deliberate: it is
+   * NOT on `ListingCard`. A grid of store cards is a low-attention surface where an
+   * outbound link has no room for the context that makes it safe to click; the detail
+   * page shows it as one labelled row next to the app's other declared facts. Adding it
+   * to the card DTO would put an un-contextualised outbound link on every `/apps` tile.
+   * The exact-key-set assertions in `app-listing.service.test.ts` pin both halves.
+   *
+   * 🔴 NOT `AppBlock.repoUrl` — that is the app's INTERNAL Forgejo repository and is
+   * never public. This is a separate, author-declared column (`source_repo_url`).
+   *
+   * A STRING (or null), not an object: this DTO also crosses the transformer-less
+   * public REST `GET /api/v1/apps/{slug}` boundary, so it must be a JSON-safe scalar.
+   * Null while the MANUAL-APPLY migration is outstanding — see `projectListingDetail`.
+   */
+  sourceRepoUrl: string | null;
+  /**
+   * The app's APPROVED scope ids (`AppBlock.approved_scopes`), for the pre-launch
+   * permission disclosure. `[]` in THREE cases, and the third is the one readers miss:
+   *   1. the listing's `kind` is not `onsite`;
+   *   2. an on-site app approved with no scopes;
+   *   3. 🔴 an on-site listing with NO BACKING `appBlock` ROW — every revision SHADOW
+   *      (`beginListingRevision` writes `appBlockId: null` onto a shadow whose `kind`
+   *      is cloned from the parent). A shadow is `kind: 'onsite'` and still gets `[]`.
+   * Case 3 is why "preview implies `[]`" is a tempting and WRONG inference: the
+   * owner-republish re-review targets the LIVE listing, not a shadow, so it has a
+   * backing block and does get scopes. See `AppListingDetailBody`'s section comment.
+   *
+   * ⚠ `[]` for an off-site listing because of its **`kind`**, NOT because it lacks a
+   * backing block — an off-site row CAN carry a non-null `appBlockId` (the
+   * `blocks.backfillAppListings` shape), and an earlier draft of this line used that
+   * retired nullness predicate. See the gate in `projectListingDetail`.
+   *
+   * 🔴 ALLOWLIST JUSTIFICATION — AND THIS FIELD IS A NEW PUBLIC EXPOSURE, NOT A
+   * RESTATEMENT OF AN EXISTING ONE. Say so plainly, because an earlier draft of this
+   * docstring claimed the ids were "already shipped to anonymous callers by
+   * `BlockRegistry.getAppDetail`", and that was FALSE: `blocks.getAppDetail` runs
+   * `enforceAppBlocksFlag` and is mod-segmented — dark to a genuine anonymous caller
+   * — whereas this DTO is returned verbatim by `GET /api/v1/apps/{slug}`, which has
+   * no ENABLE gate and serves unauthenticated callers at `PUBLIC_APPS_CATALOG_SCOPE =
+   * 'full'`. So this change MOVES approved scope ids from a flag-dark surface to a
+   * genuinely public one. That is the decision being taken here; it is not a no-op.
+   *
+   * ⚠ "No enable gate" is not "no lever": there IS an operator kill switch,
+   * `PUBLIC_APPS_CATALOG_DISABLED_FLAG = 'apps-public-catalog-disabled'`
+   * (`public-apps-catalog.ts`), absent in Flipt today so public access is on. It is
+   * blunt — it withholds the whole catalog, not this field.
+   *
+   * Why it is the right call anyway: these are coarse capability labels
+   * (`ai:write:budgeted`, `models:read:self`) describing what an APPROVED, PUBLICLY
+   * LISTED app is permitted to do. Publishing them is the entire point — a viewer
+   * cannot weigh a permission they cannot see, and the store page is the only place
+   * they can see it BEFORE launching the app. They identify no user, carry no
+   * per-user grant state, and no manifest internals (`trustTier`, `iframe.src`,
+   * `renderMode`, settings) ride along.
+   *
+   * They are NOT the manifest's raw self-declared `scopes`: only the approve paths
+   * write `approvedScopes`. ⚠ "Moderator-granted" is accurate about the WRITER, not
+   * about granularity — a moderator approves or rejects a whole manifest; there is
+   * no per-scope narrowing mechanism.
+   *
+   * 🔴 DETAIL-ONLY, like `sourceRepoUrl` — a store card is a low-attention grid tile
+   * with no room for the context that makes a capability list meaningful. The
+   * exact-key-set assertions in `app-listing.service.test.ts` pin both halves.
+   *
+   * An array of STRINGS: this DTO also crosses the transformer-less public REST
+   * `GET /api/v1/apps/{slug}` boundary, so it must be a JSON-safe scalar shape.
+   */
+  scopes: string[];
+  /**
+   * The OAuth account permissions an OFF-SITE connect listing is APPROVED TO ASK
+   * FOR, as TokenScope enum-keys (e.g. `['UserRead','BuzzRead']`). `[]` for every
+   * listing that has none — on-site, external-link, and any connect listing whose
+   * `connectRequestedScopes` column is NULL or zero.
+   *
+   * 🔴 A CEILING, NOT A PREDICTION — do not re-describe this as what the app "will
+   * request". `offsite-listing.service.ts` states that `connectRequestedScopes` is
+   * "Disclosure/review-only" and "does NOT gate OAuth token issuance (the client's
+   * `allowedScopes` remains the runtime ceiling via the existing consent flow)". The
+   * consent screen renders the `?scope=` the client asks for at authorize time, so
+   * the actual ask is usually a SUBSET of this — and can be a SUPERSET if the OAuth
+   * client's ceiling is widened after moderator approval, since nothing re-publishes
+   * the snapshot. It IS server-derived from `allowedScopes` at submit and any change
+   * re-enters moderator review, which is what makes it worth publishing at all.
+   *
+   * 🔴 ALLOWLIST JUSTIFICATION — AND THIS FIELD IS A NEW PUBLIC EXPOSURE. Like
+   * `scopes` above, it is returned verbatim by the unauthenticated
+   * `GET /api/v1/apps/{slug}` at `PUBLIC_APPS_CATALOG_SCOPE = 'full'`, so this
+   * publishes something that was previously visible only to moderators (the
+   * `ConnectScopesPanel` inside `OffsiteReviewQueue`). That is the decision being
+   * taken here; it is not a no-op. The same blunt operator kill switch applies
+   * (`PUBLIC_APPS_CATALOG_DISABLED_FLAG`) — it withholds the whole catalog, not
+   * this field.
+   *
+   * Why it is the right call: the page already tells the viewer the app "can
+   * connect to your Civitai account", and then disclosed nothing about what it
+   * would ask for — while an ON-SITE app enumerates its approved scopes in full.
+   * The surface granting the WEAKER capability disclosed MORE than the one
+   * granting real account access. These are the same coarse capability keys the
+   * OAuth consent screen shows at sign-in; publishing them earlier lets a viewer
+   * weigh the ask BEFORE starting a flow, and they identify no user and carry no
+   * per-user grant state.
+   *
+   * 🔴 NOT `connectScopeJustifications` — the owner-authored free-text rationale
+   * beside this column stays moderator-only. Disclosing it is a SEPARATE exposure
+   * decision that has not been made; nothing in this DTO carries it.
+   *
+   * 🔴 APPROVED-ONLY IS ENFORCED UPSTREAM, NOT HERE, AND THAT IS DELIBERATE.
+   * `getListingDetail` returns null for any row whose `status !== 'approved'`
+   * before this projection is reached, so a draft's intended scopes can never
+   * ride the public read. A second status clause inside `projectListingDetail`
+   * would be unreachable on that path AND actively wrong on the other one:
+   * `getListingPreviewForReview` is deliberately NOT status-filtered so a
+   * moderator can preview a draft, and gating here would blank the very
+   * enumeration they are reviewing. The reliance is pinned by a test rather than
+   * by this sentence — see `appListingConnectScopes.test.ts`.
+   *
+   * An array of STRINGS, not the raw `Int` bitmask: this crosses the
+   * transformer-less public REST boundary, so it must be a JSON-safe scalar
+   * shape, and a bitmask would couple every external consumer to bit positions.
+   * The decode runs server-side through the shared `tokenScopeMaskToList`, which
+   * is the same table the hub's consent screen uses — forking it would be a
+   * latent security bug, which is why that module says so in its own docstring.
+   */
+  connectScopes: string[];
+  /**
+   * AUTHOR-DECLARED "this app is in beta" flag. Same allowlist justification as
+   * `ListingCard.isBeta` — a label the author publishes about their own app.
+   *
+   * `false` while the MANUAL-APPLY migration is outstanding — see `projectListingDetail`.
+   */
+  isBeta: boolean;
+  /** Same moderator-set flag as `ListingCard.isOfficial`, for the page header badge. Stripped
+   *  from the public REST `GET /api/v1/apps/{slug}` response, like the card's. */
+  isOfficial?: boolean;
+  /**
+   * The author's optional short beta note (≤`BETA_MESSAGE_MAX`), or null.
+   *
+   * 🔴 PLAIN TEXT, NOT MARKDOWN, AND THAT IS A SECURITY DECISION RATHER THAN A STYLE ONE.
+   * `description` on this same DTO renders through `AppListingDescription` →
+   * `CustomMarkdown`; this deliberately does not, so the string cannot mint a link, an
+   * image or any element at all. It is rendered as a text node. Do NOT route it through
+   * `CustomMarkdown`, and never through `dangerouslySetInnerHTML`.
+   *
+   * 🔴 THE TRUST POSTURE IS THE SAME ONE `description` ALREADY HAS on this surface —
+   * author-controlled public copy that no moderator reviews before it goes live, because
+   * beta is a TRIVIAL patch field. The mitigations are deterministic rather than
+   * procedural: a bounded length enforced in zod at the request boundary, and plain-text
+   * rendering. The residual risk is the same as `description`'s: an author can write
+   * misleading prose about their own app, which is a moderation problem (the listing is
+   * delistable) and not a rendering one.
+   *
+   * A STRING (or null), not an object: this DTO also crosses the transformer-less public
+   * REST `GET /api/v1/apps/{slug}` boundary, so it must be a JSON-safe scalar. Null while
+   * the MANUAL-APPLY migration is outstanding.
+   */
+  betaMessage: string | null;
+  /**
+   * Same viewer-scoped restricted audience as `ListingCard.restrictedAudience`, for the
+   * detail header's badge. 🔴 `private` admits no cohort, so it may reach only the owner and
+   * moderators — `restrictedAudienceForViewer` decides, not this read's caller.
+   * Stripped from the public REST `GET /api/v1/apps/{slug}` response, like the card's.
+   */
+  restrictedAudience: RestrictedListingAudience | null;
+  /** Ordered gallery — screenshots whose backing Image still exists (null-image rows dropped). */
+  screenshots: ListingGalleryScreenshot[];
+  kindData: ListingDetailKindData;
+  /**
+   * The author's opt-in: "Let others fork this app's source". Read by the Fork action, which
+   * offers itself only on a forkable on-site app. `false` while the manual-apply migration is
+   * outstanding (`app-fork.service.ts`).
+   */
+  forkable: boolean;
+  /**
+   * Fork provenance, or `null` for an app that is not a fork. Shown as "Forked from …" whenever
+   * it is set — provenance is not behind the fork rollout flag.
+   *
+   * 🔴 VIEWER-SCOPED IN THE ONLY DIRECTION THAT MATTERS: the parent's name and slug are present
+   * only when THIS viewer may see the parent's store page. A hidden parent and a deleted one both
+   * read `{ visible: false }`, so this field cannot disclose a hidden listing's name or existence.
+   */
+  forkOf: ListingForkOf | null;
+};
+
+/**
+ * Where a fork came from, as the store page may disclose it. See `ListingDetail.forkOf`.
+ * JSON-safe: this DTO also crosses the public REST boundary.
+ */
+export type ListingForkOf = { visible: true; slug: string; name: string } | { visible: false };
+
+/**
+ * The published forks of one listing, newest first. Keyset-paginated on the listing id
+ * (`apl_<ULID>`, so id order is creation order); `cursor` is the last id of the previous page.
+ */
+export const listListingForksSchema = z.object({
+  listingId: z.string().min(1).max(64),
+  cursor: z.string().min(1).max(64).optional(),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(LISTING_FORKS_PAGE_MAX)
+    .optional()
+    .default(LISTING_FORKS_PAGE_DEFAULT),
+});
+export type ListListingForksInput = z.infer<typeof listListingForksSchema>;
+
+/** `appListings.startFork` — the PARENT listing to fork. Nothing else: the server picks the rest. */
+export const startForkSchema = z.object({ listingId: z.string().min(1).max(64) });
+
+/** `appListings.getForkSession` — the fork slug the App Assistant page was sent to. */
+export const getForkSessionSchema = z.object({ forkSlug: z.string().min(3).max(40) });
+
+/** One fork in a parent's fork list — only what the list renders. */
+export type ListingForkItem = { id: string; slug: string; name: string };
+
+/**
+ * A page of a listing's PUBLISHED forks. `totalCount` counts the same set the pages walk: forks
+ * this viewer could open in the store (approved, store-visible, not a revision draft).
+ */
+export type ListingForksPage = {
+  totalCount: number;
+  items: ListingForkItem[];
+  nextCursor: string | null;
+};

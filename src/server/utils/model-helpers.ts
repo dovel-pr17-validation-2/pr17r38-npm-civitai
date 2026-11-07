@@ -1,0 +1,394 @@
+import { startCase } from 'lodash-es';
+import type { ModelFileType } from '~/server/common/constants';
+import { canGenerateWithEpoch } from '~/server/common/model-helpers';
+import { ModelType } from '~/shared/utils/prisma/enums';
+import { getPrimaryFileTypes, primaryModelFileTypes } from '~/utils/file-display-helpers';
+import { getDisplayName } from '~/utils/string-helpers';
+
+type FileFormatType = {
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  type: ModelFileType | (string & {});
+  metadata: BasicFileMetadata;
+};
+
+export const defaultFilePreferences: Omit<FileFormatType, 'type'> = {
+  metadata: { format: 'SafeTensor', size: 'pruned', fp: 'fp16', quantType: 'Q4_K_M' },
+};
+
+type FileMetaKey = keyof BasicFileMetadata;
+const preferenceWeight: Partial<Record<FileMetaKey, number>> = {
+  format: 100,
+  size: 10,
+  fp: 1,
+  quantType: 0.5,
+};
+
+/**
+ * Serving order for a precision tie — lower wins. NOT `fpQualityRank` below, which ranks the same
+ * values by fidelity for the model sidebar; `mxfp8` sitting under `int8` here is deliberate.
+ *
+ * Without a total tie-break the served precision is whichever row the query returned first, so two
+ * versions of the same model can go out at different precisions.
+ */
+const fpServingPreference: Record<ModelFileFp, number> = {
+  fp8: 1,
+  fp8_scaled: 2,
+  fp8_mixed: 3,
+  bf16: 4,
+  fp16: 5,
+  fp32: 6,
+  int8: 7,
+  mxfp8: 8,
+  nvfp4: 9,
+  nf4: 10,
+  int4: 11,
+};
+
+/**
+ * Whether `candidate` should be served ahead of `incumbent`, both having scored equally.
+ *
+ * 🔴 SAME `type` ONLY. `Model`, `Pruned Model`, `Diffusion Model` and `UNet` all score +1000, so a
+ * tie can span them — and `fileTypeUrnMap` gives those different AIR **type segments**, so choosing
+ * across them would move the AIR string the orchestrator caches by. Precision decides which build of
+ * one component to serve; it is not a vote on which component.
+ */
+function preferredPrecision(candidate: FileFormatType, incumbent: FileFormatType) {
+  if (candidate.type !== incumbent.type) return false;
+  const fpA = candidate.metadata?.fp;
+  const fpB = incumbent.metadata?.fp;
+  if (fpA === fpB) return false;
+  // Precision options are mod-managed at runtime and the `ModelFileFp` union lags behind them (see
+  // `inferSafetensorsPrecision`), so a stored value can be absent from the record. Unranked ranks
+  // last, which also covers a file stating no precision at all.
+  const rank = (fp?: ModelFileFp) =>
+    (fp ? fpServingPreference[fp] : undefined) ?? Number.MAX_SAFE_INTEGER;
+  return rank(fpA) < rank(fpB);
+}
+
+export function getPrimaryFile<T extends FileFormatType>(
+  files: Array<T>,
+  preferences: Partial<FileFormatType> = defaultFilePreferences
+) {
+  if (!files.length) return null;
+
+  const preferredMetadata = { ...defaultFilePreferences.metadata, ...preferences.metadata };
+
+  const getScore = (file: FileFormatType) => {
+    let score = 1000;
+    for (const [key, value] of Object.entries(file.metadata ?? {})) {
+      const weight = preferenceWeight[key as FileMetaKey];
+      if (!weight) continue;
+      if (value === preferredMetadata[key as FileMetaKey]) score += weight;
+      else score -= weight;
+    }
+
+    // Give priority to files containing the main model weights
+    if (file.type && primaryModelFileTypes.includes(file.type as ModelFileType)) score += 1000;
+
+    return score;
+  };
+
+  // A max, not a sort: the precision tie-break is deliberately undefined across `type`, so it is not
+  // a transitive comparator and feeding it to `sort` would leave the result up to the engine.
+  return files
+    .map((file) => ({ file, score: getScore(file) }))
+    .reduce((best, entry) =>
+      entry.score > best.score ||
+      (entry.score === best.score && preferredPrecision(entry.file, best.file))
+        ? entry
+        : best
+    ).file;
+}
+
+/**
+ * The file a version's UI should describe. Every panel that shows per-file
+ * information (download picker, tensor metadata, the Hash/AIR detail rows)
+ * resolves it through here so they cannot disagree about which file is active.
+ *
+ * A `selectedFileId` left over from another version is ignored rather than
+ * blanking the panel.
+ */
+export function resolveActiveFile<T extends FileFormatType & { id: number }>(
+  files: Array<T>,
+  selectedFileId?: number | null,
+  preferences: Partial<FileFormatType> = defaultFilePreferences
+) {
+  return (
+    files.find((file) => file.id === selectedFileId) ??
+    getPrimaryFile(files, preferences) ??
+    files[0] ??
+    null
+  );
+}
+
+export const getFileDisplayName = ({
+  file,
+  modelType,
+}: {
+  file: { type: string | ModelFileType; metadata: FileMetadata };
+  modelType: ModelType;
+}) => {
+  const { format, size, fp } = file.metadata ?? {};
+  if (file.type === 'Model') {
+    if (modelType === ModelType.Checkpoint)
+      return `${startCase(size)} ${startCase(file.type)} ${fp ?? ''}`;
+    return getDisplayName(modelType);
+  }
+  return startCase(file.type);
+};
+
+export const getEpochJobAndFileName = (downloadUrl: string) => {
+  let jobFileUrl; // Leaves you with: ${jobId}/assets/${fileName}
+  let jobId;
+  let fileName;
+
+  if (downloadUrl.includes('/jobs/')) {
+    jobFileUrl = downloadUrl.split('/jobs/')[1]; // Leaves you with: ${jobId}/assets/${fileName}
+    jobId = jobFileUrl.split('/assets/')[0];
+    fileName = jobFileUrl.split('/assets/')[1];
+  } else if (downloadUrl.includes('/consumer/blobs')) {
+    jobId = 'blob';
+    fileName = downloadUrl.split('/consumer/blobs/')[1].split('?')[0];
+  } else {
+    console.warn('Download URL does not contain expected /jobs/ path:', downloadUrl);
+    return null;
+  }
+
+  if (!jobId || !fileName) {
+    throw new Error('Could not get jobId or fileName');
+  }
+
+  return { jobId, fileName };
+};
+
+export const getTrainingFileEpochNumberDetails = (
+  file: { type: string | ModelFileType; metadata: FileMetadata },
+  epochNumber?: number
+) => {
+  const epoch =
+    file.metadata.trainingResults?.epochs?.find((e) =>
+      'epoch_number' in e ? e.epoch_number === epochNumber : e.epochNumber === epochNumber
+    ) ?? file.metadata.trainingResults?.epochs?.at(-1);
+
+  if (!epoch) return null;
+
+  const downloadUrl = 'epoch_number' in epoch ? epoch.model_url : epoch.modelUrl;
+  const epochDetails = getEpochJobAndFileName(downloadUrl);
+  if (!epochDetails) return null;
+  const { jobId, fileName } = epochDetails;
+  const completeDate =
+    file.metadata.trainingResults?.version === 2
+      ? file.metadata.trainingResults.completedAt
+      : file.metadata.trainingResults?.end_time;
+
+  return {
+    jobId,
+    fileName,
+    epochNumber: epochNumber ?? ('epoch_number' in epoch ? epoch.epoch_number : epoch.epochNumber),
+    isExpired: !canGenerateWithEpoch(completeDate),
+  };
+};
+
+/**
+ * Groups model files by variant for sidebar display.
+ * - Model files are grouped by format (SafeTensor, GGUF, etc.)
+ * - Component files are grouped by component type (VAE, TextEncoder, etc.)
+ * - Within each group, files are sorted by quality (best first)
+ */
+export type GroupedFileVariants<T> = {
+  safeTensorVariants: T[];
+  ggufVariants: T[];
+  otherFormatVariants: T[];
+  requiredComponents: Partial<Record<ModelFileComponentType, T[]>>;
+  optionalFiles: T[];
+};
+
+// Quality ranking for fp (higher index = better quality)
+const fpQualityRank: Record<ModelFileFp, number> = {
+  int4: 1,
+  nvfp4: 2,
+  nf4: 3,
+  int8: 4,
+  fp8: 5,
+  fp8_scaled: 6,
+  fp8_mixed: 7,
+  mxfp8: 8,
+  bf16: 9,
+  fp16: 10,
+  fp32: 11,
+};
+
+// Quality ranking for quant types (higher index = better quality)
+const quantQualityRank: Record<ModelFileQuantType, number> = {
+  TQ1_0: 1,
+  TQ2_0: 2,
+  IQ1_M: 3,
+  IQ1_S: 4,
+  IQ2_XXS: 5,
+  IQ2_XS: 6,
+  IQ2_S: 7,
+  IQ2_M: 8,
+  Q2_K_S: 9,
+  Q2_K: 10,
+  Q2_K_XL: 11,
+  IQ3_XXS: 12,
+  IQ3_XS: 13,
+  IQ3_S: 14,
+  IQ3_M: 15,
+  Q3_K_S: 16,
+  Q3_K_M: 17,
+  Q3_K_L: 18,
+  Q3_K_XL: 19,
+  IQ4_XS: 20,
+  IQ4_KS: 21,
+  IQ4_NL: 22,
+  Q4_0: 23,
+  Q4_1: 24,
+  Q4_K_S: 25,
+  Q4_K_M: 26,
+  Q4_K_XL: 27,
+  Q5_0: 28,
+  Q5_1: 29,
+  Q5_K_S: 30,
+  Q5_K_M: 31,
+  Q6_K: 32,
+  Q8_0: 33,
+  None: 34,
+};
+
+/**
+ * Sorts files by quality (best quality first), per fpQualityRank / quantQualityRank.
+ * Full size > pruned size
+ */
+function sortByQuality<T extends FileFormatType>(files: T[]): T[] {
+  return [...files].sort((a, b) => {
+    const metaA = a.metadata ?? {};
+    const metaB = b.metadata ?? {};
+
+    // For GGUF files, sort by quant type
+    if (metaA.format === 'GGUF' && metaB.format === 'GGUF') {
+      const quantA = metaA.quantType ? quantQualityRank[metaA.quantType] ?? 0 : 0;
+      const quantB = metaB.quantType ? quantQualityRank[metaB.quantType] ?? 0 : 0;
+      if (quantA !== quantB) return quantB - quantA;
+    }
+
+    // Sort by fp precision
+    const fpA = metaA.fp ? fpQualityRank[metaA.fp] ?? 0 : 0;
+    const fpB = metaB.fp ? fpQualityRank[metaB.fp] ?? 0 : 0;
+    if (fpA !== fpB) return fpB - fpA;
+
+    // Sort by size (full > pruned)
+    const sizeA = metaA.size === 'full' ? 1 : 0;
+    const sizeB = metaB.size === 'full' ? 1 : 0;
+    return sizeB - sizeA;
+  });
+}
+
+/**
+ * Groups files by variant for display in the model sidebar.
+ *
+ * @param files - Array of model files to group
+ * @param modelType - Parent ModelType; determines which file types count as "primary".
+ *   For non-weight model types (Workflows, Poses, Wildcards, Other), Archive/Config
+ *   files are the main download instead of being shoved into Optional Files.
+ * @returns Grouped files by format and component type
+ */
+export function groupFilesByVariant<T extends FileFormatType>(
+  files: T[],
+  modelType?: ModelType | null
+): GroupedFileVariants<T> {
+  const result: GroupedFileVariants<T> = {
+    safeTensorVariants: [],
+    ggufVariants: [],
+    otherFormatVariants: [],
+    requiredComponents: {},
+    optionalFiles: [],
+  };
+
+  if (!files || files.length === 0) {
+    return result;
+  }
+
+  const primaryFileTypes = getPrimaryFileTypes(modelType);
+
+  for (const file of files) {
+    const fileType = file.type;
+    const metadata = file.metadata ?? {};
+    const format = metadata.format;
+
+    // Check if this is a primary model file type for this ModelType
+    const isModelFile = primaryFileTypes.includes(fileType as ModelFileType);
+
+    if (isModelFile) {
+      // Group model files by format
+      if (format === 'SafeTensor') {
+        result.safeTensorVariants.push(file);
+      } else if (format === 'GGUF') {
+        result.ggufVariants.push(file);
+      } else {
+        // Other formats (PickleTensor, Diffusers, Core ML, ONNX, Other)
+        result.otherFormatVariants.push(file);
+      }
+    } else {
+      // Group component files by component type, using isRequired to distinguish
+      const componentType = inferComponentType(fileType);
+      if (componentType && metadata.isRequired !== false) {
+        if (!result.requiredComponents[componentType]) {
+          result.requiredComponents[componentType] = [];
+        }
+        result.requiredComponents[componentType]!.push(file);
+      } else {
+        result.optionalFiles.push(file);
+      }
+    }
+  }
+
+  // Sort each group by quality
+  result.safeTensorVariants = sortByQuality(result.safeTensorVariants);
+  result.ggufVariants = sortByQuality(result.ggufVariants);
+  result.otherFormatVariants = sortByQuality(result.otherFormatVariants);
+
+  // Sort component groups by quality
+  for (const key of Object.keys(result.requiredComponents) as ModelFileComponentType[]) {
+    result.requiredComponents[key] = sortByQuality(result.requiredComponents[key]!);
+  }
+
+  return result;
+}
+
+/**
+ * Infers component type from file type if not explicitly set in metadata.
+ */
+export function inferComponentType(fileType: string): ModelFileComponentType | null {
+  switch (fileType) {
+    case 'Model':
+    case 'Pruned Model':
+      return 'Checkpoint';
+    case 'VAE':
+      return 'VAE';
+    case 'Text Encoder':
+      return 'TextEncoder';
+    case 'Config':
+      return 'Config';
+    case 'UNet':
+      return 'UNet';
+    case 'Diffusion Model':
+      return 'DiffusionModel';
+    case 'CLIPVision':
+      return 'CLIPVision';
+    case 'ControlNet':
+      return 'ControlNet';
+    default:
+      return null;
+  }
+}
+
+// A linked component whose source ModelFile (settings.fileId) has been deleted
+// must not surface on public reads — otherwise consumers see a component that
+// 404s on download. `liveFileIds` is the set of fileIds still present in the DB.
+export function selectLiveLinkedComponents<T extends { fileId?: number | null }>(
+  components: T[],
+  liveFileIds: Set<number>
+): T[] {
+  return components.filter((c) => c.fileId != null && liveFileIds.has(c.fileId));
+}

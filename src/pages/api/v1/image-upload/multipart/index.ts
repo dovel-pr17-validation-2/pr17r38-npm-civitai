@@ -1,0 +1,44 @@
+import { randomUUID } from 'crypto';
+import type { NextApiRequest, NextApiResponse } from 'next';
+import { instrumentApiResponse } from '~/server/prom/http-errors';
+import { getMimeTypeFromExt } from '~/shared/constants/mime-types';
+import { getApiAuthSession } from '~/server/auth/api-auth-session';
+import { getMultipartPutUrl, getImageUploadBackend } from '~/utils/s3-utils';
+import { registerMediaLocation } from '~/server/services/storage-resolver';
+import { trackImageUpload } from '~/server/services/image-upload-action.service';
+import { recordUploadKeyOwner } from '~/server/services/image-url-ownership';
+
+export default async function imageUploadMultipart(req: NextApiRequest, res: NextApiResponse) {
+  // 5xx attribution: bypasses the endpoint wrappers, so its 500s were
+  // counter-blind. Listener-only (res.once('finish')); no behavior change.
+  instrumentApiResponse(req, res);
+  try {
+    const session = await getApiAuthSession({ req, res }, { whenBanned: 'refuse' });
+    if (session === false) return;
+    const userId = session?.user?.id;
+    if (!userId || session.user?.muted) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const imageKey = randomUUID();
+
+    const imageMime: string | undefined = req.body.mimeType;
+    const fileExt: string | undefined = req.body.filename?.split('.').pop();
+
+    const mimeType = imageMime ?? (fileExt ? getMimeTypeFromExt(fileExt) : undefined);
+
+    const { s3, bucket, backend } = await getImageUploadBackend();
+    const result = await getMultipartPutUrl(imageKey, req.body.size, s3, bucket, mimeType);
+
+    // Register in storage-resolver (fire-and-forget)
+    registerMediaLocation(imageKey, backend, req.body.size ?? 0);
+    trackImageUpload(req, res, imageKey);
+    await recordUploadKeyOwner(imageKey, userId);
+
+    res.status(200).json({ ...result, backend });
+  } catch (error) {
+    const e = error as Error;
+    return res.status(500).json({ error: e.message });
+  }
+}

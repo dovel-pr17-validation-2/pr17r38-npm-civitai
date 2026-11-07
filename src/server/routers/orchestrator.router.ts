@@ -1,0 +1,1022 @@
+import { TRPCError } from '@trpc/server';
+import { assertSourceMetadataWithinCap } from '~/server/services/orchestrator/source-metadata-cap';
+import { assertGenerationInputsUsable } from '~/server/services/generation-input-urls';
+import * as z from 'zod';
+import {
+  boostWorkflow,
+  buildGenerationContext,
+  bustQueriedWorkflowsCache,
+  formatGenerationResponse2,
+  generateFromGraph,
+  getWorkflowBoostCost,
+  getWorkflowStatusUpdate,
+  queryGeneratedImageWorkflows2,
+  updateWorkflow,
+  whatIfFromGraph,
+} from '~/server/services/orchestrator/orchestration-new.service';
+import { generationSurfaceForRequest } from '~/server/services/orchestrator/generation-surface';
+import { getWorkflow as clientGetWorkflow } from '@civitai/orchestration-client';
+import { internalOrchestratorClient } from '~/server/services/orchestrator/client';
+import {
+  logToAxiom,
+  classifyErrorFault,
+  buildServerFaultErrorLog,
+  markServerFaultLogged,
+} from '~/server/logging/client';
+import { edgeCacheIt, rateLimit } from '~/server/middleware.trpc';
+import { generatorFeedbackReward } from '~/server/rewards';
+import { generationStatusDefaultMessage } from '~/server/schema/generation.schema';
+import {
+  imageTrainingRouterInputSchema,
+  imageTrainingRouterWhatIfSchema,
+} from '~/server/schema/orchestrator/training.schema';
+import {
+  patchSchema,
+  workflowIdSchema,
+  generatedImagesQuerySchema,
+  workflowQuerySchema,
+  workflowUpdateSchema,
+} from '~/server/schema/orchestrator/workflows.schema';
+import { getExperimentalFlags } from '~/server/services/orchestrator/experimental';
+import { WORKFLOW_TAGS } from '~/shared/constants/generation.constants';
+import { imageUpload } from '~/server/services/orchestrator/imageUpload';
+import { getImage } from '~/server/services/image.service';
+import { assertImageVisibleToViewer } from '~/server/services/image-visibility.service';
+import { MAX_SOURCE_IMAGES, signProvenance } from '~/server/services/orchestrator/remix-provenance';
+import {
+  createTrainingWhatIfWorkflow,
+  createTrainingWorkflow,
+} from '~/server/services/orchestrator/training/training.orch';
+import {
+  cancelWorkflow,
+  deleteManyWorkflows,
+  deleteWorkflow,
+  getWorkflow,
+  patchWorkflows,
+  patchWorkflowTags,
+  queryWorkflows,
+} from '~/server/services/orchestrator/workflows';
+import { enhancePrompt } from '~/server/services/orchestrator/promptEnhancement';
+import { promptEnhancementSchema } from '~/server/schema/orchestrator/promptEnhancement.schema';
+import { getRequiredFeatureFlagForWorkflow } from '~/shared/generation/config/workflows';
+import { patchWorkflowSteps } from '~/server/services/orchestrator/workflowSteps';
+import {
+  guardedProcedure,
+  middleware,
+  moderatorProcedure,
+  protectedProcedure,
+  router,
+} from '~/server/trpc';
+import { throwAuthorizationError } from '~/server/utils/errorHandling';
+import { getOrchestratorToken } from '~/server/orchestrator/get-orchestrator-token';
+import { regionProxyMiddleware } from '~/server/orchestrator/region-proxy.middleware';
+import { pollIterationWorkflow } from '~/server/services/orchestrator/poll-iteration';
+import {
+  getPresetModelConfig,
+  pickAspectRatioSize,
+  submitPresetImageGen,
+  whatIfPresetImageGen,
+} from '~/server/services/orchestrator/preset-image-gen.service';
+import { getEdgeUrl } from '~/client-utils/edge-url';
+import { enhanceComicPrompt } from '~/server/services/comics/prompt-enhance';
+import type { SessionUser } from '~/types/session';
+import { reviewConsumerStrikes } from '../http/orchestrator/flagged-consumers';
+import semver from 'semver';
+import { REDIS_SYS_KEYS, sysRedis, withSysReadDeadline } from '~/server/redis/client';
+import { decodeRedisString } from '~/server/redis/buffer-decode';
+import { logSysRedisFailOpen } from '~/server/redis/fail-open-log';
+import { getAllowedAccountTypes } from '../utils/buzz-helpers';
+import { getVideoMetadata } from '~/server/services/orchestrator/videoEnhancement';
+import type { BuzzSpendType } from '~/shared/constants/buzz.constants';
+import { TokenScope } from '~/shared/constants/token-scope.constants';
+import { isRawAirResource } from '~/shared/utils/air';
+
+/**
+ * True when the (unvalidated) graph input carries raw-AIR resources — training
+ * epoch blobs referenced directly, without a ModelVersion row. Used to gate the
+ * feature-flag before the input reaches the service, mirroring the
+ * workflow-flag gates below.
+ */
+function containsRawAirResources(formInput: unknown): boolean {
+  const resources = (formInput as { resources?: unknown } | undefined)?.resources;
+  if (!Array.isArray(resources)) return false;
+  return resources.some(
+    (r) => typeof r === 'object' && r !== null && isRawAirResource(r as { id?: unknown })
+  );
+}
+
+/**
+ * Resolves the currencies to use for a generation request.
+ * If the user selected a specific buzz type, validates it's allowed and uses only that type.
+ * Otherwise falls back to all allowed types for the domain.
+ */
+function resolveGenerationCurrencies(
+  features: Parameters<typeof getAllowedAccountTypes>[0],
+  userBuzzType?: string
+): BuzzSpendType[] {
+  const allowed = getAllowedAccountTypes(features, ['blue']);
+  if (userBuzzType && allowed.includes(userBuzzType as BuzzSpendType)) {
+    return [userBuzzType as BuzzSpendType];
+  }
+  return allowed;
+}
+
+const orchestratorMiddlewareFor = (options?: { allowRestricted: boolean }) =>
+  middleware(async ({ ctx, next }) => {
+    const user = ctx.user;
+    if (!user) throw throwAuthorizationError();
+    const token = await getOrchestratorToken(user.id, ctx, options);
+    const allowMatureContent = ctx.domain === 'green' || !user.showNsfw ? false : undefined;
+    return next({
+      ctx: {
+        ...ctx,
+        user,
+        token,
+        allowMatureContent,
+        hideMatureContent: ctx.domain === 'green' || !user.showNsfw,
+      },
+    });
+    // return next({ ctx: { ...ctx, user, token, allowMatureContent: ctx.features.isBlue } });
+  });
+const orchestratorMiddleware = orchestratorMiddlewareFor();
+
+const experimentalMiddleware = middleware(async ({ ctx, next }) => {
+  const user = ctx.user;
+  if (!user) throw throwAuthorizationError();
+
+  const flags = await getExperimentalFlags(user);
+
+  // `enhancedCompatibilitySdcpp` forces experimental on — it requires the
+  // experimental path in the orchestrator regardless of the Flipt flag.
+  if (ctx.features?.enhancedCompatibilitySdcpp) flags.experimental = true;
+
+  return next({ ctx: { ...ctx, user, ...flags } });
+});
+
+const enforceGenerationVersion = middleware(async ({ ctx, next }) => {
+  const result = await next();
+  const version = ctx.req?.headers['x-client-version'] as string;
+  if (!semver.valid(version)) return result;
+
+  // Fail open: this middleware runs on every generation tRPC call. A
+  // sysRedis outage would otherwise 500 every gen request — defeating
+  // the rest of the generation-path fail-open coverage in this PR.
+  let genClient: Record<string, string>;
+  try {
+    // Wall-clock deadline so a silent sysRedis half-open can't park every gen
+    // tRPC call ~11min (a fast DOWN already rejects into the catch below).
+    genClient = await withSysReadDeadline(sysRedis.hGetAll(REDIS_SYS_KEYS.GENERATION.CLIENT));
+  } catch (err) {
+    logSysRedisFailOpen('read-degraded', 'enforceGenerationVersion', err);
+    return result;
+  }
+
+  const genVersion = decodeRedisString(genClient.version);
+  if (semver.valid(genVersion) && semver.lt(version, genVersion as string)) {
+    ctx.res?.setHeader('x-generation-update-required', genVersion);
+    if (genClient.notes)
+      ctx.res?.setHeader('x-generation-update-notes', decodeRedisString(genClient.notes));
+  }
+
+  return result;
+});
+
+const orchestratorProcedure = protectedProcedure
+  .use(orchestratorMiddleware)
+  .use(enforceGenerationVersion)
+  .use(regionProxyMiddleware);
+// Restricted accounts keep reading, deleting and cancelling their own workflows; the token stays on the server.
+const orchestratorOwnWorkProcedure = protectedProcedure
+  .use(orchestratorMiddlewareFor({ allowRestricted: true }))
+  .use(enforceGenerationVersion)
+  .use(regionProxyMiddleware);
+const orchestratorGuardedProcedure = guardedProcedure
+  .use(orchestratorMiddleware)
+  .use(experimentalMiddleware)
+  .use(enforceGenerationVersion)
+  .use(regionProxyMiddleware);
+const experimentalProcedure = protectedProcedure.use(experimentalMiddleware);
+
+// The iterative editor's default preset model. The model registry itself lives
+// in `preset-image-gen.service.ts` (shared with comics + the enqueued-panels job).
+const DEFAULT_ITERATE_MODEL = 'NanoBanana';
+
+export const orchestratorRouter = router({
+  getVideoMetadata: orchestratorProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(z.object({ videoUrl: z.string() }))
+    .query(({ ctx, input }) => getVideoMetadata(input)),
+
+  // #region [prompt enhancement]
+  enhancePrompt: orchestratorGuardedProcedure
+    .meta({ requiredScope: TokenScope.AIServicesWrite })
+    .input(promptEnhancementSchema)
+    .mutation(async ({ ctx, input }) => {
+      await assertGenerationInputsUsable({
+        urls: input.images ?? [],
+        userId: ctx.user.id,
+        entry: 'enhancePrompt',
+        isApiCaller: ctx.apiKeyId != null,
+      });
+      return enhancePrompt({
+        input,
+        token: ctx.token,
+        userId: ctx.user.id,
+        isGreen: ctx.domain === 'green',
+        isModerator: ctx.user.isModerator,
+        currencies: getAllowedAccountTypes(ctx.features, ['blue']),
+      });
+    }),
+  /** Generic workflow query by tags — used for prompt enhancement history, future text workflows, etc. */
+  queryWorkflowsByTags: orchestratorOwnWorkProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(workflowQuerySchema)
+    .query(async ({ ctx, input }) => {
+      return queryWorkflows({
+        ...input,
+        token: ctx.token,
+        hideMatureContent: ctx.hideMatureContent,
+      });
+    }),
+  getWorkflow: orchestratorOwnWorkProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(workflowIdSchema)
+    .query(({ ctx, input }) =>
+      getWorkflow({ token: ctx.token, path: { workflowId: input.workflowId } })
+    ),
+  // #endregion
+
+  // #region [requests]
+  deleteWorkflow: orchestratorOwnWorkProcedure
+    .meta({ requiredScope: TokenScope.AIServicesWrite })
+    .input(workflowIdSchema)
+    .mutation(async ({ ctx, input }) => {
+      const result = await deleteWorkflow({ ...input, token: ctx.token });
+      // Bust the short-TTL queryGeneratedImages cache so a reconnect/invalidate
+      // refetch within the TTL doesn't resurrect the just-deleted workflow.
+      // ctx.token is ctx.user's own token (orchestratorMiddleware), so the
+      // owning user is ctx.user.id. Fire-and-forget — see generateFromGraph.
+      bustQueriedWorkflowsCache(ctx.user.id).catch(() => null);
+      return result;
+    }),
+  cancelWorkflow: orchestratorOwnWorkProcedure
+    .meta({ requiredScope: TokenScope.AIServicesWrite })
+    .input(workflowIdSchema)
+    .mutation(async ({ ctx, input }) => {
+      const result = await cancelWorkflow({ ...input, token: ctx.token });
+      // Bust so a refetch within the TTL doesn't show the cancelled workflow
+      // back in a non-cancelled state. Owner is ctx.user.id (own token).
+      bustQueriedWorkflowsCache(ctx.user.id).catch(() => null);
+      return result;
+    }),
+  updateWorkflow: orchestratorProcedure
+    .meta({ requiredScope: TokenScope.AIServicesWrite })
+    .input(workflowUpdateSchema)
+    .mutation(async ({ ctx, input }) => {
+      const result = await updateWorkflow({
+        ...input,
+        token: ctx.token,
+        viewer: { domain: ctx.domain, showNsfw: !!ctx.user.showNsfw },
+      });
+      // Bust so a refetch within the TTL doesn't revert the update. Owner is
+      // ctx.user.id (own token).
+      bustQueriedWorkflowsCache(ctx.user.id).catch(() => null);
+      return result;
+    }),
+  getBoostCost: orchestratorProcedure
+    // Each call is a whatif PUT to the orchestrator, and a window focus re-prices every boostable
+    // card at once.
+    .use(
+      rateLimit([{ limit: 120, period: 60 }], undefined, { sharedKey: 'orchestrator:boost-cost' })
+    )
+    .input(workflowIdSchema)
+    .query(({ ctx, input }) =>
+      getWorkflowBoostCost({ token: ctx.token, workflowId: input.workflowId })
+    ),
+  boostWorkflow: orchestratorProcedure
+    .meta({ requiredScope: TokenScope.AIServicesWrite })
+    .input(z.object({ workflowId: z.string(), expectedCost: z.number().int().min(0) }))
+    .mutation(async ({ ctx, input }) => {
+      const result = await boostWorkflow({
+        token: ctx.token,
+        workflowId: input.workflowId,
+        expectedCost: input.expectedCost,
+        user: ctx.user,
+      });
+      bustQueriedWorkflowsCache(ctx.user.id).catch(() => null);
+      return result;
+    }),
+  // #endregion
+
+  // #region [steps]
+  patch: orchestratorProcedure
+    .meta({ requiredScope: TokenScope.AIServicesWrite })
+    .input(patchSchema)
+    .mutation(async ({ ctx, input: { workflows, steps, tags, remove } }) => {
+      // const toUpdate: { workflowId: string; patches: JsonPatchOperation[] }[] = [];
+      // if (!!steps?.length) {
+      //   for (const step of steps) {
+      //     toUpdate.push({
+      //       workflowId: step.workflowId,
+      //       patches: step.patches.map((patch) => ({
+      //         ...patch,
+      //         path: `/step/${step.stepName}/metadata/${patch.path}`,
+      //       })),
+      //     });
+      //   }
+      // }
+      const { ip, user } = ctx;
+
+      if (!!workflows?.length) await patchWorkflows({ input: workflows, token: ctx.token });
+
+      // if (!!toUpdate.length) await patchWorkflows({ input: toUpdate, token: ctx.token });
+      if (!!remove?.length) await deleteManyWorkflows({ workflowIds: remove, token: ctx.token });
+      if (!!tags?.length) await patchWorkflowTags({ input: tags, token: ctx.token });
+      if (!!steps?.length) {
+        await patchWorkflowSteps({
+          input: steps.map((step) => ({
+            ...step,
+            patches: step.patches.map((patch) => ({ ...patch, path: `/metadata${patch.path}` })),
+          })),
+          token: ctx.token,
+        });
+        await Promise.all(
+          steps.map((step) =>
+            Object.values(step.patches)
+              // todo - add clickhouse tracking for user feedback/favorites
+              .filter((patch) => patch.path.includes('feedback'))
+              .map(async ({ op, path }) => {
+                if (op === 'add') {
+                  const parts = (path as string).split('/');
+                  const jobId = parts[parts.length - 2];
+                  await generatorFeedbackReward.apply(
+                    {
+                      userId: user.id,
+                      jobId,
+                    },
+                    { ip }
+                  );
+                }
+              })
+          )
+        );
+      }
+
+      // Bust the short-TTL queryGeneratedImages cache if this patch changed
+      // anything the feed renders (workflow patch, removal, tag change, or the
+      // step-metadata update behind useUpdateImageStepMetadata). Without this, a
+      // reconnect/invalidate refetch within the TTL reverts the optimistic
+      // client patch / resurrects a removed item. ctx.token is ctx.user's own
+      // token, so the owner is ctx.user.id. Fire-and-forget.
+      if (workflows?.length || remove?.length || tags?.length || steps?.length) {
+        bustQueriedWorkflowsCache(user.id).catch(() => null);
+      }
+    }),
+  // #endregion
+
+  // #region [generated images]
+  queryGeneratedImages: orchestratorOwnWorkProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(generatedImagesQuerySchema)
+    .query(({ ctx, input: { excludeAppWorkflows, ...input } }) =>
+      queryGeneratedImageWorkflows2({
+        ...input,
+        excludeTags: excludeAppWorkflows ? [WORKFLOW_TAGS.APP_BLOCK] : undefined,
+        token: ctx.token,
+        user: ctx.user,
+        tags: ctx.domain === 'green' ? [...input.tags, 'green'] : input.tags,
+        hideMatureContent: ctx.hideMatureContent,
+        // Self-serve feed: token belongs to ctx.user, so the per-user cache is safe.
+        cache: true,
+      })
+    ),
+  // #region [Generation Graph V2 endpoints]
+  /**
+   * Generate from graph - unified endpoint for all generation types
+   */
+  generateFromGraph: orchestratorGuardedProcedure
+    .meta({ requiredScope: TokenScope.AIServicesWrite })
+    .input(z.any())
+    .mutation(async ({ ctx, input }) => {
+      const {
+        input: formInput,
+        civitaiTip,
+        creatorTip,
+        tags: inputTags,
+        sourceMetadata,
+        sourceMetadataMap,
+        remixOfId,
+        buzzType,
+        externalId,
+        acknowledgedSoftBlock,
+        sourceProvenance,
+        downloadPriority,
+      } = input;
+      // Before anything serializes them into the steps (`.input(z.any())` leaves them unchecked).
+      assertSourceMetadataWithinCap(sourceMetadata, sourceMetadataMap);
+      const tags = ctx.domain === 'green' ? ['green', ...(inputTags ?? [])] : inputTags ?? [];
+      const userTier = ctx.user.tier ?? 'free';
+      const { externalCtx, status } = await buildGenerationContext(
+        userTier,
+        ctx.features,
+        { id: ctx.user.id, isModerator: ctx.user.isModerator },
+        // #3665: `onsite` for a cookie session, `api` for a bearer token. This
+        // procedure serves BOTH — `AIServicesWrite` is a user-grantable scope, so
+        // a CLI or any external integration reaches this exact code path.
+        //
+        // It was a hardcoded `'onsite'`, which meant every API substitution was
+        // recorded as the DELIBERATE, correct graceful degradation #3520 defends
+        // (a stale localStorage id after an ecosystem switch, picker visibly
+        // snapping back) — and therefore excluded from the incidence number that
+        // gates the phase-3 policy decision. An API caller has neither property:
+        // the id is deliberate and there is no picker to snap.
+        generationSurfaceForRequest(ctx)
+      );
+
+      // Workflow-level feature-flag gate. `filterWorkflowsByFeatureFlags` only
+      // hides the option in the picker UI — a crafted submission payload would
+      // otherwise reach the dispatcher unchecked. Mirrors the client filter
+      // server-side so e.g. `txt2model3d` / `img2model3d` (gated on
+      // `model3dGenerator`) is rejected for users who don't have the flag.
+      const generateRequiredFlag = getRequiredFeatureFlagForWorkflow(
+        formInput?.workflow as string | undefined
+      );
+      if (
+        generateRequiredFlag &&
+        (ctx.features as Record<string, boolean | undefined>)[generateRequiredFlag] !== true
+      ) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'This workflow is not available for your account.',
+        });
+      }
+
+      // Raw-AIR (training epoch blob) resources are flag-gated. The service
+      // still enforces ownership regardless of the flag; this is the rollout gate.
+      if (containsRawAirResources(formInput) && ctx.features.generationAirResources !== true) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'Epoch resources are not available for your account.',
+        });
+      }
+
+      // Check generation status early
+      if (status.mode === 'disabled' && !ctx.user.isModerator) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: status.message ?? generationStatusDefaultMessage,
+        });
+      }
+      if (status.mode === 'memberOnly' && userTier === 'free' && !ctx.user.isModerator) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: status.message ?? generationStatusDefaultMessage,
+        });
+      }
+
+      const result = await generateFromGraph({
+        input: formInput,
+        externalCtx,
+        userId: ctx.user.id,
+        token: ctx.token,
+        experimental: ctx.experimental,
+        isGreen: ctx.features.isGreen,
+        allowMatureContent: ctx.allowMatureContent,
+        currencies: resolveGenerationCurrencies(ctx.features, buzzType),
+        isModerator: ctx.user.isModerator,
+        track: ctx.track,
+        inputGate: { entry: 'generateFromGraph', isApiCaller: ctx.apiKeyId != null },
+        civitaiTip,
+        creatorTip,
+        tags,
+        sourceMetadata,
+        sourceMetadataMap,
+        remixOfId,
+        externalId,
+        // Tokens minted by `mintRemixProvenance` for the sources this submission
+        // started from. `.input(z.any())`, so the shape is asserted here rather
+        // than assumed: anything that is not a string survives to
+        // `verifyProvenance`, which returns null for a non-string, but narrowing
+        // at the boundary keeps that a type guarantee instead of a coincidence.
+        // Bounded HERE, at the boundary. `.input(z.any())` means the array arrives
+        // unvalidated, and every element past the cap costs an AES-GCM decrypt
+        // attempt on the event loop before the prompt audit or any Buzz check.
+        //
+        // `.slice` BEFORE `.filter`, deliberately: filtering first walks and
+        // reallocates the whole caller-controlled array before the cap applies,
+        // so the crypto would be bounded while the O(n) pass was not.
+        //
+        // What this trims is TOKENS, not resolved ids — `unionSourceImageIds`
+        // caps the ids. The two differ only when more than `MAX_SOURCE_IMAGES`
+        // tokens arrive and some of the first few fail to verify, where tokens
+        // that would once have backfilled the cap are now dropped unread. That
+        // direction is strictly fewer verified ids, never more, so it can only
+        // under-grant the free-submission gate.
+        sourceProvenance: Array.isArray(sourceProvenance)
+          ? sourceProvenance
+              .slice(0, MAX_SOURCE_IMAGES)
+              .filter((x): x is string => typeof x === 'string')
+          : undefined,
+        // `.input(z.any())` — an explicit identity check, so a truthy non-boolean
+        // from a hand-rolled client can't stand in for the acknowledgement.
+        acknowledgedSoftBlock: acknowledgedSoftBlock === true,
+        downloadPriority: downloadPriority === 'high' ? 'high' : undefined,
+      });
+
+      // Bust the short-TTL queryGeneratedImages cache so a concurrent tab or an
+      // immediate signal reconnect sees the just-submitted workflow without
+      // waiting out the TTL. Fire-and-forget: the response must not block on a
+      // cache eviction, and a failed bust only falls back to the short TTL.
+      bustQueriedWorkflowsCache(ctx.user.id).catch(() => null);
+
+      return result;
+    }),
+
+  /**
+   * What-if from graph - cost estimation for generation-graph inputs
+   */
+  whatIfFromGraph: orchestratorGuardedProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(z.any())
+    .query(async ({ ctx, input }) => {
+      const userTier = ctx.user.tier ?? 'free';
+      const { externalCtx, status } = await buildGenerationContext(
+        userTier,
+        ctx.features,
+        { id: ctx.user.id, isModerator: ctx.user.isModerator },
+        // #3665: `onsite` for a cookie session, `api` for a bearer token — see
+        // the sibling call in `generateFromGraph`. This one matters MORE, not
+        // less: `whatIfFromGraph` is the read-only, zero-spend estimate an
+        // external caller makes BEFORE committing buzz, so it is where a
+        // substitution is both most detectable and most worth counting.
+        generationSurfaceForRequest(ctx)
+      );
+
+      // Mirror of the gate in `generateFromGraph`. Reject what-if costing for
+      // flag-gated workflows the user can't reach so we don't leak pricing
+      // for hidden generation modes.
+      const whatIfRequiredFlag = getRequiredFeatureFlagForWorkflow(
+        (input as { workflow?: string } | undefined)?.workflow
+      );
+      if (
+        whatIfRequiredFlag &&
+        (ctx.features as Record<string, boolean | undefined>)[whatIfRequiredFlag] !== true
+      ) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'This workflow is not available for your account.',
+        });
+      }
+
+      // Mirror of the raw-AIR flag gate in `generateFromGraph`.
+      if (containsRawAirResources(input) && ctx.features.generationAirResources !== true) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'Epoch resources are not available for your account.',
+        });
+      }
+
+      if (status.mode === 'disabled' && !ctx.user.isModerator) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: status.message ?? generationStatusDefaultMessage,
+        });
+      }
+      if (status.mode === 'memberOnly' && userTier === 'free' && !ctx.user.isModerator) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: status.message ?? generationStatusDefaultMessage,
+        });
+      }
+
+      // Rides alongside the graph input rather than inside it — it is not a graph node.
+      const { downloadPriority, ...graphInput } = (input ?? {}) as Record<string, unknown>;
+
+      try {
+        return await whatIfFromGraph({
+          input: graphInput,
+          externalCtx,
+          userId: ctx.user.id,
+          isModerator: ctx.user.isModerator,
+          token: ctx.token,
+          experimental: ctx.experimental,
+          currencies: getAllowedAccountTypes(ctx.features, ['blue']),
+          downloadPriority: downloadPriority === 'high' ? 'high' : undefined,
+          inputGate: { entry: 'whatIfFromGraph', isApiCaller: ctx.apiKeyId != null },
+        });
+      } catch (e) {
+        // ~94% of failures here are EXPECTED client-fault validation (BAD_REQUEST
+        // et al. — "resources not available for generation", "request is invalid")
+        // for a non-critical cost PREVIEW. Logging those at error severity made
+        // this the single largest error-by-name entry in prod and buried the real
+        // ~6% server faults. Branch on the TRPCError code:
+        //  - client fault → log at 'info' (normal user feedback, not an incident);
+        //  - server fault → log at 'error' WITH the un-masked underlying cause
+        //    (errorHandling.ts replaces the message with a generic string but keeps
+        //    the original on `.cause`), so the real 500s stay diagnosable.
+        // Behavior is otherwise unchanged: the client still receives the original
+        // 400/500 because we always re-throw `e`.
+        if (classifyErrorFault(e) === 'client') {
+          logToAxiom({
+            name: 'what-if-from-graph',
+            type: 'info',
+            payload: input,
+            error: e instanceof TRPCError ? { code: e.code, name: e.name, message: e.message } : e,
+          }).catch();
+        } else {
+          logToAxiom({
+            name: 'what-if-from-graph',
+            type: 'error',
+            payload: input,
+            error: buildServerFaultErrorLog(e),
+          }).catch();
+        }
+        // Mark so the central chokepoint (tRPC onError) doesn't log this same fault
+        // a second time — this router already emitted the un-masked structured log
+        // (with the extra `payload: input` context) above.
+        markServerFaultLogged(e);
+        throw e;
+      }
+    }),
+  // #endregion
+
+  // #region [Remix provenance]
+  /**
+   * Issue a provenance token for a source image the user picked through a remix
+   * entry point.
+   *
+   * Why this exists as its own call rather than being derived at submit: the
+   * generation form re-uploads any source that is not already an orchestrator
+   * URL, so the `image.civitai.com` URL a remix seeds is gone by the time
+   * `resolveSourceImageIds` runs — measured, the engine the Animate button picks
+   * kept its on-site URL 98 times out of 2,526. Minting here binds the token to
+   * the image the user actually clicked, before the form can rewrite it.
+   *
+   * `getImage` is the gate, not a bare id lookup: it applies the needs-review,
+   * published-or-owner and Blocked checks, so a token cannot be minted for an
+   * image the caller could not open. Reused rather than reimplemented — a second
+   * copy of those rules is a second place for them to drift.
+   *
+   * Returns `{ provenance: undefined }` rather than throwing when signing is
+   * unavailable (`signProvenance` fails closed on a missing secret). An absent
+   * token means the remix simply carries no verified link, which is the same
+   * state as an off-site remix and is handled everywhere downstream.
+   */
+  mintRemixProvenance: orchestratorProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(z.object({ imageId: z.number() }))
+    .mutation(async ({ ctx, input }) => {
+      const image = await getImage({
+        id: input.imageId,
+        userId: ctx.user.id,
+        isModerator: ctx.user.isModerator,
+      });
+      if (!image) throw new TRPCError({ code: 'NOT_FOUND', message: 'Image not found' });
+
+      return {
+        // `mint`, so this token is spendable ONLY into a submit. The upload path
+        // refuses it — otherwise a click here would be worth a free remix-gallery
+        // submission with no generation behind it.
+        provenance: signProvenance({
+          userId: ctx.user.id,
+          sourceImageIds: [image.id],
+          kind: 'mint',
+        }),
+      };
+    }),
+
+  /**
+   * The same mint for the reuse-prompt entry point, which seeds no media and so
+   * leaves the server nothing to resolve a link from at submit.
+   *
+   * Separate from `mintRemixProvenance` rather than a `kind` parameter: the kind
+   * is the whole security property, and a client-chosen one would let the caller
+   * ask for the stronger `mint` audience from the weaker click.
+   *
+   * The gate is `image.get`'s visibility (needs-review, published-or-owner, Blocked) plus its
+   * owner block check, so a token cannot be minted for an image the caller could not open. Only
+   * that: the full `getImage` payload and the orchestrator middlewares (a token mint, a client
+   * version header, a response URL rewrite) cost the click seconds and refuse nothing here, and
+   * the token lands in the form only once this returns.
+   */
+  mintPromptProvenance: protectedProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(z.object({ imageId: z.number() }))
+    .mutation(async ({ ctx, input }) => {
+      const image = await assertImageVisibleToViewer({
+        id: input.imageId,
+        userId: ctx.user.id,
+        isModerator: ctx.user.isModerator,
+        // The mint is a write: a cache "not blocked" is confirmed on the primary.
+        confirmBlockOnPrimary: true,
+      });
+
+      return {
+        provenance: signProvenance({
+          userId: ctx.user.id,
+          sourceImageIds: [image.id],
+          kind: 'prompt',
+        }),
+      };
+    }),
+  // #endregion
+
+  // #region [Image upload]
+  imageUpload: orchestratorGuardedProcedure
+    .meta({ requiredScope: TokenScope.AIServicesWrite })
+    .input(z.object({ sourceImage: z.string() }))
+    .mutation(async ({ ctx, input }) => {
+      await assertGenerationInputsUsable({
+        urls: [input.sourceImage],
+        userId: ctx.user.id,
+        entry: 'imageUpload',
+        isApiCaller: ctx.apiKeyId != null,
+      });
+      return imageUpload({
+        token: ctx.token,
+        allowMatureContent: ctx.allowMatureContent,
+        ...input,
+      });
+    }),
+  // #endregion
+
+  // #region [image training]
+  createTraining: orchestratorGuardedProcedure
+    .meta({ requiredScope: TokenScope.AIServicesWrite })
+    .input(imageTrainingRouterInputSchema)
+    .mutation(async ({ ctx, input }) => {
+      const { buzzType, ...rest } = input;
+      const args = {
+        ...rest,
+        token: ctx.token,
+        user: ctx.user,
+        features: ctx.features,
+        domain: ctx.domain,
+        currencies: resolveGenerationCurrencies(ctx.features, buzzType),
+      };
+      return await createTrainingWorkflow(args);
+    }),
+  createTrainingWhatif: orchestratorProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(imageTrainingRouterWhatIfSchema)
+    .query(async ({ ctx, input }) => {
+      const args = {
+        ...input,
+        token: ctx.token,
+        userId: ctx.user.id,
+        currencies: getAllowedAccountTypes(ctx.features, ['blue']),
+      };
+      return await createTrainingWhatIfWorkflow(args);
+    }),
+  // #endregion
+
+  // #region [moderator]
+  /** Query another user's generated images (moderator only) */
+  queryUserGeneratedImages: moderatorProcedure
+    .input(workflowQuerySchema.extend({ userId: z.number() }))
+    .query(async ({ ctx, input }) => {
+      const { userId, ...query } = input;
+      // Get token for the target user, not the moderator. bypassCache=true:
+      // this is a cross-user mint — populating the per-pod cache with the
+      // TARGET user's token off a MODERATOR session would leave 60s of
+      // recoverable per-target-user state on every pod a moderator touched.
+      // See orchestrator-token-cache.ts docstring (Round-5 audit H2).
+      const targetToken = await getOrchestratorToken(userId, ctx, {
+        bypassCache: true,
+        allowRestricted: true,
+      });
+      return queryGeneratedImageWorkflows2({
+        ...query,
+        token: targetToken,
+        user: ctx.user,
+        hideMatureContent: false, // Moderators should see all content
+      });
+    }),
+
+  /** Fetch any workflow by ID and normalize it (moderator only) */
+  getWorkflowForModeration: moderatorProcedure
+    .input(workflowIdSchema)
+    .query(async ({ ctx, input }) => {
+      const { data } = await clientGetWorkflow({
+        client: internalOrchestratorClient,
+        path: { workflowId: input.workflowId },
+      });
+      if (!data) throw new TRPCError({ code: 'NOT_FOUND', message: 'Workflow not found' });
+      const [normalized] = await formatGenerationResponse2([data], ctx.user);
+      return normalized;
+    }),
+
+  reviewConsumerStrikes: moderatorProcedure
+    .input(z.object({ userId: z.number() }))
+    .mutation(({ input, ctx }) =>
+      reviewConsumerStrikes({ consumerId: `civitai-${input.userId}`, moderatorId: ctx.user.id })
+    ),
+  statusUpdate: orchestratorGuardedProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(workflowIdSchema)
+    .query(({ ctx, input }) =>
+      getWorkflowStatusUpdate({ token: ctx.token, workflowId: input.workflowId })
+    ),
+
+  // ── Generic iterative image editor endpoints ──
+
+  // `guardedProcedure`, like every other generation entry point on this router: this submits a
+  // workflow and spends Buzz, so it answers to the same onboarding, mute and email-verification
+  // checks. It was the one that did not.
+  iterateGenerate: guardedProcedure
+    .meta({ requiredScope: TokenScope.AIServicesWrite })
+    .input(
+      z.object({
+        prompt: z.string().min(1).max(2000),
+        enhance: z.boolean().default(true),
+        aspectRatio: z.string().default('3:4'),
+        baseModel: z.string().nullish(),
+        quantity: z.number().int().min(1).max(4).default(1),
+        sourceImageUrl: z.string().optional(),
+        sourceImageWidth: z.number().int().positive().optional(),
+        sourceImageHeight: z.number().int().positive().optional(),
+        referenceImages: z
+          .array(
+            z.object({
+              url: z.string(),
+              width: z.number().int().positive(),
+              height: z.number().int().positive(),
+            })
+          )
+          .optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      await assertGenerationInputsUsable({
+        urls: [input.sourceImageUrl, ...(input.referenceImages ?? []).map((ref) => ref.url)],
+        userId: ctx.user.id,
+        entry: 'iterateGenerate',
+        isApiCaller: ctx.apiKeyId != null,
+      });
+      const modelConfig = getPresetModelConfig(input.baseModel, DEFAULT_ITERATE_MODEL);
+      const effectiveVersionId =
+        input.sourceImageUrl && modelConfig.img2imgVersionId
+          ? modelConfig.img2imgVersionId
+          : modelConfig.versionId;
+
+      // Dimensions are returned to the client for the iteration UI; the graph
+      // derives the submitted dimensions from the aspect-ratio string.
+      const { width: panelWidth, height: panelHeight } = pickAspectRatioSize(
+        input.aspectRatio,
+        modelConfig.sizes
+      );
+
+      const token = await getOrchestratorToken(ctx.user!.id, ctx);
+
+      // Build prompt — optionally enhance
+      const originalPrompt = input.prompt.trim();
+      let fullPrompt = originalPrompt;
+      if (input.enhance && fullPrompt) {
+        fullPrompt = await enhanceComicPrompt({
+          token,
+          userPrompt: fullPrompt,
+          characterName: '',
+          characterNames: [],
+          currencies: getAllowedAccountTypes(ctx.features, ['blue']),
+        });
+      }
+
+      // Build images array
+      const allImages: { url: string; width: number; height: number }[] = [];
+      if (input.sourceImageUrl && input.sourceImageWidth && input.sourceImageHeight) {
+        const sourceEdgeUrl = getEdgeUrl(input.sourceImageUrl, { original: true });
+        allImages.push({
+          url: sourceEdgeUrl,
+          width: input.sourceImageWidth,
+          height: input.sourceImageHeight,
+        });
+      }
+      if (input.referenceImages) {
+        for (const ref of input.referenceImages) {
+          const refEdgeUrl = getEdgeUrl(ref.url, { original: true });
+          allImages.push({ url: refEdgeUrl, width: ref.width, height: ref.height });
+        }
+      }
+
+      const result = await submitPresetImageGen({
+        prompt: fullPrompt || undefined,
+        aspectRatio: input.aspectRatio,
+        quantity: input.quantity,
+        images: allImages,
+        modelConfig,
+        versionIdOverride: effectiveVersionId,
+        user: ctx.user! as SessionUser,
+        token,
+        flags: ctx.features,
+        currencies: getAllowedAccountTypes(ctx.features, ['blue']),
+        tags: ctx.domain === 'green' ? ['iterate', 'green'] : ['iterate'],
+        isGreen: ctx.features.isGreen,
+        allowMatureContent: ctx.domain === 'green' ? false : undefined,
+        track: ctx.track,
+      });
+
+      return {
+        workflowId: result.id,
+        width: panelWidth,
+        height: panelHeight,
+        cost: result.cost?.total ?? 0,
+        enhancedPrompt: input.enhance && fullPrompt !== originalPrompt ? fullPrompt : null,
+      };
+    }),
+
+  getIterateCostEstimate: protectedProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(
+      z.object({
+        baseModel: z.string().nullish(),
+        aspectRatio: z.string().default('3:4'),
+        quantity: z.number().int().min(1).max(4).default(1),
+        sourceImage: z
+          .object({
+            url: z.string(),
+            width: z.number().int().positive(),
+            height: z.number().int().positive(),
+          })
+          .nullish(),
+        referenceImages: z
+          .array(
+            z.object({
+              url: z.string(),
+              width: z.number().int().positive(),
+              height: z.number().int().positive(),
+            })
+          )
+          .optional(),
+      })
+    )
+    .query(async ({ ctx, input }) => {
+      // Outside the try: a refused url is an answer, not an estimate failure.
+      await assertGenerationInputsUsable({
+        urls: [input.sourceImage?.url, ...(input.referenceImages ?? []).map((ref) => ref.url)],
+        userId: ctx.user.id,
+        entry: 'getIterateCostEstimate',
+        isApiCaller: ctx.apiKeyId != null,
+      });
+      try {
+        const token = await getOrchestratorToken(ctx.user!.id, ctx);
+        const modelConfig = getPresetModelConfig(input.baseModel, DEFAULT_ITERATE_MODEL);
+        const effectiveVersionId =
+          input.sourceImage && modelConfig.img2imgVersionId
+            ? modelConfig.img2imgVersionId
+            : modelConfig.versionId;
+
+        // Build real images array for accurate pricing
+        const images: { url: string; width: number; height: number }[] = [];
+        if (input.sourceImage) {
+          const sourceEdgeUrl = getEdgeUrl(input.sourceImage.url, { original: true });
+          images.push({
+            url: sourceEdgeUrl,
+            width: input.sourceImage.width,
+            height: input.sourceImage.height,
+          });
+        }
+        if (input.referenceImages) {
+          for (const ref of input.referenceImages) {
+            const refEdgeUrl = getEdgeUrl(ref.url, { original: true });
+            images.push({ url: refEdgeUrl, width: ref.width, height: ref.height });
+          }
+        }
+
+        return await whatIfPresetImageGen({
+          aspectRatio: input.aspectRatio,
+          quantity: input.quantity,
+          images,
+          modelConfig,
+          versionIdOverride: effectiveVersionId,
+          user: ctx.user! as SessionUser,
+          token,
+          flags: ctx.features,
+          currencies: getAllowedAccountTypes(ctx.features, ['blue']),
+        });
+      } catch (error) {
+        console.error('Orchestrator getIterateCostEstimate failed:', error);
+        return { cost: 0, ready: false };
+      }
+    }),
+
+  pollIterationStatus: protectedProcedure
+    .meta({ requiredScope: TokenScope.AIServicesRead })
+    .input(
+      z.object({
+        workflowId: z.string().min(1),
+        width: z.number().int().positive().optional(),
+        height: z.number().int().positive().optional(),
+        prompt: z.string().optional(),
+      })
+    )
+    .query(async ({ ctx, input }) => {
+      return pollIterationWorkflow({
+        workflowId: input.workflowId,
+        width: input.width,
+        height: input.height,
+        prompt: input.prompt,
+        userId: ctx.user!.id,
+        ctx,
+      });
+    }),
+});

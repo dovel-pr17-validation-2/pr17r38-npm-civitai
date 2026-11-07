@@ -1,0 +1,44 @@
+// Doubled class beats Mantine's own NavLink :hover rule, which is otherwise more specific and
+// leaves the row visually inert on hover.
+.navLinkWrapper.navLinkWrapper {
+  transition: background-color 150ms ease;
+
+  &:hover {
+    background-color: light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-5));
+  }
+}
+
+.rowDefault {
+  align-items: center;
+}
+
+.rowIcon {
+  opacity: 0.8;
+  transition: opacity 150ms ease;
+
+  .navLinkWrapper:hover & {
+    opacity: 1;
+  }
+}
+
+.rowMeta {
+  line-height: 1.2;
+}
+
+.sectionHeader {
+  transition: background-color 150ms ease;
+
+  &:hover {
+    background-color: light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-5));
+  }
+}
+
+.sectionChevron {
+  flex-shrink: 0;
+  color: var(--mantine-color-dimmed);
+  transition: transform 150ms ease;
+}
+
+.sectionChevronCollapsed {
+  transform: rotate(-90deg);
+}

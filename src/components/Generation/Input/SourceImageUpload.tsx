@@ -1,0 +1,302 @@
+import type { InputWrapperProps } from '@mantine/core';
+import { Input, CloseButton, Alert, ActionIcon } from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import { IconPalette } from '@tabler/icons-react';
+import { dialogStore } from '~/components/Dialog/dialogStore';
+import { DrawingEditorModal } from './DrawingEditor/DrawingEditorModal';
+import type { DrawingElement } from './DrawingEditor/drawing.types';
+import { forwardRef, useEffect, useState } from 'react';
+import { ImageDropzone } from '~/components/Image/ImageDropzone/ImageDropzone';
+import {
+  maxOrchestratorImageFileSize,
+  maxUpscaleSize,
+  minUploadSize,
+} from '~/server/common/constants';
+import { withController } from '~/libs/form/hoc/withController';
+import { fetchBlobAsFile } from '~/utils/file-utils';
+import { uploadConsumerBlob } from '~/utils/consumer-blob-upload';
+import type { SourceImageProps } from '~/server/orchestrator/infrastructure/base.schema';
+import { imageToJpegBlob, resizeImage } from '~/shared/utils/canvas-utils';
+import { getImageDimensions } from '~/utils/image-utils';
+
+import { uniqBy } from 'lodash-es';
+import { ExifParser } from '~/utils/metadata';
+import clsx from 'clsx';
+
+const key = 'img-uploads';
+const timeoutError = 'Gateway Time-out';
+export type SourceImageUploadProps = {
+  value?: SourceImageProps | null;
+  onChange?: (value?: SourceImageProps | null) => void;
+  removable?: boolean;
+  children?: React.ReactNode;
+  iconSize?: number;
+  warnOnMissingAiMetadata?: boolean;
+  onWarnMissingAiMetadata?: (Warning: JSX.Element | null) => void;
+  /** Enable drawing overlay tools */
+  enableDrawing?: boolean;
+  /** Called when user completes a drawing overlay */
+  onDrawingComplete?: (value: SourceImageProps) => void;
+} & Omit<InputWrapperProps, 'children' | 'value' | 'onChange'>;
+
+export const SourceImageUpload = forwardRef<HTMLDivElement, SourceImageUploadProps>(
+  (
+    {
+      value,
+      onChange,
+      removable = true,
+      label,
+      children,
+      iconSize,
+      error: inputError,
+      warnOnMissingAiMetadata,
+      onWarnMissingAiMetadata,
+      enableDrawing = false,
+      onDrawingComplete,
+      ...inputWrapperProps
+    },
+    ref
+  ) => {
+    const [loaded, setLoaded] = useState(false);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    // const [warning, setWarning] = useState<string | null>(null);
+    const [Warning, setWarning] = useState<JSX.Element | null>(null);
+    // Store drawing elements for re-editing
+    const [drawingLines, setDrawingLines] = useState<DrawingElement[]>([]);
+
+    function handleWarnOnMissingAiMetadata(Warning: JSX.Element | null) {
+      setWarning(Warning);
+      if (onWarnMissingAiMetadata) onWarnMissingAiMetadata(Warning);
+    }
+
+    function handleUrlChange(url: string) {
+      getImageDimensions(url).then(({ width, height }) => {
+        setError(null);
+        handleWarnOnMissingAiMetadata(null);
+        onChange?.({ url, width, height });
+      });
+    }
+
+    function handleClear() {
+      setError(null);
+      handleWarnOnMissingAiMetadata(null);
+      onChange?.(null);
+    }
+
+    async function handleDrop(files: File[]) {
+      handleDropCapture(files[0]);
+    }
+
+    async function handleDropCapture(src: File | Blob | string) {
+      setLoading(true);
+      setError(null);
+      handleWarnOnMissingAiMetadata(null);
+
+      try {
+        const resized = await resizeImage(src, {
+          maxHeight: maxUpscaleSize,
+          maxWidth: maxUpscaleSize,
+          minWidth: minUploadSize,
+          minHeight: minUploadSize,
+        });
+        const jpegBlob = await imageToJpegBlob(resized);
+        const blob = await uploadConsumerBlob(jpegBlob);
+
+        if (blob.url) {
+          handleUrlChange(blob.url);
+        }
+      } catch (e) {
+        console.log({ dropzoneError: e });
+        setError((e as Error).message);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    useEffect(() => {
+      if (!error || error === timeoutError) {
+        if (value && typeof value === 'string' && (value as string).length > 0)
+          handleUrlChange(value);
+        else if (value && value instanceof Blob) handleDropCapture(value);
+      } else if (error) {
+        onChange?.(null);
+      }
+    }, [value, error]);
+
+    const _value = value instanceof Blob ? null : value;
+
+    // Clear drawing lines when source image changes
+    useEffect(() => {
+      setDrawingLines([]);
+    }, [_value?.url]);
+
+    function getHistory() {
+      const stored = localStorage.getItem(key);
+      return stored ? (JSON.parse(stored) as SourceImageProps[]) : [];
+    }
+
+    function addToHistory(value: SourceImageProps) {
+      const items = uniqBy([value, ...getHistory()], 'url').splice(0, 30);
+      localStorage.setItem(key, JSON.stringify(items));
+    }
+
+    function removeFromHistory(url: string) {
+      const items = getHistory().filter((x) => x.url !== url);
+      localStorage.setItem(key, JSON.stringify(items));
+    }
+
+    useEffect(() => {
+      if (_value && loaded) {
+        addToHistory(_value);
+
+        if (warnOnMissingAiMetadata || onWarnMissingAiMetadata) {
+          fetchBlobAsFile(_value.url).then(async (file) => {
+            if (file) {
+              const parser = await ExifParser(file);
+
+              const meta = await parser.getMetadata();
+              if (!Object.keys(meta).length && !parser.isMadeOnSite()) {
+                handleWarnOnMissingAiMetadata(
+                  <Alert color="yellow" title="We couldn't detect valid metadata in this image.">
+                    {`Outputs based on this image must be PG, PG-13, or they will be blocked and you will not be refunded.`}
+                  </Alert>
+                );
+              } else handleWarnOnMissingAiMetadata(null);
+            }
+          });
+        }
+      }
+    }, [_value, warnOnMissingAiMetadata, loaded]);
+
+    function handleRemoveItem() {
+      handleClear();
+    }
+
+    function handleError() {
+      handleRemoveItem();
+      setError('Failed to load image');
+      if (_value) removeFromHistory(_value.url);
+    }
+
+    async function handleDrawingComplete(drawingBlob: Blob, elements: DrawingElement[]) {
+      if (!onDrawingComplete) return;
+
+      // Store elements for re-editing
+      setDrawingLines(elements);
+
+      setLoading(true);
+      try {
+        const blob = await uploadConsumerBlob(drawingBlob);
+        if (blob.url) {
+          const { width, height } = await getImageDimensions(blob.url);
+          onDrawingComplete({ url: blob.url, width, height });
+        }
+      } catch (e) {
+        console.error('Failed to upload drawing:', e);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    function handleOpenDrawingEditor() {
+      if (!_value) return;
+
+      dialogStore.trigger({
+        id: 'drawing-editor-modal',
+        component: DrawingEditorModal,
+        props: {
+          sourceImage: _value,
+          onConfirm: handleDrawingComplete,
+          initialLines: drawingLines,
+        },
+      });
+    }
+
+    const _error = error ?? inputError;
+    const showError = !!_error && _error !== timeoutError;
+
+    return (
+      <div className="flex flex-1 flex-col gap-2" ref={ref}>
+        <Input.Wrapper
+          {...inputWrapperProps}
+          className={clsx({
+            ['rounded-md border-2 border-solid border-yellow-4 ']: Warning,
+          })}
+        >
+          {/* <ActionIcon size="xs">
+            <IconHistory />
+          </ActionIcon> */}
+          {!_value ? (
+            <div className="flex aspect-video size-full max-h-72 flex-col rounded-md">
+              <ImageDropzone
+                allowExternalImageDrop
+                onDrop={handleDrop}
+                count={_value ? 1 : 0}
+                max={1}
+                maxSize={maxOrchestratorImageFileSize}
+                label="Drag image here or click to select a file"
+                onDropCapture={handleDropCapture}
+                loading={loading}
+                iconSize={iconSize}
+                // onMissingAiMetadata={warnOnMissingAiMetadata ? handleMissingAiMetadata : undefined}
+              >
+                {children}
+              </ImageDropzone>
+              {showError && <Input.Error>{_error}</Input.Error>}
+            </div>
+          ) : (
+            <div
+              className={clsx(
+                'relative flex aspect-video size-full max-h-72 items-stretch justify-center overflow-hidden rounded-md bg-gray-2 dark:bg-dark-6'
+              )}
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={_value.url}
+                alt="image to refine"
+                className="mx-auto max-h-full"
+                onLoad={() => {
+                  setLoaded(true);
+                }}
+                onError={handleError}
+              />
+              {loaded && removable && (
+                <CloseButton
+                  color="red"
+                  variant="filled"
+                  className="absolute right-0 top-0 rounded-md"
+                  onClick={handleRemoveItem}
+                />
+              )}
+              {loaded && enableDrawing && (
+                <Tooltip label="Sketch Edit" withArrow>
+                  <ActionIcon
+                    variant="filled"
+                    size="sm"
+                    className="absolute left-0 top-0 m-1 rounded-md"
+                    onClick={handleOpenDrawingEditor}
+                  >
+                    <IconPalette size={16} />
+                  </ActionIcon>
+                </Tooltip>
+              )}
+              {loaded && (
+                <div className="absolute bottom-0 right-0 rounded-br-md rounded-tl-md bg-dark-9/50 px-2 text-white">
+                  {_value.width} x {_value.height}
+                </div>
+              )}
+            </div>
+          )}
+        </Input.Wrapper>
+        {!onWarnMissingAiMetadata ? Warning : null}
+      </div>
+    );
+  }
+);
+
+SourceImageUpload.displayName = 'SourceImageUpload';
+
+export const InputSourceImageUpload = withController(SourceImageUpload, ({ field }) => ({
+  value: field.value,
+}));

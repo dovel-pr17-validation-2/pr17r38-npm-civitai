@@ -1,0 +1,392 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { dbMock } from '~/__tests__/mocks/db.mock';
+import { redisMock } from '~/__tests__/mocks/redis.mock';
+redisMock.redis.packed.set.mockImplementation(async () => undefined);
+redisMock.redis.set.mockImplementation(async () => undefined);
+redisMock.redis.scanIterator.mockImplementation(async function* () {});
+const mockDbRead = dbMock.dbRead;
+
+// getAppDetail builds liveUrl from `env.APPS_DOMAIN` via a dynamic import of
+// `~/env/server` — stub it so the test doesn't pull the real env schema.
+// LOGGING is read by cache-helpers' createLogger at module-eval (the service
+// now imports cache-helpers for the review-aggregate queryCache); '' = no-op
+// logger.
+vi.mock('~/env/server', () => ({ env: { APPS_DOMAIN: 'civit.ai', LOGGING: '' } }));
+
+/** Reconstructs the SQL string from the tagged-template args Prisma received. */
+function capturedSql(): string {
+  expect(mockDbRead.$queryRaw).toHaveBeenCalled();
+  const lastCall = mockDbRead.$queryRaw.mock.calls.at(-1);
+  if (!lastCall) return '';
+  const strings = lastCall[0] as unknown as TemplateStringsArray;
+  const values = lastCall.slice(1);
+  let sql = '';
+  for (let i = 0; i < strings.length; i++) {
+    sql += strings[i];
+    if (i < values.length) sql += `$${i + 1}`;
+  }
+  return sql;
+}
+
+/**
+ * One raw DB row (snake_case, as returned by $queryRaw). The `manifest`
+ * deliberately carries private/internal fields a malicious/careless publisher
+ * (or the server's own trustTier stamp) could put there — the projection must
+ * strip every one. `approved_scopes` is the SEPARATE approved-scope column.
+ */
+function rawRow(over: Partial<Record<string, unknown>> = {}) {
+  return {
+    id: 'ab_1',
+    block_id: 'cool-block',
+    app_id: 'app_1',
+    // 🔴 The OAuth client's name. In prod this ALWAYS equals the app's own
+    // title, which is why rendering it as the author was a bug — the real owner
+    // is the joined User row below.
+    app_name: 'Cool App',
+    owner_user_id: 42,
+    owner_username: 'zachlowdenzx',
+    owner_image: 'owner-avatar.png',
+    status: 'approved',
+    content_rating: 'PG',
+    version: '1.2.3',
+    approved_scopes: ['ai:write:budgeted', 'models:read:self'],
+    // DEPLOY-GATE: a deployed on-platform app (non-null timestamp) so the detail
+    // read returns its projection. The dedicated deploy-gate suite covers the
+    // never-deployed (NULL → NOT_FOUND) and offsite-exempt cases.
+    external_url: null,
+    current_version_deployed_at: new Date('2026-01-01T00:00:00Z'),
+    install_count: 7n,
+    // F-E E5 stored screenshot records (jsonb). The projection must expose ONLY
+    // a public DISPLAY URL + index + content-type — NEVER the underlying MinIO
+    // `key`. Index/ext build the opaque gated app route.
+    screenshots: [
+      { key: 'screenshots/ab_1/0.png', index: 0, ext: 'png', contentType: 'image/png' },
+      { key: 'screenshots/ab_1/1.jpg', index: 1, ext: 'jpg', contentType: 'image/jpeg' },
+    ],
+    manifest: {
+      name: 'Cool Block',
+      description: 'Does cool things',
+      targets: [{ slotId: 'model.sidebar_top', secretCfg: 'leak-me' }],
+      // --- private / internal fields that MUST NOT leak to anon ---
+      trustTier: 'internal',
+      iframe: { src: 'https://cool-block.internal.example/', sandbox: 'allow-scripts' },
+      renderMode: 'iframe',
+      // The manifest's OWN scopes declaration — distinct from approved_scopes;
+      // it must not leak (we surface approved_scopes instead).
+      scopes: ['ai:write:budgeted', 'social:tip:self', 'INTERNAL_secret_scope'],
+      settings: { apiKey: 'super-secret' },
+      arbitraryPublisherField: { nested: 'secret' },
+    },
+    ...over,
+  };
+}
+
+describe('BlockRegistry.getAppDetail — anon-exposure protections (F-E E2)', () => {
+  beforeEach(() => {
+    mockDbRead.$queryRaw.mockClear();
+    mockDbRead.$queryRaw.mockResolvedValue([rawRow()]);
+  });
+
+  it('returns the public projection for an approved app', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail).not.toBeNull();
+    expect(detail).toMatchObject({
+      id: 'ab_1',
+      blockId: 'cool-block',
+      appId: 'app_1',
+      appName: 'Cool App',
+      contentRating: 'PG',
+      version: '1.2.3',
+      installCount: 7,
+      liveUrl: 'https://cool-block.civit.ai',
+    });
+    expect(detail!.manifest.name).toBe('Cool Block');
+    expect(detail!.manifest.description).toBe('Does cool things');
+    expect(detail!.manifest.targets).toEqual([{ slotId: 'model.sidebar_top' }]);
+  });
+
+  it('scopes come from approved_scopes (the disclosure list), not the manifest', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail!.scopes).toEqual(['ai:write:budgeted', 'models:read:self']);
+    // Manifest-declared scopes (incl. an internal one) are NOT surfaced.
+    expect(detail!.scopes).not.toContain('social:tip:self');
+    expect(detail!.scopes).not.toContain('INTERNAL_secret_scope');
+  });
+
+  it('returns null for a NON-APPROVED app — never its data (no id-enumeration)', async () => {
+    for (const status of ['pending', 'rejected', 'withdrawn', 'disabled']) {
+      mockDbRead.$queryRaw.mockResolvedValueOnce([rawRow({ status })]);
+      const { BlockRegistry } = await import('../block-registry.service');
+      const detail = await BlockRegistry.getAppDetail('ab_1');
+      expect(detail, `status="${status}" must not return data`).toBeNull();
+    }
+  });
+
+  it('returns null for a missing app', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([]);
+    const { BlockRegistry } = await import('../block-registry.service');
+    expect(await BlockRegistry.getAppDetail('ab_missing')).toBeNull();
+  });
+
+  it('projects ONLY the public allowlist — no private/internal manifest field leaks', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    const manifest = detail!.manifest as Record<string, unknown>;
+
+    for (const forbidden of [
+      'trustTier',
+      'iframe',
+      'renderMode',
+      'scopes',
+      'settings',
+      'arbitraryPublisherField',
+    ]) {
+      expect(manifest, `manifest leaked "${forbidden}"`).not.toHaveProperty(forbidden);
+    }
+    // Per-target fields beyond slotId are dropped (no nested config leak).
+    const target0 = (manifest.targets as Array<Record<string, unknown>>)[0];
+    expect(Object.keys(target0)).toEqual(['slotId']);
+  });
+
+  it('the serialized result contains NO secret value (mutation-test the projection)', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    const serialized = JSON.stringify(detail);
+    for (const secret of [
+      'super-secret', // manifest.settings.apiKey
+      'internal.example', // manifest.iframe.src host
+      'leak-me', // manifest.targets[0].secretCfg
+      'INTERNAL_secret_scope', // manifest.scopes internal entry
+    ]) {
+      expect(serialized, `serialized output leaked "${secret}"`).not.toContain(secret);
+    }
+  });
+
+  it('top-level shape is the PublicAppDetail allowlist only (no status/raw leak)', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(Object.keys(detail!).sort()).toEqual(
+      [
+        'appId',
+        'appName',
+        'blockId',
+        'contentRating',
+        'externalUrl',
+        'id',
+        'installCount',
+        'liveUrl',
+        'manifest',
+        // The public owner chip ({id, username, image} only) — the real author,
+        // as opposed to `appName` (the OAuth client name == the app title).
+        'owner',
+        'scopes',
+        'screenshots',
+        'version',
+      ].sort()
+    );
+    // `status` is a DB-internal field; it must never appear on the wire shape.
+    expect(detail!).not.toHaveProperty('status');
+    // The raw manifest internals (re-checked at the top level just in case).
+    expect(detail!).not.toHaveProperty('trustTier');
+  });
+
+  it('liveUrl is the already-public standalone origin (no token/secret)', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail!.liveUrl).toBe('https://cool-block.civit.ai');
+    expect(detail!.liveUrl).not.toMatch(/token|jwt|secret|\?/i);
+  });
+
+  it('screenshots are PUBLIC display URLs only — the stored MinIO key never leaks (F-E E5)', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail!.screenshots).toEqual([
+      { index: 0, url: '/api/blocks/screenshot/ab_1/0.png', contentType: 'image/png' },
+      { index: 1, url: '/api/blocks/screenshot/ab_1/1.jpg', contentType: 'image/jpeg' },
+    ]);
+    // The opaque app route only — never the underlying MinIO key.
+    const serialized = JSON.stringify(detail!.screenshots);
+    expect(serialized).not.toContain('screenshots/ab_1/0.png'); // the raw stored key
+    expect(serialized).not.toContain('"key"');
+    for (const shot of detail!.screenshots) {
+      expect(shot.url.startsWith('/api/blocks/screenshot/')).toBe(true);
+      expect(shot.url).not.toMatch(/token|jwt|secret|\?/i);
+    }
+  });
+
+  it('a NULL screenshots column yields an empty gallery (no crash) (F-E E5)', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([rawRow({ screenshots: null })]);
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail!.screenshots).toEqual([]);
+  });
+
+  it('a non-image content-type in a stored screenshot record is DROPPED (F-E E5)', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([
+      rawRow({
+        screenshots: [
+          { key: 'screenshots/ab_1/0.png', index: 0, ext: 'png', contentType: 'image/png' },
+          // tampered/legacy entry — must be dropped, not surfaced to the client.
+          { key: 'screenshots/ab_1/1.html', index: 1, ext: 'html', contentType: 'text/html' },
+        ],
+      }),
+    ]);
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail!.screenshots).toHaveLength(1);
+    expect(detail!.screenshots[0].contentType).toBe('image/png');
+  });
+
+  it('a VALID image extension paired with a non-image content-type is DROPPED (content-type allowlist is independent of the ext check, F-E E5 Low-3)', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([
+      rawRow({
+        screenshots: [
+          // ext is an allowlisted image ext (png) but the recorded content-type
+          // is text/html — the content-type allowlist must drop it on its OWN
+          // (the ext check alone would let this through). Exercises the
+          // content-type belt independently of the ext belt.
+          { key: 'screenshots/ab_1/0.png', index: 0, ext: 'png', contentType: 'text/html' },
+        ],
+      }),
+    ]);
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail!.screenshots).toHaveLength(0);
+  });
+
+  // ── Owner attribution (the `/apps/<appBlockId>` "by {appName}" bug) ─────────
+
+  it('projects the REAL owner as a public {id, username, image} chip', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail!.owner).toEqual({
+      id: 42,
+      username: 'zachlowdenzx',
+      image: 'owner-avatar.png',
+    });
+    // …and it is DISTINCT from appName (the OAuth client name == the app title).
+    expect(detail!.owner!.username).not.toBe(detail!.appName);
+  });
+
+  it('JOINs the owner via OauthClient.userId and selects ONLY the three chip columns', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    await BlockRegistry.getAppDetail('ab_1');
+    const sql = capturedSql();
+    expect(sql).toMatch(/LEFT JOIN "User" u ON u\.id = oc\."userId"/);
+    expect(sql).toMatch(/u\.id AS owner_user_id/);
+    expect(sql).toMatch(/u\.username AS owner_username/);
+    expect(sql).toMatch(/u\.image AS owner_image/);
+    // 🔴 The SELECT list PROJECTS exactly this key set and nothing else.
+    //
+    // Assert on the PROJECTED KEYS (the `AS` alias, else the trailing column
+    // name), not on `u.`-prefixed source text. The alias-scoped version of this
+    // guard — collect every `u.<col>` in the SELECT list, expect
+    // ['id','image','username'] — reads like a widened-SELECT guard but is only
+    // a guard on ONE table alias: adding a second `"User"` join and selecting
+    // `usr.email AS owner_email` off it walks straight past, and so does any
+    // widening of `oc.`/`ab.`. The projection is what actually reaches the
+    // caller (it becomes a `Row` key, which `projectPublicOwner` then reads), so
+    // that is what gets pinned. A new column here is a deliberate act and must
+    // update this list.
+    const selectList = sql.slice(
+      sql.indexOf('SELECT') + 'SELECT'.length,
+      sql.indexOf('FROM app_blocks')
+    );
+    // Split on TOP-LEVEL commas only — `install_count` is an inline subquery.
+    const items: string[] = [];
+    let depth = 0;
+    let buf = '';
+    for (const ch of selectList) {
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+      if (ch === ',' && depth === 0) {
+        items.push(buf);
+        buf = '';
+      } else buf += ch;
+    }
+    items.push(buf);
+    const projected = items
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .map((item) => {
+        const alias = /\bAS\s+(?:"([^"]+)"|(\w+))\s*$/i.exec(item);
+        if (alias) return alias[1] ?? alias[2];
+        // No alias → the projected key is the bare/qualified column name.
+        const bare = /(?:"([^"]+)"|(\w+))\s*$/.exec(item);
+        return bare?.[1] ?? bare?.[2] ?? item;
+      });
+    expect([...projected].sort()).toEqual([
+      'app_id',
+      'app_name',
+      'approved_scopes',
+      'block_id',
+      'content_rating',
+      'current_version_deployed_at',
+      'external_url',
+      'id',
+      'install_count',
+      'manifest',
+      'owner_image',
+      'owner_user_id',
+      'owner_username',
+      'screenshots',
+      'status',
+      'version',
+    ]);
+    // No duplicate projected key (two sources colliding on one `Row` field).
+    expect(new Set(projected).size).toBe(projected.length);
+  });
+
+  it('an unresolvable owner yields owner:null (no crash, no fallback to appName)', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([
+      rawRow({ owner_user_id: null, owner_username: null, owner_image: null }),
+    ]);
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail!.owner).toBeNull();
+  });
+
+  it('🔒 an extra user column present on the row does NOT reach the projection', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([
+      rawRow({ owner_email: 'owner@example.com', owner_settings: { apiKey: 'owner-secret' } }),
+    ]);
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    const serialized = JSON.stringify(detail);
+    expect(serialized).not.toContain('owner@example.com');
+    expect(serialized).not.toContain('owner-secret');
+    expect(Object.keys(detail!.owner!).sort()).toEqual(['id', 'image', 'username']);
+  });
+
+  it('SELECTs the screenshots column (so getAppDetail can render the gallery)', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    await BlockRegistry.getAppDetail('ab_1');
+    const sql = capturedSql();
+    expect(sql).toMatch(/ab\.screenshots/);
+  });
+
+  it('a NULL approved_scopes column yields an empty scope list (no crash)', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([rawRow({ approved_scopes: null })]);
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail!.scopes).toEqual([]);
+  });
+
+  it('a malformed/missing manifest yields an empty public manifest (no crash, no leak)', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([rawRow({ manifest: null })]);
+    const { BlockRegistry } = await import('../block-registry.service');
+    const detail = await BlockRegistry.getAppDetail('ab_1');
+    expect(detail!.manifest).not.toHaveProperty('trustTier');
+    expect(detail!.manifest).toEqual({});
+  });
+
+  it('looks up by id (single approved row by appBlockId)', async () => {
+    const { BlockRegistry } = await import('../block-registry.service');
+    await BlockRegistry.getAppDetail('ab_1');
+    const sql = capturedSql();
+    expect(sql).toMatch(/FROM app_blocks ab/);
+    expect(sql).toMatch(/WHERE ab\.id =/);
+  });
+});

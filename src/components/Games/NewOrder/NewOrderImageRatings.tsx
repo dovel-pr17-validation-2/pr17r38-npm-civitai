@@ -1,0 +1,120 @@
+import { Badge, Card, Loader, ScrollArea, Text, UnstyledButton } from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import { IconChevronLeft, IconHammer } from '@tabler/icons-react';
+import { useState } from 'react';
+import type { NsfwLevel } from '~/server/common/enums';
+import { browsingLevelLabels } from '~/shared/constants/browsingLevel.constants';
+import { useInquisitorTools, useQueryImageRaters } from '~/components/Games/KnightsNewOrder.utils';
+import { PlayerStats } from '~/components/Games/PlayerCard';
+import { NewOrderRankType } from '~/shared/utils/prisma/enums';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+
+export function NewOrderImageRatings({ imageId, imageNsfwLevel }: Props) {
+  const [opened, setOpened] = useState(false);
+
+  const { smitePlayer, applyingSmite, smitePayload } = useInquisitorTools();
+  const { raters, isLoading } = useQueryImageRaters({ imageId });
+  const nothingFound = raters.Knight?.length === 0 && raters.Templar?.length === 0;
+
+  return (
+    // The only `fixed`-to-the-RIGHT-edge surface in the app, and therefore the
+    // one place `--safe-area-inset-right` is load-bearing on its own: the
+    // collapsed state is a 40px chevron flush to `right: 0`, which in landscape
+    // on a notched phone is entirely inside the ~47px cutout strip — the handle
+    // that opens the panel becomes untappable. Vertically centred, so neither
+    // vertical inset applies.
+    <div
+      className={`fixed right-[var(--safe-area-inset-right)] top-1/2 -translate-y-1/2 ${
+        opened ? 'z-30' : 'z-0'
+      }`}
+    >
+      <div
+        className={`relative flex items-center transition-transform duration-300 ${
+          opened ? 'translate-x-0' : 'translate-x-[350px]'
+        }`}
+      >
+        <UnstyledButton
+          className="flex size-10 items-center justify-center rounded-l-lg bg-gray-1 p-2 transition-all duration-300 hover:bg-gray-0 dark:bg-dark-7 dark:hover:bg-dark-5"
+          onClick={() => setOpened((o) => !o)}
+        >
+          <IconChevronLeft
+            size={32}
+            className={`text-black transition-transform duration-300 dark:text-white ${
+              opened ? 'rotate-180' : ''
+            }`}
+          />
+        </UnstyledButton>
+        <div
+          className={`flex w-[350px] flex-col gap-2 overflow-hidden rounded-l-lg bg-gray-1 p-4 transition-all duration-300 dark:bg-dark-7 ${
+            opened ? 'opacity-100' : 'opacity-0'
+          }`}
+        >
+          <h2 className="text-lg font-semibold text-black dark:text-white">Raters</h2>
+          <ScrollArea.Autosize mah={400}>
+            {isLoading ? (
+              <div className="flex size-full items-center justify-center">
+                <Loader />
+              </div>
+            ) : nothingFound ? (
+              <div className="flex size-full items-center justify-center p-4">
+                <Text c="dimmed">There are no raters yet</Text>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {[NewOrderRankType.Templar, NewOrderRankType.Knight].map((rankType) => {
+                  const ratersForRank = raters[rankType] ?? [];
+
+                  return ratersForRank.length > 0 ? (
+                    <div key={rankType}>
+                      <h3 className="mb-1 text-sm font-bold text-black dark:text-white">
+                        {rankType}s
+                      </h3>
+                      {ratersForRank.map(({ player, rating }) => {
+                        const loading = smitePayload?.playerId === player.id && applyingSmite;
+
+                        return (
+                          <Card key={player.id} className="mb-2 flex flex-col gap-1">
+                            <div className="flex items-center justify-between">
+                              <div className="flex flex-col gap-1">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-sm">{player.username}</span>
+                                  <Badge
+                                    className={`${
+                                      rating === imageNsfwLevel ? 'text-green-500' : 'text-red-500'
+                                    }`}
+                                  >
+                                    {browsingLevelLabels[rating] ?? '?'}
+                                  </Badge>
+                                </div>
+                                <PlayerStats stats={{ ...player.stats }} size="sm" showSmiteCount />
+                              </div>
+                              <Tooltip label="Smite player" withinPortal>
+                                <LegacyActionIcon
+                                  color="red"
+                                  variant="filled"
+                                  onClick={() => smitePlayer({ playerId: player.id, imageId })}
+                                  loading={loading}
+                                >
+                                  <IconHammer size={18} />
+                                </LegacyActionIcon>
+                              </Tooltip>
+                            </div>
+                          </Card>
+                        );
+                      })}
+                    </div>
+                  ) : null;
+                })}
+              </div>
+            )}
+          </ScrollArea.Autosize>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type Props = {
+  imageId: number;
+  imageNsfwLevel?: NsfwLevel;
+};

@@ -1,0 +1,23 @@
+import { Container, Stack, Title } from '@mantine/core';
+import { Meta } from '~/components/Meta/Meta';
+import { SupportContent } from '~/components/Support/SupportContent';
+
+export default function SupportPage() {
+  return (
+    <>
+      <Meta
+        title="Civitai Support | Get help with Civitai"
+        description="Need help? Visit the Civitai support page to get help with using Civitai, report a bug, and more."
+        canonical="/support"
+      />
+      <Container size="md" py="xl">
+        <Stack gap={32}>
+          <Title size={32} className="font-semibold text-gray-1">
+            Let&apos;s pick a support option that works for you
+          </Title>
+          <SupportContent />
+        </Stack>
+      </Container>
+    </>
+  );
+}

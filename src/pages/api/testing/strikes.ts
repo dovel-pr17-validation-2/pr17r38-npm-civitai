@@ -1,0 +1,195 @@
+import type { NextApiRequest, NextApiResponse } from 'next';
+import * as z from 'zod';
+import { dbRead } from '~/server/db/client';
+import {
+  evaluateStrikeEscalation,
+  expireStrikes,
+  getActiveStrikePoints,
+  getStrikesForUser,
+  processTimedUnmutes,
+  shouldRateLimitStrike,
+  type EscalationAction,
+} from '~/server/services/strike.service';
+import { STRIKE_MUTE_REASON } from '~/server/common/tos-reacceptance';
+import type { UserMeta } from '~/server/schema/user.schema';
+import { StrikeStatus } from '~/shared/utils/prisma/enums';
+import { WebhookEndpoint } from '~/server/utils/endpoint-helpers';
+
+// NOTE: the mutating `create` / `void` actions were moved to the attributed
+// moderator endpoint at src/pages/api/mod/strike/create.ts (issuedBy/voidedBy =
+// calling moderator). This endpoint retains read + dry-run + job-trigger actions.
+const schema = z
+  .object({
+    action: z.enum([
+      'get-user-strikes',
+      'get-active-points',
+      'check-rate-limit',
+      'evaluate-escalation',
+      'expire',
+      'unmute',
+    ]),
+    userId: z.coerce.number().optional(),
+    includeExpired: z
+      .string()
+      .optional()
+      .transform((v) => v === 'true'),
+    dryRun: z
+      .string()
+      .optional()
+      .transform((v) => v === 'true'),
+  })
+  .superRefine((data, ctx) => {
+    const userActions = [
+      'get-user-strikes',
+      'get-active-points',
+      'check-rate-limit',
+      'evaluate-escalation',
+    ];
+    if (userActions.includes(data.action) && !data.userId) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `userId is required for action "${data.action}"`,
+      });
+    }
+  });
+
+export default WebhookEndpoint(async function (req: NextApiRequest, res: NextApiResponse) {
+  const payload = schema.parse(req.query);
+  const { action, userId, dryRun } = payload;
+
+  // ── Read-only actions ──────────────────────────────────────────────
+  if (action === 'get-user-strikes') {
+    const result = await getStrikesForUser(userId!, {
+      includeExpired: payload.includeExpired,
+      includeInternalNotes: true,
+    });
+    return res.status(200).json({ action, userId, ...result });
+  }
+
+  if (action === 'get-active-points') {
+    const points = await getActiveStrikePoints(userId!);
+    return res.status(200).json({ action, userId, activePoints: points });
+  }
+
+  if (action === 'check-rate-limit') {
+    const limited = await shouldRateLimitStrike(userId!);
+    return res.status(200).json({ action, userId, isRateLimited: limited });
+  }
+
+  // ── Evaluate escalation ────────────────────────────────────────────
+  if (action === 'evaluate-escalation') {
+    if (dryRun) {
+      const totalPoints = await getActiveStrikePoints(userId!);
+      const user = await dbRead.user.findUnique({
+        where: { id: userId! },
+        select: { muted: true, muteExpiresAt: true, meta: true },
+      });
+
+      let predictedAction: EscalationAction = 'none';
+      if (user) {
+        const currentMeta = (user.meta as UserMeta) ?? {};
+        // A dry run cannot predict a MUTE: only `createStrike` passes `allowMute`, so an evaluation
+        // triggered from here can release and nothing else.
+        const strikeMuted = currentMeta.muteReason === STRIKE_MUTE_REASON;
+        if (
+          totalPoints < 2 &&
+          user.muted &&
+          (user.muteExpiresAt !== null || currentMeta.strikeFlaggedForReview || strikeMuted)
+        ) {
+          predictedAction = 'unmuted';
+        }
+      }
+
+      return res.status(200).json({
+        action,
+        dryRun: true,
+        userId,
+        totalPoints,
+        currentState: user
+          ? { muted: user.muted, muteExpiresAt: user.muteExpiresAt, meta: user.meta }
+          : null,
+        predictedAction,
+      });
+    }
+
+    const result = await evaluateStrikeEscalation(userId!);
+    return res
+      .status(200)
+      .json({ action, userId, totalPoints: result.totalPoints, escalationAction: result.action });
+  }
+
+  // ── Expire strikes ─────────────────────────────────────────────────
+  if (action === 'expire') {
+    if (dryRun) {
+      const strikesToExpire = await dbRead.userStrike.findMany({
+        where: {
+          status: StrikeStatus.Active,
+          expiresAt: { lte: new Date() },
+        },
+        select: { id: true, userId: true, points: true, expiresAt: true },
+      });
+      const affectedUserIds = [...new Set(strikesToExpire.map((s) => s.userId))];
+
+      return res.status(200).json({
+        action,
+        dryRun: true,
+        strikesToExpire,
+        affectedUserIds,
+        count: strikesToExpire.length,
+      });
+    }
+
+    const result = await expireStrikes();
+    return res.status(200).json({ action, ...result });
+  }
+
+  // ── Process timed unmutes ──────────────────────────────────────────
+  if (action === 'unmute') {
+    if (dryRun) {
+      // Both arms the job sweeps: strike mutes (no expiry — found by their reason) and moderator
+      // mutes whose own expiry has passed.
+      const usersWithExpiredMutes = await dbRead.user.findMany({
+        where: {
+          muted: true,
+          OR: [
+            { mutedAt: null, meta: { path: ['muteReason'], equals: STRIKE_MUTE_REASON } },
+            { muteExpiresAt: { not: null, lte: new Date() } },
+          ],
+        },
+        select: { id: true, username: true, muteExpiresAt: true },
+      });
+
+      const predictions = await Promise.all(
+        usersWithExpiredMutes.map(async (u) => {
+          const totalPoints = await getActiveStrikePoints(u.id);
+          let predictedAction: EscalationAction = 'none';
+          if (totalPoints >= 3) predictedAction = 'muted-and-flagged';
+          else if (totalPoints >= 2) predictedAction = 'muted';
+          else predictedAction = 'unmuted';
+
+          return {
+            userId: u.id,
+            username: u.username,
+            muteExpiresAt: u.muteExpiresAt,
+            activePoints: totalPoints,
+            predictedAction,
+            wouldUnmute: predictedAction === 'unmuted',
+          };
+        })
+      );
+
+      return res.status(200).json({
+        action,
+        dryRun: true,
+        usersWithExpiredMutes: predictions,
+        count: predictions.length,
+        wouldUnmuteCount: predictions.filter((p) => p.wouldUnmute).length,
+      });
+    }
+
+    const result = await processTimedUnmutes();
+    return res.status(200).json({ action, ...result });
+  }
+
+  return res.status(400).json({ error: 'Unknown action' });
+});

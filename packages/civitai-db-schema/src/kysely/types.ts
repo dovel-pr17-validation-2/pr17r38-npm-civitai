@@ -1,0 +1,6957 @@
+import type { ColumnType } from 'kysely';
+export type Generated<T> = T extends ColumnType<infer S, infer I, infer U>
+  ? ColumnType<S, I | undefined, U>
+  : ColumnType<T, T | undefined, T>;
+export type Timestamp = ColumnType<Date, Date | string, Date | string>;
+
+import type {
+  ReferralRewardStatus,
+  ReferralRewardKind,
+  ReferralRedemptionType,
+  BuzzWithdrawalRequestStatus,
+  UserPaymentConfigurationProvider,
+  CashWithdrawalStatus,
+  CashWithdrawalMethod,
+  CryptoTransactionStatus,
+  RewardsEligibility,
+  PaymentProvider,
+  MembershipGiftStatus,
+  UserEngagementType,
+  LinkType,
+  ModelType,
+  ImportStatus,
+  HuggingFaceImportStatus,
+  ModelStatus,
+  TrainingStatus,
+  CommercialUse,
+  CheckpointType,
+  ModelUploadType,
+  ModelUsageControl,
+  ModelModifier,
+  ContentType,
+  ModelFlagStatus,
+  ModelEngagementType,
+  ModelVersionSponsorshipSettingsType,
+  ModelVersionMonetizationType,
+  LicensingFeeType,
+  LicensingFeeSettlementCurrency,
+  ModelVersionEngagementType,
+  ModelHashType,
+  ScanResultCode,
+  ModelFileVisibility,
+  MetricTimeframe,
+  AssociationType,
+  ReportReason,
+  ReportStatus,
+  ReviewReactions,
+  ImageGenerationProcess,
+  NsfwLevel,
+  ImageIngestionStatus,
+  MediaType,
+  BlockImageReason,
+  EntityModerationStatus,
+  TextScanHoldStatus,
+  ImageEngagementType,
+  ImageOnModelType,
+  TagTarget,
+  TagType,
+  TagsOnTagsType,
+  TagSource,
+  PartnerPricingModel,
+  ApiKeyType,
+  CommentEntityType,
+  TagEngagementType,
+  DomainColor,
+  CosmeticType,
+  CosmeticSource,
+  CosmeticShopItemStatus,
+  CosmeticEntity,
+  BuzzAccountType,
+  ArticleStatus,
+  ArticleIngestionStatus,
+  ArticleEngagementType,
+  GenerationSchedulers,
+  CollectionWriteConfiguration,
+  CollectionReadConfiguration,
+  CollectionType,
+  CollectionMode,
+  CollectionItemStatus,
+  CollectionItemRejectionReason,
+  CollectionContributorPermission,
+  CollectionCollaboratorRole,
+  CollectionInviteStatus,
+  HomeBlockType,
+  Currency,
+  BountyType,
+  BountyMode,
+  BountyEntryMode,
+  BountyEngagementType,
+  CsamReportType,
+  CsamQueueSetAsideOutcome,
+  Availability,
+  PaidAccessEntityType,
+  SaleDiscountType,
+  EntityCollaboratorStatus,
+  ClubAdminPermission,
+  ChatMemberStatus,
+  ChatNotifyLevel,
+  ChatMessageType,
+  PurchasableRewardUsage,
+  EntityType,
+  JobQueueType,
+  VaultItemStatus,
+  RedeemableCodeType,
+  ToolType,
+  TechniqueType,
+  AppealStatus,
+  AppealCategory,
+  AuctionType,
+  ModerationRuleAction,
+  ChangelogType,
+  NewOrderRankType,
+  ChallengeSource,
+  ChallengeStatus,
+  PrizeMode,
+  PoolTrigger,
+  ChallengeReviewCostType,
+  ChallengeIngestionStatus,
+  ChallengeEngagementType,
+  EntityMetric_EntityType_Type,
+  EntityMetric_MetricType_Type,
+  ComicProjectStatus,
+  ComicReferenceStatus,
+  ComicPanelStatus,
+  ComicChapterStatus,
+  ComicReferenceType,
+  ComicEngagementType,
+  ComicGenre,
+  UserRestrictionStatus,
+  StrikeReason,
+  StrikeStatus,
+  WildcardSetKind,
+  WildcardSetAuditStatus,
+  WildcardSetCategoryAuditStatus,
+  ReviewVerdict,
+  Model3DStatus,
+  Model3DEngagementType,
+  ShopifyMerchOrderStatus,
+  OutboxEntity,
+  StorylineStatus,
+  StorylineWhoCanContinue,
+  StorylineFollowScope,
+  ServiceOfferingStatus,
+  ServicePreviewKind,
+  ServiceBuzzType,
+  ServiceDealStatus,
+  ServiceDealEventType,
+  ServiceDealFileKind,
+  ServiceDealFileStatus,
+  ServiceDealFileScanStatus,
+  ServiceDisputeResolution,
+  ServiceDealLeg,
+  UserHubSourceType,
+  CrucibleStatus,
+  CrucibleIngestionStatus,
+  CrucibleEngagementType,
+  PrizeSourceType,
+} from './enums';
+
+export type AccessToken = {
+  id: Generated<number>;
+  resourceType: string;
+  resourceId: number;
+  tokenHash: string;
+  createdById: number;
+  createdAt: Generated<Timestamp>;
+  expiresAt: Timestamp;
+  revokedAt: Timestamp | null;
+};
+export type Account = {
+  id: Generated<number>;
+  userId: number;
+  type: string;
+  provider: string;
+  providerAccountId: string;
+  refresh_token: string | null;
+  access_token: string | null;
+  expires_at: number | null;
+  token_type: string | null;
+  scope: string | null;
+  id_token: string | null;
+  session_state: string | null;
+  metadata: Generated<unknown>;
+};
+export type AdToken = {
+  id: Generated<number>;
+  token: string;
+  userId: number;
+  createdAt: Generated<Timestamp>;
+  expiresAt: Timestamp | null;
+};
+export type Announcement = {
+  id: Generated<number>;
+  title: string;
+  content: string;
+  emoji: string | null;
+  color: Generated<string>;
+  domain: Generated<DomainColor[]>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  startsAt: Timestamp | null;
+  endsAt: Timestamp | null;
+  metadata: unknown | null;
+  disabled: Generated<boolean>;
+  /**
+   * Author. Null is Civitai itself; the sitewide caches select on null, so a
+   * non-null row can never reach the global banner.
+   */
+  userId: number | null;
+  coverId: number | null;
+  /**
+   * Profile-only rows never enter the announcements feed and never notify.
+   */
+  profileOnly: Generated<boolean>;
+};
+export type AnnouncementDismissal = {
+  announcementId: number;
+  userId: number;
+  dismissedAt: Generated<Timestamp>;
+};
+export type AnnouncementReport = {
+  announcementId: number;
+  reportId: number;
+};
+export type AnnouncementSpend = {
+  id: Generated<number>;
+  userId: number;
+  announcementId: number | null;
+  createdAt: Generated<Timestamp>;
+};
+export type AnnouncementUser = {
+  announcementId: number;
+  userId: number;
+};
+export type Answer = {
+  id: Generated<number>;
+  questionId: number;
+  userId: number;
+  content: string;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type AnswerMetric = {
+  answerId: number;
+  timeframe: MetricTimeframe;
+  checkCount: number;
+  crossCount: number;
+  heartCount: number;
+  commentCount: number;
+};
+export type AnswerRank = {
+  answerId: number;
+  checkCountDay: number;
+  checkCountWeek: number;
+  checkCountMonth: number;
+  checkCountYear: number;
+  checkCountAllTime: number;
+  crossCountDay: number;
+  crossCountWeek: number;
+  crossCountMonth: number;
+  crossCountYear: number;
+  crossCountAllTime: number;
+  heartCountDay: number;
+  heartCountWeek: number;
+  heartCountMonth: number;
+  heartCountYear: number;
+  heartCountAllTime: number;
+  commentCountDay: number;
+  commentCountWeek: number;
+  commentCountMonth: number;
+  commentCountYear: number;
+  commentCountAllTime: number;
+  checkCountDayRank: number;
+  checkCountWeekRank: number;
+  checkCountMonthRank: number;
+  checkCountYearRank: number;
+  checkCountAllTimeRank: number;
+  crossCountDayRank: number;
+  crossCountWeekRank: number;
+  crossCountMonthRank: number;
+  crossCountYearRank: number;
+  crossCountAllTimeRank: number;
+  heartCountDayRank: number;
+  heartCountWeekRank: number;
+  heartCountMonthRank: number;
+  heartCountYearRank: number;
+  heartCountAllTimeRank: number;
+  commentCountDayRank: number;
+  commentCountWeekRank: number;
+  commentCountMonthRank: number;
+  commentCountYearRank: number;
+  commentCountAllTimeRank: number;
+};
+export type AnswerReaction = {
+  id: Generated<number>;
+  answerId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type AnswerVote = {
+  answerId: number;
+  userId: number;
+  vote: boolean | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ApiKey = {
+  id: Generated<number>;
+  key: string;
+  name: string;
+  tokenScope: Generated<number>;
+  userId: number;
+  createdAt: Generated<Timestamp>;
+  type: Generated<ApiKeyType>;
+  expiresAt: Timestamp | null;
+  lastUsedAt: Timestamp | null;
+  clientId: string | null;
+  buzzLimit: unknown | null;
+  /**
+   * Set on `Worker` tokens only: the device the token was issued to.
+   */
+  workerDeviceId: number | null;
+};
+export type AppAccessRequest = {
+  id: Generated<number>;
+  userId: number;
+  whatToBuild: string;
+  /**
+   * pending | approved | declined (CHECK `AppAccessRequest_status_check`). At most one `pending` row
+   * per user: the migration's PARTIAL unique index, which Prisma cannot express.
+   */
+  status: Generated<string>;
+  createdAt: Generated<Timestamp>;
+  reviewedAt: Timestamp | null;
+  reviewedById: number | null;
+};
+export type AppBlock = {
+  id: string;
+  app_id: string;
+  block_id: string;
+  version: string;
+  manifest: unknown;
+  status: Generated<string>;
+  content_rating: string;
+  promotion_eligible: Generated<boolean>;
+  health_status: Generated<string>;
+  health_checked_at: Timestamp | null;
+  render_mode: Generated<string>;
+  trust_tier: Generated<string>;
+  asset_bundle_url: string | null;
+  asset_bundle_sha256: string | null;
+  approved_scopes: Generated<string[]>;
+  current_version_sha: string | null;
+  current_version_deployed_at: Timestamp | null;
+  repo_url: string | null;
+  category: string | null;
+  featured: Generated<boolean>;
+  featured_order: number | null;
+  screenshots: unknown | null;
+  external_url: string | null;
+  spend_tier: Generated<string>;
+  spend_cap_buzz_per_day: number | null;
+  spend_velocity_max_gens: number | null;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppBlockBuildAttempt = {
+  id: Generated<number>;
+  publish_request_id: string | null;
+  slug: string;
+  sha: string;
+  run_id: string | null;
+  mode: string;
+  status: string;
+  failed_step: string | null;
+  failed_reason: string | null;
+  failure_class: string | null;
+  created_at: Generated<Timestamp>;
+};
+export type AppBlockPublishRequest = {
+  id: string;
+  app_block_id: string | null;
+  slug: string;
+  submitted_by_user_id: number;
+  submitted_at: Generated<Timestamp>;
+  version: string;
+  manifest: unknown;
+  bundle_key: string;
+  bundle_sha256: string;
+  bundle_size_bytes: string;
+  file_summary: unknown;
+  manifest_diff_summary: unknown;
+  status: string;
+  reviewed_by_user_id: number | null;
+  reviewed_at: Timestamp | null;
+  rejection_reason: string | null;
+  approval_notes: string | null;
+  forgejo_commit_sha: string | null;
+  source_commit: string | null;
+  source_dirty: boolean | null;
+  deploy_state: string | null;
+  deploy_detail: string | null;
+  deploy_updated_at: Timestamp | null;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppCollaborator = {
+  app_listing_id: string;
+  user_id: number;
+  /**
+   * Capability role. 'editor' today. What it actually unlocks is DERIVED from the
+   * listing's kind (`capabilitiesForKind`), not stored here: content + media + submit
+   * for review + analytics on both kinds, plus earnings and submit-version/git on
+   * on-site only. Owner-only actions (managing collaborators, initiating a transfer)
+   * are NOT a role — they are reserved to the listing owner.
+   */
+  role: Generated<string>;
+  /**
+   * 'pending' | 'accepted' | 'rejected'. Only 'accepted' confers capability, and
+   * only 'accepted' is ever visible publicly.
+   */
+  status: Generated<string>;
+  /**
+   * Public-byline opt-in. Immediate-apply (no mod review) — safe because this row is
+   * outside the revision copy sets (see the header). A collaborator is listed on the
+   * public listing only when status='accepted' AND displayed=true.
+   */
+  displayed: Generated<boolean>;
+  /**
+   * The OWNER who issued the invite (audit + the "invited by" chip).
+   */
+  invited_by: number;
+  /**
+   * Last time an invite NOTIFICATION was emitted for this row — the re-invite
+   * throttle key. NB: the `EntityCollaborator` sibling has an inverted throttle
+   * (`>=` where it means `<=`); this one is written correctly (see the service).
+   */
+  last_notified_at: Timestamp | null;
+  created_at: Generated<Timestamp>;
+  responded_at: Timestamp | null;
+};
+export type AppDeveloperTermsAcceptance = {
+  user_id: number;
+  version: string;
+  accepted_at: Generated<Timestamp>;
+};
+export type AppDevForgejoIdentity = {
+  user_id: number;
+  forgejo_username: string;
+  forgejo_token_encrypted: string;
+  created_at: Generated<Timestamp>;
+};
+export type Appeal = {
+  id: Generated<number>;
+  userId: number;
+  entityType: EntityType;
+  entityId: number;
+  status: Generated<AppealStatus>;
+  appealMessage: string;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  resolvedAt: Timestamp | null;
+  resolvedBy: number | null;
+  resolvedMessage: string | null;
+  resolvedReason: string | null;
+  internalNotes: string | null;
+  buzzTransactionId: string | null;
+  entityRemovedAt: Timestamp | null;
+  category: AppealCategory | null;
+  /**
+   * What the form collected beyond the message (`SiteAppealContext`); on an in-app model appeal, the
+   * locked settings an owner asks a moderator to review (`LockReviewContext`), else NULL.
+   */
+  context: unknown | null;
+};
+export type AppealDecisionRecord = {
+  id: Generated<string>;
+  appealId: number;
+  imageId: number;
+  imageUrl: string;
+  pHash: string | null;
+  promptHash: string | null;
+  nsfwLevel: number;
+  nsfwLevelLocked: boolean;
+  nsfwLevelReason: string | null;
+  aiNsfwLevel: number | null;
+  blockedFor: string | null;
+  decision: string;
+  resolvedReason: string | null;
+  decidedAt: Timestamp;
+  removalLabel: string | null;
+  removalNsfw: string | null;
+  restoredLevel: number | null;
+  trainingLabelCorrectedAt: Timestamp | null;
+  trainingCopyState: string | null;
+  trainingObjectKey: string | null;
+  ownerHash: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type AppealTrainingObjectDeletion = {
+  key: string;
+  createdAt: Generated<Timestamp>;
+};
+export type AppListing = {
+  id: string;
+  serial_id: Generated<number>;
+  kind: string;
+  slug: string;
+  name: string;
+  tagline: string | null;
+  description: string | null;
+  icon_id: number | null;
+  cover_id: number | null;
+  category: string | null;
+  status: Generated<string>;
+  /**
+   * Per-listing cohort gate: private|moderators|testers|public, or NULL.
+   *
+   * NULLABLE WITH NO DEFAULT, and NULL is NOT the `private` level — it means the owner
+   * has expressed no choice, so the pre-feature rule for the row's `status` applies
+   * (approved is visible, non-approved is not). That is what lets a level be
+   * authoritative on an `approved` listing without a new approval -- of which there are
+   * eight scattered writes and no chokepoint -- minting a row that vanishes from the
+   * store. A level that IS set binds at every eligible status, `approved` included, so
+   * an owner can restrict a live listing (discovery-only: hidden from the store, still
+   * runnable by slug).
+   *
+   * Free-text `text` like `status`; the allowed set is a DB CHECK that lives ONLY in the
+   * migration .sql (canonical code set = APP_LISTING_VISIBILITIES), and NULL passes that
+   * CHECK by design. Always an AND with the surface flags, never an override.
+   *
+   * 🔴 THE no-type ANNOTATION ON THE FIELD LINE STRIPS IT FROM THE GENERATED CLIENT ON
+   * PURPOSE, AND THAT
+   * IS A FIX FOR A PRODUCTION 500, NOT A STYLE CHOICE. Prisma names every scalar the model
+   * declares in its default SELECT/RETURNING, so while this was an ordinary field every
+   * `appListing` call that returns rows with no explicit `select` emitted it - 18 such sites
+   * on this tree, 17 of them WRITES - and during the manual-apply window that is
+   * `prisma.appListing.create()` dying with P2022. It happened: off-site submit, approve and
+   * delist all 500d on the PR preview. Stripping the field makes every one of those sites
+   * immune by construction. The column is reached ONLY by raw SQL, in
+   * `app-listing-visibility.service.ts` (read) and `-write.service.ts` (write). Re-adding it
+   * to the client re-opens the outage; `app-listing-visibility.no-prisma-field` is the guard.
+   *
+   * MANUAL-APPLY, like every migration here. Read it ONLY through
+   * `app-listing-visibility.service.ts` and never add it to a shared `select`: a
+   * `select` naming a missing column throws P2022 for the WHOLE query, which on the
+   * grid's shared select is a public-store outage.
+   */
+  content_rating: string | null;
+  external_url: string | null;
+  source_repo_url: string | null;
+  is_beta: Generated<boolean>;
+  beta_message: string | null;
+  connect_client_id: string | null;
+  connect_requested_scopes: number | null;
+  connect_scope_justifications: unknown | null;
+  app_block_id: string | null;
+  revision_of_id: string | null;
+  featured: Generated<boolean>;
+  featured_order: number | null;
+  user_id: number;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppListingMetric = {
+  app_listing_id: string;
+  thumbs_up_count: Generated<number>;
+  thumbs_down_count: Generated<number>;
+  install_count: Generated<number>;
+  open_count: Generated<number>;
+  connect_count: Generated<number>;
+  visit_count: Generated<number>;
+  tipped_count: Generated<number>;
+  tipped_amount_count: Generated<number>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppListingModerationEvent = {
+  id: string;
+  app_listing_id: string | null;
+  slug: string;
+  actor_user_id: number | null;
+  report_id: string | null;
+  action: string;
+  reason: string | null;
+  detail: string | null;
+  before: unknown | null;
+  after: unknown | null;
+  created_at: Generated<Timestamp>;
+};
+export type AppListingPublishRequest = {
+  id: string;
+  app_listing_id: string | null;
+  kind: string;
+  slug: string;
+  submitted_by_user_id: number;
+  submitted_at: Generated<Timestamp>;
+  status: string;
+  reviewed_by_user_id: number | null;
+  reviewed_at: Timestamp | null;
+  rejection_reason: string | null;
+  approval_notes: string | null;
+  changelog: string | null;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppListingReport = {
+  id: string;
+  app_listing_id: string;
+  reporter_user_id: number;
+  reason: string;
+  details: string | null;
+  status: Generated<string>;
+  resolved_by_user_id: number | null;
+  resolved_at: Timestamp | null;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppListingReview = {
+  id: Generated<number>;
+  app_listing_id: string;
+  user_id: number;
+  recommended: boolean;
+  details: string | null;
+  exclude: Generated<boolean>;
+  tos_violation: Generated<boolean>;
+  metadata: unknown | null;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppListingScreenshot = {
+  id: string;
+  app_listing_id: string;
+  image_id: number | null;
+  order: Generated<number>;
+  caption: string | null;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppOwnershipEvent = {
+  id: string;
+  app_listing_id: string | null;
+  /**
+   * Denormalized so the event stays self-describing after the listing is gone.
+   */
+  slug: string;
+  /**
+   * invite | accept | reject | remove | leave | display | transfer_initiated |
+   * transfer_accepted | transfer_cancelled. Bounded by a CHECK in the migration.
+   */
+  action: string;
+  /**
+   * Who performed the action.
+   */
+  actor_user_id: number | null;
+  /**
+   * Who it was performed ON (the invitee / removed editor / transfer recipient).
+   */
+  target_user_id: number | null;
+  /**
+   * Structured extras (role, before/after owner, expiry, …).
+   */
+  metadata: unknown | null;
+  created_at: Generated<Timestamp>;
+};
+export type AppOwnershipTransfer = {
+  id: string;
+  app_listing_id: string;
+  /**
+   * Snapshot of the owner at initiate time — re-asserted in-tx at accept, so a
+   * transfer initiated by an owner who has since lost the listing cannot complete.
+   */
+  from_user_id: number;
+  to_user_id: number;
+  /**
+   * 'pending' | 'accepted' | 'cancelled' | 'rejected' | 'expired'. CHECK in the migration.
+   */
+  status: Generated<string>;
+  /**
+   * Hard expiry — an unaccepted transfer stops being acceptable after this instant.
+   * Enforced in the ACCEPT path (a read-time predicate), so no sweeper job is
+   * required for correctness; a sweeper would only tidy the rows.
+   */
+  expires_at: Timestamp;
+  created_at: Generated<Timestamp>;
+  responded_at: Timestamp | null;
+};
+export type AppPageAccess = {
+  app: string;
+  path: string;
+  roles: string[];
+  updatedById: number | null;
+  updatedAt: Generated<Timestamp>;
+};
+export type AppPostIntent = {
+  listing_id: string;
+  host: string;
+  path_prefix: string;
+  enabled: Generated<boolean>;
+  reviewed_by_id: number | null;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppReviewAgentReport = {
+  id: string;
+  publish_request_id: string;
+  slug: string;
+  kind: Generated<string>;
+  app_block_id: string | null;
+  oauth_client_id: string | null;
+  version: string;
+  bundle_sha256: string;
+  status: Generated<string>;
+  model: string | null;
+  started_at: Generated<Timestamp>;
+  completed_at: Timestamp | null;
+  code_review: unknown | null;
+  security_audit: unknown | null;
+  scope_verdicts: unknown | null;
+  summary_md: string | null;
+  prior_report_id: string | null;
+  token_usage: unknown | null;
+  cost_usd: string | null;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppSubListing = {
+  id: string;
+  parent_listing_id: string;
+  item_key: string;
+  author_user_id: number;
+  title: string;
+  tagline: string | null;
+  image_id: number | null;
+  sub_path: string;
+  content_rating: string | null;
+  pending_title: string | null;
+  pending_tagline: string | null;
+  pending_image_id: number | null;
+  pending_sub_path: string | null;
+  pending_content_rating: string | null;
+  pending_submitted_at: Timestamp | null;
+  edit_rejection_reason: string | null;
+  status: Generated<string>;
+  status_reason: string | null;
+  moderated_by_id: number | null;
+  moderated_at: Timestamp | null;
+  approved_at: Timestamp | null;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppSubListingParent = {
+  parent_listing_id: string;
+  enabled: Generated<boolean>;
+  max_per_author: Generated<number>;
+  /**
+   * The https URL an off-site parent's store cards open, with one `{id}` (manual-apply column).
+   */
+  link_template: string | null;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type AppUserScopeGrant = {
+  id: string;
+  user_id: number;
+  app_block_id: string;
+  version: string;
+  granted_scopes: Generated<string[]>;
+  granted_at: Generated<Timestamp>;
+  revoked_at: Timestamp | null;
+  /**
+   * PER-SCOPE REVOCATION — the SUPPRESSION LIST, not the absence of a grant.
+   *
+   * 🔴 A REVOKE CANNOT BE MODELLED AS REMOVAL FROM `granted_scopes`, AND THAT IS
+   * THE WHOLE REASON THIS COLUMN EXISTS. `BlockRegistry.recordInstallConsent`
+   * passes the app's ENTIRE consent-gated effective set into `recordScopeGrant`,
+   * which UNIONS it into `granted_scopes` — so a revoke expressed only as removal
+   * is silently undone by the user's next install or subscribe of that app, with
+   * no consent prompt anywhere. A scope listed here is subtracted at every read
+   * (`getGrantedScopes`), so a union that puts it back grants nothing.
+   *
+   * Cleared ONLY by an explicit prompted re-consent (`blocks.grantScopes` →
+   * `recordScopeGrant({ clearRevocations: true })`), and then only for the scopes
+   * that consent actually covered — never wholesale, or re-consenting to scope A
+   * would resurrect a revoked scope B.
+   */
+  revoked_scopes: Generated<string[]>;
+  /**
+   * When the MOST RECENT per-scope revoke happened for this (user, app).
+   *
+   * ⚠️ NOT A PER-SCOPE TIMESTAMP, and deliberately not: `revoked_scopes` is a
+   * TEXT[] with no room for one, and a per-scope time would need a child table.
+   * Two revokes a week apart leave ONE value here — the later. So it is honest as
+   * an APP-LEVEL "permissions last changed", and a UI must not render it beside an
+   * individual scope as though it dated that scope's revoke.
+   */
+  revoked_scopes_at: Timestamp | null;
+  /**
+   * The per-UTC-day Buzz ceiling the VIEWER set for THIS app at consent time.
+   * NULL = the user set no budget, and the app spends under the platform's own
+   * per-user daily ceiling (`BLOCK_BUZZ_CAP_PER_DAY`, 50,000) alone — which is
+   * exactly the behaviour of every grant written before this column existed, so
+   * no backfill is needed and nobody is silently tightened. Non-NULL adds a
+   * SECOND reservation at spend time keyed on (user, app, UTC-day); both caps
+   * apply and the tighter one binds. Meaningful only alongside the
+   * `ai:write:budgeted` scope (nothing else in a grant can spend).
+   */
+  buzz_budget_per_day: number | null;
+};
+export type Article = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp | null>;
+  updatedAt: Timestamp | null;
+  nsfw: Generated<boolean>;
+  tosViolation: Generated<boolean>;
+  metadata: unknown | null;
+  title: string;
+  content: string;
+  cover: string | null;
+  coverId: number | null;
+  bannerId: number | null;
+  publishedAt: Timestamp | null;
+  scheduledAt: Timestamp | null;
+  contentScannedAt: Timestamp | null;
+  ingestion: Generated<ArticleIngestionStatus>;
+  scanRequestedAt: Timestamp | null;
+  userId: number;
+  availability: Generated<Availability>;
+  unlisted: Generated<boolean>;
+  nsfwLevel: Generated<number>;
+  userNsfwLevel: Generated<number>;
+  moderatorNsfwLevel: number | null;
+  moderatorNsfwLevelBasis: number | null;
+  lockedProperties: Generated<string[]>;
+  isOfficial: Generated<boolean>;
+  status: Generated<ArticleStatus>;
+};
+export type ArticleContentLinkHold = {
+  articleId: number;
+  deferred: Generated<string[]>;
+  refused: Generated<string[]>;
+  /**
+   * Who saved the content; their own keys count as the owner's.
+   */
+  editorId: number;
+  /**
+   * When a url was first deferred, kept while any stays deferred.
+   */
+  deferredSince: Timestamp | null;
+  /**
+   * Set once a deferral outlives the backstop and a moderator report is filed.
+   */
+  reportedAt: Timestamp | null;
+  checkedAt: Generated<Timestamp>;
+};
+export type ArticleEngagement = {
+  userId: number;
+  articleId: number;
+  type: ArticleEngagementType;
+  createdAt: Generated<Timestamp>;
+};
+export type ArticleMetric = {
+  articleId: number;
+  timeframe: MetricTimeframe;
+  likeCount: Generated<number>;
+  dislikeCount: Generated<number>;
+  laughCount: Generated<number>;
+  cryCount: Generated<number>;
+  heartCount: Generated<number>;
+  commentCount: Generated<number>;
+  viewCount: Generated<number>;
+  favoriteCount: Generated<number>;
+  hideCount: Generated<number>;
+  collectedCount: Generated<number>;
+  tippedCount: Generated<number>;
+  tippedAmountCount: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+};
+export type ArticleRank = {
+  articleId: number;
+  cryCountDayRank: Generated<number | null>;
+  cryCountWeekRank: Generated<number | null>;
+  cryCountMonthRank: Generated<number | null>;
+  cryCountYearRank: Generated<number | null>;
+  cryCountAllTimeRank: Generated<number | null>;
+  dislikeCountDayRank: Generated<number | null>;
+  dislikeCountWeekRank: Generated<number | null>;
+  dislikeCountMonthRank: Generated<number | null>;
+  dislikeCountYearRank: Generated<number | null>;
+  dislikeCountAllTimeRank: Generated<number | null>;
+  heartCountDayRank: Generated<number | null>;
+  heartCountWeekRank: Generated<number | null>;
+  heartCountMonthRank: Generated<number | null>;
+  heartCountYearRank: Generated<number | null>;
+  heartCountAllTimeRank: Generated<number | null>;
+  laughCountDayRank: Generated<number | null>;
+  laughCountWeekRank: Generated<number | null>;
+  laughCountMonthRank: Generated<number | null>;
+  laughCountYearRank: Generated<number | null>;
+  laughCountAllTimeRank: Generated<number | null>;
+  likeCountDayRank: Generated<number | null>;
+  likeCountWeekRank: Generated<number | null>;
+  likeCountMonthRank: Generated<number | null>;
+  likeCountYearRank: Generated<number | null>;
+  likeCountAllTimeRank: Generated<number | null>;
+  commentCountDayRank: Generated<number | null>;
+  commentCountWeekRank: Generated<number | null>;
+  commentCountMonthRank: Generated<number | null>;
+  commentCountYearRank: Generated<number | null>;
+  commentCountAllTimeRank: Generated<number | null>;
+  reactionCountDayRank: Generated<number | null>;
+  reactionCountWeekRank: Generated<number | null>;
+  reactionCountMonthRank: Generated<number | null>;
+  reactionCountYearRank: Generated<number | null>;
+  reactionCountAllTimeRank: Generated<number | null>;
+  viewCountDayRank: Generated<number | null>;
+  viewCountWeekRank: Generated<number | null>;
+  viewCountMonthRank: Generated<number | null>;
+  viewCountYearRank: Generated<number | null>;
+  viewCountAllTimeRank: Generated<number | null>;
+  favoriteCountDayRank: Generated<number | null>;
+  favoriteCountWeekRank: Generated<number | null>;
+  favoriteCountMonthRank: Generated<number | null>;
+  favoriteCountYearRank: Generated<number | null>;
+  favoriteCountAllTimeRank: Generated<number | null>;
+  hideCountDayRank: Generated<number | null>;
+  hideCountWeekRank: Generated<number | null>;
+  hideCountMonthRank: Generated<number | null>;
+  hideCountYearRank: Generated<number | null>;
+  hideCountAllTimeRank: Generated<number | null>;
+  collectedCountDayRank: Generated<number | null>;
+  collectedCountWeekRank: Generated<number | null>;
+  collectedCountMonthRank: Generated<number | null>;
+  collectedCountYearRank: Generated<number | null>;
+  collectedCountAllTimeRank: Generated<number | null>;
+  tippedCountDayRank: Generated<number | null>;
+  tippedCountWeekRank: Generated<number | null>;
+  tippedCountMonthRank: Generated<number | null>;
+  tippedCountYearRank: Generated<number | null>;
+  tippedCountAllTimeRank: Generated<number | null>;
+  tippedAmountCountDayRank: Generated<number | null>;
+  tippedAmountCountWeekRank: Generated<number | null>;
+  tippedAmountCountMonthRank: Generated<number | null>;
+  tippedAmountCountYearRank: Generated<number | null>;
+  tippedAmountCountAllTimeRank: Generated<number | null>;
+};
+export type ArticleRatingReview = {
+  id: Generated<number>;
+  articleId: number;
+  userId: number;
+  createdAt: Generated<Timestamp>;
+  resolvedAt: Timestamp | null;
+  resolvedBy: number | null;
+  currentLevel: number;
+  suggestedLevel: number;
+  appliedLevel: number | null;
+  userComment: string | null;
+  modComment: string | null;
+  status: Generated<ReportStatus>;
+};
+export type ArticleReaction = {
+  id: Generated<number>;
+  articleId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ArticleReport = {
+  articleId: number;
+  reportId: number;
+};
+export type ArticleShareCheck = {
+  articleId: number;
+  generation: Generated<number>;
+  workflowId: string | null;
+  textHash: string | null;
+  updatedAt: Timestamp;
+};
+export type ArticleStat = {
+  articleId: number;
+  cryCountDay: Generated<number>;
+  cryCountWeek: Generated<number>;
+  cryCountMonth: Generated<number>;
+  cryCountYear: Generated<number>;
+  cryCountAllTime: Generated<number>;
+  dislikeCountDay: Generated<number>;
+  dislikeCountWeek: Generated<number>;
+  dislikeCountMonth: Generated<number>;
+  dislikeCountYear: Generated<number>;
+  dislikeCountAllTime: Generated<number>;
+  heartCountDay: Generated<number>;
+  heartCountWeek: Generated<number>;
+  heartCountMonth: Generated<number>;
+  heartCountYear: Generated<number>;
+  heartCountAllTime: Generated<number>;
+  laughCountDay: Generated<number>;
+  laughCountWeek: Generated<number>;
+  laughCountMonth: Generated<number>;
+  laughCountYear: Generated<number>;
+  laughCountAllTime: Generated<number>;
+  likeCountDay: Generated<number>;
+  likeCountWeek: Generated<number>;
+  likeCountMonth: Generated<number>;
+  likeCountYear: Generated<number>;
+  likeCountAllTime: Generated<number>;
+  commentCountDay: Generated<number>;
+  commentCountWeek: Generated<number>;
+  commentCountMonth: Generated<number>;
+  commentCountYear: Generated<number>;
+  commentCountAllTime: Generated<number>;
+  reactionCountDay: Generated<number>;
+  reactionCountWeek: Generated<number>;
+  reactionCountMonth: Generated<number>;
+  reactionCountYear: Generated<number>;
+  reactionCountAllTime: Generated<number>;
+  viewCountDay: Generated<number>;
+  viewCountWeek: Generated<number>;
+  viewCountMonth: Generated<number>;
+  viewCountYear: Generated<number>;
+  viewCountAllTime: Generated<number>;
+  favoriteCountDay: Generated<number>;
+  favoriteCountWeek: Generated<number>;
+  favoriteCountMonth: Generated<number>;
+  favoriteCountYear: Generated<number>;
+  favoriteCountAllTime: Generated<number>;
+  collectedCountDay: Generated<number>;
+  collectedCountWeek: Generated<number>;
+  collectedCountMonth: Generated<number>;
+  collectedCountYear: Generated<number>;
+  collectedCountAllTime: Generated<number>;
+  hideCountDay: Generated<number>;
+  hideCountWeek: Generated<number>;
+  hideCountMonth: Generated<number>;
+  hideCountYear: Generated<number>;
+  hideCountAllTime: Generated<number>;
+  tippedCountDay: Generated<number>;
+  tippedCountWeek: Generated<number>;
+  tippedCountMonth: Generated<number>;
+  tippedCountYear: Generated<number>;
+  tippedCountAllTime: Generated<number>;
+  tippedAmountCountDay: Generated<number>;
+  tippedAmountCountWeek: Generated<number>;
+  tippedAmountCountMonth: Generated<number>;
+  tippedAmountCountYear: Generated<number>;
+  tippedAmountCountAllTime: Generated<number>;
+};
+export type Auction = {
+  id: Generated<number>;
+  auctionBaseId: number;
+  startAt: Timestamp;
+  endAt: Timestamp;
+  quantity: number;
+  minPrice: number;
+  validFrom: Timestamp;
+  validTo: Timestamp;
+  finalized: Generated<boolean>;
+};
+export type AuctionBase = {
+  id: Generated<number>;
+  type: AuctionType;
+  ecosystem: string | null;
+  name: string;
+  slug: string;
+  quantity: number;
+  minPrice: number;
+  active: Generated<boolean>;
+  runForDays: Generated<number>;
+  validForDays: Generated<number>;
+  description: string | null;
+};
+export type Bid = {
+  id: Generated<number>;
+  auctionId: number;
+  userId: number;
+  entityId: number;
+  amount: number;
+  createdAt: Generated<Timestamp>;
+  deleted: Generated<boolean>;
+  transactionIds: Generated<string[]>;
+  isRefunded: Generated<boolean>;
+  fromRecurring: Generated<boolean>;
+  accountType: Generated<string>;
+};
+export type BidRecurring = {
+  id: Generated<number>;
+  auctionBaseId: number;
+  userId: number;
+  entityId: number;
+  amount: number;
+  createdAt: Generated<Timestamp>;
+  startAt: Timestamp;
+  endAt: Timestamp | null;
+  isPaused: Generated<boolean>;
+  accountType: Generated<string>;
+};
+export type BlockAttributionPayout = {
+  id: string;
+  app_owner_user_id: number;
+  /**
+   * Caller-supplied period bucket, e.g. ISO week '2026-W22'. The
+   * (owner, period) pair is the idempotency key.
+   */
+  period_key: string;
+  /**
+   * Net publisher share minted for this period (sum of contributing
+   * confirmed rows' app_owner_share_cents, after clawbacks net out).
+   */
+  total_cents: number;
+  /**
+   * Number of block_buzz_attribution rows flipped to paid_out by this mint.
+   */
+  row_count: number;
+  created_at: Generated<Timestamp>;
+};
+export type BlockAuthorFeeAccrual = {
+  id: string;
+  /**
+   * Orchestrator workflow id — the idempotency anchor. A resubmit of the same
+   * workflow must never charge or accrue twice.
+   */
+  workflow_id: string;
+  app_id: string;
+  app_block_id: string;
+  /**
+   * 🔴 Resolved at WRITE time, never at settlement. An app that changes hands
+   * must not retroactively move earnings already accrued to the previous owner
+   * (`app-ownership-transfer.service.ts` is the precedent). Resolving the owner
+   * in the settlement query would do exactly that.
+   */
+  app_owner_user_id: number;
+  /**
+   * The viewer who paid. What the self-dealing exclusion is measured against,
+   * and what slice 2b's refund path will join on to reverse a fee.
+   */
+  viewer_user_id: number;
+  /**
+   * 🔴 D6 — a viewer spending blue Buzz pays in blue and the author receives
+   * blue (non-withdrawable). The settlement job groups by this and never
+   * coerces to yellow; defaulting it would silently convert non-withdrawable
+   * Buzz into withdrawable earnings. No `@default` for that reason.
+   */
+  buzz_type: string;
+  /**
+   * Whole Buzz owed to the author, always > 0 — pinned by a CHECK. There is no
+   * negative row: the clawback was retired in round 0 (zero production callers,
+   * and its carry-forward arm unreachable until something had settled). Slice 2b
+   * adds it together with the refund path that drives it.
+   */
+  fee_buzz: number;
+  /**
+   * The pricing inputs, kept so a disputed charge can be explained without
+   * re-deriving it from a workflow that may no longer exist.
+   */
+  base_generation_buzz: number;
+  flat_leg_buzz: number;
+  pct_leg_buzz: number;
+  governing_leg: string;
+  /**
+   * The resolved '<coarse>' or '<coarse>:<subtype>' the fee was priced under.
+   * NULL when the type could not be resolved — the fee still applies, falling
+   * to the app's default (see `resolveBlockAuthorFeeParams`).
+   */
+  generation_type: string | null;
+  /**
+   * 'accrued' | 'settled'.
+   */
+  status: Generated<string>;
+  /**
+   * The externalTransactionId this row settled under, so a row traces to the
+   * exact mint. NULL until settled; a CHECK keeps it and `settledAt` in step
+   * with `status`.
+   */
+  settlement_key: string | null;
+  accrued_at: Generated<Timestamp>;
+  settled_at: Timestamp | null;
+};
+export type BlockBuzzAttribution = {
+  id: string;
+  user_id: number;
+  buzz_amount: number;
+  usd_amount_cents: number;
+  buzz_type: Generated<string>;
+  payment_provider: string;
+  payment_transaction_id: string;
+  buzz_transaction_id: string | null;
+  app_id: string;
+  app_block_id: string;
+  block_instance_id: string;
+  scope: string;
+  model_id: number | null;
+  rate_card_version: string;
+  app_owner_share_cents: number;
+  platform_share_cents: number;
+  provider_fee_cents: number;
+  app_owner_user_id: number;
+  status: Generated<string>;
+  voided_reason: string | null;
+  hold_reason: string | null;
+  held_at: Timestamp | null;
+  entry_type: Generated<string>;
+  attributed_at: Generated<Timestamp>;
+  confirmed_at: Timestamp | null;
+  voided_at: Timestamp | null;
+  paid_out_at: Timestamp | null;
+  payout_id: string | null;
+};
+export type BlockedImage = {
+  hash: string;
+  reason: Generated<BlockImageReason>;
+  createdAt: Generated<Timestamp>;
+};
+export type BlockGoodEntitlement = {
+  id: string;
+  user_id: number;
+  app_block_id: string;
+  good_id: string;
+  /**
+   * 'good' | 'app_unlock' — see BLOCK_GOOD_KINDS.
+   */
+  kind: Generated<string>;
+  /**
+   * The opaque app payload, snapshotted from the manifest at purchase.
+   */
+  payload: Generated<unknown>;
+  /**
+   * The purchase that granted it. One-to-one: a purchase grants exactly one
+   * entitlement, and an entitlement always has a purchase behind it.
+   */
+  purchase_id: string;
+  granted_at: Generated<Timestamp>;
+  /**
+   * Set when the purchase is refunded or the good is taken down. A revoked
+   * entitlement is kept, never deleted — the row is the audit trail for a
+   * reversal.
+   */
+  revoked_at: Timestamp | null;
+  revoke_reason: string | null;
+};
+export type BlockGoodPurchase = {
+  id: string;
+  /**
+   * The buyer. Always the verified block-token subject, never a body field.
+   */
+  user_id: number;
+  app_id: string;
+  app_block_id: string;
+  /**
+   * NOT an FK and NULLABLE, for the same reason the attribution tables give:
+   * synthetic instance ids (`bus_pub_*`, `page_*`, `ephemeral-*`) resolve to no
+   * row. NULL means the instance could not be resolved — the purchase still
+   * happened and is still attributed to the app; only the install context is
+   * unknown. A purchase must never fail because attribution could not.
+   */
+  block_instance_id: string | null;
+  /**
+   * The manifest `goods[].id` bought, and the manifest `version` it was bought
+   * under. Together they explain a disputed price without needing the manifest
+   * that was live at the time (a later approved version may have repriced it).
+   */
+  good_id: string;
+  manifest_version: string;
+  /**
+   * What the viewer was charged, in whole Buzz. Always > 0 (CHECK).
+   */
+  price_buzz: number;
+  /**
+   * How much of `price_buzz` came out of the BLUE (granted) account. Drives
+   * the proportional colour split of the payout, so a viewer paying blue does
+   * not turn non-withdrawable Buzz into withdrawable earnings.
+   */
+  blue_paid_buzz: Generated<number>;
+  app_owner_user_id: number;
+  app_owner_share_buzz: number;
+  platform_share_buzz: number;
+  /**
+   * The deterministic `externalTransactionIdPrefix` the buyer's debit was
+   * made under. UNIQUE — this is the LEDGER-backed half of idempotency: a
+   * retry after the Redis sentinel expired collides here instead of charging
+   * twice.
+   */
+  buzz_transaction_id: string;
+  /**
+   * What was actually paid, per recipient and colour, with each payout's own
+   * ledger transaction id: `[{ userId, amount, color, transactionId? }]`.
+   * Empty until the payout leg runs. A refund reads THIS, never a re-derived
+   * split.
+   */
+  payouts: Generated<unknown>;
+  /**
+   * 'pending' | 'paid' | 'refunded'. A row is INSERTED as `pending` BEFORE the
+   * buyer is charged — the UNIQUE `buzzTransactionId` is what serialises
+   * concurrent attempts, so exactly one can reach the charge. A surviving
+   * `pending` row is the reconciliation record for a charge whose outcome is
+   * unknown.
+   *
+   * `refunded` also marks a charge that was reversed before any entitlement
+   * was granted: that row is kept, not deleted, because its `buzzTransactionId`
+   * stays occupied in the Buzz ledger and the next attempt supersedes it.
+   */
+  status: Generated<string>;
+  refund_reason: string | null;
+  refunded_at: Timestamp | null;
+  created_at: Generated<Timestamp>;
+};
+export type Blocklist = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  type: string;
+  data: string[];
+};
+export type BlockScopeInvocation = {
+  id: Generated<string>;
+  user_id: number;
+  /**
+   * NULLABLE (App Dev Tunnel Phase 2): a PRE-APPROVAL dev-tunnel spend has NO
+   * AppBlock row (approval is what creates it), so the token carries a SYNTHETIC
+   * `ephemeral-<slug>` appBlockId that can never FK-resolve. For that case this
+   * column is NULL and the synthetic ref is captured in `syntheticAppId`, so the
+   * durable per-spend audit row persists instead of FK-failing + being swallowed
+   * (the "only a log line" gap). An APPROVED app still sets this (real FK).
+   */
+  app_block_id: string | null;
+  /**
+   * The synthetic, non-resolving dev-app reference (`ephemeral-<slug>` /
+   * `local-<slug>` / `pending-<pubreqId>`) for a PRE-APPROVAL dev-tunnel spend —
+   * the forensic anchor when `appBlockId` is NULL. NULL for every approved-app row.
+   */
+  synthetic_app_id: string | null;
+  /**
+   * NULLABLE: an EXTERNAL OAuth invocation (`source = 'external-oauth'`) has no
+   * block instance — the acting app is a pure OauthClient with no App Block. A
+   * block-token row always sets this.
+   */
+  block_instance_id: string | null;
+  /**
+   * The acting OauthClient id for an EXTERNAL OAuth invocation (`source =
+   * 'external-oauth'`) — the "which app" for external OAuth API usage, mirroring
+   * what `appBlockId` is for a block-token row. NULL for a block-token row.
+   * Intentionally FK-LESS text so the audit row SURVIVES deletion of the
+   * OauthClient it references (an audit trail must outlive the app).
+   */
+  oauth_client_id: string | null;
+  /**
+   * Discriminates the token population that made the call. THREE values, and this
+   * comment is the single source for the generated type docs, so keep it complete:
+   * * `'app-block'`      — an App Block block-token, the historical default.
+   * * `'external-oauth'` — a standard external OAuth access token verified at
+   * `enforceTokenScope`; carries no `app_block_id`.
+   * * `'private-run'`    — a block-token minted for a PRIVATE RUN: a moderator, the
+   * owner, or an accepted listing collaborator running a
+   * delisted/suspended app's deployed bundle. It carries the
+   * app's REAL id, and this value is the ONLY thing keeping the
+   * row out of that app owner's analytics, so it is a
+   * load-bearing discriminator rather than a label. Written
+   * only from the verified `privateRun` token claim; see
+   * `scope-activity-predicate.ts`.
+   * Free-text with NO CHECK constraint — the value space is enforced in TypeScript
+   * (`BlockScopeInvocationSource`), not by the database. Additive: existing rows
+   * backfill to `'app-block'` via the column DEFAULT.
+   */
+  source: Generated<string>;
+  scope: string;
+  endpoint: string;
+  status_code: number;
+  /**
+   * Structured per-action audit detail (W13). NULL for a passive read (whose
+   * friendly label is derived from `scope` at render time) and for any row
+   * written before this column existed. For an impactful MUTATION it carries a
+   * stable `action` code + minimal subject refs (`{ action, amount?, toUserId?,
+   * modelVersionId?, entityId?, entityType?, key?, outcome? }` — see
+   * BlockActionDetail). Stores IDS, not display names — the view resolves them
+   * via batch lookups, so the row never rots when a name changes. Nullable + no
+   * default → additive, backwards-compatible, no backfill.
+   */
+  detail: unknown | null;
+  invoked_at: Generated<Timestamp>;
+};
+export type BlockSpendAttribution = {
+  id: string;
+  user_id: number;
+  buzz_amount: number;
+  buzz_type: Generated<string>;
+  /**
+   * USD value of the Buzz burned (buzzDollarRatio 1000:1 -> cents).
+   * Recorded for reporting — it is platform revenue, NOT a split pool.
+   */
+  gross_value_cents: number;
+  /**
+   * Orchestrator workflow id — the idempotency anchor.
+   */
+  workflow_id: string;
+  app_id: string;
+  app_block_id: string;
+  block_instance_id: string;
+  model_id: number | null;
+  /**
+   * Always the 'unrated' sentinel — the write path hardcodes it. No rate card
+   * is applied to a spend row, and nothing re-stamps it (the backpay that would
+   * have is removed). Measured in production 2026-09-18: a
+   * `GROUP BY rate_card_version` over the whole table returned a single
+   * 'unrated' group — self-discriminating, since any other stamped version
+   * would have been a second group. Re-measure before relying on it.
+   */
+  rate_card_version: string;
+  /**
+   * Always 0. This was the spend rev-share percentage stamped at write time,
+   * for the removed platform-funded bounty; the write path now hardcodes 0 and
+   * the column is retained only to keep the row shape + CHECK constraints.
+   */
+  spend_share_pct: number;
+  app_owner_share_cents: number;
+  app_owner_user_id: number;
+  /**
+   * The USER who published the shared content this generation ran on behalf
+   * of (the "content author") — the durable BASIS for a FUTURE creator
+   * payout. Resolved SERVER-SIDE from `sharedContentKey` against the calling
+   * app's own `app_<slug>.shared_kv`, never client-supplied. NULL when no
+   * key was supplied, the row is missing/hidden, or the author is the
+   * spender (self) or the app owner. FULLY GENERIC — any app that publishes
+   * cross-user shared content can populate it — not tied to any one app kind.
+   * TRACK-ONLY today: nothing pays out on it yet.
+   */
+  content_author_user_id: number | null;
+  /**
+   * The opaque shared-storage `key` the app supplied for this generation
+   * (bounded, app-owned). NULL when the app supplied none.
+   */
+  shared_content_key: string | null;
+  /**
+   * The APP-FACING generation type this spend paid for, as `<coarse>` or
+   * `<coarse>:<subtype>` — e.g. `textToImage:img2img-edit`,
+   * `customComfy:seamless-pano-360`, `customComfy:inline`, a bare registered
+   * STEP ID (`convert-image`, `chat-completion`), or `step:<orchestrator $type>`
+   * on the PASS-THROUGH step arm.
+   *
+   * 🔴 EVERY VALUE IS AN APP-FACING ID AND NEVER THE ORCHESTRATOR'S INTERNAL
+   * `$type` — EXCEPT UNDER THE `step` COARSE KEY, WHICH IS EXACTLY THAT, AND IS
+   * CALLER-SUPPLIED. The pass-through arm (`kind:'step'` with a bare `$type` and
+   * no registry id) has no app-facing id at all: the `$type` IS the contract the
+   * app wrote, it is validated against nothing but the platform-internal
+   * denylist, and it is bounded here only by SHAPE (≤64 chars of
+   * `[A-Za-z0-9._-]`). The `step:` prefix is what keeps that visible and keeps it
+   * out of the other keys' namespaces — `textToImage` and `customComfy` are
+   * themselves real orchestrator `$type`s, so a bare one would be indistinguishable
+   * from a genuine image submit. Every other arm's value is server-owned.
+   *
+   * 🔴 THE COARSE KEY IS EVERYTHING BEFORE THE FIRST COLON, and a value carries
+   * at most one. A per-generation-type author fee keys on the coarse key, so
+   * `split_part(generation_type, ':', 1)` is the stable grouping no matter how
+   * the subtype axis grows — and on `step:` rows it is also the ONLY safe
+   * grouping, because the subtype is app-chosen. Do not key a fee, a rate or a
+   * payout on the full value. A registry step id implies `kind: 'step'` and
+   * carries no subtype, so one column still covers the whole axis with no
+   * companion `kind`.
+   *
+   * Deliberately unconstrained TEXT — no CHECK, no enum. Both the step and
+   * recipe registries are designed to grow additively (register an entry, not
+   * a schema change), and a CHECK would make every new step or recipe a
+   * migration. The bound is enforced in code against those registries
+   * (`resolveBlockGenerationType` / `isBlockGenerationType`, in
+   * `src/server/services/blocks/generation-type.ts`) and re-checked at the
+   * write.
+   *
+   * NULL on rows written before this column existed (no backfill is possible —
+   * the type was never recorded) and on any submit whose type could not be
+   * resolved. Resolution is fail-open: an unresolvable SUB-axis degrades to the
+   * bare coarse key, and an unresolvable body to NULL, rather than throwing on
+   * the fire-and-forget spend path.
+   */
+  generation_type: string | null;
+  status: Generated<string>;
+  /**
+   * 'self_spend' / 'internal_owner' / 'manual_review'. Spend has no
+   * refund path, so this is never 'refund'/'chargeback'.
+   * 'manual_review' carries TWO senses on this table: an operator void, and a
+   * PRIVATE RUN of a delisted app (the value is reused rather than adding a
+   * 'private_run' member, which would need a hand-applied migration). A
+   * cross-table query cannot tell them apart here; the private-run mint's audit
+   * line is what discriminates. Nothing pays out of this table either way.
+   */
+  voided_reason: string | null;
+  attributed_at: Generated<Timestamp>;
+  confirmed_at: Timestamp | null;
+  voided_at: Timestamp | null;
+  paid_out_at: Timestamp | null;
+  payout_id: string | null;
+};
+export type BlockSubscriptionAttribution = {
+  id: string;
+  user_id: number;
+  buzz_amount: Generated<number>;
+  buzz_type: Generated<string>;
+  /**
+   * Gross USD value of the invoice, in cents.
+   */
+  gross_value_cents: number;
+  payment_provider: string;
+  /**
+   * Per-period idempotency anchor — each renewal has its own invoice_id.
+   */
+  invoice_id: string;
+  /**
+   * Groups the periods of one subscription.
+   */
+  subscription_id: string | null;
+  /**
+   * subscription_create | subscription_cycle | subscription_update.
+   */
+  billing_reason: string | null;
+  period_start: Timestamp | null;
+  period_end: Timestamp | null;
+  app_id: string;
+  app_block_id: string;
+  block_instance_id: string;
+  scope: string;
+  model_id: number | null;
+  tier: string | null;
+  /**
+   * TRACK-ONLY (#2629): no rate applied at write time. 'unrated' sentinel
+   * until the payout-time backpay stamps the signed-off version.
+   */
+  rate_card_version: Generated<string>;
+  /**
+   * 0 at write time; the payout-time backpay computes the real share.
+   */
+  subscription_share_pct: Generated<number>;
+  app_owner_share_cents: Generated<number>;
+  platform_share_cents: number;
+  provider_fee_cents: number;
+  app_owner_user_id: number;
+  /**
+   * 'tracked' (track-only event) | pending | confirmed | voided | paid_out | held.
+   */
+  status: Generated<string>;
+  /**
+   * 'charge' (forward) | 'clawback' (negative carry-forward on refund/proration).
+   */
+  entry_type: Generated<string>;
+  /**
+   * 'refund' / 'chargeback' / 'proration' / 'self_purchase' / 'internal_owner' / 'manual_review'.
+   */
+  voided_reason: string | null;
+  attributed_at: Generated<Timestamp>;
+  confirmed_at: Timestamp | null;
+  voided_at: Timestamp | null;
+  paid_out_at: Timestamp | null;
+  payout_id: string | null;
+};
+export type BlockUserSettings = {
+  block_instance_id: string;
+  user_id: number;
+  settings: Generated<unknown>;
+  updated_at: Generated<Timestamp>;
+};
+export type BlockUserSubscription = {
+  id: string;
+  user_id: number;
+  app_block_id: string;
+  scope: string;
+  target_model_types: string[];
+  target_base_models: string[];
+  /**
+   * NEW (kill_per_model_installs): pin this subscription to specific model
+   * ids. Empty = blanket (applies to every model that passes the type +
+   * base-model filters). Non-empty + non-NULL slot_id = the per-model
+   * install path that model_block_installs used to carry.
+   */
+  target_model_ids: Generated<number[]>;
+  /**
+   * NEW (kill_per_model_installs): when set, this subscription targets a
+   * specific slot id (e.g. "model.sidebar_top"). When NULL, it applies to
+   * every slot the manifest declares (the blanket-subscription shape).
+   */
+  slot_id: string | null;
+  /**
+   * NEW (kill_per_model_installs): copied from model_block_installs.pinned
+   * _version. NULL = use the AppBlock's current approved manifest; semver
+   * string = use that version's manifest from app_block_publish_requests.
+   */
+  pinned_version: string | null;
+  /**
+   * NEW (kill_per_model_installs): preserves the bki_* id from the migrated
+   * install row so block_buzz_attribution, block_scope_invocations, and
+   * block_user_settings continue to resolve. NULL for blanket
+   * subscriptions (which synthesise bus_pub_* / bus_view_* on read).
+   */
+  block_instance_id: string | null;
+  /**
+   * NEW (kill_per_model_installs): mirrors model_block_installs.installed
+   * _by_user_id. For migrated rows this equals user_id by construction;
+   * kept as a separate column so future "installed by mod / installed via
+   * admin tooling" cases are expressible without schema change.
+   */
+  installed_by_user_id: number | null;
+  settings: Generated<unknown>;
+  enabled: Generated<boolean>;
+  created_at: Generated<Timestamp>;
+  updated_at: Generated<Timestamp>;
+};
+export type Blurb = {
+  id: Generated<number>;
+  userId: number;
+  name: string;
+  content: string;
+  contentHash: string;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  deletedAt: Timestamp | null;
+};
+export type BlurbReference = {
+  blurbId: number;
+  entityType: string;
+  entityId: number;
+  materializedHash: string;
+  materializedAt: Timestamp;
+  /**
+   * Set when the blurb is edited or soft-deleted, cleared once the entity is rewritten. The
+   * fan-out selector filters on it because the cross-table hash inequality it replaced cannot be
+   * indexed — see the note in 20260825000000_add_blurbs.
+   */
+  pendingSince: Timestamp | null;
+};
+export type Bounty = {
+  id: Generated<number>;
+  userId: number | null;
+  name: string;
+  description: string;
+  startsAt: Timestamp;
+  expiresAt: Timestamp;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  details: unknown | null;
+  mode: Generated<BountyMode>;
+  entryMode: Generated<BountyEntryMode>;
+  type: BountyType;
+  minBenefactorUnitAmount: number;
+  maxBenefactorUnitAmount: number | null;
+  entryLimit: Generated<number>;
+  nsfw: Generated<boolean>;
+  poi: Generated<boolean>;
+  complete: Generated<boolean>;
+  refunded: Generated<boolean>;
+  /**
+   * When the award (or, with `refunded`, the refund) was recorded under the payout lock.
+   */
+  payoutRecordedAt: Timestamp | null;
+  /**
+   * When that payout's Buzz moved. Recorded but unsettled rows are retried by `bounty-payout-retry`.
+   */
+  payoutSettledAt: Timestamp | null;
+  /**
+   * The award's winner, captured when it is recorded: the entry it went to can be deleted first.
+   */
+  payoutWinnerUserId: number | null;
+  availability: Generated<Availability>;
+  nsfwLevel: Generated<number>;
+  moderatorNsfwLevel: number | null;
+  moderatorNsfwLevelBasis: number | null;
+  lockedProperties: Generated<string[]>;
+  meta: unknown | null;
+};
+export type BountyBenefactor = {
+  userId: number;
+  bountyId: number;
+  unitAmount: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  awardedAt: Timestamp | null;
+  awardedToId: number | null;
+  currency: Generated<Currency>;
+  buzzTransactionId: Generated<string[]>;
+};
+export type BountyEngagement = {
+  userId: number;
+  bountyId: number;
+  type: BountyEngagementType;
+  createdAt: Generated<Timestamp>;
+};
+export type BountyEntry = {
+  id: Generated<number>;
+  userId: number | null;
+  bountyId: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  locked: Generated<boolean>;
+  description: string | null;
+  nsfwLevel: Generated<number>;
+  moderatorNsfwLevel: number | null;
+  moderatorNsfwLevelBasis: number | null;
+};
+export type BountyEntryMetric = {
+  bountyEntryId: number;
+  timeframe: MetricTimeframe;
+  likeCount: Generated<number>;
+  dislikeCount: Generated<number>;
+  laughCount: Generated<number>;
+  cryCount: Generated<number>;
+  heartCount: Generated<number>;
+  unitAmountCount: Generated<number>;
+  tippedCount: Generated<number>;
+  tippedAmountCount: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+};
+export type BountyEntryRank = {
+  bountyEntryId: number;
+  cryCountDayRank: Generated<number | null>;
+  cryCountWeekRank: Generated<number | null>;
+  cryCountMonthRank: Generated<number | null>;
+  cryCountYearRank: Generated<number | null>;
+  cryCountAllTimeRank: Generated<number | null>;
+  dislikeCountDayRank: Generated<number | null>;
+  dislikeCountWeekRank: Generated<number | null>;
+  dislikeCountMonthRank: Generated<number | null>;
+  dislikeCountYearRank: Generated<number | null>;
+  dislikeCountAllTimeRank: Generated<number | null>;
+  heartCountDayRank: Generated<number | null>;
+  heartCountWeekRank: Generated<number | null>;
+  heartCountMonthRank: Generated<number | null>;
+  heartCountYearRank: Generated<number | null>;
+  heartCountAllTimeRank: Generated<number | null>;
+  laughCountDayRank: Generated<number | null>;
+  laughCountWeekRank: Generated<number | null>;
+  laughCountMonthRank: Generated<number | null>;
+  laughCountYearRank: Generated<number | null>;
+  laughCountAllTimeRank: Generated<number | null>;
+  likeCountDayRank: Generated<number | null>;
+  likeCountWeekRank: Generated<number | null>;
+  likeCountMonthRank: Generated<number | null>;
+  likeCountYearRank: Generated<number | null>;
+  likeCountAllTimeRank: Generated<number | null>;
+  reactionCountDayRank: Generated<number | null>;
+  reactionCountWeekRank: Generated<number | null>;
+  reactionCountMonthRank: Generated<number | null>;
+  reactionCountYearRank: Generated<number | null>;
+  reactionCountAllTimeRank: Generated<number | null>;
+  unitAmountCountDayRank: Generated<number | null>;
+  unitAmountCountWeekRank: Generated<number | null>;
+  unitAmountCountMonthRank: Generated<number | null>;
+  unitAmountCountYearRank: Generated<number | null>;
+  unitAmountCountAllTimeRank: Generated<number | null>;
+  tippedCountDayRank: Generated<number | null>;
+  tippedCountWeekRank: Generated<number | null>;
+  tippedCountMonthRank: Generated<number | null>;
+  tippedCountYearRank: Generated<number | null>;
+  tippedCountAllTimeRank: Generated<number | null>;
+  tippedAmountCountDayRank: Generated<number | null>;
+  tippedAmountCountWeekRank: Generated<number | null>;
+  tippedAmountCountMonthRank: Generated<number | null>;
+  tippedAmountCountYearRank: Generated<number | null>;
+  tippedAmountCountAllTimeRank: Generated<number | null>;
+};
+export type BountyEntryReaction = {
+  bountyEntryId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+};
+export type BountyEntryReport = {
+  bountyEntryId: number;
+  reportId: number;
+};
+export type BountyEntryStat = {
+  bountyEntryId: number;
+  cryCountDay: number;
+  cryCountWeek: number;
+  cryCountMonth: number;
+  cryCountYear: number;
+  cryCountAllTime: number;
+  dislikeCountDay: number;
+  dislikeCountWeek: number;
+  dislikeCountMonth: number;
+  dislikeCountYear: number;
+  dislikeCountAllTime: number;
+  heartCountDay: number;
+  heartCountWeek: number;
+  heartCountMonth: number;
+  heartCountYear: number;
+  heartCountAllTime: number;
+  laughCountDay: number;
+  laughCountWeek: number;
+  laughCountMonth: number;
+  laughCountYear: number;
+  laughCountAllTime: number;
+  likeCountDay: number;
+  likeCountWeek: number;
+  likeCountMonth: number;
+  likeCountYear: number;
+  likeCountAllTime: number;
+  reactionCountDay: number;
+  reactionCountWeek: number;
+  reactionCountMonth: number;
+  reactionCountYear: number;
+  reactionCountAllTime: number;
+  unitAmountCountDay: number;
+  unitAmountCountWeek: number;
+  unitAmountCountMonth: number;
+  unitAmountCountYear: number;
+  unitAmountCountAllTime: number;
+  tippedCountDay: Generated<number>;
+  tippedCountWeek: Generated<number>;
+  tippedCountMonth: Generated<number>;
+  tippedCountYear: Generated<number>;
+  tippedCountAllTime: Generated<number>;
+  tippedAmountCountDay: Generated<number>;
+  tippedAmountCountWeek: Generated<number>;
+  tippedAmountCountMonth: Generated<number>;
+  tippedAmountCountYear: Generated<number>;
+  tippedAmountCountAllTime: Generated<number>;
+};
+export type BountyMetric = {
+  bountyId: number;
+  timeframe: MetricTimeframe;
+  favoriteCount: Generated<number>;
+  trackCount: Generated<number>;
+  entryCount: Generated<number>;
+  benefactorCount: Generated<number>;
+  unitAmountCount: Generated<number>;
+  commentCount: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+};
+export type BountyRank = {
+  bountyId: number;
+  favoriteCountDayRank: Generated<number | null>;
+  favoriteCountWeekRank: Generated<number | null>;
+  favoriteCountMonthRank: Generated<number | null>;
+  favoriteCountYearRank: Generated<number | null>;
+  favoriteCountAllTimeRank: Generated<number | null>;
+  trackCountDayRank: Generated<number | null>;
+  trackCountWeekRank: Generated<number | null>;
+  trackCountMonthRank: Generated<number | null>;
+  trackCountYearRank: Generated<number | null>;
+  trackCountAllTimeRank: Generated<number | null>;
+  entryCountDayRank: Generated<number | null>;
+  entryCountWeekRank: Generated<number | null>;
+  entryCountMonthRank: Generated<number | null>;
+  entryCountYearRank: Generated<number | null>;
+  entryCountAllTimeRank: Generated<number | null>;
+  benefactorCountDayRank: Generated<number | null>;
+  benefactorCountWeekRank: Generated<number | null>;
+  benefactorCountMonthRank: Generated<number | null>;
+  benefactorCountYearRank: Generated<number | null>;
+  benefactorCountAllTimeRank: Generated<number | null>;
+  unitAmountCountDayRank: Generated<number | null>;
+  unitAmountCountWeekRank: Generated<number | null>;
+  unitAmountCountMonthRank: Generated<number | null>;
+  unitAmountCountYearRank: Generated<number | null>;
+  unitAmountCountAllTimeRank: Generated<number | null>;
+  commentCountDayRank: Generated<number | null>;
+  commentCountWeekRank: Generated<number | null>;
+  commentCountMonthRank: Generated<number | null>;
+  commentCountYearRank: Generated<number | null>;
+  commentCountAllTimeRank: Generated<number | null>;
+};
+export type BountyReport = {
+  bountyId: number;
+  reportId: number;
+};
+export type BountyStat = {
+  bountyId: number;
+  favoriteCountDay: number;
+  favoriteCountWeek: number;
+  favoriteCountMonth: number;
+  favoriteCountYear: number;
+  favoriteCountAllTime: number;
+  trackCountDay: number;
+  trackCountWeek: number;
+  trackCountMonth: number;
+  trackCountYear: number;
+  trackCountAllTime: number;
+  entryCountDay: number;
+  entryCountWeek: number;
+  entryCountMonth: number;
+  entryCountYear: number;
+  entryCountAllTime: number;
+  benefactorCountDay: number;
+  benefactorCountWeek: number;
+  benefactorCountMonth: number;
+  benefactorCountYear: number;
+  benefactorCountAllTime: number;
+  unitAmountCountDay: number;
+  unitAmountCountWeek: number;
+  unitAmountCountMonth: number;
+  unitAmountCountYear: number;
+  unitAmountCountAllTime: number;
+  commentCountDay: number;
+  commentCountWeek: number;
+  commentCountMonth: number;
+  commentCountYear: number;
+  commentCountAllTime: number;
+};
+export type BountyUnpaidAward = {
+  bountyId: number;
+  /**
+   * The supporter whose award is unpaid.
+   */
+  userId: number;
+  unitAmount: number;
+  buzzTransactionIds: Generated<string[]>;
+  winnerUserId: number | null;
+  /**
+   * The bounty owner when the award was recorded, before any delete detaches the bounty.
+   */
+  ownerId: number | null;
+  /**
+   * Null on a row backfilled from ModActivity, which did not record the moderator.
+   */
+  recordedById: number | null;
+  recordedAt: Generated<Timestamp>;
+  /**
+   * paid_winner | refunded_supporter | no_charge_found
+   */
+  ruling: string | null;
+  ledgerReference: string | null;
+  resolvedById: number | null;
+  resolvedAt: Timestamp | null;
+};
+export type BoxContent = {
+  id: Generated<number>;
+  boxDefinitionId: number;
+  tierId: number;
+  rewardDefinitionId: number;
+  enabled: Generated<boolean>;
+};
+export type BoxOddsSnapshot = {
+  boxDefinitionId: number;
+  version: number;
+  snapshot: unknown;
+  createdById: number | null;
+  createdAt: Generated<Timestamp>;
+};
+export type BoxOpening = {
+  boxItemId: string;
+  boxDefinitionId: number;
+  boxVersion: number;
+  userId: number;
+  boxSourceKey: string;
+  tierId: number;
+  contentId: number;
+  rewardDefinitionId: number;
+  rewardType: string;
+  tierWeight: number;
+  eligibleWeight: number;
+  tierRoll: number;
+  tierPoolSize: number;
+  itemRoll: number;
+  /**
+   * granted | refunded (text + CHECK)
+   */
+  rewardStatus: string;
+  createdAt: Generated<Timestamp>;
+};
+export type BoxRevision = {
+  id: Generated<number>;
+  boxDefinitionId: number;
+  /**
+   * The box version the proposal was made against. Approval refuses it once the box has moved on.
+   */
+  baseVersion: number;
+  /**
+   * { steepness, tiers: [{ key, cosmeticIds }], price }
+   */
+  proposal: unknown;
+  /**
+   * pending | approved | rejected | withdrawn | stale (text + CHECK)
+   */
+  status: Generated<string>;
+  /**
+   * The box version approval produced.
+   */
+  appliedVersion: number | null;
+  submittedById: number;
+  reviewedById: number | null;
+  reviewedAt: Timestamp | null;
+  note: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type BoxTier = {
+  id: Generated<number>;
+  boxDefinitionId: number;
+  key: string;
+  name: string;
+  /**
+   * The tier's odds: weight / sum of the weights of tiers with anything left for the buyer.
+   */
+  weight: number;
+  color: string | null;
+  sortOrder: Generated<number>;
+};
+export type Bug = {
+  id: Generated<number>;
+  title: string;
+  summary: string;
+  content: string | null;
+  status: Generated<string>;
+  clickupUrl: string | null;
+  firstSeenAt: Generated<Timestamp>;
+  resolvedAt: Timestamp | null;
+  publishedAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  disabled: Generated<boolean>;
+  domain: Generated<DomainColor[]>;
+  tags: Generated<string[]>;
+};
+export type BuildGuide = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  name: string;
+  message: string;
+  userId: number;
+  components: unknown;
+  capabilities: unknown;
+};
+export type BuzzClaim = {
+  key: string;
+  title: string;
+  description: string;
+  transactionIdQuery: string;
+  amount: number;
+  availableStart: Timestamp | null;
+  availableEnd: Timestamp | null;
+  claimed: Generated<number>;
+  limit: number | null;
+  accountType: Generated<BuzzAccountType>;
+  useMultiplier: Generated<boolean>;
+};
+export type BuzzTip = {
+  entityType: string;
+  entityId: number;
+  toUserId: number;
+  fromUserId: number;
+  amount: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type BuzzWithdrawalRequest = {
+  id: string;
+  userId: number | null;
+  requestedToProvider: Generated<UserPaymentConfigurationProvider>;
+  requestedToId: string;
+  buzzWithdrawalTransactionId: string;
+  requestedBuzzAmount: number;
+  platformFeeRate: number;
+  transferredAmount: number | null;
+  transferId: string | null;
+  currency: Currency | null;
+  metadata: Generated<unknown>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  status: Generated<BuzzWithdrawalRequestStatus>;
+};
+export type BuzzWithdrawalRequestHistory = {
+  id: string;
+  requestId: string;
+  updatedById: number;
+  status: Generated<BuzzWithdrawalRequestStatus>;
+  note: string | null;
+  createdAt: Generated<Timestamp>;
+  metadata: Generated<unknown>;
+};
+export type CashWithdrawal = {
+  id: string;
+  transactionId: string | null;
+  userId: number;
+  amount: number;
+  method: CashWithdrawalMethod;
+  fee: number;
+  status: CashWithdrawalStatus;
+  note: string | null;
+  metadata: Generated<unknown>;
+  createdAt: Generated<Timestamp | null>;
+  updatedAt: Timestamp | null;
+};
+export type Challenge = {
+  id: Generated<number>;
+  startsAt: Timestamp;
+  endsAt: Timestamp;
+  visibleAt: Timestamp;
+  title: string;
+  description: string | null;
+  theme: string | null;
+  invitation: string | null;
+  coverImageId: number | null;
+  nsfwLevel: Generated<number>;
+  moderatorNsfwLevel: number | null;
+  moderatorNsfwLevelBasis: number | null;
+  modelVersionIds: Generated<number[]>;
+  allowedNsfwLevel: Generated<number>;
+  judgingPrompt: string | null;
+  judgingCategories: unknown | null;
+  reviewPercentage: Generated<number>;
+  maxReviews: number | null;
+  judgingEngine: Generated<string>;
+  collectionId: number | null;
+  maxEntriesPerUser: Generated<number>;
+  maxParticipants: number | null;
+  prizes: Generated<unknown>;
+  entryPrize: unknown | null;
+  entryPrizeRequirement: Generated<number>;
+  prizePool: Generated<number>;
+  prizeMode: Generated<PrizeMode>;
+  basePrizePool: Generated<number>;
+  buzzPerAction: Generated<number>;
+  poolTrigger: PoolTrigger | null;
+  maxPrizePool: number | null;
+  prizeDistribution: unknown | null;
+  operationBudget: Generated<number>;
+  operationSpent: Generated<number>;
+  reviewCostType: Generated<ChallengeReviewCostType>;
+  reviewCost: Generated<number>;
+  entryFee: Generated<number>;
+  buzzType: Generated<string>;
+  createdById: number | null;
+  source: Generated<ChallengeSource>;
+  judgeId: number | null;
+  status: Generated<ChallengeStatus>;
+  ingestion: Generated<ChallengeIngestionStatus>;
+  scannedAt: Timestamp | null;
+  metadata: unknown | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  eventId: number | null;
+};
+export type ChallengeCategory = {
+  key: string;
+  label: string;
+  group: string;
+  criteria: string;
+  rubric: string | null;
+  rubricNsfw: string | null;
+  sortOrder: Generated<number>;
+  active: Generated<boolean>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ChallengeEngagement = {
+  userId: number;
+  challengeId: number;
+  type: ChallengeEngagementType;
+  createdAt: Generated<Timestamp>;
+};
+export type ChallengeEntryComparison = {
+  id: Generated<number>;
+  challengeId: number;
+  phase: string;
+  imageIdA: number;
+  imageIdB: number;
+  firstSeatImageId: number;
+  winnerImageId: number | null;
+  margin: string | null;
+  model: string;
+  rerouted: Generated<boolean>;
+  perCategory: unknown | null;
+  reason: string | null;
+  buzzCost: Generated<number>;
+  createdAt: Generated<Timestamp>;
+};
+export type ChallengeEntryStanding = {
+  challengeId: number;
+  imageId: number;
+  userId: number;
+  rank: number;
+  comparisons: Generated<number>;
+  winRate: number | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type ChallengeEvent = {
+  id: Generated<number>;
+  title: string;
+  description: string | null;
+  titleColor: string | null;
+  startDate: Timestamp;
+  endDate: Timestamp;
+  active: Generated<boolean>;
+  winnerCooldownDays: number | null;
+  coverImageId: number | null;
+  createdById: number | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ChallengeJudge = {
+  id: Generated<number>;
+  userId: number;
+  name: string;
+  bio: string | null;
+  sourceCollectionId: number | null;
+  systemPrompt: string | null;
+  collectionPrompt: string | null;
+  contentPrompt: string | null;
+  reviewPrompt: string | null;
+  reviewTemplate: string | null;
+  winnerSelectionPrompt: string | null;
+  active: Generated<boolean>;
+  userSelectable: Generated<boolean>;
+  judgingEngine: Generated<string>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ChallengeReport = {
+  challengeId: number;
+  reportId: number;
+};
+export type ChallengeWinner = {
+  id: Generated<number>;
+  challengeId: number;
+  userId: number;
+  imageId: number | null;
+  place: number;
+  buzzAwarded: number;
+  pointsAwarded: number;
+  reason: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type Changelog = {
+  id: Generated<number>;
+  title: string;
+  content: string;
+  link: string | null;
+  cta: string | null;
+  effectiveAt: Timestamp;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  type: ChangelogType;
+  tags: Generated<string[]>;
+  disabled: Generated<boolean>;
+  titleColor: string | null;
+  sticky: Generated<boolean>;
+  domain: Generated<DomainColor[]>;
+};
+export type Chat = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  hash: string | null;
+  ownerId: number;
+  isGroup: Generated<boolean>;
+  name: string | null;
+};
+export type ChatMember = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  userId: number;
+  chatId: number;
+  isOwner: Generated<boolean>;
+  isMuted: Generated<boolean>;
+  status: ChatMemberStatus;
+  lastViewedMessageId: number | null;
+  joinedAt: Timestamp | null;
+  ignoredAt: Timestamp | null;
+  leftAt: Timestamp | null;
+  kickedAt: Timestamp | null;
+  unkickedAt: Timestamp | null;
+  filteredAt: Timestamp | null;
+  notifyLevel: Generated<ChatNotifyLevel>;
+  pinnedAt: Timestamp | null;
+  clearedAt: Timestamp | null;
+};
+export type ChatMessage = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  userId: number;
+  chatId: number;
+  content: string;
+  contentType: Generated<ChatMessageType>;
+  referenceMessageId: number | null;
+  editedAt: Timestamp | null;
+  deletedAt: Timestamp | null;
+};
+export type ChatMessageEdit = {
+  id: Generated<number>;
+  messageId: number;
+  /**
+   * No relation: a deleted editor must neither block nor erase the history.
+   */
+  editorId: number;
+  previousContent: string;
+  createdAt: Generated<Timestamp>;
+};
+export type ChatReport = {
+  chatId: number;
+  reportId: number;
+};
+export type Club = {
+  id: Generated<number>;
+  userId: number;
+  coverImageId: number | null;
+  headerImageId: number | null;
+  avatarId: number | null;
+  name: string;
+  description: string;
+  nsfw: Generated<boolean>;
+  billing: Generated<boolean>;
+  unlisted: Generated<boolean>;
+};
+export type ClubAdmin = {
+  userId: number;
+  clubId: number;
+  createdAt: Generated<Timestamp>;
+  permissions: ClubAdminPermission[];
+};
+export type ClubAdminInvite = {
+  id: string;
+  expiresAt: Timestamp | null;
+  clubId: number;
+  createdAt: Generated<Timestamp>;
+  permissions: ClubAdminPermission[];
+};
+export type ClubMembership = {
+  id: Generated<number>;
+  userId: number;
+  clubId: number;
+  clubTierId: number;
+  startedAt: Timestamp;
+  expiresAt: Timestamp | null;
+  cancelledAt: Timestamp | null;
+  nextBillingAt: Timestamp;
+  unitAmount: number;
+  currency: Generated<Currency>;
+  downgradeClubTierId: number | null;
+  billingPausedAt: Timestamp | null;
+};
+export type ClubMembershipCharge = {
+  id: Generated<number>;
+  userId: number;
+  clubId: number;
+  clubTierId: number;
+  chargedAt: Timestamp;
+  status: string | null;
+  invoiceId: string | null;
+  unitAmount: number;
+  unitAmountPurchased: number;
+  currency: Generated<Currency>;
+};
+export type ClubMetric = {
+  clubId: number;
+  timeframe: MetricTimeframe;
+  memberCount: Generated<number>;
+  clubPostCount: Generated<number>;
+  resourceCount: Generated<number>;
+};
+export type ClubPost = {
+  id: Generated<number>;
+  clubId: number;
+  createdById: number;
+  createdAt: Generated<Timestamp>;
+  membersOnly: boolean;
+  title: string | null;
+  description: string | null;
+  coverImageId: number | null;
+  entityId: number | null;
+  entityType: string | null;
+};
+export type ClubPostMetric = {
+  clubPostId: number;
+  timeframe: MetricTimeframe;
+  likeCount: Generated<number>;
+  dislikeCount: Generated<number>;
+  laughCount: Generated<number>;
+  cryCount: Generated<number>;
+  heartCount: Generated<number>;
+};
+export type ClubPostReaction = {
+  id: Generated<number>;
+  clubPostId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ClubRank = {
+  clubId: number;
+  memberCountDayRank: Generated<number | null>;
+  memberCountWeekRank: Generated<number | null>;
+  memberCountMonthRank: Generated<number | null>;
+  memberCountYearRank: Generated<number | null>;
+  memberCountAllTimeRank: Generated<number | null>;
+  resourceCountDayRank: Generated<number | null>;
+  resourceCountWeekRank: Generated<number | null>;
+  resourceCountMonthRank: Generated<number | null>;
+  resourceCountYearRank: Generated<number | null>;
+  resourceCountAllTimeRank: Generated<number | null>;
+  clubPostCountDayRank: Generated<number | null>;
+  clubPostCountWeekRank: Generated<number | null>;
+  clubPostCountMonthRank: Generated<number | null>;
+  clubPostCountYearRank: Generated<number | null>;
+  clubPostCountAllTimeRank: Generated<number | null>;
+};
+export type ClubStat = {
+  clubId: number;
+  memberCountDay: number;
+  memberCountWeek: number;
+  memberCountMonth: number;
+  memberCountYear: number;
+  memberCountAllTime: number;
+  resourceCountDay: number;
+  resourceCountWeek: number;
+  resourceCountMonth: number;
+  resourceCountYear: number;
+  resourceCountAllTime: number;
+  clubPostCountDay: number;
+  clubPostCountWeek: number;
+  clubPostCountMonth: number;
+  clubPostCountYear: number;
+  clubPostCountAllTime: number;
+};
+export type ClubTier = {
+  id: Generated<number>;
+  clubId: number;
+  unitAmount: number;
+  currency: Generated<Currency>;
+  name: string;
+  description: string;
+  coverImageId: number | null;
+  unlisted: Generated<boolean>;
+  joinable: boolean;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp | null;
+  memberLimit: number | null;
+  oneTimeFee: Generated<boolean>;
+};
+export type Collection = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp | null>;
+  updatedAt: Timestamp | null;
+  name: string;
+  description: string | null;
+  nsfw: Generated<boolean | null>;
+  userId: number;
+  imageId: number | null;
+  write: Generated<CollectionWriteConfiguration>;
+  read: Generated<CollectionReadConfiguration>;
+  type: CollectionType | null;
+  mode: CollectionMode | null;
+  metadata: Generated<unknown>;
+  availability: Generated<Availability>;
+  nsfwLevel: Generated<number>;
+  moderatorNsfwLevel: number | null;
+  moderatorNsfwLevelBasis: number | null;
+  collaborationDisabledAt: Timestamp | null;
+};
+export type CollectionContributor = {
+  createdAt: Generated<Timestamp | null>;
+  updatedAt: Timestamp | null;
+  userId: number;
+  collectionId: number;
+  permissions: CollectionContributorPermission[];
+};
+export type CollectionInvite = {
+  id: Generated<number>;
+  collectionId: number;
+  userId: number;
+  invitedById: number;
+  role: CollectionCollaboratorRole;
+  status: Generated<CollectionInviteStatus>;
+  createdAt: Generated<Timestamp>;
+  respondedAt: Timestamp | null;
+};
+export type CollectionItem = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp | null>;
+  updatedAt: Timestamp | null;
+  collectionId: number;
+  articleId: number | null;
+  postId: number | null;
+  imageId: number | null;
+  modelId: number | null;
+  model3dId: number | null;
+  addedById: number | null;
+  reviewedById: number | null;
+  reviewedAt: Timestamp | null;
+  note: string | null;
+  status: Generated<CollectionItemStatus>;
+  rejectionReason: CollectionItemRejectionReason | null;
+  rejectionDetail: string | null;
+  tagId: number | null;
+};
+export type CollectionItemScore = {
+  userId: number;
+  collectionItemId: number;
+  score: number;
+  createdAt: Generated<Timestamp>;
+};
+export type CollectionMetric = {
+  collectionId: number;
+  timeframe: MetricTimeframe;
+  followerCount: Generated<number>;
+  itemCount: Generated<number>;
+  contributorCount: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+};
+export type CollectionRank = {
+  collectionId: number;
+  followerCountDayRank: Generated<number | null>;
+  followerCountWeekRank: Generated<number | null>;
+  followerCountMonthRank: Generated<number | null>;
+  followerCountYearRank: Generated<number | null>;
+  followerCountAllTimeRank: Generated<number | null>;
+  itemCountDayRank: Generated<number | null>;
+  itemCountWeekRank: Generated<number | null>;
+  itemCountMonthRank: Generated<number | null>;
+  itemCountYearRank: Generated<number | null>;
+  itemCountAllTimeRank: Generated<number | null>;
+  contributorCountDayRank: Generated<number | null>;
+  contributorCountWeekRank: Generated<number | null>;
+  contributorCountMonthRank: Generated<number | null>;
+  contributorCountYearRank: Generated<number | null>;
+  contributorCountAllTimeRank: Generated<number | null>;
+};
+export type CollectionReport = {
+  collectionId: number;
+  reportId: number;
+};
+export type CollectionStat = {
+  collectionId: number;
+  followerCountDay: number;
+  followerCountWeek: number;
+  followerCountMonth: number;
+  followerCountYear: number;
+  followerCountAllTime: number;
+  itemCountDay: number;
+  itemCountWeek: number;
+  itemCountMonth: number;
+  itemCountYear: number;
+  itemCountAllTime: number;
+  contributorCountDay: number;
+  contributorCountWeek: number;
+  contributorCountMonth: number;
+  contributorCountYear: number;
+  contributorCountAllTime: number;
+};
+export type ComicChapter = {
+  id: Generated<number>;
+  projectId: number;
+  name: Generated<string>;
+  position: Generated<number>;
+  status: Generated<ComicChapterStatus>;
+  availability: Generated<Availability>;
+  earlyAccessConfig: unknown | null;
+  earlyAccessEndsAt: Timestamp | null;
+  publishedAt: Timestamp | null;
+  initialPublishedAt: Timestamp | null;
+  nsfwLevel: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ComicChapterRead = {
+  userId: number;
+  chapterId: number;
+  unread: Generated<boolean>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type ComicPanel = {
+  id: Generated<number>;
+  projectId: number;
+  chapterPosition: number;
+  imageId: number | null;
+  prompt: string;
+  enhancedPrompt: string | null;
+  imageUrl: string | null;
+  position: Generated<number>;
+  status: Generated<ComicPanelStatus>;
+  workflowId: string | null;
+  civitaiJobId: string | null;
+  errorMessage: string | null;
+  metadata: unknown | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ComicPanelReference = {
+  panelId: number;
+  referenceId: number;
+};
+export type ComicProject = {
+  id: Generated<number>;
+  userId: number;
+  name: string;
+  description: string | null;
+  coverImageId: number | null;
+  heroImageId: number | null;
+  heroImagePosition: Generated<number>;
+  status: Generated<ComicProjectStatus>;
+  tosViolation: Generated<boolean>;
+  meta: unknown | null;
+  baseModel: string | null;
+  genre: ComicGenre | null;
+  nsfwLevel: Generated<number>;
+  publishedAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ComicProjectEngagement = {
+  userId: number;
+  projectId: number;
+  type: Generated<ComicEngagementType>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type ComicProjectMetric = {
+  comicProjectId: number;
+  updatedAt: Generated<Timestamp>;
+  tippedCount: Generated<number>;
+  tippedAmountCount: Generated<number>;
+  followerCount: Generated<number>;
+  hiddenCount: Generated<number>;
+  readerCount: Generated<number>;
+  chapterReadCount: Generated<number>;
+};
+export type ComicProjectReference = {
+  projectId: number;
+  referenceId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type ComicProjectReport = {
+  comicProjectId: number;
+  reportId: number;
+};
+export type ComicReference = {
+  id: Generated<number>;
+  userId: number;
+  name: string;
+  type: Generated<ComicReferenceType>;
+  description: string | null;
+  status: Generated<ComicReferenceStatus>;
+  errorMessage: string | null;
+  buzzCost: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ComicReferenceImage = {
+  referenceId: number;
+  imageId: number;
+  position: Generated<number>;
+  createdAt: Generated<Timestamp>;
+};
+export type Comment = {
+  id: Generated<number>;
+  content: string;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  nsfw: Generated<boolean>;
+  tosViolation: Generated<boolean>;
+  parentId: number | null;
+  userId: number;
+  modelId: number;
+  locked: Generated<boolean | null>;
+  hidden: Generated<boolean | null>;
+  pinnedAt: Timestamp | null;
+  /**
+   * No longer set; only the reverse copy reads it. Kept until a migration drops it.
+   */
+  removedByAuthor: Generated<boolean>;
+};
+export type CommentMute = {
+  userId: number;
+  commentId: number;
+  mutedAt: Generated<Timestamp>;
+};
+export type CommentReaction = {
+  id: Generated<number>;
+  commentId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type CommentReport = {
+  commentId: number;
+  reportId: number;
+};
+export type CommentTopic = {
+  entityType: CommentEntityType;
+  entityId: number;
+  locked: Generated<boolean>;
+  commentCount: Generated<number>;
+};
+export type CommentTopicMute = {
+  userId: number;
+  entityType: CommentEntityType;
+  entityId: number;
+  mutedAt: Generated<Timestamp>;
+};
+export type CommentV2 = {
+  id: Generated<number>;
+  content: string;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  nsfw: Generated<boolean>;
+  tosViolation: Generated<boolean>;
+  userId: number;
+  threadId: number;
+  metadata: unknown | null;
+  hidden: Generated<boolean | null>;
+  pinnedAt: Timestamp | null;
+  reactionCount: Generated<number>;
+};
+export type CommentV2Reaction = {
+  id: Generated<number>;
+  commentId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type CommentV2Report = {
+  commentV2Id: number;
+  reportId: number;
+};
+export type CommentV3 = {
+  id: Generated<number>;
+  entityType: CommentEntityType;
+  entityId: number;
+  parentId: number | null;
+  replyToId: number | null;
+  rootId: Generated<number>;
+  depth: Generated<number>;
+  userId: number;
+  content: string;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+  deletedAt: Timestamp | null;
+  tosViolation: Generated<boolean>;
+  hidden: Generated<boolean>;
+  locked: Generated<boolean>;
+  pinnedAt: Timestamp | null;
+  reactionCount: Generated<number>;
+  legacyV1Id: number | null;
+  removedByAuthor: Generated<boolean>;
+};
+export type CommentV3Reaction = {
+  id: Generated<number>;
+  commentId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type CommentV3Report = {
+  commentId: number;
+  reportId: number;
+};
+export type Cosmetic = {
+  id: Generated<number>;
+  name: string;
+  description: string | null;
+  videoUrl: string | null;
+  type: CosmeticType;
+  source: CosmeticSource;
+  permanentUnlock: boolean;
+  data: unknown;
+  createdAt: Generated<Timestamp | null>;
+  updatedAt: Timestamp | null;
+  availableStart: Timestamp | null;
+  availableEnd: Timestamp | null;
+  availableQuery: string | null;
+  productId: string | null;
+  leaderboardId: string | null;
+  leaderboardPosition: number | null;
+  createdById: number | null;
+  pHash: string | null;
+  pHashUrl: string | null;
+  pHashHex: string | null;
+  pHashVersion: string | null;
+  pHashFailedAt: Timestamp | null;
+  /**
+   * Bitwise `CosmeticFlag` (src/shared/constants/cosmetic-flags.constants.ts). Moderator-owned; creator edits never write it.
+   */
+  flags: Generated<number>;
+};
+export type CosmeticShopItem = {
+  id: Generated<number>;
+  cosmeticId: number | null;
+  unitAmount: number;
+  addedById: number | null;
+  createdAt: Generated<Timestamp>;
+  availableFrom: Timestamp | null;
+  availableTo: Timestamp | null;
+  availableQuantity: number | null;
+  meta: Generated<unknown>;
+  title: string;
+  description: string | null;
+  archivedAt: Timestamp | null;
+  status: Generated<CosmeticShopItemStatus>;
+  reviewedById: number | null;
+  reviewedAt: Timestamp | null;
+  rejectionReason: string | null;
+  listed: Generated<boolean>;
+  itemDefinitionId: number | null;
+  eventTags: Generated<string[]>;
+};
+export type CosmeticShopItemCosmetic = {
+  shopItemId: number;
+  cosmeticId: number;
+  index: Generated<number>;
+  floorAmount: number;
+};
+export type CosmeticShopPurchaseClaim = {
+  /**
+   * The charge's external transaction id prefix (UserCosmeticShopPurchases.buzzTransactionId once paid).
+   */
+  transactionId: string;
+  userId: number;
+  shopItemId: number;
+  /**
+   * What this claim charges. A retry of a pending claim charges this, not the current price.
+   */
+  amount: number;
+  /**
+   * pending | refunding | refunded | paid (text + CHECK, not an enum).
+   */
+  status: string;
+  /**
+   * Requests that have charged under this claim: 1 for the one that created it, +1 per resume.
+   */
+  attempts: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type CosmeticShopSection = {
+  id: Generated<number>;
+  addedById: number | null;
+  title: string;
+  description: string | null;
+  placement: Generated<number>;
+  meta: Generated<unknown>;
+  imageId: number | null;
+  published: Generated<boolean>;
+};
+export type CosmeticShopSectionItem = {
+  shopItemId: number;
+  shopSectionId: number;
+  index: Generated<number>;
+  createdAt: Generated<Timestamp>;
+};
+export type CoveredCheckpoint = {
+  model_id: number;
+  version_id: number;
+};
+export type CreatorGalleryHiddenUser = {
+  creatorId: number;
+  userId: number;
+  note: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type CreatorMilestone = {
+  key: string;
+  track: string;
+  threshold: number | null;
+  hidden: Generated<boolean>;
+  /**
+   * A special (hidden, not score or activity) milestone left off the journey page's special list until earned. Honoured there only.
+   */
+  unlisted: Generated<boolean>;
+  hint: string | null;
+  name: string;
+  description: string | null;
+  cosmeticId: number | null;
+  sortOrder: Generated<number>;
+};
+export type CreatorMilestoneCosmetic = {
+  milestoneKey: string;
+  cosmeticId: number;
+};
+export type CreatorProgramPayoutReview = {
+  id: Generated<number>;
+  period: string;
+  userId: number;
+  status: Generated<string>;
+  hold: Generated<boolean>;
+  signals: string[];
+  payoutCents: number;
+  evidence: Generated<unknown>;
+  firstFlaggedAt: Generated<Timestamp>;
+  lastEvaluatedAt: Generated<Timestamp>;
+  evaluations: Generated<number>;
+  decidedAt: Timestamp | null;
+  decidedBy: string | null;
+  decisionNote: string | null;
+  askRef: string | null;
+  version: Generated<number>;
+  decisions: Generated<unknown>;
+};
+export type CreatorProgramPayoutReviewRun = {
+  id: Generated<number>;
+  period: string;
+  startedAt: Timestamp;
+  finishedAt: Timestamp | null;
+  creditedCount: Generated<number>;
+  evaluatedCount: Generated<number>;
+  flaggedCount: Generated<number>;
+  error: string | null;
+};
+export type CreatorScoreGrant = {
+  id: Generated<number>;
+  userId: number;
+  amount: number;
+  reason: string;
+  grantedById: number | null;
+  createdAt: Generated<Timestamp>;
+  revokedAt: Timestamp | null;
+  revokedById: number | null;
+  revokeReason: string | null;
+};
+export type Crucible = {
+  id: Generated<number>;
+  userId: number;
+  name: string;
+  description: string | null;
+  imageId: number | null;
+  heroImageId: number | null;
+  buzzType: Generated<string>;
+  nsfwLevel: Generated<number>;
+  moderatorNsfwLevel: number | null;
+  moderatorNsfwLevelBasis: number | null;
+  contentType: Generated<MediaType>;
+  entryFee: Generated<number>;
+  seededPrizePool: Generated<number>;
+  prizePool: Generated<number>;
+  entryLimit: Generated<number>;
+  ownerRemovalCount: Generated<number>;
+  freeEntriesPerUser: Generated<number>;
+  maxTotalEntries: number | null;
+  entryWarningPercent: Generated<number>;
+  entryCutoffPercent: Generated<number>;
+  minViewSeconds: number | null;
+  maxClipSeconds: number | null;
+  prizePositions: Generated<unknown>;
+  allowedResources: unknown | null;
+  allowedBaseModels: Generated<string[]>;
+  duration: Generated<number>;
+  startAt: Timestamp | null;
+  endAt: Timestamp | null;
+  status: Generated<CrucibleStatus>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  buzzTransactionId: string | null;
+  seedTransactionId: string | null;
+  ingestion: Generated<CrucibleIngestionStatus>;
+  scannedAt: Timestamp | null;
+  textNsfw: Generated<boolean>;
+  timeAdjustedPlacement: Generated<boolean>;
+  eventTags: Generated<string[]>;
+  takenDownAt: Timestamp | null;
+  takenDownById: number | null;
+  takedownReason: string | null;
+  takedownRefundsCreator: Generated<boolean>;
+};
+export type CrucibleEngagement = {
+  userId: number;
+  crucibleId: number;
+  type: CrucibleEngagementType;
+  createdAt: Generated<Timestamp>;
+};
+export type CrucibleEntry = {
+  id: Generated<number>;
+  crucibleId: number;
+  userId: number;
+  imageId: number | null;
+  score: Generated<number>;
+  voteCount: Generated<number>;
+  position: number | null;
+  buzzTransactionId: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type CrucibleReport = {
+  crucibleId: number;
+  reportId: number;
+};
+export type CryptoDeposit = {
+  paymentId: string;
+  userId: number;
+  status: Generated<string>;
+  payCurrency: string;
+  payAmount: number | null;
+  outcomeAmount: number | null;
+  buzzCredited: number | null;
+  bonusBuzz: number | null;
+  multiplier: number | null;
+  depositFee: number | null;
+  serviceFee: number | null;
+  feeCurrency: string | null;
+  paidFiat: number | null;
+  chain: string | null;
+  retryCount: Generated<number>;
+  stuckNotifiedAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type CryptoTransaction = {
+  key: string;
+  userId: number;
+  status: Generated<CryptoTransactionStatus>;
+  amount: number;
+  currency: Generated<Currency>;
+  sweepTxHash: string | null;
+  note: string | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type CryptoWallet = {
+  userId: number;
+  chain: Generated<string>;
+  wallet: string;
+  smartAccount: string | null;
+  payCurrency: Generated<string>;
+};
+export type CsamFlagRelease = {
+  id: Generated<number>;
+  userId: number;
+  moderatorId: number;
+  approvalRef: string;
+  reason: string;
+  /**
+   * The hold legs the release overrode.
+   */
+  overriddenLegs: unknown;
+  imageCount: number;
+  createdAt: Generated<Timestamp>;
+};
+export type CsamQueueSetAside = {
+  imageId: number;
+  userId: number;
+  outcome: CsamQueueSetAsideOutcome;
+  /**
+   * The report an `AfterReport` row follows. Nothing writes `AfterReport` rows yet.
+   */
+  csamReportId: number | null;
+  moderatorId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type CsamReport = {
+  id: Generated<number>;
+  userId: number | null;
+  createdAt: Generated<Timestamp>;
+  reportedById: number;
+  reportSentAt: Timestamp | null;
+  archivedAt: Timestamp | null;
+  contentRemovedAt: Timestamp | null;
+  reportId: number | null;
+  details: Generated<unknown>;
+  images: Generated<unknown>;
+  type: Generated<CsamReportType>;
+  /**
+   * The send run holding this unsent report, and when it took it. A filing never folds into a held report.
+   */
+  sendClaimId: string | null;
+  sendClaimedAt: Timestamp | null;
+};
+export type CsamReportArchiveObject = {
+  id: Generated<number>;
+  csamReportId: number;
+  /**
+   * base | images | generatedImages | trainingData
+   */
+  kind: string;
+  key: string;
+  etag: string | null;
+  /**
+   * Entries appended to a zip archive.
+   */
+  entries: number | null;
+  /**
+   * Items the report names that this archive was expected to hold, and how many it lacks.
+   */
+  namedExpected: number | null;
+  namedMissing: number | null;
+  uploadedAt: Generated<Timestamp>;
+};
+export type CsamReportAudit = {
+  id: Generated<number>;
+  csamReportId: number;
+  op: string;
+  oldUserId: number | null;
+  oldReportId: number | null;
+  oldType: string | null;
+  oldSecondaryUserId: number | null;
+  oldImageCount: number | null;
+  /**
+   * A keyed fingerprint of the details for tamper detection, never their content.
+   */
+  oldDetailsFingerprint: string | null;
+  oldReportSentAt: Timestamp | null;
+  changedAt: Generated<Timestamp>;
+  changedBy: Generated<string>;
+};
+export type CustomerSubscription = {
+  id: string;
+  userId: number;
+  buzzType: Generated<string>;
+  metadata: unknown;
+  status: string;
+  priceId: string;
+  productId: string;
+  cancelAtPeriodEnd: boolean;
+  cancelAt: Timestamp | null;
+  canceledAt: Timestamp | null;
+  currentPeriodStart: Timestamp;
+  currentPeriodEnd: Timestamp;
+  createdAt: Timestamp;
+  endedAt: Timestamp | null;
+  updatedAt: Timestamp | null;
+};
+export type Donation = {
+  id: Generated<number>;
+  userId: number;
+  donationGoalId: number;
+  amount: number;
+  buzzTransactionId: string;
+  notes: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type DonationGoal = {
+  id: Generated<number>;
+  userId: number;
+  title: string;
+  description: string | null;
+  goalAmount: number;
+  entityType: PaidAccessEntityType | null;
+  entityId: number | null;
+  modelVersionId: number | null;
+  createdAt: Generated<Timestamp>;
+  active: Generated<boolean>;
+};
+export type DownloadHistory = {
+  userId: number;
+  modelVersionId: number;
+  downloadAt: Timestamp;
+  hidden: Generated<boolean>;
+};
+export type EcosystemCheckpoints = {
+  id: number;
+  name: string;
+};
+export type EntityAccess = {
+  accessToId: number;
+  accessToType: string;
+  accessorId: number;
+  accessorType: string;
+  addedById: number;
+  addedAt: Generated<Timestamp>;
+  permissions: Generated<number>;
+  meta: Generated<unknown | null>;
+};
+export type EntityCollaborator = {
+  entityType: EntityType;
+  entityId: number;
+  userId: number;
+  status: Generated<EntityCollaboratorStatus>;
+  createdAt: Generated<Timestamp>;
+  createdBy: number;
+  lastMessageSentAt: Timestamp | null;
+};
+export type EntityMetric = {
+  entityType: EntityMetric_EntityType_Type;
+  entityId: number;
+  metricType: EntityMetric_MetricType_Type;
+  metricValue: Generated<number>;
+};
+export type EntityMetricImage = {
+  imageId: number;
+  reactionLike: number | null;
+  reactionHeart: number | null;
+  reactionLaugh: number | null;
+  reactionCry: number | null;
+  reactionTotal: number | null;
+  comment: number | null;
+  collection: number | null;
+  buzz: number | null;
+};
+export type EntityModeration = {
+  id: Generated<number>;
+  entityType: string;
+  entityId: number;
+  workflowId: string | null;
+  status: Generated<EntityModerationStatus>;
+  retryCount: Generated<number>;
+  blocked: boolean | null;
+  triggeredLabels: Generated<string[]>;
+  result: unknown | null;
+  contentHash: string | null;
+  nsfwLevel: number | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type EventCosmeticPlacement = {
+  id: Generated<string>;
+  event: string;
+  userId: number;
+  cosmeticId: number;
+  claimKey: string;
+  team: string;
+  entityType: CosmeticEntity;
+  entityId: number;
+  entityOwnerId: number | null;
+  startedAt: Generated<Timestamp>;
+  endedAt: Timestamp | null;
+  updatedAt: Generated<Timestamp>;
+};
+export type EventCosmeticScoreDaily = {
+  event: string;
+  day: Timestamp;
+  userId: number;
+  cosmeticId: number;
+  claimKey: string;
+  team: string;
+  impressions: Generated<number>;
+  anonImpressions: Generated<number>;
+  reactions: Generated<number>;
+  comments: Generated<number>;
+  stickers: Generated<number>;
+  remixes: Generated<number>;
+  modelLikes: Generated<number>;
+  points: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+};
+export type EventTurfSticker = {
+  id: Generated<string>;
+  event: string;
+  imageId: number;
+  userId: number;
+  team: string;
+  cosmeticId: number;
+  data: Generated<unknown>;
+  createdAt: Generated<Timestamp>;
+  removedAt: Timestamp | null;
+  removedById: number | null;
+};
+export type EventTurfStock = {
+  event: string;
+  userId: number;
+  stock: number;
+  refilledAt: Timestamp;
+};
+export type EvidenceHeldUser = {
+  userId: number;
+  heldUntil: Timestamp | null;
+};
+export type EvidenceHold = {
+  id: Generated<number>;
+  userId: number;
+  csamReportId: number | null;
+  /**
+   * subject | secondary | manual
+   */
+  role: string;
+  reportSentAt: Timestamp | null;
+  /**
+   * NULL holds until released.
+   */
+  releaseAt: Timestamp | null;
+  extendedUntil: Timestamp | null;
+  /**
+   * Who asked for the extension, and their reference.
+   */
+  extensionRequestedBy: string | null;
+  extensionReference: string | null;
+  reason: string;
+  createdAt: Generated<Timestamp>;
+  createdById: number | null;
+  releasedAt: Timestamp | null;
+  releasedById: number | null;
+  releaseReason: string | null;
+};
+export type EvidenceHoldImage = {
+  imageId: number;
+  userId: number;
+  postId: number | null;
+  keptAt: Generated<Timestamp>;
+  priorIngestion: string | null;
+  priorBlockedFor: string | null;
+  priorNsfwLevel: number | null;
+};
+export type EvidenceHoldPost = {
+  postId: number;
+  userId: number;
+  title: string | null;
+  detail: string | null;
+  createdAt: Timestamp | null;
+  publishedAt: Timestamp | null;
+  modelVersionId: number | null;
+  collectionId: number | null;
+  metadata: unknown | null;
+  keptAt: Generated<Timestamp>;
+};
+export type FeaturedModelVersion = {
+  id: Generated<number>;
+  modelVersionId: number;
+  validFrom: Timestamp;
+  validTo: Timestamp;
+  position: number;
+};
+export type Feedback = {
+  id: Generated<number>;
+  area: string;
+  userId: number;
+  message: string;
+  context: Generated<unknown>;
+  status: Generated<string>;
+  createdAt: Generated<Timestamp>;
+  /**
+   * Moderator-internal. Never seeded into a Bug — a Bug is public, this is not.
+   */
+  triageNote: string | null;
+  handledById: number | null;
+  handledAt: Timestamp | null;
+  bugId: number | null;
+  /**
+   * The `app-block` area only: the `Feedback_app_columns_check` CHECK requires this and the seven app
+   * columns below (appBlockVersion, appBlockSha, ownerStatus, ownerStatusAt, ownerStatusById,
+   * ownerFlaggedAt, hiddenFromOwnerAt) to be NULL unless `area` is 'app-block'; it requires nothing of
+   * an app-block row. Always the PARENT listing, never a shadow revision. SetNull, not Cascade:
+   * deleting a listing must not destroy the report for moderators.
+   */
+  appListingId: string | null;
+  /**
+   * The block version live when the feedback was sent, stamped server-side. NULL for off-site apps.
+   */
+  appBlockVersion: string | null;
+  appBlockSha: string | null;
+  /**
+   * Owner (developer) status, SEPARATE from the moderator `status` / `triageNote` / `handledBy`
+   * columns above so an owner can never move moderator triage. NULL = new to the developer; otherwise
+   * one of FEEDBACK_OWNER_STATUSES (CHECK `Feedback_ownerStatus_check`).
+   */
+  ownerStatus: string | null;
+  ownerStatusAt: Timestamp | null;
+  ownerStatusById: number | null;
+  /**
+   * The owner flagged this report as abusive, for moderators.
+   */
+  ownerFlaggedAt: Timestamp | null;
+  /**
+   * A moderator hid this report from the developer. Which moderator is recorded by the
+   * append-only ModActivity row written on each hide/unhide, not by a column here.
+   */
+  hiddenFromOwnerAt: Timestamp | null;
+};
+export type File = {
+  id: Generated<number>;
+  name: string;
+  url: string;
+  sizeKB: number;
+  createdAt: Generated<Timestamp>;
+  entityId: number;
+  entityType: string;
+  metadata: unknown | null;
+};
+export type GameFrameGame = {
+  id: Generated<number>;
+  slug: string;
+  title: string;
+  userId: number | null;
+  official: Generated<boolean>;
+  visibility: string;
+  url: string;
+  coverUrl: string | null;
+  stateAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type GameFrameGameReport = {
+  gameFrameGameId: number;
+  reportId: number;
+};
+export type GameFrameReportReceipt = {
+  gfReportId: string;
+  reportId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type GenerationBaseModel = {
+  baseModel: string;
+};
+export type GenerationCoverage = {
+  modelId: number;
+  modelVersionId: number;
+  /**
+   * The live rule. A row exists when EITHER column is true, so test the column, not existence.
+   */
+  covered: boolean;
+  /**
+   * The staged rule: community checkpoints qualify on their own and load on demand.
+   */
+  coveredNext: boolean;
+};
+export type GenerationPreset = {
+  id: Generated<number>;
+  userId: number;
+  name: string;
+  description: string | null;
+  ecosystem: string;
+  values: unknown;
+  sortOrder: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type GenerationServiceProvider = {
+  name: string;
+  schedulers: GenerationSchedulers[];
+};
+export type GenerationSizePreset = {
+  id: Generated<number>;
+  userId: number;
+  width: number;
+  height: number;
+  createdAt: Generated<Timestamp>;
+};
+export type HeldResourceReview = {
+  /**
+   * The original ResourceReview id.
+   */
+  id: number;
+  modelId: number;
+  modelVersionId: number;
+  userId: number;
+  rating: number;
+  recommended: boolean;
+  details: string | null;
+  exclude: boolean;
+  nsfw: boolean;
+  tosViolation: boolean;
+  metadata: unknown | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  heldAt: Generated<Timestamp>;
+  /**
+   * The holds on the author when it was copied.
+   */
+  holdReasons: string[];
+};
+export type HomeBlock = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp | null>;
+  updatedAt: Timestamp | null;
+  userId: number;
+  metadata: Generated<unknown>;
+  index: number | null;
+  type: HomeBlockType;
+  permanent: Generated<boolean>;
+  sourceId: number | null;
+};
+export type HuggingFaceImport = {
+  id: Generated<number>;
+  repo: string;
+  /**
+   * Commit sha, never a branch name — an import must name the exact bytes it took.
+   */
+  revision: string;
+  filename: string;
+  /**
+   * What a moderator calls this batch, defaulting to the repo's own name. Never appears in a
+   * storage key — the key is the ordinary upload shape — so this is free to be corrected.
+   */
+  groupName: string;
+  sourceUrl: string;
+  /**
+   * Both come from the HF tree API before any bytes move: size, and lfs.oid which is the content
+   * sha256 for LFS files. The sha is what lets us skip a file we already store under the same hash;
+   * the transfer itself is not verified against it.
+   */
+  sizeBytes: string | null;
+  sourceSha256: string | null;
+  status: Generated<HuggingFaceImportStatus>;
+  bytesTransferred: Generated<string>;
+  /**
+   * The resume point. A transfer is a sequence of ranged reads from HF written as multipart parts,
+   * and `uploadId` + `parts` is what lets a LATER job run continue one an earlier run left unfinished
+   * instead of starting the file again.
+   */
+  uploadId: string | null;
+  partSize: number | null;
+  parts: unknown | null;
+  bucket: string | null;
+  key: string | null;
+  url: string | null;
+  error: string | null;
+  attempts: Generated<number>;
+  nextAttemptAt: Timestamp | null;
+  userId: number | null;
+  modelVersionId: number | null;
+  modelFileId: number | null;
+  /**
+   * Where this file is headed, recorded before the bytes move so the transfer job can attach it
+   * itself. `modelVersionId` cannot carry this: it means "attached to", and detaching clears it.
+   */
+  attachVersionId: number | null;
+  attachType: string | null;
+  /**
+   * Worker lease. A transfer outlives any one job run, so a claim plus a heartbeat is what stops two
+   * runs moving the same file and what lets the next run tell "in flight" from "abandoned".
+   */
+  claimedBy: string | null;
+  claimedAt: Timestamp | null;
+  heartbeatAt: Timestamp | null;
+  startedAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type Image = {
+  id: Generated<number>;
+  pHash: string | null;
+  name: string | null;
+  url: string;
+  userId: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  meta: unknown | null;
+  hash: string | null;
+  height: number | null;
+  width: number | null;
+  type: Generated<MediaType>;
+  metadata: Generated<unknown>;
+  nsfw: Generated<NsfwLevel>;
+  nsfwLevel: Generated<number>;
+  nsfwLevelLocked: Generated<boolean>;
+  tosViolation: Generated<boolean>;
+  analysis: unknown | null;
+  generationProcess: ImageGenerationProcess | null;
+  featuredAt: Timestamp | null;
+  postId: number | null;
+  needsReview: string | null;
+  hideMeta: Generated<boolean>;
+  index: number | null;
+  scannedAt: Timestamp | null;
+  scanRequestedAt: Timestamp | null;
+  mimeType: string | null;
+  sizeKB: number | null;
+  ingestion: Generated<ImageIngestionStatus>;
+  blockedFor: string | null;
+  scanJobs: unknown | null;
+  sortAt: Generated<Timestamp>;
+  minor: Generated<boolean>;
+  poi: Generated<boolean>;
+  acceptableMinor: Generated<boolean>;
+};
+export type ImageAudioScan = {
+  imageId: number;
+  workflowId: string;
+  /**
+   * Pending | Succeeded | Failed
+   */
+  status: Generated<string>;
+  /**
+   * null when the video has no audio or the scan failed: unknown, never "clean"
+   */
+  flagged: boolean | null;
+  hasAudio: boolean | null;
+  result: unknown | null;
+  resultVersion: number | null;
+  error: string | null;
+  createdAt: Generated<Timestamp>;
+  completedAt: Timestamp | null;
+};
+export type ImageCaption = {
+  imageId: number;
+  /**
+   * Who wrote it, the post's author when written. Not a relation: the image carries the owner.
+   */
+  userId: number;
+  content: string;
+  /**
+   * The text scan refused it: never shown to readers. Set and cleared only by the scan.
+   */
+  refused: Generated<boolean>;
+  /**
+   * The text's rating from the scan, a single `NsfwLevel` flag (0 until scanned).
+   */
+  nsfwLevel: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ImageCdnAccess = {
+  url: string;
+  state: string;
+  deniedAt: Generated<Timestamp>;
+  retractedAt: Timestamp | null;
+  lastAssertedAt: Generated<Timestamp>;
+};
+export type ImageCdnAccessClaim = {
+  url: string;
+  token: string;
+  claimedUntil: Timestamp;
+};
+export type ImageCdnModeratorDelete = {
+  imageId: number;
+  url: string;
+  userId: number | null;
+  csamReview: Generated<boolean>;
+  deletedAt: Generated<Timestamp>;
+};
+export type ImageCdnShopTakedown = {
+  id: Generated<number>;
+  url: string;
+  shopItemId: number;
+  userId: number | null;
+  takenDownAt: Generated<Timestamp>;
+};
+export type ImageConnection = {
+  imageId: number;
+  entityId: number;
+  entityType: string;
+};
+export type ImageEngagement = {
+  userId: number;
+  imageId: number;
+  type: ImageEngagementType;
+  createdAt: Generated<Timestamp>;
+};
+export type ImageFlag = {
+  imageId: number;
+  promptNsfw: Generated<boolean>;
+  resourcesNsfw: Generated<boolean>;
+};
+export type ImageMetaFlags = {
+  imageId: number;
+  hasMeta: boolean;
+  onSite: boolean;
+};
+export type ImageModHelper = {
+  imageId: number;
+  assessedNSFW: Generated<boolean | null>;
+  nsfwReportCount: Generated<number>;
+};
+export type ImageRatingRequest = {
+  userId: number;
+  imageId: number;
+  createdAt: Generated<Timestamp>;
+  nsfwLevel: number;
+  status: Generated<ReportStatus>;
+  weight: Generated<number>;
+};
+export type ImageReaction = {
+  id: Generated<number>;
+  imageId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ImageRemovalConfirmation = {
+  id: Generated<number>;
+  imageId: number;
+  appealId: number;
+  requestedById: number;
+  requestedAt: Generated<Timestamp>;
+  violationType: string | null;
+  violationDetails: string | null;
+  /**
+   * Which removal path was held, e.g. `moderator.block`, `site.setTosViolation`.
+   */
+  source: string;
+  reportIds: Generated<number[]>;
+  /**
+   * Pending | Confirmed | Declined | Void
+   */
+  status: Generated<string>;
+  decidedById: number | null;
+  decidedAt: Timestamp | null;
+  decisionNote: string | null;
+};
+export type ImageReport = {
+  imageId: number;
+  reportId: number;
+};
+export type ImageResource = {
+  id: Generated<number>;
+  modelVersionId: number | null;
+  name: string | null;
+  hash: string | null;
+  imageId: number;
+  strength: number | null;
+  detected: Generated<boolean>;
+};
+export type ImageResourceHelper = {
+  imageId: number;
+  reviewId: number | null;
+  reviewRating: number | null;
+  reviewDetails: string | null;
+  reviewCreatedAt: Timestamp | null;
+  name: string | null;
+  modelVersionId: number;
+  modelVersionName: string | null;
+  modelVersionCreatedAt: Timestamp | null;
+  modelId: number | null;
+  modelName: string | null;
+  modelDownloadCount: number | null;
+  modelCommentCount: number | null;
+  modelThumbsUpCount: number | null;
+  modelThumbsDownCount: number | null;
+  modelType: ModelType | null;
+  modelVersionBaseModel: string | null;
+  detected: boolean | null;
+};
+export type ImageResourceNew = {
+  imageId: number;
+  modelVersionId: number;
+  strength: number | null;
+  detected: Generated<boolean>;
+};
+export type ImageTag = {
+  imageId: number;
+  tagId: number;
+  tagName: string;
+  tagType: TagType;
+  tagNsfwLevel: number;
+  automated: boolean;
+  confidence: number | null;
+  score: number;
+  upVotes: number;
+  downVotes: number;
+  needsReview: boolean;
+  concrete: boolean;
+  lastUpvote: Timestamp | null;
+  source: TagSource;
+};
+export type ImageTagForReview = {
+  imageId: number;
+  tagId: number;
+};
+export type ImageTechnique = {
+  imageId: number;
+  techniqueId: number;
+  notes: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ImageTool = {
+  imageId: number;
+  toolId: number;
+  notes: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type Import = {
+  id: Generated<number>;
+  userId: number | null;
+  createdAt: Generated<Timestamp>;
+  startedAt: Timestamp | null;
+  finishedAt: Timestamp | null;
+  source: string;
+  status: Generated<ImportStatus>;
+  data: unknown | null;
+  parentId: number | null;
+  importId: number | null;
+};
+export type Item = {
+  id: Generated<string>;
+  itemDefinitionId: number;
+  /**
+   * user (text + CHECK; factions add their own holder types)
+   */
+  holderType: string;
+  holderId: number;
+  quantity: Generated<number>;
+  expiresAt: Timestamp | null;
+  data: Generated<unknown>;
+  /**
+   * What granted it (a purchase claim's transactionId, a prize key). Unique, so a retried grant cannot make a second row.
+   */
+  sourceKey: string;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type ItemDefinition = {
+  id: Generated<number>;
+  /**
+   * cosmetic | box
+   */
+  type: string;
+  name: string;
+  description: string | null;
+  imageUrl: string | null;
+  /**
+   * Type settings. box: { event?: string, emptyRule: 'keep' }.
+   */
+  params: Generated<unknown>;
+  /**
+   * A cosmetic definition's cosmetic. A column rather than params so the FK keeps a box's contents grantable.
+   */
+  cosmeticId: number | null;
+  rarity: string | null;
+  /**
+   * Buzz value, for balancing and the average-value line. Never a price.
+   */
+  value: number | null;
+  /**
+   * Bitwise `ItemFlag`. TRADABLE is read by no code path; turning it on needs Legal and counsel.
+   */
+  flags: Generated<number>;
+  /**
+   * NULL = unlimited.
+   */
+  quantityAvailable: number | null;
+  /**
+   * Bumped on any change to a box's tiers, weights or contents. A purchase and an open must name the version they were shown.
+   */
+  version: Generated<number>;
+  /**
+   * draft | published | archived
+   */
+  status: Generated<string>;
+  createdById: number | null;
+  updatedById: number | null;
+  /**
+   * A creator box: the creator its sales pay (the creator side of computeCreatorShopSplit, never a reseller). NULL = a platform box, which pays no one. Only a box has one (CHECK).
+   */
+  sellerId: number | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type JobQueue = {
+  type: JobQueueType;
+  entityType: EntityType;
+  entityId: number;
+  createdAt: Generated<Timestamp>;
+  data: unknown | null;
+};
+export type KeyValue = {
+  key: string;
+  value: unknown;
+};
+export type Leaderboard = {
+  id: string;
+  index: number;
+  title: string;
+  description: string;
+  scoringDescription: string;
+  query: string;
+  active: boolean;
+  public: boolean;
+  domain: Generated<DomainColor[]>;
+};
+export type LeaderboardResult = {
+  leaderboardId: string;
+  date: Timestamp;
+  position: number;
+  userId: number;
+  score: Generated<number>;
+  metrics: Generated<unknown>;
+  createdAt: Generated<Timestamp>;
+};
+export type License = {
+  id: Generated<number>;
+  name: string;
+  url: string;
+};
+export type LicenseToModel = {
+  A: number;
+  B: number;
+};
+export type LicensingRoot = {
+  id: Generated<number>;
+  baseModel: string;
+  modelType: ModelType;
+  modelVersionId: number;
+  isDefault: Generated<boolean>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type Link = {
+  id: Generated<number>;
+  url: string;
+  type: LinkType;
+  entityId: number;
+  entityType: string;
+};
+export type MembershipGift = {
+  id: string;
+  gifterId: number;
+  recipientId: number;
+  holderId: number;
+  tier: string;
+  months: number;
+  amountCents: number;
+  status: Generated<MembershipGiftStatus>;
+  message: string | null;
+  anonymous: Generated<boolean>;
+  monthsRemaining: Generated<number>;
+  monthsConsumed: Generated<number>;
+  acceptedAt: Timestamp | null;
+  expiresAt: Timestamp | null;
+  stripeCheckoutSessionId: string | null;
+  stripePaymentIntentId: string | null;
+  stripeCouponId: string | null;
+  stripeSubscriptionId: string | null;
+  armedCouponId: string | null;
+  armedAt: Timestamp | null;
+  fulfilledAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ModActivity = {
+  id: Generated<number>;
+  userId: number | null;
+  activity: string;
+  entityType: string | null;
+  entityId: number | null;
+  createdAt: Generated<Timestamp>;
+  host: string | null;
+};
+export type Model = {
+  id: Generated<number>;
+  name: string;
+  description: string | null;
+  type: ModelType;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  lastVersionAt: Timestamp | null;
+  nsfw: Generated<boolean>;
+  tosViolation: Generated<boolean>;
+  poi: Generated<boolean>;
+  minor: Generated<boolean>;
+  userId: number;
+  status: Generated<ModelStatus>;
+  publishedAt: Timestamp | null;
+  fromImportId: number | null;
+  meta: Generated<unknown>;
+  deletedAt: Timestamp | null;
+  deletedBy: number | null;
+  checkpointType: CheckpointType | null;
+  uploadType: Generated<ModelUploadType>;
+  locked: Generated<boolean>;
+  underAttack: Generated<boolean>;
+  mode: ModelModifier | null;
+  unlisted: Generated<boolean>;
+  gallerySettings: Generated<unknown>;
+  availability: Generated<Availability>;
+  nsfwLevel: Generated<number>;
+  lockedProperties: Generated<string[]>;
+  scannedAt: Timestamp | null;
+  sfwOnly: Generated<boolean>;
+  isOfficial: Generated<boolean>;
+  sfwName: string | null;
+  sfwDescription: string | null;
+  coverImageId: number | null;
+  sfwCoverImageId: number | null;
+  allowNoCredit: Generated<boolean>;
+  allowCommercialUse: Generated<CommercialUse[]>;
+  allowDerivatives: Generated<boolean>;
+  allowDifferentLicense: Generated<boolean>;
+};
+export type Model3D = {
+  id: Generated<number>;
+  name: string;
+  description: string | null;
+  userId: number;
+  thumbnailImageId: number | null;
+  licenseId: number;
+  licenseDetails: string | null;
+  workflowId: string | null;
+  sourceImageId: number | null;
+  generationParams: unknown | null;
+  status: Generated<Model3DStatus>;
+  nsfw: Generated<boolean>;
+  tosViolation: Generated<boolean>;
+  poi: Generated<boolean>;
+  minor: Generated<boolean>;
+  unlisted: Generated<boolean>;
+  lockedProperties: Generated<string[]>;
+  availability: Generated<Availability>;
+  nsfwLevel: Generated<number>;
+  meta: Generated<unknown>;
+  gallerySettings: Generated<unknown>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  publishedAt: Timestamp | null;
+  deletedAt: Timestamp | null;
+  deletedBy: number | null;
+};
+export type Model3DEngagement = {
+  userId: number;
+  model3dId: number;
+  type: Model3DEngagementType;
+  createdAt: Generated<Timestamp>;
+};
+export type Model3DFile = {
+  id: Generated<number>;
+  model3dId: number;
+  name: string;
+  url: string;
+  sizeKB: number;
+  format: string;
+  variant: Generated<string>;
+  isPrimary: Generated<boolean>;
+  metadata: unknown | null;
+  virusScanResult: Generated<ScanResultCode>;
+  virusScanMessage: string | null;
+  rawScanResult: unknown | null;
+  scannedAt: Timestamp | null;
+  scanRequestedAt: Timestamp | null;
+  exists: boolean | null;
+  createdAt: Generated<Timestamp>;
+};
+export type Model3DLicense = {
+  id: Generated<number>;
+  name: string;
+  description: string;
+  allowCommercialUse: Generated<boolean>;
+  allowPrintFarm: Generated<boolean>;
+  allowDerivatives: Generated<boolean>;
+  allowRedistribution: Generated<boolean>;
+  requireAttribution: Generated<boolean>;
+  isCustom: Generated<boolean>;
+  createdAt: Generated<Timestamp>;
+};
+export type Model3DMetric = {
+  model3dId: number;
+  downloadCount: Generated<number>;
+  commentCount: Generated<number>;
+  collectedCount: Generated<number>;
+  imageCount: Generated<number>;
+  tippedCount: Generated<number>;
+  tippedAmountCount: Generated<number>;
+  ratingCount: Generated<number>;
+  recommendedCount: Generated<number>;
+  reactionCount: Generated<number>;
+  earnedAmount: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+  nsfwLevel: Generated<number>;
+  userId: Generated<number>;
+  status: Generated<Model3DStatus>;
+  availability: Generated<Availability>;
+  poi: Generated<boolean>;
+  minor: Generated<boolean>;
+};
+export type Model3DReport = {
+  model3dId: number;
+  reportId: number;
+};
+export type Model3DReview = {
+  id: Generated<number>;
+  model3dId: number;
+  userId: number;
+  recommended: Generated<boolean>;
+  details: string | null;
+  nsfw: Generated<boolean>;
+  tosViolation: Generated<boolean>;
+  exclude: Generated<boolean>;
+  metadata: unknown | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type Model3DReviewReport = {
+  model3dReviewId: number;
+  reportId: number;
+};
+export type ModelAssociations = {
+  id: Generated<number>;
+  fromModelId: number;
+  toModelId: number | null;
+  toArticleId: number | null;
+  associatedById: number | null;
+  createdAt: Generated<Timestamp>;
+  type: AssociationType;
+  index: number | null;
+};
+export type ModelBaseModelMetric = {
+  modelId: number;
+  baseModel: string;
+  thumbsUpCount: Generated<number>;
+  downloadCount: Generated<number>;
+  imageCount: Generated<number>;
+  status: Generated<ModelStatus>;
+  availability: Generated<Availability>;
+  nsfwLevel: Generated<number>;
+  mode: ModelModifier | null;
+  poi: Generated<boolean>;
+  minor: Generated<boolean>;
+  updatedAt: Generated<Timestamp>;
+  /**
+   * This base model's OWN hot score, so a filtered feed ranks on the slice rather than on
+   * engagement the model earned in another ecosystem. Served by mbmm_feed_hot. Computed by
+   * trigger from the columns below; falls back to mirroring ModelMetric.hotScore while
+   * generationCount is NULL. Same formula as the whole-model score, so a rank does not jump
+   * when a filter is applied.
+   */
+  hotScore: number | null;
+  /**
+   * Generations attributed to this model's versions of THIS base model. A plain SUM over
+   * ModelVersionMetric, so it arrives with the metrics job.
+   */
+  generationCount: number | null;
+  /**
+   * Distinct generators for this slice, merged across its versions; caps generationCount the
+   * same way ModelMetric.uniqueGeneratorCount does. NULL is what gates hotScore onto the
+   * mirrored fallback, because this is the one value that needs ClickHouse and so arrives
+   * last — a row scores on its own slice only once all three are in hand.
+   */
+  uniqueGeneratorCount: number | null;
+  /**
+   * EARLIEST published version for this base model — not the model's first publish, which
+   * would make a new version in a new ecosystem read as old there, and not the newest, which
+   * would let a republish refresh recency inside a filtered feed.
+   */
+  publishedAt: Timestamp | null;
+};
+export type ModelEngagement = {
+  userId: number;
+  modelId: number;
+  type: ModelEngagementType;
+  createdAt: Generated<Timestamp>;
+};
+export type ModelFile = {
+  id: Generated<number>;
+  name: string;
+  overrideName: string | null;
+  url: string;
+  sizeKB: number;
+  createdAt: Generated<Timestamp>;
+  type: Generated<string>;
+  modelVersionId: number;
+  pickleScanResult: Generated<ScanResultCode>;
+  exists: boolean | null;
+  pickleScanMessage: string | null;
+  virusScanResult: Generated<ScanResultCode>;
+  virusScanMessage: string | null;
+  scannedAt: Timestamp | null;
+  scanRequestedAt: Timestamp | null;
+  rawScanResult: unknown | null;
+  metadata: unknown | null;
+  headerData: unknown | null;
+  visibility: Generated<ModelFileVisibility>;
+  dataPurged: Generated<boolean>;
+  replacedAt: Timestamp | null;
+};
+export type ModelFileHash = {
+  fileId: number;
+  type: ModelHashType;
+  hash: string;
+  createdAt: Generated<Timestamp>;
+};
+export type ModelFlag = {
+  modelId: number;
+  poi: Generated<boolean>;
+  minor: Generated<boolean>;
+  sfwOnly: Generated<boolean>;
+  nsfw: Generated<boolean>;
+  triggerWords: Generated<boolean>;
+  poiName: Generated<boolean>;
+  status: Generated<ModelFlagStatus>;
+  details: unknown | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ModelHash = {
+  modelId: number;
+  modelVersionId: number;
+  hashType: ModelHashType;
+  fileType: string;
+  hash: string;
+};
+export type ModelInterest = {
+  userId: number;
+  modelId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type ModelMetric = {
+  modelId: number;
+  downloadCount: Generated<number>;
+  commentCount: Generated<number>;
+  collectedCount: Generated<number>;
+  imageCount: Generated<number>;
+  tippedCount: Generated<number>;
+  tippedAmountCount: Generated<number>;
+  generationCount: Generated<number>;
+  thumbsUpCount: Generated<number>;
+  thumbsDownCount: Generated<number>;
+  earnedAmount: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+  poi: Generated<boolean>;
+  minor: Generated<boolean>;
+  nsfwLevel: Generated<number>;
+  userId: Generated<number>;
+  lastVersionAt: Timestamp | null;
+  publishedAt: Timestamp | null;
+  mode: ModelModifier | null;
+  status: Generated<ModelStatus>;
+  availability: Generated<Availability>;
+  /**
+   * Hot feed sort key, maintained by the trg_model_metric_hot_score trigger. Never write it
+   * from application code: the DB computes it so the migration can ship before the deploy.
+   * Int, not float — the keyset cursor parser runs parseInt on the sort token.
+   */
+  hotScore: number | null;
+  /**
+   * Distinct users who have generated with any version of this model, merged across
+   * versions rather than summed. Caps hotScore's generation term so one person — the
+   * owner included — cannot lift a model on their own generations. Since 20261013120000
+   * the first generator earns nothing, so 0 means "no generation credit" (it was "not
+   * computed yet" and inert before). Kept current by the Model metrics job.
+   */
+  uniqueGeneratorCount: Generated<number>;
+};
+export type ModelMetricDaily = {
+  modelId: number;
+  modelVersionId: number;
+  type: string;
+  date: Timestamp;
+  count: number;
+};
+export type ModelOwnership = {
+  id: Generated<number>;
+  modelId: number;
+  userId: number;
+  /**
+   * 'create' | 'transfer' | 'account-delete' | 'restore' | 'baseline' (a CHECK in SQL)
+   */
+  reason: string;
+  actorId: number | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ModelPermissionSnapshot = {
+  id: Generated<number>;
+  modelId: number;
+  effectiveAt: Generated<Timestamp>;
+  source: string;
+  actorUserId: number | null;
+  actorRole: string | null;
+  allowNoCredit: boolean;
+  allowCommercialUse: CommercialUse[];
+  allowDerivatives: boolean;
+  allowDifferentLicense: boolean;
+};
+export type ModelReport = {
+  modelId: number;
+  reportId: number;
+};
+export type ModelReportStat = {
+  modelId: number;
+  tosViolationPending: number;
+  tosViolationUnactioned: number;
+  tosViolationActioned: number;
+  nsfwPending: number;
+  nsfwUnactioned: number;
+  nsfwActioned: number;
+  ownershipPending: number;
+  ownershipProcessing: number;
+  ownershipActioned: number;
+  ownershipUnactioned: number;
+  adminAttentionPending: number;
+  adminAttentionActioned: number;
+  adminAttentionUnactioned: number;
+  claimPending: number;
+  claimActioned: number;
+  claimUnactioned: number;
+};
+export type ModelSelfGeneration = {
+  modelId: number;
+  userId: number;
+  generationCount: Generated<string>;
+  updatedAt: Generated<Timestamp>;
+};
+export type ModelTag = {
+  modelId: number;
+  tagId: number;
+  tagName: string;
+  tagType: TagType;
+  score: number;
+  upVotes: number;
+  downVotes: number;
+  needsReview: boolean;
+};
+export type ModelVersion = {
+  id: Generated<number>;
+  index: number | null;
+  name: string;
+  description: string | null;
+  modelId: number;
+  trainedWords: string[];
+  steps: number | null;
+  epochs: number | null;
+  clipSkip: number | null;
+  vaeId: number | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  publishedAt: Timestamp | null;
+  initialPublishedAt: Timestamp | null;
+  status: Generated<ModelStatus>;
+  trainingStatus: TrainingStatus | null;
+  trainingDetails: unknown | null;
+  fromImportId: number | null;
+  inaccurate: Generated<boolean>;
+  baseModel: string;
+  baseModelType: Generated<string>;
+  meta: Generated<unknown>;
+  requireAuth: Generated<boolean>;
+  settings: unknown | null;
+  availability: Generated<Availability>;
+  nsfwLevel: Generated<number>;
+  uploadType: Generated<ModelUploadType>;
+  usageControl: Generated<ModelUsageControl>;
+  earlyAccessTimeFrame: Generated<number>;
+  flags: Generated<number>;
+  generatorLoaded: Generated<boolean>;
+  licensingFee: string | null;
+  licensingFeeType: Generated<LicensingFeeType | null>;
+  licensingFeeSettlementCurrency: Generated<LicensingFeeSettlementCurrency | null>;
+  licensingSourceVersionId: number | null;
+};
+export type ModelVersionEngagement = {
+  userId: number;
+  modelVersionId: number;
+  type: ModelVersionEngagementType;
+  createdAt: Generated<Timestamp>;
+};
+export type ModelVersionExploration = {
+  index: number;
+  name: string;
+  prompt: string;
+  modelVersionId: number;
+};
+export type ModelVersionMetric = {
+  modelVersionId: number;
+  downloadCount: Generated<number>;
+  commentCount: Generated<number>;
+  collectedCount: Generated<number>;
+  imageCount: Generated<number>;
+  tippedCount: Generated<number>;
+  tippedAmountCount: Generated<number>;
+  generationCount: Generated<number>;
+  thumbsUpCount: Generated<number>;
+  thumbsDownCount: Generated<number>;
+  earnedAmount: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+};
+export type ModelVersionMonetization = {
+  id: Generated<number>;
+  modelVersionId: number;
+  type: Generated<ModelVersionMonetizationType>;
+  currency: Generated<Currency>;
+  unitAmount: number | null;
+};
+export type ModelVersionSale = {
+  id: Generated<number>;
+  userId: number;
+  name: string | null;
+  discountType: SaleDiscountType;
+  discountAmount: number;
+  startsAt: Timestamp;
+  endsAt: Timestamp;
+  canceledAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ModelVersionSaleItem = {
+  saleId: number;
+  modelVersionId: number;
+};
+export type ModelVersionSponsorshipSettings = {
+  id: Generated<number>;
+  modelVersionMonetizationId: number;
+  type: Generated<ModelVersionSponsorshipSettingsType>;
+  currency: Generated<Currency>;
+  unitAmount: number;
+};
+export type ModerationRule = {
+  id: Generated<number>;
+  entityType: EntityType;
+  definition: unknown;
+  action: ModerationRuleAction;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  enabled: Generated<boolean>;
+  order: number | null;
+  reason: string | null;
+  createdById: number;
+};
+export type ModerationRuleVersion = {
+  id: Generated<number>;
+  ruleId: number;
+  definition: unknown;
+  enabled: boolean;
+  action: ModerationRuleAction;
+  reason: string | null;
+  createdById: number;
+  createdAt: Generated<Timestamp>;
+};
+export type ModThreadClaim = {
+  chatId: number;
+  moderatorId: number;
+  claimedAt: Generated<Timestamp>;
+  expiresAt: Timestamp;
+};
+export type NewOrderPlayer = {
+  userId: number;
+  rankType: NewOrderRankType;
+  startAt: Generated<Timestamp>;
+  exp: Generated<number>;
+  fervor: Generated<number>;
+};
+export type NewOrderRank = {
+  type: NewOrderRankType;
+  name: string;
+  minExp: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  iconUrl: string | null;
+};
+export type NewOrderSmite = {
+  id: Generated<number>;
+  targetPlayerId: number;
+  givenById: number;
+  size: number;
+  remaining: number;
+  reason: string | null;
+  createdAt: Generated<Timestamp>;
+  cleansedAt: Timestamp | null;
+  cleansedReason: string | null;
+};
+export type OauthClient = {
+  id: string;
+  secret: string | null;
+  name: string;
+  description: Generated<string>;
+  logoUrl: string | null;
+  redirectUris: Generated<string[]>;
+  allowedOrigins: Generated<string[]>;
+  grants: Generated<string[]>;
+  allowedScopes: Generated<number>;
+  isConfidential: Generated<boolean>;
+  /**
+   * Login gating: "open" (anyone), "testers" (only users holding the "tester" UserRole), "disabled" (no one).
+   * Read by the auth hub's /authorize gate. First-party (spoke) clients have no row here, so are never gated.
+   */
+  accessMode: Generated<string>;
+  /**
+   * Staff-only, confidential system apps only (auth hub admin, OAuth Apps): signed-in users go straight through
+   * /authorize with no consent screen, as first-party (spoke) clients do. Ignored for a public app.
+   */
+  skipConsent: Generated<boolean>;
+  /**
+   * Staff-only, confidential system apps only: this client's own /oauth/token limit per minute, used once a request
+   * is past the per-IP limit and the client has proved its secret. Null = the per-IP limit only.
+   */
+  tokenRateLimit: number | null;
+  userId: number;
+  isVerified: Generated<boolean>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type OauthConsent = {
+  id: Generated<number>;
+  userId: number;
+  clientId: string;
+  scope: number;
+  buzzLimit: unknown | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type Outbox = {
+  id: Generated<string>;
+  event: string;
+  entityType: OutboxEntity;
+  entityId: string;
+  createdAt: Generated<Timestamp | null>;
+  details: unknown | null;
+  attempts: number | null;
+};
+export type PaidAccess = {
+  entityType: PaidAccessEntityType;
+  entityId: number;
+  ownerId: number;
+  endsAt: Timestamp | null;
+  timeframeDays: number | null;
+  terms: unknown;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type Partner = {
+  id: Generated<number>;
+  name: string;
+  homepage: string | null;
+  tos: string | null;
+  privacy: string | null;
+  startupTime: number | null;
+  onDemand: boolean;
+  onDemandStrategy: string | null;
+  onDemandTypes: Generated<ModelType[]>;
+  onDemandBaseModels: Generated<string[]>;
+  stepsPerSecond: number;
+  pricingModel: PartnerPricingModel;
+  price: string;
+  about: string | null;
+  createdAt: Generated<Timestamp>;
+  nsfw: Generated<boolean>;
+  poi: Generated<boolean>;
+  personal: Generated<boolean>;
+  token: string | null;
+  tier: Generated<number>;
+  logo: string | null;
+  disabled: Generated<boolean>;
+};
+export type PersonalDataExport = {
+  id: Generated<number>;
+  userId: number;
+  requestedById: number;
+  /**
+   * queued | building | built | held | failed | released
+   */
+  status: Generated<string>;
+  /**
+   * Always text-redacted-separate-file: the notes file beside the archive.
+   */
+  modNotesMode: Generated<string>;
+  /**
+   * Neutral codes for the holds found when the archive was built; re-checked at release.
+   */
+  holdReasons: Generated<string[]>;
+  archiveKey: string | null;
+  modNotesKey: string | null;
+  /**
+   * Per-source row counts and notes: what the archive's manifest.json holds, without data.
+   */
+  manifest: unknown | null;
+  error: string | null;
+  attempts: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  startedAt: Timestamp | null;
+  builtAt: Timestamp | null;
+  /**
+   * When the requester was emailed the link.
+   */
+  sentAt: Timestamp | null;
+  linkExpiresAt: Timestamp | null;
+  releasedAt: Timestamp | null;
+  releasedById: number | null;
+  /**
+   * The help-desk ticket the request came in on, when it did.
+   */
+  ticketId: number | null;
+  /**
+   * The date the user asked (the ticket's own date, or as entered): starts the response deadline.
+   */
+  requestedAt: Timestamp | null;
+};
+export type Placement = {
+  id: Generated<number>;
+  surface: string;
+  targetType: string;
+  targetId: number;
+  ownerId: number;
+  placerId: number;
+  data: Generated<unknown>;
+  /**
+   * A sticker's movement over a video, in the shape of `StickerTrack`. Null for a still sticker;
+   * `data` holds the pose at time zero either way. Its own column because the feed reads `data`.
+   */
+  track: unknown | null;
+  status: string;
+  /**
+   * 'owner' | 'moderator' | 'cosmeticTakedown' | 'placer', set with status 'removed'. The
+   * removals refund different amounts, so the status alone cannot settle the
+   * money. Constrained by "Placement_removedBy_check" — a new value needs a
+   * migration even though the column is TEXT.
+   */
+  removedBy: string | null;
+  /**
+   * What the placer paid into escrow, in Buzz. Kept per row rather than read back from
+   * the space, whose price may move between placement and release.
+   *
+   * Always 0 on a free placement, and nothing reads it there — the payout is
+   * derived from receipted holds, of which a free placement has none.
+   */
+  amount: number;
+  /**
+   * A placement made against the space's free capacity rather than paid for.
+   *
+   * Escrow is bypassed entirely: zero-amount Buzz transactions are a landmine,
+   * and the escrow's two-hold structure has neither a decline fee nor a
+   * principal to hold. Settlement moves no money at all for one of these.
+   *
+   * On the row rather than inferred from `amount = 0`, which is also what a paid
+   * placement into a zero-priced space looks like. It also has to be immutable
+   * and readable by a sweeper that never saw the request that made it.
+   */
+  free: Generated<boolean>;
+  /**
+   * Which Buzz the placer paid in, so the settlement pays the same kind back out.
+   * On the row for the same reason `amount` is: settlement is resumable, and the
+   * domain that decided the currency is not visible to a sweeper.
+   *
+   * NULL means a placement made before this column existed. Those were booked
+   * into escrow as yellow whatever was spent, and settle as yellow to match the
+   * ledger. Deliberately not backfilled — the bank is not balance-constrained,
+   * so it is a choice about legacy rows, not a limit. See `settledSpendType`.
+   */
+  spendType: string | null;
+  /**
+   * Who sold the thing being placed, when an approved placement owes them a cut.
+   * On the row rather than passed in, because the settlement is resumable and a
+   * sweeper that never saw the argument would strand the seller's share.
+   */
+  sellerId: number | null;
+  /**
+   * Set when a block declined this placement. A block is the owner refusing to
+   * give attention to anyone, and the decline fee is the price of that attention,
+   * so no fee is taken. Stored rather than inferred: settlement is resumable and
+   * must replay the same decision.
+   */
+  feeWaived: Generated<boolean>;
+  createdAt: Generated<Timestamp>;
+  expiresAt: Timestamp | null;
+  resolvedAt: Timestamp | null;
+  resolvedById: number | null;
+  /**
+   * A moderator takedown of an already-settled placement. Its own columns because
+   * `resolvedAt`/`resolvedById` record who approved it, and overwriting them on the
+   * one path whose purpose is a moderation record would destroy the approval trail.
+   */
+  takenDownAt: Timestamp | null;
+  takenDownById: number | null;
+  /**
+   * When this placement's Buzz reached the target's counter. The counter lives in
+   * ClickHouse, which has no per-placement key to ask, so the fact that it was
+   * counted is recorded here or nowhere. NULL on a placement that reached
+   * `approved` is the reconcile sweep's work queue.
+   */
+  metricCountedAt: Timestamp | null;
+  /**
+   * When a sweep took this row to count it. Two columns rather than one because
+   * the claim has to be atomic and the confirmation cannot be: two sweeps can
+   * overlap (the job lock fails open when Redis is down), and without a claim
+   * both read the same unstamped rows and both emit before either stamps. The
+   * counter never reverses, so that over-count is permanent. A claim older than
+   * the recovery window is retried, which is what stops a crash between the two
+   * writes turning into the loss this whole feature exists to end.
+   */
+  metricClaimedAt: Timestamp | null;
+  /**
+   * How many times a sweep has taken this row. A row the tracker rejects fails
+   * identically on every retry, and the claim orders by `resolvedAt`, so
+   * without a ceiling one poisoned row sits at the head of the queue being
+   * re-claimed forever and starves everything behind it.
+   */
+  metricAttempts: Generated<number>;
+};
+export type PlacementSpace = {
+  id: Generated<number>;
+  surface: string;
+  entityType: string;
+  entityId: number;
+  mode: string;
+  /**
+   * What the owner asks. The charged price is min(price, cap) computed at read; a
+   * stored effective price goes stale the moment a membership lapses.
+   */
+  price: number | null;
+  /**
+   * How many free placements this space accepts. NULL means the owner has never
+   * chosen, which resolves to the surface's default (1) rather than to zero —
+   * free capacity is opt-out. An explicit 0 is the owner taking none, which is
+   * why this replaces an on/off toggle instead of sitting beside one.
+   *
+   * Stored uncapped and ceilinged at read by the score/tier table, exactly like
+   * `price`: a stored effective value goes stale the moment a membership lapses.
+   *
+   * A column rather than a key in `settings`, because the foundation reads it
+   * and `settings` is surface-owned by construction.
+   */
+  freeSlots: number | null;
+  /**
+   * Surface-owned settings, read only by the surface that wrote them — a max
+   * sticker size means nothing to a remix gallery. Kept as JSON so this layer
+   * does not grow a column per surface idea.
+   */
+  settings: Generated<unknown>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type PlacementSuspension = {
+  userId: number;
+  reason: string | null;
+  createdAt: Generated<Timestamp>;
+  createdById: number | null;
+};
+export type PlacementTransaction = {
+  id: Generated<number>;
+  placementId: number;
+  kind: string;
+  transactionId: string | null;
+  amount: number;
+  /**
+   * Failure accounting. Without it a leg that can never succeed is
+   * indistinguishable from one that has not been tried yet, so it stays in the
+   * recovery sweep forever and — past the batch limit — starves it, while the
+   * sweep reports healthy numbers.
+   */
+  attempts: Generated<number>;
+  lastAttemptAt: Timestamp | null;
+  lastError: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type PlatformDefaultBlock = {
+  app_block_id: string;
+  slot_id: string;
+  target_model_types: string[];
+  min_content_rating: string | null;
+  max_content_rating: string | null;
+  priority: Generated<number>;
+  enabled: Generated<boolean>;
+  promoted_at: Generated<Timestamp>;
+  promoted_by: number | null;
+};
+export type Post = {
+  id: Generated<number>;
+  nsfw: Generated<boolean>;
+  title: string | null;
+  detail: string | null;
+  userId: number;
+  modelVersionId: number | null;
+  model3dId: number | null;
+  model3dReviewId: number | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  publishedAt: Timestamp | null;
+  metadata: unknown | null;
+  tosViolation: Generated<boolean>;
+  collectionId: number | null;
+  unlisted: Generated<boolean>;
+  availability: Generated<Availability>;
+  nsfwLevel: Generated<number>;
+  moderatorNsfwLevel: number | null;
+  moderatorNsfwLevelBasis: number | null;
+};
+export type PostHelper = {
+  postId: number;
+  scanned: boolean;
+};
+export type PostImageTag = {
+  postId: number;
+  tagId: number;
+};
+export type PostIntentManifest = {
+  id: Generated<number>;
+  manifest_url: string;
+  app_id: string;
+  listing_id: string;
+  user_id: number;
+  manifest: unknown;
+  staged: Generated<unknown>;
+  claim_expires_at: Timestamp;
+  post_id: number | null;
+  posted_at: Timestamp | null;
+  created_at: Generated<Timestamp>;
+};
+export type PostMetric = {
+  postId: number;
+  timeframe: MetricTimeframe;
+  likeCount: Generated<number>;
+  dislikeCount: Generated<number>;
+  laughCount: Generated<number>;
+  cryCount: Generated<number>;
+  heartCount: Generated<number>;
+  commentCount: Generated<number>;
+  collectedCount: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+  ageGroup: Generated<MetricTimeframe>;
+};
+export type PostPreset = {
+  id: Generated<number>;
+  userId: number;
+  name: string;
+  data: unknown;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type PostReaction = {
+  id: Generated<number>;
+  postId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type PostReport = {
+  postId: number;
+  reportId: number;
+};
+export type PostResourceHelper = {
+  postId: number;
+  reviewId: number | null;
+  reviewRating: number | null;
+  reviewRecommended: boolean | null;
+  reviewDetails: string | null;
+  reviewCreatedAt: Timestamp | null;
+  name: string | null;
+  imageId: number;
+  modelVersionId: number;
+  modelVersionName: string | null;
+  modelVersionCreatedAt: Timestamp | null;
+  modelId: number | null;
+  modelName: string | null;
+  modelDownloadCount: number | null;
+  modelCommentCount: number | null;
+  modelThumbsUpCount: number | null;
+  modelThumbsDownCount: number | null;
+  modelType: ModelType | null;
+};
+export type PostStat = {
+  postId: number;
+  cryCountDay: Generated<number>;
+  cryCountWeek: Generated<number>;
+  cryCountMonth: Generated<number>;
+  cryCountYear: Generated<number>;
+  cryCountAllTime: Generated<number>;
+  dislikeCountDay: Generated<number>;
+  dislikeCountWeek: Generated<number>;
+  dislikeCountMonth: Generated<number>;
+  dislikeCountYear: Generated<number>;
+  dislikeCountAllTime: Generated<number>;
+  heartCountDay: Generated<number>;
+  heartCountWeek: Generated<number>;
+  heartCountMonth: Generated<number>;
+  heartCountYear: Generated<number>;
+  heartCountAllTime: Generated<number>;
+  laughCountDay: Generated<number>;
+  laughCountWeek: Generated<number>;
+  laughCountMonth: Generated<number>;
+  laughCountYear: Generated<number>;
+  laughCountAllTime: Generated<number>;
+  likeCountDay: Generated<number>;
+  likeCountWeek: Generated<number>;
+  likeCountMonth: Generated<number>;
+  likeCountYear: Generated<number>;
+  likeCountAllTime: Generated<number>;
+  commentCountDay: Generated<number>;
+  commentCountWeek: Generated<number>;
+  commentCountMonth: Generated<number>;
+  commentCountYear: Generated<number>;
+  commentCountAllTime: Generated<number>;
+  reactionCountDay: Generated<number>;
+  reactionCountWeek: Generated<number>;
+  reactionCountMonth: Generated<number>;
+  reactionCountYear: Generated<number>;
+  reactionCountAllTime: Generated<number>;
+};
+export type PostTag = {
+  postId: number;
+  tagId: number;
+  tagName: string;
+  tagType: TagType;
+  score: number;
+  upVotes: number;
+  downVotes: number;
+};
+export type PressMention = {
+  id: Generated<number>;
+  title: string;
+  url: string;
+  source: string;
+  publishedAt: Generated<Timestamp>;
+  createdAt: Generated<Timestamp>;
+};
+export type Price = {
+  id: string;
+  productId: string;
+  active: boolean;
+  currency: string;
+  description: string | null;
+  type: string;
+  unitAmount: number | null;
+  interval: string | null;
+  intervalCount: number | null;
+  metadata: unknown;
+  provider: Generated<PaymentProvider>;
+};
+export type PricingSlot = {
+  entityType: PaidAccessEntityType;
+  entityId: number;
+  ownerId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type Prize = {
+  id: Generated<number>;
+  userId: number;
+  sourceType: PrizeSourceType;
+  sourceId: number;
+  subjectId: number | null;
+  position: number | null;
+  amount: number;
+  title: string;
+  externalTransactionId: string;
+  createdAt: Generated<Timestamp>;
+  autoClaimAt: Timestamp;
+  claimedAt: Timestamp | null;
+  buzzType: string | null;
+  autoClaimed: Generated<boolean>;
+  paidAt: Timestamp | null;
+  voidedAt: Timestamp | null;
+};
+export type Product = {
+  id: string;
+  active: boolean;
+  name: string;
+  description: string | null;
+  metadata: unknown;
+  defaultPriceId: string | null;
+  provider: Generated<PaymentProvider>;
+};
+export type PurchasableReward = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  title: string;
+  unitPrice: number;
+  about: string;
+  redeemDetails: string;
+  termsOfUse: string;
+  usage: PurchasableRewardUsage;
+  codes: string[];
+  archived: Generated<boolean>;
+  availableFrom: Timestamp | null;
+  availableTo: Timestamp | null;
+  availableCount: number | null;
+  addedById: number | null;
+  coverImageId: number | null;
+};
+export type Purchase = {
+  id: Generated<number>;
+  userId: number;
+  productId: string | null;
+  priceId: string | null;
+  status: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type PushSubscription = {
+  id: Generated<number>;
+  userId: number;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  userAgent: string | null;
+  createdAt: Generated<Timestamp>;
+  lastSeenAt: Generated<Timestamp>;
+  lastSuccessAt: Timestamp | null;
+  failureCount: Generated<number>;
+};
+export type Question = {
+  id: Generated<number>;
+  userId: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  title: string;
+  content: string;
+  selectedAnswerId: number | null;
+};
+export type QuestionMetric = {
+  questionId: number;
+  timeframe: MetricTimeframe;
+  heartCount: Generated<number>;
+  commentCount: Generated<number>;
+  answerCount: Generated<number>;
+};
+export type QuestionRank = {
+  questionId: number;
+  answerCountDay: number;
+  answerCountWeek: number;
+  answerCountMonth: number;
+  answerCountYear: number;
+  answerCountAllTime: number;
+  heartCountDay: number;
+  heartCountWeek: number;
+  heartCountMonth: number;
+  heartCountYear: number;
+  heartCountAllTime: number;
+  commentCountDay: number;
+  commentCountWeek: number;
+  commentCountMonth: number;
+  commentCountYear: number;
+  commentCountAllTime: number;
+  answerCountDayRank: number;
+  answerCountWeekRank: number;
+  answerCountMonthRank: number;
+  answerCountYearRank: number;
+  answerCountAllTimeRank: number;
+  heartCountDayRank: number;
+  heartCountWeekRank: number;
+  heartCountMonthRank: number;
+  heartCountYearRank: number;
+  heartCountAllTimeRank: number;
+  commentCountDayRank: number;
+  commentCountWeekRank: number;
+  commentCountMonthRank: number;
+  commentCountYearRank: number;
+  commentCountAllTimeRank: number;
+};
+export type QuestionReaction = {
+  id: Generated<number>;
+  questionId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type RatingReview = {
+  id: Generated<number>;
+  entityType: string;
+  entityId: number;
+  userId: number;
+  currentLevel: number;
+  suggestedLevel: number;
+  appliedLevel: number | null;
+  userComment: string | null;
+  modComment: string | null;
+  status: Generated<ReportStatus>;
+  resolvedBy: number | null;
+  resolvedAt: Timestamp | null;
+  resolvedTextHash: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type RecommendedResource = {
+  id: Generated<number>;
+  resourceId: number;
+  sourceId: number | null;
+  settings: unknown | null;
+};
+export type RedeemableCode = {
+  code: string;
+  unitValue: number;
+  userId: number | null;
+  createdAt: Generated<Timestamp>;
+  type: RedeemableCodeType;
+  expiresAt: Timestamp | null;
+  redeemedAt: Timestamp | null;
+  transactionId: string | null;
+  metadata: unknown | null;
+  priceId: string | null;
+};
+export type ReferralAttribution = {
+  id: Generated<number>;
+  referralCodeId: number;
+  refereeId: number;
+  eventType: string;
+  sourceEventId: string | null;
+  tier: string | null;
+  amount: number | null;
+  paymentProvider: string | null;
+  stripePaymentIntentId: string | null;
+  stripeInvoiceId: string | null;
+  stripeChargeId: string | null;
+  paymentMethodFingerprint: string | null;
+  ipAddress: string | null;
+  metadata: Generated<unknown>;
+  createdAt: Generated<Timestamp>;
+};
+export type ReferralMilestone = {
+  id: Generated<number>;
+  userId: number;
+  threshold: number;
+  bonusAmount: number;
+  awardedAt: Generated<Timestamp>;
+};
+export type ReferralRedemption = {
+  id: Generated<number>;
+  userId: number;
+  tokensSpent: number;
+  rewardType: Generated<ReferralRedemptionType>;
+  metadata: Generated<unknown>;
+  createdAt: Generated<Timestamp>;
+};
+export type ReferralReward = {
+  id: Generated<number>;
+  userId: number;
+  refereeId: number | null;
+  kind: ReferralRewardKind;
+  status: Generated<ReferralRewardStatus>;
+  tokenAmount: Generated<number>;
+  buzzAmount: Generated<number>;
+  points: Generated<number>;
+  tierGranted: string | null;
+  sourceEventId: string;
+  metadata: Generated<unknown>;
+  earnedAt: Generated<Timestamp>;
+  settledAt: Timestamp | null;
+  redeemedAt: Timestamp | null;
+  expiresAt: Timestamp | null;
+  revokedAt: Timestamp | null;
+  revokedReason: string | null;
+};
+export type RemovalScoreExemption = {
+  imageId: number;
+  /**
+   * The rule and its inputs that created the row, so a later run with other inputs can be told apart.
+   */
+  reason: string;
+  createdAt: Generated<Timestamp>;
+  createdBy: number | null;
+};
+export type Report = {
+  id: Generated<number>;
+  userId: number;
+  reason: ReportReason;
+  createdAt: Generated<Timestamp>;
+  details: unknown | null;
+  internalNotes: string | null;
+  previouslyReviewedCount: Generated<number>;
+  alsoReportedBy: Generated<number[]>;
+  status: ReportStatus;
+  statusSetAt: Timestamp | null;
+  statusSetBy: number | null;
+};
+export type ReportAutomated = {
+  id: Generated<number>;
+  reportId: number;
+  metadata: Generated<unknown>;
+  createdAt: Generated<Timestamp>;
+};
+export type ResourceInsight = {
+  modelVersionId: number;
+  role: string;
+  styleFamily: string;
+  contentTypes: string[];
+  qualityScore: number;
+  confidence: number;
+  specHash: string;
+  model: string;
+  createdAt: Generated<Timestamp>;
+  stale: Generated<boolean>;
+};
+export type ResourceIntentCoocSnapshot = {
+  id: string;
+  kind: string;
+  status: Generated<string>;
+  contentHash: string | null;
+  specHash: string;
+  trainStart: Timestamp;
+  trainEnd: Timestamp;
+  seed: number;
+  pinnedUntil: Timestamp | null;
+  builtAt: Generated<Timestamp>;
+  trainCreatedAtMin: Timestamp | null;
+  trainCreatedAtMax: Timestamp | null;
+  idsTried: number | null;
+  trainRows: number | null;
+  vocab: number | null;
+  models: number | null;
+  keptPairs: number | null;
+  payload: Buffer | null;
+  trainImageIds: Buffer | null;
+};
+export type ResourceIntentTagIndexSnapshot = {
+  id: string;
+  status: Generated<string>;
+  vocabVersion: string;
+  specHash: string;
+  payloadSha256: string;
+  payloadBytes: number;
+  objectKey: string;
+  buildStats: unknown;
+  createdAt: Generated<Timestamp>;
+  retiredAt: Timestamp | null;
+};
+export type ResourceIntentVocabulary = {
+  id: string;
+  vocabVersion: string;
+  status: Generated<string>;
+  payload: Buffer;
+  rulesSummary: unknown;
+  createdAt: Generated<Timestamp>;
+  frozenAt: Timestamp | null;
+  frozenBy: string | null;
+};
+export type ResourceOverride = {
+  hash: string;
+  modelVersionId: number;
+  type: ModelHashType;
+  createdAt: Generated<Timestamp>;
+};
+export type ResourceReview = {
+  id: Generated<number>;
+  modelId: number;
+  modelVersionId: number;
+  rating: number;
+  recommended: Generated<boolean>;
+  details: string | null;
+  userId: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  exclude: Generated<boolean>;
+  nsfw: Generated<boolean>;
+  tosViolation: Generated<boolean>;
+  metadata: unknown | null;
+};
+export type ResourceReviewHelper = {
+  resourceReviewId: number;
+  imageCount: number;
+};
+export type ResourceReviewReaction = {
+  id: Generated<number>;
+  reviewId: number;
+  userId: number;
+  reaction: ReviewReactions;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ResourceReviewReport = {
+  resourceReviewId: number;
+  reportId: number;
+};
+export type RestrictedBaseModels = {
+  baseModel: string;
+};
+export type RewardsBonusEvent = {
+  id: Generated<number>;
+  name: string;
+  description: string | null;
+  /**
+   * Stored as multiplier * 10. e.g. 15 = 1.5x (50% MORE), 20 = 2x, 30 = 3x, 40 = 4x. Minimum effective value 10 (no bonus).
+   */
+  multiplier: number;
+  articleId: number | null;
+  bannerLabel: string | null;
+  enabled: Generated<boolean>;
+  startsAt: Timestamp | null;
+  endsAt: Timestamp | null;
+  createdById: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type Role = {
+  id: string;
+  description: string | null;
+  createdById: number | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type RunStrategy = {
+  modelVersionId: number;
+  partnerId: number;
+  url: string;
+  createdAt: Generated<Timestamp>;
+};
+export type SavedModel = {
+  modelId: number;
+  userId: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ScanLabelClaim = {
+  itemId: number;
+  userId: number;
+  expiresAt: Timestamp;
+  token: Generated<string | null>;
+};
+export type ScanLabelCopyObject = {
+  key: string;
+  itemId: number;
+  imageId: number;
+  createdAt: Generated<Timestamp>;
+  withdrawnAt: Timestamp | null;
+  removedAt: Timestamp | null;
+  withdrawReason: string | null;
+  withdrawError: string | null;
+};
+export type ScanLabelFlag = {
+  id: Generated<number>;
+  itemId: number;
+  source: string;
+  flaggerVersion: string;
+  reason: string | null;
+  workflowId: string;
+  flaggedAt: Timestamp;
+  snapshot: unknown | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ScanLabelItem = {
+  id: Generated<number>;
+  imageId: number;
+  lane: Generated<string>;
+  firstFlaggedAt: Timestamp;
+  status: Generated<string>;
+  voidReason: string | null;
+  votes: Generated<number>;
+  blockVotes: Generated<number>;
+  outcome: string | null;
+  unanimous: boolean | null;
+  decidedAt: Timestamp | null;
+  actionedAt: Timestamp | null;
+  actionStartedAt: Timestamp | null;
+  actionResult: string | null;
+  actionError: string | null;
+  copyState: string | null;
+  copyKey: string | null;
+  copiedAt: Timestamp | null;
+  copyError: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ScanLabelQuota = {
+  userId: number;
+  dailyVotes: Generated<number>;
+  active: Generated<boolean>;
+  updatedBy: number | null;
+  updatedAt: Generated<Timestamp>;
+};
+export type ScanLabelVote = {
+  itemId: number;
+  userId: number;
+  block: boolean;
+  reason: string | null;
+  reasonComment: string | null;
+  msOnItem: number | null;
+  createdAt: Generated<Timestamp>;
+  claimToken: string | null;
+};
+export type ScannerContentSnapshot = {
+  contentHash: string;
+  scanner: string;
+  content: unknown;
+  createdAt: Generated<Timestamp>;
+};
+export type ScannerLabelReview = {
+  id: Generated<number>;
+  contentHash: string;
+  version: string;
+  label: string;
+  reviewedBy: number;
+  reviewedAt: Generated<Timestamp>;
+  verdict: ReviewVerdict;
+  note: string | null;
+};
+export type ServiceDeal = {
+  id: Generated<number>;
+  offeringId: number;
+  buyerId: number;
+  sellerId: number;
+  price: number;
+  buzzType: ServiceBuzzType;
+  /**
+   * Kept by the platform out of `price` on release; the seller receives the rest.
+   */
+  feeAmount: Generated<number>;
+  revisionsIncluded: number;
+  revisionsUsed: Generated<number>;
+  deliveryDays: number;
+  previewKind: ServicePreviewKind;
+  /**
+   * The offering's maxNsfwLevel when requested; never re-read from the offering.
+   */
+  maxNsfwLevel: Generated<number>;
+  status: Generated<ServiceDealStatus>;
+  /**
+   * Set once the Hold leg's Buzz call has succeeded, whatever the deal's status by then. A
+   * deal without it was never paid for: the migration refuses any worked or payable status
+   * without it. Release and Refund receipts are NOT tied to it in the database, so code must
+   * claim them only against a paid Hold.
+   */
+  heldAt: Timestamp | null;
+  /**
+   * Set once the Release or Refund leg's Buzz call has succeeded.
+   */
+  settledAt: Timestamp | null;
+  chatId: number | null;
+  requestText: string;
+  requestedAt: Generated<Timestamp>;
+  acceptedAt: Timestamp | null;
+  dueAt: Timestamp | null;
+  /**
+   * Latest delivery. Starts the auto-complete window.
+   */
+  deliveredAt: Timestamp | null;
+  completedAt: Timestamp | null;
+  /**
+   * When the release leg may run: the end of the dispute window after completion.
+   * Required once Completed (a CHECK in the migration).
+   */
+  releaseAt: Timestamp | null;
+  cancellationRequestedAt: Timestamp | null;
+  cancellationRequestedById: number | null;
+  cancellationReason: string | null;
+  disputeOpenedAt: Timestamp | null;
+  disputeReason: string | null;
+  disputeResolvedAt: Timestamp | null;
+  disputeResolution: ServiceDisputeResolution | null;
+  disputeResolvedById: number | null;
+  closedAt: Timestamp | null;
+  closeReason: string | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ServiceDealEvent = {
+  id: Generated<number>;
+  dealId: number;
+  actorId: number;
+  type: ServiceDealEventType;
+  round: Generated<number>;
+  comment: string | null;
+  /**
+   * Validated against the per-action lists in creator-services.constants; no DB CHECK.
+   */
+  reasonCode: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ServiceDealFile = {
+  id: Generated<number>;
+  dealId: number;
+  round: Generated<number>;
+  kind: ServiceDealFileKind;
+  s3Key: string;
+  watermarkedKey: string | null;
+  /**
+   * The hidden, downscaled, unwatermarked copy a preview is scanned as. Deleted once its verdict
+   * lands; `scanKey` is its object key, recorded before the Image row exists so a retry reuses it.
+   */
+  imageId: number | null;
+  scanKey: string | null;
+  /**
+   * The rating the scan gave the preview, recorded when it passes.
+   */
+  nsfwLevel: number | null;
+  fileName: Generated<string>;
+  mimeType: string;
+  size: number;
+  /**
+   * Uploading until the uploader confirms the object is in the bucket.
+   */
+  status: Generated<ServiceDealFileStatus>;
+  failReason: string | null;
+  uploadedAt: Timestamp | null;
+  /**
+   * Set when preview processing last started, so a crashed worker's file is picked up again.
+   */
+  processingAt: Timestamp | null;
+  scanStatus: Generated<ServiceDealFileScanStatus>;
+  /**
+   * The malware scanner's own verdict; `scanStatus` can pass only once this has.
+   */
+  malwareScanStatus: Generated<ServiceDealFileScanStatus>;
+  /**
+   * The scan workflow the verdict is awaited from; cleared when a submission has to be retried.
+   */
+  malwareScanWorkflowId: string | null;
+  /**
+   * When the file was first handed to the scan; the give-up window runs from here.
+   */
+  malwareScanStartedAt: Timestamp | null;
+  malwareScanSubmittedAt: Timestamp | null;
+  malwareScanAttempts: Generated<number>;
+  /**
+   * Set once the file's contents have been listed and checked (a zip unpacked, an image read).
+   */
+  unpackedAt: Timestamp | null;
+  /**
+   * What a buyer downloads: for a zip, an archive the server built from the entries it checked
+   * (`deliveryKey`); for any other file the upload itself, with `deliveryKey` null. `repackedAt`
+   * is set when the file is ready for its malware scan.
+   */
+  deliveryKey: string | null;
+  deliverySize: number | null;
+  repackedAt: Timestamp | null;
+  /**
+   * An Attachment only: when the buyer confirmed the rights and likeness attestations for it.
+   */
+  attestedAt: Timestamp | null;
+  /**
+   * Set when the uploader removed the file but its row and objects must stay; only moderators
+   * see it after that. Null is a live file.
+   */
+  removedAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ServiceDealFileEntry = {
+  id: Generated<number>;
+  /**
+   * Null once the file was deleted: an image whose scan has not finished, or that was rejected,
+   * outlives its file so the evidence stays with the moderators.
+   */
+  fileId: number | null;
+  dealId: number;
+  entryIndex: number;
+  path: string;
+  size: number;
+  imageId: number | null;
+  scanKey: string | null;
+  nsfwLevel: number | null;
+  scanStatus: Generated<ServiceDealFileScanStatus>;
+  failReason: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ServiceDealTransaction = {
+  id: Generated<number>;
+  dealId: number;
+  leg: ServiceDealLeg;
+  externalTransactionId: string;
+  transactionId: string | null;
+  amount: number;
+  buzzType: ServiceBuzzType;
+  attempts: Generated<number>;
+  lastAttemptAt: Timestamp | null;
+  lastError: string | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ServiceDisputeReview = {
+  id: Generated<number>;
+  dealId: number;
+  /**
+   * Allowed values: DISPUTE_REVIEW_CLASSES in creator-service-dispute-review.service.ts.
+   */
+  class: string;
+  proposal: ServiceDisputeResolution | null;
+  confidence: number | null;
+  rationale: string;
+  /**
+   * The evidence bundle the review read, as submitted.
+   */
+  evidence: unknown;
+  agentVersion: string;
+  /**
+   * Allowed values: DISPUTE_REVIEW_MODES in the same file.
+   */
+  mode: string;
+  humanRuling: ServiceDisputeResolution | null;
+  humanId: number | null;
+  agreed: boolean | null;
+  createdAt: Generated<Timestamp>;
+};
+export type ServiceOffering = {
+  id: Generated<number>;
+  sellerId: number;
+  title: string;
+  description: string;
+  coverImageId: number | null;
+  price: number;
+  acceptsBlue: Generated<boolean>;
+  previewKind: Generated<ServicePreviewKind>;
+  /**
+   * The highest content rating delivered: one NsfwLevel value, PG..XXX. Copied onto each deal.
+   */
+  maxNsfwLevel: Generated<number>;
+  deliveryDays: number;
+  revisionsIncluded: Generated<number>;
+  maxOpenDeals: number | null;
+  status: Generated<ServiceOfferingStatus>;
+  /**
+   * Set only when a moderator removes the offering: a key of the moderator reason list in code.
+   * Null on a seller's own remove, which is how the two are told apart.
+   */
+  removedReason: string | null;
+  removedDetails: string | null;
+  removedAt: Timestamp | null;
+  removedById: number | null;
+  /**
+   * The seller's agreement to the services terms when they published: userId, offeringId,
+   * affirmedAt, version and the statement verbatim. Null until first published.
+   */
+  sellerAffirmation: unknown | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type ServiceOfferingReport = {
+  serviceOfferingId: number;
+  reportId: number;
+};
+export type Session = {
+  id: Generated<number>;
+  sessionToken: string;
+  userId: number;
+  expires: Timestamp;
+};
+export type SessionInvalidation = {
+  userId: number;
+  invalidatedAt: Generated<Timestamp>;
+};
+export type ShadowTagsOnImage = {
+  imageId: number;
+  tagId: number;
+  confidence: number;
+};
+export type ShopArtworkKeyOwner = {
+  key: string;
+  userId: number;
+  recordedAt: Generated<Timestamp>;
+};
+export type ShopifyCustomerLink = {
+  id: Generated<number>;
+  shopifyCustomerId: string;
+  email: string;
+  userId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type ShopifyMerchOrder = {
+  id: Generated<number>;
+  shopifyOrderId: string;
+  email: string;
+  shopifyCustomerId: string | null;
+  subtotal: string;
+  couponCodes: string[];
+  buzzAmount: number;
+  status: Generated<ShopifyMerchOrderStatus>;
+  userId: number | null;
+  grantedAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+};
+export type Storyline = {
+  id: Generated<number>;
+  userId: number;
+  title: string;
+  status: Generated<StorylineStatus>;
+  whoCanContinue: Generated<StorylineWhoCanContinue>;
+  /**
+   * The highest rating a chapter may carry, as a single `NsfwLevel` flag from PG to XXX
+   * (CHECK in the migration). Continuations above it cannot be added, and chapters above
+   * it are never shown in this storyline.
+   */
+  maxNsfwLevel: number;
+  /**
+   * Whether the storyline as a whole is taken down: true while the title scan or a moderator
+   * holds a takedown (the two flags below). Every read gates on this. Individual chapters are
+   * taken down through their posts.
+   */
+  tosViolation: Generated<boolean>;
+  /**
+   * The title scan holds a takedown. Cleared on a clean rescan or by a moderator lifting it
+   * for the title they reviewed; neither clears `tosViolation` while a moderator's takedown is
+   * in place.
+   */
+  tosViolationByScan: Generated<boolean>;
+  /**
+   * A moderator holds a takedown. Only a moderator's restore clears it, and that leaves
+   * `tosViolation` set while the scan holds one too.
+   */
+  tosViolationByModerator: Generated<boolean>;
+  /**
+   * The title scan's restricting finding. Not a takedown: every chapter is held to
+   * `storylineCeiling` while it is set, whatever `maxNsfwLevel` says. Set and cleared only
+   * by the scan.
+   */
+  minorByScan: Generated<boolean>;
+  /**
+   * The title text a moderator lifted a scan takedown for, as `textScanTextHash`. A scan of
+   * the same text does not take it down again; an edited title is scanned afresh.
+   */
+  scanFlagLiftedTextHash: string | null;
+  /**
+   * The title's rating from the text scan, a single `NsfwLevel` flag (0 until scanned). A
+   * reader is shown the story only if their browsing level admits the higher of this and
+   * chapter 1's level.
+   */
+  nsfwLevel: Generated<number>;
+  /**
+   * A moderator's ruling on the title's rating; used in place of `nsfwLevel` when set.
+   */
+  moderatorNsfwLevel: number | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  /**
+   * The feed card's picture and the page banner, chosen by the owner from images in their own
+   * chapters or endorsed collaborators' (checked when chosen). Readers who may not see the
+   * chosen image get chapter 1's first image they may see instead.
+   */
+  coverImageId: number | null;
+  heroImageId: number | null;
+  /**
+   * The banner's vertical focus, as a percentage (0 top to 100 bottom).
+   */
+  heroImagePosition: Generated<number>;
+  /**
+   * The image the storyline was started from, credited above chapter 1. Not a chapter. Shown only
+   * while the image is visible and within the storyline's ceiling, which may not go below it.
+   */
+  sparkImageId: number | null;
+};
+export type StorylineBranchChoice = {
+  userId: number;
+  parentChapterId: number;
+  chapterId: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type StorylineChapter = {
+  id: Generated<number>;
+  storylineId: number;
+  /**
+   * One storyline per post. NULL once the post is deleted.
+   */
+  postId: number | null;
+  /**
+   * The chapter's author when it was added. Not a relation on purpose: a deleted
+   * account must not cascade away a chapter other people's chapters hang from.
+   */
+  userId: number;
+  /**
+   * Distance from the first chapter, which is 0, through the chapter's first parent. A
+   * rejoined chapter's number on a reader's route can differ. A storyline has exactly one
+   * chapter at depth 0 (enforced by a partial unique index in the migration).
+   */
+  depth: number;
+  /**
+   * The placement that added this chapter, when one did. Unique so replaying an
+   * approval cannot add the chapter twice.
+   */
+  placementId: number | null;
+  createdAt: Generated<Timestamp>;
+  /**
+   * Set when the placement that added this chapter is removed. The row stays and readers other
+   * than moderators see a removed tombstone.
+   */
+  removedAt: Timestamp | null;
+};
+export type StorylineChapterEdge = {
+  storylineId: number;
+  chapterId: number;
+  parentChapterId: number;
+  /**
+   * The storyline owner's main route out of the parent. At most one per parent (partial
+   * unique index in the migration). Whether a non-canon child is "endorsed" or
+   * "community" is not stored: it follows the current collaborator list, so endorsing
+   * someone reorders their existing chapters too.
+   */
+  canon: Generated<boolean>;
+  createdAt: Generated<Timestamp>;
+};
+export type StorylineChapterRemovalHold = {
+  id: Generated<number>;
+  storylineId: number;
+  /**
+   * The storyline's title at removal: the hold outlives the storyline.
+   */
+  storylineTitle: string;
+  /**
+   * The removed chapter's id, its post and its author, as they were.
+   */
+  chapterId: number;
+  postId: number | null;
+  chapterUserId: number;
+  depth: number;
+  placementId: number | null;
+  parentChapterIds: number[];
+  chapterCreatedAt: Timestamp;
+  removedById: number;
+  /**
+   * 'owner' or 'author'.
+   */
+  removedByRole: string;
+  /**
+   * The reports open when it was removed.
+   */
+  reportIds: number[];
+  createdAt: Generated<Timestamp>;
+};
+export type StorylineCollaborator = {
+  storylineId: number;
+  userId: number;
+  createdAt: Generated<Timestamp>;
+  /**
+   * When the user accepted the invitation; null while it is pending. Declining deletes the row.
+   */
+  acceptedAt: Timestamp | null;
+};
+export type StorylineCoverUpload = {
+  storylineId: number;
+  imageId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type StorylineCreateClick = {
+  userId: number;
+  parentChapterId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type StorylineEarlyAccessSignup = {
+  userId: number;
+  /**
+   * Where they signed up from, for context only.
+   */
+  storylineId: number | null;
+  createdAt: Generated<Timestamp>;
+};
+export type StorylineFollow = {
+  storylineId: number;
+  userId: number;
+  scope: Generated<StorylineFollowScope>;
+  createdAt: Generated<Timestamp>;
+};
+export type StorylinePendingChapter = {
+  postId: number;
+  storylineId: number;
+  /**
+   * null = chapter 1. At most one chapter-1 draft per storyline (partial unique index in the
+   * migration). Keyed with storylineId, so the parent is always a chapter of the same storyline.
+   */
+  parentChapterId: number | null;
+  /**
+   * The draft's author when it was linked. Not a relation, as on StorylineChapter.
+   */
+  userId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type StorylineReport = {
+  reportId: number;
+  storylineId: number | null;
+  /**
+   * The storyline's id once deleted, when a held copy of it was kept ("HeldStoryline").
+   */
+  heldStorylineId: number | null;
+  /**
+   * The storyline's title when it was deleted.
+   */
+  storylineTitle: string | null;
+};
+export type Tag = {
+  id: Generated<number>;
+  name: string;
+  /**
+   * Casing for display, where capitalising `name` gets it wrong ("LoRA", "ComfyUI").
+   */
+  displayName: string | null;
+  color: string | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  target: TagTarget[];
+  type: Generated<TagType>;
+  /**
+   * Whether the TERM itself is adult; `nsfwLevel` rates the content it marks.
+   */
+  nsfwTerm: Generated<boolean>;
+  nsfwLevel: Generated<number>;
+  unlisted: Generated<boolean>;
+  unfeatured: Generated<boolean>;
+  isCategory: Generated<boolean>;
+  adminOnly: Generated<boolean>;
+};
+export type TagEngagement = {
+  userId: number;
+  tagId: number;
+  type: TagEngagementType;
+  createdAt: Generated<Timestamp>;
+};
+export type TagMetric = {
+  tagId: number;
+  timeframe: MetricTimeframe;
+  modelCount: Generated<number>;
+  imageCount: Generated<number>;
+  postCount: Generated<number>;
+  articleCount: Generated<number>;
+  hiddenCount: Generated<number>;
+  followerCount: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+};
+export type TagRank = {
+  tagId: number;
+  followerCountDayRank: Generated<number | null>;
+  followerCountWeekRank: Generated<number | null>;
+  followerCountMonthRank: Generated<number | null>;
+  followerCountYearRank: Generated<number | null>;
+  followerCountAllTimeRank: Generated<number | null>;
+  hiddenCountDayRank: Generated<number | null>;
+  hiddenCountWeekRank: Generated<number | null>;
+  hiddenCountMonthRank: Generated<number | null>;
+  hiddenCountYearRank: Generated<number | null>;
+  hiddenCountAllTimeRank: Generated<number | null>;
+  modelCountDayRank: Generated<number | null>;
+  modelCountWeekRank: Generated<number | null>;
+  modelCountMonthRank: Generated<number | null>;
+  modelCountYearRank: Generated<number | null>;
+  modelCountAllTimeRank: Generated<number | null>;
+  imageCountDayRank: Generated<number | null>;
+  imageCountWeekRank: Generated<number | null>;
+  imageCountMonthRank: Generated<number | null>;
+  imageCountYearRank: Generated<number | null>;
+  imageCountAllTimeRank: Generated<number | null>;
+  postCountDayRank: Generated<number | null>;
+  postCountWeekRank: Generated<number | null>;
+  postCountMonthRank: Generated<number | null>;
+  postCountYearRank: Generated<number | null>;
+  postCountAllTimeRank: Generated<number | null>;
+  articleCountDayRank: Generated<number | null>;
+  articleCountWeekRank: Generated<number | null>;
+  articleCountMonthRank: Generated<number | null>;
+  articleCountYearRank: Generated<number | null>;
+  articleCountAllTimeRank: Generated<number | null>;
+};
+export type TagsOnArticle = {
+  articleId: number;
+  tagId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type TagsOnBounty = {
+  bountyId: number;
+  tagId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type TagsOnCollection = {
+  collectionId: number;
+  tagId: number;
+  createdAt: Generated<Timestamp | null>;
+  filterableOnly: Generated<boolean>;
+};
+export type TagsOnImageDetails = {
+  imageId: number;
+  tagId: number;
+  source: TagSource;
+  automated: boolean;
+  disabled: boolean;
+  needsReview: boolean;
+  reserved_1: boolean;
+  reserved_2: boolean;
+  confidence: number;
+};
+export type TagsOnImageNew = {
+  imageId: number;
+  tagId: number;
+  attributes: number;
+};
+export type TagsOnImageVote = {
+  imageId: number;
+  tagId: number;
+  userId: number;
+  vote: number;
+  createdAt: Generated<Timestamp>;
+  applied: Generated<boolean>;
+};
+export type TagsOnModel3D = {
+  model3dId: number;
+  tagId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type TagsOnModels = {
+  modelId: number;
+  tagId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type TagsOnModelsVote = {
+  modelId: number;
+  tagId: number;
+  userId: number;
+  vote: number;
+  createdAt: Generated<Timestamp>;
+};
+export type TagsOnPost = {
+  postId: number;
+  tagId: number;
+  createdAt: Generated<Timestamp>;
+  confidence: number | null;
+  disabled: Generated<boolean>;
+  needsReview: Generated<boolean>;
+};
+export type TagsOnPostVote = {
+  postId: number;
+  tagId: number;
+  userId: number;
+  vote: number;
+  createdAt: Generated<Timestamp>;
+};
+export type TagsOnQuestions = {
+  questionId: number;
+  tagId: number;
+};
+export type TagsOnTags = {
+  fromTagId: number;
+  toTagId: number;
+  type: Generated<TagsOnTagsType>;
+  createdAt: Generated<Timestamp>;
+};
+export type TagStat = {
+  tagId: number;
+  followerCountDay: number;
+  followerCountWeek: number;
+  followerCountMonth: number;
+  followerCountYear: number;
+  followerCountAllTime: number;
+  hiddenCountDay: number;
+  hiddenCountWeek: number;
+  hiddenCountMonth: number;
+  hiddenCountYear: number;
+  hiddenCountAllTime: number;
+  modelCountDay: number;
+  modelCountWeek: number;
+  modelCountMonth: number;
+  modelCountYear: number;
+  modelCountAllTime: number;
+  imageCountDay: number;
+  imageCountWeek: number;
+  imageCountMonth: number;
+  imageCountYear: number;
+  imageCountAllTime: number;
+  postCountDay: number;
+  postCountWeek: number;
+  postCountMonth: number;
+  postCountYear: number;
+  postCountAllTime: number;
+};
+export type Technique = {
+  id: Generated<number>;
+  name: string;
+  createdAt: Generated<Timestamp>;
+  enabled: Generated<boolean>;
+  type: TechniqueType;
+};
+export type TextScanHold = {
+  id: Generated<number>;
+  entityType: string;
+  entityId: number;
+  label: string;
+  textHash: string;
+  status: Generated<TextScanHoldStatus>;
+  /**
+   * Content author. A plain column so the hold keeps it after the account is deleted.
+   */
+  userId: number | null;
+  /**
+   * The text as composed for the scan.
+   */
+  text: string;
+  reason: string;
+  workflowId: string | null;
+  promptId: number | null;
+  contentAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  decidedAt: Timestamp | null;
+  decidedById: number | null;
+  decisionNote: string | null;
+  hiddenAt: Timestamp | null;
+  restoredAt: Timestamp | null;
+  meta: unknown | null;
+};
+export type TextScanPrompt = {
+  id: Generated<number>;
+  key: string;
+  content: string;
+  note: string | null;
+  createdById: number | null;
+  createdAt: Generated<Timestamp>;
+};
+export type Thread = {
+  id: Generated<number>;
+  locked: Generated<boolean>;
+  parentThreadId: number | null;
+  rootThreadId: number | null;
+  questionId: number | null;
+  answerId: number | null;
+  imageId: number | null;
+  postId: number | null;
+  reviewId: number | null;
+  commentId: number | null;
+  modelId: number | null;
+  articleId: number | null;
+  bountyId: number | null;
+  bountyEntryId: number | null;
+  clubPostId: number | null;
+  comicProjectId: number | null;
+  comicChapterPosition: number | null;
+  challengeId: number | null;
+  model3dId: number | null;
+  model3dReviewId: number | null;
+  appListingId: number | null;
+  crucibleId: number | null;
+  storylineId: number | null;
+  metadata: Generated<unknown>;
+  commentCount: Generated<number>;
+};
+export type ThreadMute = {
+  userId: number;
+  threadId: number;
+  mutedAt: Generated<Timestamp>;
+};
+export type TipConnection = {
+  transactionId: string;
+  entityId: number;
+  entityType: string;
+};
+export type Tool = {
+  id: Generated<number>;
+  name: string;
+  icon: string | null;
+  createdAt: Generated<Timestamp>;
+  enabled: Generated<boolean>;
+  unlisted: Generated<boolean>;
+  type: ToolType;
+  domain: string | null;
+  priority: number | null;
+  description: string | null;
+  supported: Generated<boolean>;
+  company: string | null;
+  metadata: Generated<unknown>;
+  alias: string | null;
+};
+export type TrustedSpokeDomain = {
+  id: Generated<number>;
+  domain: string;
+  includeSubdomains: Generated<boolean>;
+  label: string | null;
+  enabled: Generated<boolean>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type User = {
+  id: Generated<number>;
+  name: string | null;
+  username: string | null;
+  email: string | null;
+  emailVerified: Timestamp | null;
+  image: string | null;
+  showNsfw: Generated<boolean>;
+  blurNsfw: Generated<boolean>;
+  browsingLevel: Generated<number>;
+  onboarding: Generated<number>;
+  flags: Generated<number>;
+  isModerator: Generated<boolean | null>;
+  createdAt: Generated<Timestamp>;
+  deletedAt: Timestamp | null;
+  /**
+   * Set on moderator mute-confirmation; cleared via trigger on unmute
+   */
+  mutedAt: Timestamp | null;
+  muted: Generated<boolean>;
+  /**
+   * For timed mutes from strike escalation
+   */
+  muteExpiresAt: Timestamp | null;
+  bannedAt: Timestamp | null;
+  autoplayGifs: Generated<boolean | null>;
+  filePreferences: Generated<unknown>;
+  meta: Generated<unknown | null>;
+  leaderboardShowcase: string | null;
+  excludeFromLeaderboards: Generated<boolean>;
+  rewardsEligibility: Generated<RewardsEligibility>;
+  eligibilityChangedAt: Timestamp | null;
+  customerId: string | null;
+  subscriptionId: string | null;
+  paddleCustomerId: string | null;
+  profilePictureId: number | null;
+  settings: Generated<unknown | null>;
+  publicSettings: Generated<unknown | null>;
+};
+export type UserAnnouncementMute = {
+  userId: number;
+  creatorId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type UserCosmetic = {
+  userId: number;
+  cosmeticId: number;
+  obtainedAt: Generated<Timestamp>;
+  equippedAt: Timestamp | null;
+  data: unknown | null;
+  claimKey: Generated<string>;
+  equippedToId: number | null;
+  equippedToType: CosmeticEntity | null;
+  forId: number | null;
+  forType: CosmeticEntity | null;
+  remaining: number | null;
+};
+export type UserCosmeticShopItemResale = {
+  userId: number;
+  shopItemId: number;
+  sellerShare: number;
+  index: Generated<number>;
+  createdAt: Generated<Timestamp>;
+};
+export type UserCosmeticShopItemWishlist = {
+  userId: number;
+  shopItemId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type UserCosmeticShopPurchaseCosmetic = {
+  buzzTransactionId: string;
+  cosmeticId: number;
+  unitAmount: number;
+  meta: unknown | null;
+};
+export type UserCosmeticShopPurchases = {
+  userId: number;
+  cosmeticId: number | null;
+  shopItemId: number;
+  unitAmount: number;
+  purchasedAt: Generated<Timestamp>;
+  buzzTransactionId: string;
+  refunded: boolean;
+  meta: unknown | null;
+};
+export type UserCreatorMilestone = {
+  userId: number;
+  milestoneKey: string;
+  achievedAt: Generated<Timestamp>;
+  seenAt: Timestamp | null;
+};
+export type UserEmailNotificationOptOut = {
+  userId: number;
+  type: string;
+  createdAt: Generated<Timestamp>;
+};
+export type UserEngagement = {
+  userId: number;
+  targetUserId: number;
+  type: UserEngagementType;
+  createdAt: Generated<Timestamp>;
+};
+export type UserHub = {
+  id: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  userId: number;
+  name: string;
+  index: Generated<number>;
+  sort: Generated<string>;
+  period: Generated<MetricTimeframe>;
+  mediaTypes: MediaType[];
+  metadata: Generated<unknown>;
+  availability: Generated<Availability>;
+  forcedBrowsingLevel: Generated<number>;
+};
+export type UserHubFollow = {
+  userId: number;
+  hubId: number;
+  createdAt: Generated<Timestamp>;
+};
+export type UserHubSource = {
+  id: Generated<number>;
+  hubId: number;
+  type: UserHubSourceType;
+  targetId: number;
+  alias: string | null;
+  enabled: Generated<boolean>;
+  exclude: Generated<boolean>;
+  index: Generated<number>;
+  groupKey: number | null;
+};
+export type UserLink = {
+  id: Generated<number>;
+  userId: number;
+  url: string;
+  type: LinkType;
+};
+export type UserMembershipOverride = {
+  userId: number;
+  tier: string;
+  note: string | null;
+  grantedById: number | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+};
+export type UserMetric = {
+  userId: number;
+  timeframe: MetricTimeframe;
+  followingCount: Generated<number>;
+  followerCount: Generated<number>;
+  reactionCount: Generated<number>;
+  hiddenCount: Generated<number>;
+  uploadCount: Generated<number>;
+  reviewCount: Generated<number>;
+  answerCount: Generated<number>;
+  answerAcceptCount: Generated<number>;
+  updatedAt: Generated<Timestamp>;
+};
+export type UserNotificationSettings = {
+  id: Generated<number>;
+  userId: number;
+  type: string;
+  disabledAt: Generated<Timestamp>;
+};
+export type UserPaymentConfiguration = {
+  userId: number;
+  tipaltiAccountId: string | null;
+  tipaltiAccountStatus: Generated<string>;
+  tipaltiPaymentsEnabled: Generated<boolean>;
+  tipaltiWithdrawalMethod: CashWithdrawalMethod | null;
+  stripeAccountId: string | null;
+  stripeAccountStatus: Generated<string>;
+  stripePaymentsEnabled: Generated<boolean>;
+  meta: Generated<unknown>;
+};
+export type UserProfile = {
+  userId: number;
+  coverImageId: number | null;
+  bio: string | null;
+  message: string | null;
+  messageAddedAt: Timestamp | null;
+  sfwCoverImageId: number | null;
+  sfwBio: string | null;
+  sfwMessage: string | null;
+  sfwMessageAddedAt: Timestamp | null;
+  location: string | null;
+  nsfw: Generated<boolean>;
+  privacySettings: Generated<unknown>;
+  profileSectionsSettings: Generated<unknown>;
+  showcaseItems: Generated<unknown>;
+  showcaseSections: Generated<unknown>;
+};
+export type UserPurchasedRewards = {
+  buzzTransactionId: string;
+  userId: number | null;
+  purchasableRewardId: number | null;
+  createdAt: Generated<Timestamp>;
+  meta: Generated<unknown>;
+  code: string;
+};
+export type UserPushSetting = {
+  userId: number;
+  type: string;
+  createdAt: Generated<Timestamp>;
+};
+export type UserRank = {
+  userId: number;
+  leaderboardRank: number | null;
+  leaderboardId: string | null;
+  leaderboardTitle: string | null;
+  leaderboardCosmetic: string | null;
+};
+export type UserReferral = {
+  id: Generated<number>;
+  userReferralCodeId: number | null;
+  source: string | null;
+  landingPage: string | null;
+  loginRedirectReason: string | null;
+  createdAt: Generated<Timestamp>;
+  userId: number;
+  note: string | null;
+  firstPaidAt: Timestamp | null;
+  paidMonthCount: Generated<number>;
+};
+export type UserReferralCode = {
+  id: Generated<number>;
+  userId: number;
+  code: string;
+  note: string | null;
+  deletedAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+};
+export type UserReport = {
+  userId: number;
+  reportId: number;
+};
+export type UserRestriction = {
+  id: Generated<number>;
+  userId: number;
+  type: Generated<string>;
+  status: Generated<UserRestrictionStatus>;
+  triggers: Generated<unknown>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  resolvedAt: Timestamp | null;
+  resolvedBy: number | null;
+  resolvedMessage: string | null;
+  resolvedReason: string | null;
+  internalNotes: string | null;
+  userMessage: string | null;
+  userMessageAt: Timestamp | null;
+};
+export type UserRole = {
+  userId: number;
+  role: string;
+  note: string | null;
+  addedById: number | null;
+  createdAt: Generated<Timestamp>;
+};
+export type UserStat = {
+  userId: number;
+  uploadCountAllTime: number;
+  reviewCountAllTime: number;
+  downloadCountAllTime: number;
+  generationCountAllTime: number;
+  followingCountAllTime: number;
+  followerCountAllTime: number;
+  hiddenCountAllTime: number;
+  answerCountAllTime: number;
+  answerAcceptCountAllTime: number;
+  thumbsUpCountAllTime: number;
+  thumbsDownCountAllTime: number;
+  reactionCountAllTime: number;
+};
+export type UserStorageRollup = {
+  userId: number;
+  imagesRequestedAt: Timestamp | null;
+  imagesStartedAt: Timestamp | null;
+  imagesComputedAt: Timestamp | null;
+};
+export type UserStorageSnapshot = {
+  userId: number;
+  date: Timestamp;
+  kind: string;
+  fileCount: number;
+  bytes: string;
+};
+export type UserStorageUsage = {
+  userId: number;
+  kind: string;
+  publicStatus: string;
+  baseModel: Generated<string>;
+  month: Timestamp;
+  fileCount: number;
+  bytes: string;
+  computedAt: Generated<Timestamp>;
+};
+export type UserStrike = {
+  id: Generated<number>;
+  userId: number;
+  reason: StrikeReason;
+  status: Generated<StrikeStatus>;
+  points: Generated<number>;
+  description: string;
+  internalNotes: string | null;
+  entityType: EntityType | null;
+  entityId: number | null;
+  reportId: number | null;
+  createdAt: Generated<Timestamp>;
+  expiresAt: Timestamp;
+  voidedAt: Timestamp | null;
+  voidedBy: number | null;
+  voidReason: string | null;
+  issuedBy: number | null;
+};
+export type Vault = {
+  userId: number;
+  storageKb: number;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  meta: Generated<unknown>;
+};
+export type VaultItem = {
+  id: Generated<number>;
+  vaultId: number;
+  status: Generated<VaultItemStatus>;
+  files: Generated<unknown>;
+  modelVersionId: number;
+  modelId: number;
+  modelName: string;
+  versionName: string;
+  creatorId: number | null;
+  creatorName: string;
+  type: ModelType;
+  baseModel: string;
+  category: string;
+  createdAt: Generated<Timestamp>;
+  addedAt: Generated<Timestamp>;
+  refreshedAt: Timestamp | null;
+  modelSizeKb: number;
+  detailsSizeKb: number;
+  imagesSizeKb: number;
+  notes: string | null;
+  meta: Generated<unknown>;
+};
+export type VerificationToken = {
+  identifier: string;
+  token: string;
+  expires: Timestamp;
+};
+export type Webhook = {
+  id: Generated<number>;
+  url: string;
+  notifyOn: string[];
+  active: Generated<boolean>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+  userId: number;
+};
+export type WildcardSet = {
+  id: Generated<number>;
+  kind: WildcardSetKind;
+  modelVersionId: number | null;
+  ownerUserId: number | null;
+  name: string;
+  auditStatus: Generated<WildcardSetAuditStatus>;
+  auditRuleVersion: string | null;
+  auditedAt: Timestamp | null;
+  nsfw: Generated<boolean>;
+  usable: Generated<boolean>;
+  isInvalidated: Generated<boolean>;
+  invalidationReason: string | null;
+  invalidatedAt: Timestamp | null;
+  metadata: unknown | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type WildcardSetCategory = {
+  id: Generated<number>;
+  wildcardSetId: number;
+  name: string;
+  values: string[];
+  valueCount: Generated<number>;
+  auditStatus: Generated<WildcardSetCategoryAuditStatus>;
+  auditRuleVersion: string | null;
+  auditedAt: Timestamp | null;
+  auditNote: string | null;
+  nsfw: Generated<boolean>;
+  blocked: Generated<boolean>;
+  metadata: unknown | null;
+  displayOrder: Generated<number>;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Timestamp;
+};
+export type WorkerClient = {
+  clientId: string;
+  /**
+   * The orchestrator provider this pool's workers register as.
+   */
+  provider: string;
+  /**
+   * The `subject_token_type` URNs this client may exchange.
+   */
+  subjectTokenTypes: Generated<string[]>;
+  /**
+   * Salad container groups whose IMDS tokens this client accepts.
+   */
+  saladContainerGroupIds: Generated<string[]>;
+  createdAt: Generated<Timestamp>;
+};
+export type WorkerDevice = {
+  id: Generated<number>;
+  clientId: string;
+  /**
+   * `self` (device id sent by the worker) or `salad` (Salad IMDS token).
+   */
+  issuer: string;
+  subject: string;
+  /**
+   * `active` or `blocked`.
+   */
+  status: Generated<string>;
+  firstSeenAt: Generated<Timestamp>;
+  lastSeenAt: Generated<Timestamp>;
+  lastIp: string | null;
+  blockedAt: Timestamp | null;
+  blockedReason: string | null;
+};
+export type DB = {
+  _LicenseToModel: LicenseToModel;
+  AccessToken: AccessToken;
+  Account: Account;
+  AdToken: AdToken;
+  Announcement: Announcement;
+  AnnouncementDismissal: AnnouncementDismissal;
+  AnnouncementReport: AnnouncementReport;
+  AnnouncementSpend: AnnouncementSpend;
+  AnnouncementUser: AnnouncementUser;
+  Answer: Answer;
+  AnswerMetric: AnswerMetric;
+  AnswerRank: AnswerRank;
+  AnswerReaction: AnswerReaction;
+  AnswerVote: AnswerVote;
+  ApiKey: ApiKey;
+  app_block_build_attempts: AppBlockBuildAttempt;
+  app_block_publish_requests: AppBlockPublishRequest;
+  app_blocks: AppBlock;
+  app_collaborators: AppCollaborator;
+  app_dev_forgejo_identity: AppDevForgejoIdentity;
+  app_developer_terms_acceptances: AppDeveloperTermsAcceptance;
+  app_listing_metrics: AppListingMetric;
+  app_listing_moderation_events: AppListingModerationEvent;
+  app_listing_publish_requests: AppListingPublishRequest;
+  app_listing_reports: AppListingReport;
+  app_listing_reviews: AppListingReview;
+  app_listing_screenshots: AppListingScreenshot;
+  app_listings: AppListing;
+  app_ownership_events: AppOwnershipEvent;
+  app_ownership_transfers: AppOwnershipTransfer;
+  app_post_intents: AppPostIntent;
+  app_review_agent_reports: AppReviewAgentReport;
+  app_sub_listing_parents: AppSubListingParent;
+  app_sub_listings: AppSubListing;
+  app_user_scope_grants: AppUserScopeGrant;
+  AppAccessRequest: AppAccessRequest;
+  Appeal: Appeal;
+  AppealDecisionRecord: AppealDecisionRecord;
+  AppealTrainingObjectDeletion: AppealTrainingObjectDeletion;
+  AppPageAccess: AppPageAccess;
+  Article: Article;
+  ArticleContentLinkHold: ArticleContentLinkHold;
+  ArticleEngagement: ArticleEngagement;
+  ArticleMetric: ArticleMetric;
+  ArticleRank: ArticleRank;
+  ArticleRatingReview: ArticleRatingReview;
+  ArticleReaction: ArticleReaction;
+  ArticleReport: ArticleReport;
+  ArticleShareCheck: ArticleShareCheck;
+  ArticleStat: ArticleStat;
+  Auction: Auction;
+  AuctionBase: AuctionBase;
+  Bid: Bid;
+  BidRecurring: BidRecurring;
+  block_attribution_payout: BlockAttributionPayout;
+  block_author_fee_accrual: BlockAuthorFeeAccrual;
+  block_buzz_attribution: BlockBuzzAttribution;
+  block_good_entitlement: BlockGoodEntitlement;
+  block_good_purchase: BlockGoodPurchase;
+  block_scope_invocations: BlockScopeInvocation;
+  block_spend_attribution: BlockSpendAttribution;
+  block_subscription_attribution: BlockSubscriptionAttribution;
+  block_user_settings: BlockUserSettings;
+  block_user_subscriptions: BlockUserSubscription;
+  BlockedImage: BlockedImage;
+  Blocklist: Blocklist;
+  Blurb: Blurb;
+  BlurbReference: BlurbReference;
+  Bounty: Bounty;
+  BountyBenefactor: BountyBenefactor;
+  BountyEngagement: BountyEngagement;
+  BountyEntry: BountyEntry;
+  BountyEntryMetric: BountyEntryMetric;
+  BountyEntryRank: BountyEntryRank;
+  BountyEntryReaction: BountyEntryReaction;
+  BountyEntryReport: BountyEntryReport;
+  BountyEntryStat: BountyEntryStat;
+  BountyMetric: BountyMetric;
+  BountyRank: BountyRank;
+  BountyReport: BountyReport;
+  BountyStat: BountyStat;
+  BountyUnpaidAward: BountyUnpaidAward;
+  BoxContent: BoxContent;
+  BoxOddsSnapshot: BoxOddsSnapshot;
+  BoxOpening: BoxOpening;
+  BoxRevision: BoxRevision;
+  BoxTier: BoxTier;
+  Bug: Bug;
+  BuildGuide: BuildGuide;
+  BuzzClaim: BuzzClaim;
+  BuzzTip: BuzzTip;
+  BuzzWithdrawalRequest: BuzzWithdrawalRequest;
+  BuzzWithdrawalRequestHistory: BuzzWithdrawalRequestHistory;
+  CashWithdrawal: CashWithdrawal;
+  Challenge: Challenge;
+  ChallengeCategory: ChallengeCategory;
+  ChallengeEngagement: ChallengeEngagement;
+  ChallengeEntryComparison: ChallengeEntryComparison;
+  ChallengeEntryStanding: ChallengeEntryStanding;
+  ChallengeEvent: ChallengeEvent;
+  ChallengeJudge: ChallengeJudge;
+  ChallengeReport: ChallengeReport;
+  ChallengeWinner: ChallengeWinner;
+  Changelog: Changelog;
+  Chat: Chat;
+  ChatMember: ChatMember;
+  ChatMessage: ChatMessage;
+  ChatMessageEdit: ChatMessageEdit;
+  ChatReport: ChatReport;
+  Club: Club;
+  ClubAdmin: ClubAdmin;
+  ClubAdminInvite: ClubAdminInvite;
+  ClubMembership: ClubMembership;
+  ClubMembershipCharge: ClubMembershipCharge;
+  ClubMetric: ClubMetric;
+  ClubPost: ClubPost;
+  ClubPostMetric: ClubPostMetric;
+  ClubPostReaction: ClubPostReaction;
+  ClubRank: ClubRank;
+  ClubStat: ClubStat;
+  ClubTier: ClubTier;
+  Collection: Collection;
+  CollectionContributor: CollectionContributor;
+  CollectionInvite: CollectionInvite;
+  CollectionItem: CollectionItem;
+  CollectionItemScore: CollectionItemScore;
+  CollectionMetric: CollectionMetric;
+  CollectionRank: CollectionRank;
+  CollectionReport: CollectionReport;
+  CollectionStat: CollectionStat;
+  ComicChapter: ComicChapter;
+  ComicChapterRead: ComicChapterRead;
+  ComicPanel: ComicPanel;
+  ComicPanelReference: ComicPanelReference;
+  ComicProject: ComicProject;
+  ComicProjectEngagement: ComicProjectEngagement;
+  ComicProjectMetric: ComicProjectMetric;
+  ComicProjectReference: ComicProjectReference;
+  ComicProjectReport: ComicProjectReport;
+  ComicReference: ComicReference;
+  ComicReferenceImage: ComicReferenceImage;
+  Comment: Comment;
+  CommentMute: CommentMute;
+  CommentReaction: CommentReaction;
+  CommentReport: CommentReport;
+  CommentTopic: CommentTopic;
+  CommentTopicMute: CommentTopicMute;
+  CommentV2: CommentV2;
+  CommentV2Reaction: CommentV2Reaction;
+  CommentV2Report: CommentV2Report;
+  CommentV3: CommentV3;
+  CommentV3Reaction: CommentV3Reaction;
+  CommentV3Report: CommentV3Report;
+  Cosmetic: Cosmetic;
+  CosmeticShopItem: CosmeticShopItem;
+  CosmeticShopItemCosmetic: CosmeticShopItemCosmetic;
+  CosmeticShopPurchaseClaim: CosmeticShopPurchaseClaim;
+  CosmeticShopSection: CosmeticShopSection;
+  CosmeticShopSectionItem: CosmeticShopSectionItem;
+  CoveredCheckpoint: CoveredCheckpoint;
+  CreatorGalleryHiddenUser: CreatorGalleryHiddenUser;
+  CreatorMilestone: CreatorMilestone;
+  CreatorMilestoneCosmetic: CreatorMilestoneCosmetic;
+  CreatorProgramPayoutReview: CreatorProgramPayoutReview;
+  CreatorProgramPayoutReviewRun: CreatorProgramPayoutReviewRun;
+  CreatorScoreGrant: CreatorScoreGrant;
+  Crucible: Crucible;
+  CrucibleEngagement: CrucibleEngagement;
+  CrucibleEntry: CrucibleEntry;
+  CrucibleReport: CrucibleReport;
+  CryptoDeposit: CryptoDeposit;
+  CryptoTransaction: CryptoTransaction;
+  CryptoWallet: CryptoWallet;
+  CsamFlagRelease: CsamFlagRelease;
+  CsamQueueSetAside: CsamQueueSetAside;
+  CsamReport: CsamReport;
+  CsamReportArchiveObject: CsamReportArchiveObject;
+  CsamReportAudit: CsamReportAudit;
+  CustomerSubscription: CustomerSubscription;
+  Donation: Donation;
+  DonationGoal: DonationGoal;
+  DownloadHistory: DownloadHistory;
+  EcosystemCheckpoints: EcosystemCheckpoints;
+  EntityAccess: EntityAccess;
+  EntityCollaborator: EntityCollaborator;
+  EntityMetric: EntityMetric;
+  EntityMetricImage: EntityMetricImage;
+  EntityModeration: EntityModeration;
+  EventCosmeticPlacement: EventCosmeticPlacement;
+  EventCosmeticScoreDaily: EventCosmeticScoreDaily;
+  EventTurfSticker: EventTurfSticker;
+  EventTurfStock: EventTurfStock;
+  EvidenceHeldUser: EvidenceHeldUser;
+  EvidenceHold: EvidenceHold;
+  EvidenceHoldImage: EvidenceHoldImage;
+  EvidenceHoldPost: EvidenceHoldPost;
+  FeaturedModelVersion: FeaturedModelVersion;
+  Feedback: Feedback;
+  File: File;
+  GameFrameGame: GameFrameGame;
+  GameFrameGameReport: GameFrameGameReport;
+  GameFrameReportReceipt: GameFrameReportReceipt;
+  GenerationBaseModel: GenerationBaseModel;
+  GenerationCoverage: GenerationCoverage;
+  GenerationPreset: GenerationPreset;
+  GenerationServiceProvider: GenerationServiceProvider;
+  GenerationSizePreset: GenerationSizePreset;
+  HeldResourceReview: HeldResourceReview;
+  HomeBlock: HomeBlock;
+  HuggingFaceImport: HuggingFaceImport;
+  Image: Image;
+  ImageAudioScan: ImageAudioScan;
+  ImageCaption: ImageCaption;
+  ImageCdnAccess: ImageCdnAccess;
+  ImageCdnAccessClaim: ImageCdnAccessClaim;
+  ImageCdnModeratorDelete: ImageCdnModeratorDelete;
+  ImageCdnShopTakedown: ImageCdnShopTakedown;
+  ImageConnection: ImageConnection;
+  ImageEngagement: ImageEngagement;
+  ImageFlag: ImageFlag;
+  ImageMetaFlags: ImageMetaFlags;
+  ImageModHelper: ImageModHelper;
+  ImageRatingRequest: ImageRatingRequest;
+  ImageReaction: ImageReaction;
+  ImageRemovalConfirmation: ImageRemovalConfirmation;
+  ImageReport: ImageReport;
+  ImageResource: ImageResource;
+  ImageResourceHelper: ImageResourceHelper;
+  ImageResourceNew: ImageResourceNew;
+  ImageTag: ImageTag;
+  ImageTagForReview: ImageTagForReview;
+  ImageTechnique: ImageTechnique;
+  ImageTool: ImageTool;
+  Import: Import;
+  Item: Item;
+  ItemDefinition: ItemDefinition;
+  JobQueue: JobQueue;
+  KeyValue: KeyValue;
+  Leaderboard: Leaderboard;
+  LeaderboardResult: LeaderboardResult;
+  License: License;
+  LicensingRoot: LicensingRoot;
+  Link: Link;
+  MembershipGift: MembershipGift;
+  ModActivity: ModActivity;
+  Model: Model;
+  Model3D: Model3D;
+  Model3DEngagement: Model3DEngagement;
+  Model3DFile: Model3DFile;
+  Model3DLicense: Model3DLicense;
+  Model3DMetric: Model3DMetric;
+  Model3DReport: Model3DReport;
+  Model3DReview: Model3DReview;
+  Model3DReviewReport: Model3DReviewReport;
+  ModelAssociations: ModelAssociations;
+  ModelBaseModelMetric: ModelBaseModelMetric;
+  ModelEngagement: ModelEngagement;
+  ModelFile: ModelFile;
+  ModelFileHash: ModelFileHash;
+  ModelFlag: ModelFlag;
+  ModelHash: ModelHash;
+  ModelInterest: ModelInterest;
+  ModelMetric: ModelMetric;
+  ModelMetricDaily: ModelMetricDaily;
+  ModelOwnership: ModelOwnership;
+  ModelPermissionSnapshot: ModelPermissionSnapshot;
+  ModelReport: ModelReport;
+  ModelReportStat: ModelReportStat;
+  ModelSelfGeneration: ModelSelfGeneration;
+  ModelTag: ModelTag;
+  ModelVersion: ModelVersion;
+  ModelVersionEngagement: ModelVersionEngagement;
+  ModelVersionExploration: ModelVersionExploration;
+  ModelVersionMetric: ModelVersionMetric;
+  ModelVersionMonetization: ModelVersionMonetization;
+  ModelVersionSale: ModelVersionSale;
+  ModelVersionSaleItem: ModelVersionSaleItem;
+  ModelVersionSponsorshipSettings: ModelVersionSponsorshipSettings;
+  ModerationRule: ModerationRule;
+  ModerationRuleVersion: ModerationRuleVersion;
+  ModThreadClaim: ModThreadClaim;
+  NewOrderPlayer: NewOrderPlayer;
+  NewOrderRank: NewOrderRank;
+  NewOrderSmite: NewOrderSmite;
+  OauthClient: OauthClient;
+  OauthConsent: OauthConsent;
+  Outbox: Outbox;
+  PaidAccess: PaidAccess;
+  Partner: Partner;
+  PersonalDataExport: PersonalDataExport;
+  Placement: Placement;
+  PlacementSpace: PlacementSpace;
+  PlacementSuspension: PlacementSuspension;
+  PlacementTransaction: PlacementTransaction;
+  platform_default_blocks: PlatformDefaultBlock;
+  Post: Post;
+  post_intent_manifests: PostIntentManifest;
+  PostHelper: PostHelper;
+  PostImageTag: PostImageTag;
+  PostMetric: PostMetric;
+  PostPreset: PostPreset;
+  PostReaction: PostReaction;
+  PostReport: PostReport;
+  PostResourceHelper: PostResourceHelper;
+  PostStat: PostStat;
+  PostTag: PostTag;
+  PressMention: PressMention;
+  Price: Price;
+  PricingSlot: PricingSlot;
+  Prize: Prize;
+  Product: Product;
+  PurchasableReward: PurchasableReward;
+  Purchase: Purchase;
+  PushSubscription: PushSubscription;
+  Question: Question;
+  QuestionMetric: QuestionMetric;
+  QuestionRank: QuestionRank;
+  QuestionReaction: QuestionReaction;
+  RatingReview: RatingReview;
+  RecommendedResource: RecommendedResource;
+  RedeemableCode: RedeemableCode;
+  ReferralAttribution: ReferralAttribution;
+  ReferralMilestone: ReferralMilestone;
+  ReferralRedemption: ReferralRedemption;
+  ReferralReward: ReferralReward;
+  RemovalScoreExemption: RemovalScoreExemption;
+  Report: Report;
+  ReportAutomated: ReportAutomated;
+  ResourceInsight: ResourceInsight;
+  ResourceIntentCoocSnapshot: ResourceIntentCoocSnapshot;
+  ResourceIntentTagIndexSnapshot: ResourceIntentTagIndexSnapshot;
+  ResourceIntentVocabulary: ResourceIntentVocabulary;
+  ResourceOverride: ResourceOverride;
+  ResourceReview: ResourceReview;
+  ResourceReviewHelper: ResourceReviewHelper;
+  ResourceReviewReaction: ResourceReviewReaction;
+  ResourceReviewReport: ResourceReviewReport;
+  RestrictedBaseModels: RestrictedBaseModels;
+  RewardsBonusEvent: RewardsBonusEvent;
+  Role: Role;
+  RunStrategy: RunStrategy;
+  SavedModel: SavedModel;
+  ScanLabelClaim: ScanLabelClaim;
+  ScanLabelCopyObject: ScanLabelCopyObject;
+  ScanLabelFlag: ScanLabelFlag;
+  ScanLabelItem: ScanLabelItem;
+  ScanLabelQuota: ScanLabelQuota;
+  ScanLabelVote: ScanLabelVote;
+  ScannerContentSnapshot: ScannerContentSnapshot;
+  ScannerLabelReview: ScannerLabelReview;
+  ServiceDeal: ServiceDeal;
+  ServiceDealEvent: ServiceDealEvent;
+  ServiceDealFile: ServiceDealFile;
+  ServiceDealFileEntry: ServiceDealFileEntry;
+  ServiceDealTransaction: ServiceDealTransaction;
+  ServiceDisputeReview: ServiceDisputeReview;
+  ServiceOffering: ServiceOffering;
+  ServiceOfferingReport: ServiceOfferingReport;
+  Session: Session;
+  SessionInvalidation: SessionInvalidation;
+  ShadowTagsOnImage: ShadowTagsOnImage;
+  ShopArtworkKeyOwner: ShopArtworkKeyOwner;
+  ShopifyCustomerLink: ShopifyCustomerLink;
+  ShopifyMerchOrder: ShopifyMerchOrder;
+  Storyline: Storyline;
+  StorylineBranchChoice: StorylineBranchChoice;
+  StorylineChapter: StorylineChapter;
+  StorylineChapterEdge: StorylineChapterEdge;
+  StorylineChapterRemovalHold: StorylineChapterRemovalHold;
+  StorylineCollaborator: StorylineCollaborator;
+  StorylineCoverUpload: StorylineCoverUpload;
+  StorylineCreateClick: StorylineCreateClick;
+  StorylineEarlyAccessSignup: StorylineEarlyAccessSignup;
+  StorylineFollow: StorylineFollow;
+  StorylinePendingChapter: StorylinePendingChapter;
+  StorylineReport: StorylineReport;
+  Tag: Tag;
+  TagEngagement: TagEngagement;
+  TagMetric: TagMetric;
+  TagRank: TagRank;
+  TagsOnArticle: TagsOnArticle;
+  TagsOnBounty: TagsOnBounty;
+  TagsOnCollection: TagsOnCollection;
+  TagsOnImageDetails: TagsOnImageDetails;
+  TagsOnImageNew: TagsOnImageNew;
+  TagsOnImageVote: TagsOnImageVote;
+  TagsOnModel3D: TagsOnModel3D;
+  TagsOnModels: TagsOnModels;
+  TagsOnModelsVote: TagsOnModelsVote;
+  TagsOnPost: TagsOnPost;
+  TagsOnPostVote: TagsOnPostVote;
+  TagsOnQuestions: TagsOnQuestions;
+  TagsOnTags: TagsOnTags;
+  TagStat: TagStat;
+  Technique: Technique;
+  TextScanHold: TextScanHold;
+  TextScanPrompt: TextScanPrompt;
+  Thread: Thread;
+  ThreadMute: ThreadMute;
+  TipConnection: TipConnection;
+  Tool: Tool;
+  TrustedSpokeDomain: TrustedSpokeDomain;
+  User: User;
+  UserAnnouncementMute: UserAnnouncementMute;
+  UserCosmetic: UserCosmetic;
+  UserCosmeticShopItemResale: UserCosmeticShopItemResale;
+  UserCosmeticShopItemWishlist: UserCosmeticShopItemWishlist;
+  UserCosmeticShopPurchaseCosmetic: UserCosmeticShopPurchaseCosmetic;
+  UserCosmeticShopPurchases: UserCosmeticShopPurchases;
+  UserCreatorMilestone: UserCreatorMilestone;
+  UserEmailNotificationOptOut: UserEmailNotificationOptOut;
+  UserEngagement: UserEngagement;
+  UserHub: UserHub;
+  UserHubFollow: UserHubFollow;
+  UserHubSource: UserHubSource;
+  UserLink: UserLink;
+  UserMembershipOverride: UserMembershipOverride;
+  UserMetric: UserMetric;
+  UserNotificationSettings: UserNotificationSettings;
+  UserPaymentConfiguration: UserPaymentConfiguration;
+  UserProfile: UserProfile;
+  UserPurchasedRewards: UserPurchasedRewards;
+  UserPushSetting: UserPushSetting;
+  UserRank: UserRank;
+  UserReferral: UserReferral;
+  UserReferralCode: UserReferralCode;
+  UserReport: UserReport;
+  UserRestriction: UserRestriction;
+  UserRole: UserRole;
+  UserStat: UserStat;
+  UserStorageRollup: UserStorageRollup;
+  UserStorageSnapshot: UserStorageSnapshot;
+  UserStorageUsage: UserStorageUsage;
+  UserStrike: UserStrike;
+  Vault: Vault;
+  VaultItem: VaultItem;
+  VerificationToken: VerificationToken;
+  Webhook: Webhook;
+  WildcardSet: WildcardSet;
+  WildcardSetCategory: WildcardSetCategory;
+  WorkerClient: WorkerClient;
+  WorkerDevice: WorkerDevice;
+};

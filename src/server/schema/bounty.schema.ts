@@ -1,0 +1,155 @@
+import {
+  BountyEntryMode,
+  BountyMode,
+  BountyType,
+  Currency,
+  MetricTimeframe,
+} from '~/shared/utils/prisma/enums';
+import dayjs from '~/shared/utils/dayjs';
+import * as z from 'zod';
+import { constants } from '~/server/common/constants';
+import { imageGenerationSchema, imageReferenceInputSchema } from '~/server/schema/image.schema';
+import { BountySort, BountyStatus } from '../common/enums';
+import { infiniteQuerySchema } from './base.schema';
+import { baseFileSchema } from './file.schema';
+import { tagSchema } from './tag.schema';
+import { stripTime } from '~/utils/date-helpers';
+import { stringToDate } from '~/utils/zod-helpers';
+import { getSanitizedStringSchema } from '~/server/schema/utils.schema';
+import { BOUNTY_AWARD_RULINGS } from '@civitai/shared/bounty-award';
+
+// A function, not a value: a bound computed at module load freezes "today" at the pod's boot date.
+const utcToday = () => dayjs.utc(stripTime(new Date()));
+
+export type GetInfiniteBountySchema = z.infer<typeof getInfiniteBountySchema>;
+export const getInfiniteBountySchema = infiniteQuerySchema.merge(
+  z.object({
+    query: z.string().optional(),
+    types: z.enum(BountyType).array().optional(),
+    mode: z.enum(BountyMode).optional(),
+    status: z.enum(BountyStatus).optional(),
+    nsfw: z.boolean().optional(),
+    period: z.enum(MetricTimeframe).default(MetricTimeframe.AllTime),
+    sort: z.enum(BountySort).default(BountySort.Newest),
+    engagement: z.enum(constants.bounties.engagementTypes).optional(),
+    userId: z.number().optional(),
+    baseModels: z.string().array().optional(),
+    limit: z.coerce.number().min(1).max(200).default(60),
+    excludedUserIds: z.number().array().optional(),
+  })
+);
+
+export type BountyDetailsSchema = z.infer<typeof bountyDetailsSchema>;
+export const bountyDetailsSchema = z.object({
+  baseModel: z.string(),
+  modelSize: z.enum(constants.modelFileSizes),
+  modelFormat: z.enum(constants.modelFileFormats),
+  profanityMatches: z.string().array().optional(),
+  profanityEvaluation: z
+    .object({
+      reason: z.string().optional(),
+      metrics: z.record(z.string(), z.number()).optional(),
+    })
+    .optional(),
+});
+
+export type CreateBountyInput = z.infer<typeof createBountyInputSchema>;
+export const createBountyInputSchema = z.object({
+  name: z.string().trim().nonempty(),
+  description: getSanitizedStringSchema({ allowBlurbs: true }).refine(
+    (data) => data.length > 0,
+    'Cannot be empty'
+  ),
+  unitAmount: z
+    .number()
+    .min(constants.bounties.minCreateAmount)
+    .max(constants.bounties.maxCreateAmount),
+  currency: z.enum(Currency),
+  expiresAt: stringToDate(
+    z
+      .date()
+      .refine(
+        (date) => date >= utcToday().add(1, 'day').toDate(),
+        'Expiration date must come after the start date'
+      )
+  ),
+  startsAt: z.coerce
+    .date()
+    .refine((date) => date >= utcToday().toDate(), 'Start date must be in the future'),
+  mode: z.enum(BountyMode),
+  type: z.enum(BountyType),
+  details: bountyDetailsSchema.passthrough().partial().optional(),
+  entryMode: z.enum(BountyEntryMode),
+  minBenefactorUnitAmount: z.number().min(1),
+  maxBenefactorUnitAmount: z.number().optional(),
+  entryLimit: z.number().min(1).optional(),
+  tags: z.array(tagSchema).optional(),
+  nsfw: z.boolean().optional(),
+  poi: z.boolean().optional(),
+  ownRights: z.boolean().optional(),
+  files: z.array(baseFileSchema).optional(),
+  images: z
+    .array(
+      imageReferenceInputSchema.extend({
+        meta: imageGenerationSchema.omit({ comfy: true }).nullish(),
+      })
+    )
+    .min(1, 'At least one example image must be uploaded'),
+  buzzType: z.enum(['green', 'yellow']).default('yellow'),
+});
+
+export type UpdateBountyInput = z.infer<typeof updateBountyInputSchema>;
+export const updateBountyInputSchema = createBountyInputSchema
+  .pick({
+    name: true,
+    description: true,
+    tags: true,
+    files: true,
+    type: true,
+    details: true,
+    poi: true,
+    nsfw: true,
+    ownRights: true,
+    images: true,
+    entryLimit: true,
+  })
+  .extend({
+    id: z.number(),
+    startsAt: z.coerce.date(),
+    expiresAt: stringToDate(
+      z
+        .date()
+        .refine(
+          (date) => date >= dayjs().add(1, 'day').startOf('day').toDate(),
+          'Expiration date must be in the future'
+        )
+    ),
+    lockedProperties: z.string().array().optional(),
+  });
+
+export type UpsertBountyInput = z.infer<typeof upsertBountyInputSchema>;
+export const upsertBountyInputSchema = createBountyInputSchema.extend({
+  id: z.number().optional(),
+  startsAt: z.string(),
+  expiresAt: z.string(),
+  lockedProperties: z.string().array().optional(),
+});
+
+export type AddBenefactorUnitAmountInputSchema = z.infer<typeof addBenefactorUnitAmountInputSchema>;
+export const addBenefactorUnitAmountInputSchema = z.object({
+  unitAmount: z.number().min(1),
+  bountyId: z.number(),
+});
+
+export const resolveUnpaidBountyAwardInputSchema = z.object({
+  bountyId: z.number().int().positive(),
+  userId: z.number().int().positive(),
+  ruling: z.enum(BOUNTY_AWARD_RULINGS),
+  ledgerReference: z.string().trim().min(1).max(500),
+});
+
+export type GetBountyEntriesInputSchema = z.infer<typeof getBountyEntriesInputSchema>;
+export const getBountyEntriesInputSchema = infiniteQuerySchema.extend({
+  id: z.number(),
+  owned: z.boolean().optional(),
+});

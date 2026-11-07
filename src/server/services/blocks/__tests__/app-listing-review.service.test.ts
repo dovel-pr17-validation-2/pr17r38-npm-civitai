@@ -1,0 +1,443 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { TRPCError } from '@trpc/server';
+
+import {
+  getMyAppListingReview,
+  listAppListingReviews,
+  upsertAppListingReview,
+} from '~/server/services/blocks/app-listing-review.service';
+import { LISTING_REVIEW_DETAILS_MAX } from '~/server/schema/blocks/app-listing-review.schema';
+
+/**
+ * W13 — AppListing REVIEW (thumbs/recommend) service tests.
+ *
+ * Covers upsertReview (the SYNCHRONOUS metric-delta feed: new / details-only edit
+ * / recommend flip; the non-negative clamp; the self-review + approved-only +
+ * details-cap gates), getMyReview, and listReviews (mod-filter + keyset). All DB
+ * deps are mocked — no real Prisma. `dbWrite.$transaction` runs its callback
+ * against the SAME `dbWrite` mock (the tx client) so a test asserts the exact
+ * metric writes made inside the tx. `dbRead`/`dbWrite` are DISTINCT mocks so a
+ * test proves the listing load went to the replica and the writes to the primary.
+ */
+
+type WriteMock = {
+  $transaction: ReturnType<typeof vi.fn>;
+  // The prior review is read with `SELECT … FOR UPDATE` (raw — Prisma has no row lock
+  // on `findUnique`), so the delta cannot be computed against a stale `exclude` that a
+  // concurrent moderator hide has already changed. It returns ROWS, not a row.
+  $queryRaw: ReturnType<typeof vi.fn>;
+  appListingReview: { findUnique: ReturnType<typeof vi.fn>; upsert: ReturnType<typeof vi.fn> };
+  appListingMetric: { upsert: ReturnType<typeof vi.fn>; updateMany: ReturnType<typeof vi.fn> };
+};
+type ReadMock = {
+  appListing: { findUnique: ReturnType<typeof vi.fn> };
+  appListingReview: {
+    findUnique: ReturnType<typeof vi.fn>;
+    // `getMyAppListingReview` uses findFirst, not findUnique: the store-scope KIND
+    // gate is a RELATION filter, which a unique-key lookup cannot express.
+    findFirst: ReturnType<typeof vi.fn>;
+    findMany: ReturnType<typeof vi.fn>;
+  };
+};
+
+const SAVED_REVIEW = {
+  id: 7,
+  appListingId: 'apl_target',
+  userId: 42,
+  recommended: true,
+  details: null,
+  createdAt: new Date('2026-07-07T00:00:00Z'),
+  updatedAt: new Date('2026-07-07T00:00:00Z'),
+};
+
+const { mockRead, mockWrite } = vi.hoisted(() => {
+  const write: WriteMock = {
+    $transaction: vi.fn(),
+    $queryRaw: vi.fn(async () => []),
+    appListingReview: {
+      findUnique: vi.fn(async () => null),
+      upsert: vi.fn(async () => SAVED_REVIEW),
+    },
+    appListingMetric: {
+      upsert: vi.fn(async () => ({})),
+      updateMany: vi.fn(async () => ({ count: 0 })),
+    },
+  };
+  write.$transaction.mockImplementation(async (cb: (tx: WriteMock) => Promise<unknown>) =>
+    cb(write)
+  );
+  const read: ReadMock = {
+    appListing: { findUnique: vi.fn(async () => null) },
+    appListingReview: {
+      findUnique: vi.fn(async () => null),
+      findFirst: vi.fn(async () => null),
+      findMany: vi.fn(async () => []),
+    },
+  };
+  return { mockRead: read, mockWrite: write };
+});
+
+// The guard reads the blocklist table, which this file's db fake does not model.
+vi.mock('~/server/services/blocklist.service', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  throwOnBlockedUserContent: vi.fn(async () => undefined),
+}));
+
+vi.mock('~/server/db/client', () => ({ dbRead: mockRead, dbWrite: mockWrite }));
+vi.mock('~/server/utils/cache-helpers', () => ({ bustCacheTag: vi.fn(async () => undefined) }));
+
+const CALLER = 42;
+const OWNER = 99;
+const APP_ID = 'apl_target';
+
+/** Approved listing owned by someone OTHER than the caller (reviewable). */
+function reviewableListing() {
+  return { id: APP_ID, userId: OWNER, status: 'approved' };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockWrite.$transaction.mockImplementation(async (cb: (tx: WriteMock) => Promise<unknown>) =>
+    cb(mockWrite)
+  );
+  mockWrite.$queryRaw.mockResolvedValue([]);
+  mockWrite.appListingReview.findUnique.mockResolvedValue(null);
+  mockWrite.appListingReview.upsert.mockResolvedValue(SAVED_REVIEW);
+  mockWrite.appListingMetric.upsert.mockResolvedValue({});
+  mockWrite.appListingMetric.updateMany.mockResolvedValue({ count: 0 });
+  mockRead.appListing.findUnique.mockResolvedValue(reviewableListing());
+  mockRead.appListingReview.findUnique.mockResolvedValue(null);
+  mockRead.appListingReview.findFirst.mockResolvedValue(null);
+  mockRead.appListingReview.findMany.mockResolvedValue([]);
+});
+
+function metricUpsertArgs() {
+  return mockWrite.appListingMetric.upsert.mock.calls[0][0] as {
+    where: { appListingId: string };
+    create: { thumbsUpCount: number; thumbsDownCount: number };
+    update: {
+      thumbsUpCount?: { increment: number };
+      thumbsDownCount?: { increment: number };
+    };
+  };
+}
+
+describe('upsertAppListingReview — new review (no prior)', () => {
+  it('recommend=true → +1 thumbsUp; creates the metric row (zeros) if absent; isNewReview', async () => {
+    const res = await upsertAppListingReview({
+      userId: CALLER,
+      input: { appListingId: APP_ID, recommended: true },
+      scope: 'full',
+    });
+
+    expect(res.isNewReview).toBe(true);
+    // Review written to the PRIMARY, keyed on (appListingId, userId), userId FORCED.
+    const upsertArgs = mockWrite.appListingReview.upsert.mock.calls[0][0];
+    expect(upsertArgs.where).toEqual({
+      appListingId_userId: { appListingId: APP_ID, userId: CALLER },
+    });
+    expect(upsertArgs.create).toMatchObject({
+      appListingId: APP_ID,
+      userId: CALLER,
+      recommended: true,
+    });
+
+    // Metric: create ensures the row exists with +1; update path increments +1.
+    const m = metricUpsertArgs();
+    expect(m.where).toEqual({ appListingId: APP_ID });
+    expect(m.create).toEqual({ appListingId: APP_ID, thumbsUpCount: 1, thumbsDownCount: 0 });
+    expect(m.update).toEqual({ thumbsUpCount: { increment: 1 } });
+    // No decrement → no clamp.
+    expect(mockWrite.appListingMetric.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('recommend=false → +1 thumbsDown', async () => {
+    await upsertAppListingReview({
+      userId: CALLER,
+      input: { appListingId: APP_ID, recommended: false },
+      scope: 'full',
+    });
+    const m = metricUpsertArgs();
+    expect(m.create).toEqual({ appListingId: APP_ID, thumbsUpCount: 0, thumbsDownCount: 1 });
+    expect(m.update).toEqual({ thumbsDownCount: { increment: 1 } });
+  });
+});
+
+describe('upsertAppListingReview — editing an existing review', () => {
+  it('details-only edit (same recommend) does NOT touch the metric (no double-count)', async () => {
+    mockWrite.$queryRaw.mockResolvedValue([{ id: 7, recommended: true, exclude: false }]);
+    const res = await upsertAppListingReview({
+      userId: CALLER,
+      input: { appListingId: APP_ID, recommended: true, details: 'nice app' },
+      scope: 'full',
+    });
+    expect(res.isNewReview).toBe(false);
+    expect(mockWrite.appListingReview.upsert).toHaveBeenCalledTimes(1);
+    // Zero delta → no metric write at all.
+    expect(mockWrite.appListingMetric.upsert).not.toHaveBeenCalled();
+  });
+
+  it('flipping recommend true→false moves the count (−1 up, +1 down) and clamps up ≥0', async () => {
+    mockWrite.$queryRaw.mockResolvedValue([{ id: 7, recommended: true, exclude: false }]);
+    await upsertAppListingReview({
+      userId: CALLER,
+      input: { appListingId: APP_ID, recommended: false },
+      scope: 'full',
+    });
+    const m = metricUpsertArgs();
+    // create clamps the down bucket to ≥0 (only reached if the row were absent).
+    expect(m.create).toEqual({ appListingId: APP_ID, thumbsUpCount: 0, thumbsDownCount: 1 });
+    expect(m.update).toEqual({
+      thumbsUpCount: { increment: -1 },
+      thumbsDownCount: { increment: 1 },
+    });
+    // A decrement fired → the defensive non-negative clamp runs for the up bucket.
+    expect(mockWrite.appListingMetric.updateMany).toHaveBeenCalledWith({
+      where: { appListingId: APP_ID, thumbsUpCount: { lt: 0 } },
+      data: { thumbsUpCount: 0 },
+    });
+  });
+
+  it('a mod-EXCLUDED prior review is treated as un-counted → editing it makes no delta', async () => {
+    mockWrite.$queryRaw.mockResolvedValue([{ id: 7, recommended: true, exclude: true }]);
+    await upsertAppListingReview({
+      userId: CALLER,
+      input: { appListingId: APP_ID, recommended: false },
+      scope: 'full',
+    });
+    // Prior didn't count (excluded) and the edit stays excluded → no counter change.
+    expect(mockWrite.appListingMetric.upsert).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE PRIOR READ IS A LOCKED READ — asserted on the SQL TEXT.
+//
+// 🔴 Every other test in this file mocks `$queryRaw` away, which means the SQL
+// STRING is never asserted and never executed: measured, three mutations on that
+// template all SURVIVED the full 21k-test suite —
+//   • deleting `FOR UPDATE`  → silently reverts the race fix this commit exists for
+//   • `app_listing_reviews` → `app_listing_review` → a hard runtime failure, zero CI signal
+//   • dropping `"exclude"` from the SELECT → `prior.exclude` is `undefined`, so a
+//     mod-hidden review starts counting again and the delta is wrong
+// None of them touch a mocked RESULT, so no behavioural assertion can see them. The
+// conditional-update half of this fix has four kills plus an ordering pin; this half
+// had none. Asserting the tagged template's static strings closes it with no DB.
+//
+// `$queryRaw` is called as a tagged template, so `calls[0][0]` is the
+// TemplateStringsArray (the static text) and the rest are the BOUND values.
+// ---------------------------------------------------------------------------
+describe('upsertAppListingReview — the prior read is a LOCKED read (SQL text)', () => {
+  function priorReadCall() {
+    expect(mockWrite.$queryRaw).toHaveBeenCalledTimes(1);
+    const call = mockWrite.$queryRaw.mock.calls[0] as [string[], ...unknown[]];
+    return { sql: call[0].join('?'), values: call.slice(1) };
+  }
+
+  beforeEach(async () => {
+    await upsertAppListingReview({
+      userId: CALLER,
+      input: { appListingId: APP_ID, recommended: true },
+      scope: 'full',
+    });
+  });
+
+  it('POSITIVE CONTROL: the assertion is reading real SQL, not an empty string', () => {
+    const { sql } = priorReadCall();
+    // Without this, every `toContain` below is a claim about `''` and passes only
+    // because nothing was there to contradict it.
+    expect(sql.length).toBeGreaterThan(40);
+    expect(sql).toMatch(/\bSELECT\b/);
+  });
+
+  it('takes a ROW LOCK — the clause whose deletion silently reverts the fix', () => {
+    expect(priorReadCall().sql).toMatch(/\bFOR\s+UPDATE\b/);
+  });
+
+  it('reads the right TABLE, quoted', () => {
+    expect(priorReadCall().sql).toContain('"app_listing_reviews"');
+  });
+
+  it('selects every column the delta needs — `exclude` above all', () => {
+    const { sql } = priorReadCall();
+    // `exclude` is the one that fails QUIETLY: dropped, `prior.exclude` is undefined,
+    // `countedContribution` reads it as falsy, and a mod-hidden review re-enters the
+    // aggregate on its author's next edit.
+    for (const col of ['"id"', '"recommended"', '"exclude"']) expect(sql).toContain(col);
+    expect(sql).toContain('"app_listing_id"');
+    expect(sql).toContain('"user_id"');
+  });
+
+  it('passes the lookup keys as BOUND parameters, never interpolated text', () => {
+    const { sql, values } = priorReadCall();
+    expect(values).toEqual([APP_ID, CALLER]);
+    // The ids must not appear in the static half — that would mean string-built SQL.
+    expect(sql).not.toContain(APP_ID);
+    expect(sql).not.toContain(String(CALLER));
+  });
+});
+
+describe('upsertAppListingReview — eligibility + input gates', () => {
+  it('self-review is rejected (owner) with no write', async () => {
+    mockRead.appListing.findUnique.mockResolvedValue({
+      id: APP_ID,
+      userId: CALLER,
+      status: 'approved',
+    });
+    await expect(
+      upsertAppListingReview({
+        userId: CALLER,
+        input: { appListingId: APP_ID, recommended: true },
+        scope: 'full',
+      })
+    ).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    expect(mockWrite.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('a missing listing → NOT_FOUND', async () => {
+    mockRead.appListing.findUnique.mockResolvedValue(null);
+    await expect(
+      upsertAppListingReview({
+        userId: CALLER,
+        input: { appListingId: APP_ID, recommended: true },
+        scope: 'full',
+      })
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(mockWrite.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('a non-approved (draft/removed/rejected) listing is not reviewable → BAD_REQUEST', async () => {
+    for (const status of ['draft', 'pending', 'rejected', 'removed']) {
+      mockRead.appListing.findUnique.mockResolvedValue({ id: APP_ID, userId: OWNER, status });
+      await expect(
+        upsertAppListingReview({
+          userId: CALLER,
+          input: { appListingId: APP_ID, recommended: true },
+          scope: 'full',
+        })
+      ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    }
+    expect(mockWrite.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('details over the cap → BAD_REQUEST before any listing load', async () => {
+    await expect(
+      upsertAppListingReview({
+        userId: CALLER,
+        input: {
+          appListingId: APP_ID,
+          recommended: true,
+          details: 'x'.repeat(LISTING_REVIEW_DETAILS_MAX + 1),
+        },
+      })
+    ).rejects.toBeInstanceOf(TRPCError);
+    expect(mockRead.appListing.findUnique).not.toHaveBeenCalled();
+    expect(mockWrite.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('trims details and stores null for whitespace-only', async () => {
+    await upsertAppListingReview({
+      userId: CALLER,
+      input: { appListingId: APP_ID, recommended: true, details: '  loved it  ' },
+      scope: 'full',
+    });
+    expect(mockWrite.appListingReview.upsert.mock.calls[0][0].create.details).toBe('loved it');
+
+    await upsertAppListingReview({
+      userId: CALLER,
+      input: { appListingId: APP_ID, recommended: true, details: '   ' },
+      scope: 'full',
+    });
+    expect(mockWrite.appListingReview.upsert.mock.calls[1][0].create.details).toBeNull();
+  });
+});
+
+describe('getMyAppListingReview', () => {
+  it('returns the caller review from the replica', async () => {
+    mockRead.appListingReview.findFirst.mockResolvedValue({
+      id: 7,
+      recommended: true,
+      details: 'ok',
+      createdAt: new Date(),
+    });
+    const res = await getMyAppListingReview(APP_ID, CALLER, { scope: 'full' });
+    expect(res).toMatchObject({ id: 7, recommended: true });
+    // The (appListingId, userId) pair is still the whole identity — `findFirst` only
+    // exists so the store-scope relation filter can AND onto it (empty under `full`).
+    expect(mockRead.appListingReview.findFirst.mock.calls[0][0].where).toEqual({
+      appListingId: APP_ID,
+      userId: CALLER,
+      appListing: { is: {} },
+    });
+  });
+
+  it('returns null when the caller has no review', async () => {
+    mockRead.appListingReview.findFirst.mockResolvedValue(null);
+    expect(await getMyAppListingReview(APP_ID, CALLER, { scope: 'full' })).toBeNull();
+  });
+});
+
+describe('listAppListingReviews', () => {
+  function row(id: number) {
+    return {
+      id,
+      recommended: true,
+      details: null,
+      createdAt: new Date(),
+      user: { id: 1, username: 'u', image: null },
+    };
+  }
+
+  it('filters exclude + tosViolation, newest-first, off the replica', async () => {
+    mockRead.appListingReview.findMany.mockResolvedValue([row(3), row(2), row(1)]);
+    await listAppListingReviews({ appListingId: APP_ID, limit: 20 });
+    const args = mockRead.appListingReview.findMany.mock.calls[0][0];
+    expect(args.where).toMatchObject({ appListingId: APP_ID, exclude: false, tosViolation: false });
+    expect(args.orderBy).toEqual({ id: 'desc' });
+  });
+
+  it('gates on the listing being approved (reviews of a removed/rejected listing are not enumerable)', async () => {
+    mockRead.appListingReview.findMany.mockResolvedValue([]);
+    await listAppListingReviews({ appListingId: APP_ID, limit: 20 });
+    const args = mockRead.appListingReview.findMany.mock.calls[0][0];
+    // The relation filter is what makes a later-removed listing's reviews vanish (and a
+    // missing listing return empty) — critical before the P2d public read cutover.
+    expect(args.where).toMatchObject({ appListing: { is: { status: 'approved' } } });
+  });
+
+  it("public-external scope → relation filter ANDs kind:offsite (an onsite listing's reviews are empty)", async () => {
+    mockRead.appListingReview.findMany.mockResolvedValue([]);
+    await listAppListingReviews({ appListingId: APP_ID, limit: 20 }, { scope: 'public-external' });
+    const args = mockRead.appListingReview.findMany.mock.calls[0][0];
+    // Under the public scope the target listing must ITSELF be offsite — so a
+    // crafted onsite appListingId matches nothing (empty), the review security gate.
+    expect(args.where).toMatchObject({
+      appListing: { is: { status: 'approved', kind: 'offsite' } },
+    });
+  });
+
+  it('full scope (default) → NO kind restriction on the relation filter (unchanged)', async () => {
+    mockRead.appListingReview.findMany.mockResolvedValue([]);
+    await listAppListingReviews({ appListingId: APP_ID, limit: 20 }, { scope: 'full' });
+    const args = mockRead.appListingReview.findMany.mock.calls[0][0];
+    expect(args.where.appListing.is).toEqual({ status: 'approved' });
+    expect(args.where.appListing.is.kind).toBeUndefined();
+  });
+
+  it('emits a nextCursor when a full page + 1 comes back (keyset)', async () => {
+    // limit 2 → take 3; return 3 rows → hasNext, cursor = last VISIBLE row id.
+    mockRead.appListingReview.findMany.mockResolvedValue([row(5), row(4), row(3)]);
+    const res = await listAppListingReviews({ appListingId: APP_ID, limit: 2 });
+    expect(res.items.map((i: { id: number }) => i.id)).toEqual([5, 4]);
+    expect(res.nextCursor).toBe(4);
+  });
+
+  it('no nextCursor on a short page; applies the cursor as id < cursor', async () => {
+    mockRead.appListingReview.findMany.mockResolvedValue([row(2), row(1)]);
+    const res = await listAppListingReviews({ appListingId: APP_ID, limit: 20, cursor: 3 });
+    expect(res.nextCursor).toBeUndefined();
+    expect(mockRead.appListingReview.findMany.mock.calls[0][0].where).toMatchObject({
+      id: { lt: 3 },
+    });
+  });
+});

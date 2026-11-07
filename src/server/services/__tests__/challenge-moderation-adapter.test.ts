@@ -1,0 +1,141 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { dbMock } from '~/__tests__/mocks/db.mock';
+import { loggingMock } from '~/__tests__/mocks/logging.mock';
+import { NsfwLevel } from '~/server/common/enums';
+import type * as ModeModule from '~/server/services/text-scan/mode';
+import type * as SubmitModule from '~/server/services/text-scan/submit';
+const mockDbRead = dbMock.dbRead;
+const mockDbWrite = dbMock.dbWrite;
+
+// applyFailure must only downgrade a challenge that is actually mid-scan. A moderator rescan
+// (rescanChallenge) is the first path that submits a workflow for an already-Scanned challenge, so
+// an unscoped write would let one transient orchestrator failure hide a live challenge from the
+// feeds and 404 its detail page.
+vi.mock('~/server/services/notification.service', () => ({ createNotification: vi.fn() }));
+vi.mock('~/server/services/text-moderation.service', () => ({ submitTextModeration: vi.fn() }));
+vi.mock('~/server/games/daily-challenge/challenge-nsfw-escalation', () => ({
+  applyChallengeNsfwEscalation: vi.fn(),
+}));
+vi.mock('~/server/prom/challenge.metrics', () => ({ recordChallengeScanResult: vi.fn() }));
+// Pinned off so this suite stays about the XGuard path.
+vi.mock('~/server/services/text-scan/mode', async (importOriginal) => ({
+  ...(await importOriginal<typeof ModeModule>()),
+  getTextScanMode: vi.fn(async () => 'off'),
+}));
+vi.mock('~/server/services/text-scan/submit', async (importOriginal) => ({
+  ...(await importOriginal<typeof SubmitModule>()),
+  scanEntity: vi.fn(),
+}));
+
+const { challengeModerationAdapter } = await import(
+  '~/server/services/challenge-moderation.adapter'
+);
+const { applyChallengeNsfwEscalation } = await import(
+  '~/server/games/daily-challenge/challenge-nsfw-escalation'
+);
+const { recordChallengeScanResult } = await import('~/server/prom/challenge.metrics');
+const { getTextScanMode } = await import('~/server/services/text-scan/mode');
+const { scanEntity } = await import('~/server/services/text-scan/submit');
+
+describe('challengeModerationAdapter.applyFailure', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDbWrite.challenge.updateMany.mockResolvedValue({ count: 1 });
+    // applyFailure now reads the challenge source (for the scan-result 'error' metric) after a real
+    // Pending→Error transition; give findUnique a resolved value so the chained .catch() is valid.
+    mockDbRead.challenge.findUnique.mockResolvedValue({ source: 'User' });
+  });
+
+  it('only marks Error on a challenge still Pending', async () => {
+    await challengeModerationAdapter.applyFailure?.({
+      entityId: 42,
+      workflowId: 'wf-1',
+      status: 'expired',
+    });
+
+    expect(mockDbWrite.challenge.updateMany).toHaveBeenCalledWith({
+      where: { id: 42, ingestion: 'Pending' },
+      data: { ingestion: 'Error' },
+    });
+    // A bare `update` here is the regression: it would downgrade a Scanned challenge too.
+    expect(mockDbWrite.challenge.update).not.toHaveBeenCalled();
+  });
+
+  it('leaves an already-Scanned challenge alone when the scoped write matches nothing', async () => {
+    mockDbWrite.challenge.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      challengeModerationAdapter.applyFailure?.({
+        entityId: 42,
+        workflowId: 'wf-1',
+        status: 'failed',
+      })
+    ).resolves.not.toThrow();
+  });
+});
+
+describe('challengeModerationAdapter.applyResult telemetry-read safety', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // The scanned (not-blocked) path fetches `source` ONLY to label the scan-result metric, guarded by
+  // `.catch(() => null)`. That guard is load-bearing: a transient DB failure on this telemetry read
+  // must NEVER throw out of applyResult and skip the real safety step (applyChallengeNsfwEscalation).
+  // Removing the `.catch(() => null)` makes this test fail (applyResult rejects, escalation is skipped).
+  it('still runs the NSFW escalation when the telemetry source read rejects', async () => {
+    mockDbRead.challenge.findUnique.mockRejectedValueOnce(new Error('transient db failure'));
+
+    await expect(
+      challengeModerationAdapter.applyResult({
+        entityId: 42,
+        blocked: false,
+        triggeredLabels: [],
+        output: undefined,
+      })
+    ).resolves.not.toThrow();
+
+    // Non-negotiable: the safety step still ran despite the failed telemetry read.
+    expect(applyChallengeNsfwEscalation).toHaveBeenCalledTimes(1);
+    expect(applyChallengeNsfwEscalation).toHaveBeenCalledWith({ entityId: 42, isNsfw: false });
+
+    // The failed read collapses to null → `source: undefined` is passed, which normSource maps to
+    // the 'unknown' bucket — the metric is still recorded, never skipped.
+    expect(recordChallengeScanResult).toHaveBeenCalledWith({
+      source: undefined,
+      result: 'scanned',
+    });
+  });
+});
+
+describe('challengeModerationAdapter.submit under text-scan', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getTextScanMode).mockResolvedValueOnce('active');
+    mockDbWrite.challenge.findUnique.mockResolvedValue({ source: 'User' });
+  });
+
+  // Only the retry cron calls submit, and it has already bumped the Pending row.
+  it('submits as a retry, past the in-flight dedupe', async () => {
+    vi.mocked(scanEntity).mockResolvedValueOnce({ status: 'submitted', workflowId: 'ts-1' });
+
+    const result = await challengeModerationAdapter.submit({ entityId: 42, content: 'Theme' });
+
+    expect(scanEntity).toHaveBeenCalledWith(
+      expect.objectContaining({ entityType: 'Challenge', entityId: 42, fromRetry: true })
+    );
+    expect(result).toEqual({ id: 'ts-1' });
+  });
+
+  it('settles a retry the scan skips, so the challenge does not stay Pending', async () => {
+    vi.mocked(scanEntity).mockResolvedValueOnce({ status: 'skipped', reason: 'too-short' });
+
+    expect(await challengeModerationAdapter.submit({ entityId: 42, content: 'T' })).toBeNull();
+
+    expect(applyChallengeNsfwEscalation).toHaveBeenCalledWith({
+      entityId: 42,
+      isNsfw: false,
+      level: NsfwLevel.PG,
+    });
+  });
+});

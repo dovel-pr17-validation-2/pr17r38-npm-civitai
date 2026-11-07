@@ -1,0 +1,511 @@
+import {
+  ActionIcon,
+  AspectRatio,
+  Badge,
+  Box,
+  Group,
+  Indicator,
+  LoadingOverlay,
+  Stack,
+  Text,
+  ThemeIcon,
+} from '@mantine/core';
+import { HoverCard, Menu } from '~/components/MantineOverlays';
+import { CollectionType, ModelStatus } from '~/shared/utils/prisma/enums';
+import {
+  IconBrush,
+  IconDotsVertical,
+  IconDownload,
+  IconFlag,
+  IconMessageCircle2,
+  IconTagOff,
+} from '@tabler/icons-react';
+import { useRouter } from 'next/router';
+import React, { useEffect, useState } from 'react';
+
+import { CivitaiLinkManageButton } from '~/components/CivitaiLink/CivitaiLinkManageButton';
+import { CivitaiTooltip } from '~/components/CivitaiWrapped/CivitaiTooltip';
+import { EdgeMedia } from '~/components/EdgeMedia/EdgeMedia';
+import { HideModelButton } from '~/components/HideModelButton/HideModelButton';
+import { BlockUserButton } from '~/components/HideUserButton/BlockUserButton';
+import { HideUserButton } from '~/components/HideUserButton/HideUserButton';
+import { IconBadge } from '~/components/IconBadge/IconBadge';
+import { MediaHash } from '~/components/ImageHash/ImageHash';
+import { LoginRedirect } from '~/components/LoginRedirect/LoginRedirect';
+import { MasonryCard } from '~/components/MasonryGrid/MasonryCard';
+import { AddToCollectionMenuItem } from '~/components/MenuItems/AddToCollectionMenuItem';
+import { UserAvatar } from '~/components/UserAvatar/UserAvatar';
+import { ModeratorLookupMenuItem } from '~/components/Moderation/ModeratorLookupMenuItem';
+import { moderatorModelLookupPath } from '~/shared/constants/moderator-app';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useEngagedModelMembership } from '~/hooks/useEngagedModelMembership';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { useHiddenPreferencesContext } from '~/components/HiddenPreferences/HiddenPreferencesProvider';
+import { ReportEntity } from '~/shared/utils/report-helpers';
+import { isFutureDate } from '~/utils/date-helpers';
+import { getDisplayName, getModelUrl } from '~/utils/string-helpers';
+import { AddToShowcaseMenuItem } from '~/components/Profile/AddToShowcaseMenuItem';
+import { ToggleSearchableMenuItem } from '../../MenuItems/ToggleSearchableMenuItem';
+import type { AssociatedResourceModelCardData } from '~/server/controllers/model.controller';
+import { ImageGuard2 } from '~/components/ImageGuard/ImageGuard2';
+import { ThumbsUpIcon } from '~/components/ThumbsIcon/ThumbsIcon';
+import { isDefined } from '~/utils/type-guards';
+import { useModelCardContextMenu } from '~/components/Model/Actions/ModelCardContextMenu';
+import { openAddToCollectionModal } from '~/components/Dialog/triggers/add-to-collection';
+import { openBlockModelTagsModal } from '~/components/Dialog/triggers/block-model-tags';
+import { openReportModal } from '~/components/Dialog/triggers/report';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
+import { ElementInView, useElementInView } from '~/components/IntersectionObserver/ElementInView';
+import { AnimatedCount, Metrics } from '~/components/Metrics';
+import { HiddenMetricNotice } from '~/components/Model/HiddenMetricNotice';
+import classes from './ModelCategoryCard.module.css';
+import clsx from 'clsx';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { getModelRecency } from '~/components/Cards/model-card.utils';
+
+export function ModelCategoryCard(
+  props: ElementDataAttributes & {
+    data: AssociatedResourceModelCardData;
+    height: number;
+  }
+) {
+  return <ModelCategoryCardContent {...props} />;
+}
+
+function ModelCategoryCardContent({
+  data,
+  ...props
+}: ElementDataAttributes & {
+  data: AssociatedResourceModelCardData;
+  height: number;
+}) {
+  const router = useRouter();
+  const modelId = router.query.model ? Number(router.query.model) : undefined;
+  const currentUser = useCurrentUser();
+  const features = useFeatureFlags();
+
+  const [loading, setLoading] = useState(false);
+
+  const { id, images, name, user, earlyAccessDeadline } = data;
+  const image = images[0];
+
+  const inEarlyAccess = earlyAccessDeadline && isFutureDate(earlyAccessDeadline);
+  const { isNew, isUpdated } = getModelRecency(data);
+
+  const { isEngaged } = useEngagedModelMembership(id);
+  const hasReview = isEngaged('Recommended');
+  const { hiddenUsers: hiddenUsers, hiddenModels: hiddenModels } = useHiddenPreferencesContext();
+  const isHidden = hiddenUsers.get(user.id) || hiddenModels.get(id);
+  const { setMenuItems } = useModelCardContextMenu();
+
+  const modelText = (
+    <Text fz={14} fw={500} c="white" style={{ flex: 1, lineHeight: 1 }}>
+      {name}
+    </Text>
+  );
+
+  const modelBadges = (
+    <>
+      <Badge className={clsx(classes.floatingBadge, classes.typeBadge)} radius="sm" size="sm">
+        {getDisplayName(data.type)}
+      </Badge>
+      {data.status !== ModelStatus.Published && (
+        <Badge className={clsx(classes.floatingBadge, classes.statusBadge)} radius="sm" size="sm">
+          {data.status}
+        </Badge>
+      )}
+      {data.status === ModelStatus.Published && inEarlyAccess && (
+        <Badge
+          className={clsx(classes.floatingBadge, classes.earlyAccessBadge)}
+          radius="sm"
+          size="sm"
+        >
+          Early Access
+        </Badge>
+      )}
+    </>
+  );
+
+  const reportOption = {
+    key: 'report-model',
+    component: (
+      <LoginRedirect reason="report-model" key="report">
+        <Menu.Item
+          leftSection={<IconFlag size={14} stroke={1.5} />}
+          onClick={(e: React.MouseEvent<HTMLButtonElement>) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openReportModal({ entityType: ReportEntity.Model, entityId: id });
+          }}
+        >
+          Report Resource
+        </Menu.Item>
+      </LoginRedirect>
+    ),
+  };
+
+  const reportImageOption = image
+    ? {
+        key: 'report-content',
+        component: (
+          <LoginRedirect reason="report-content" key="report-image">
+            <Menu.Item
+              leftSection={<IconFlag size={14} stroke={1.5} />}
+              onClick={(e: React.MouseEvent<HTMLButtonElement>) => {
+                e.preventDefault();
+                e.stopPropagation();
+                openReportModal({ entityType: ReportEntity.Image, entityId: image.id });
+              }}
+            >
+              Report Image
+            </Menu.Item>
+          </LoginRedirect>
+        ),
+      }
+    : null;
+
+  const blockTagsOption = {
+    key: 'block-tags',
+    component: (
+      <Menu.Item
+        key="block-tags"
+        leftSection={<IconTagOff size={14} stroke={1.5} />}
+        onClick={(e: React.MouseEvent<HTMLButtonElement>) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openBlockModelTagsModal({ props: { modelId: id } });
+        }}
+      >
+        {`Hide content with these tags`}
+      </Menu.Item>
+    ),
+  };
+
+  let contextMenuItems: { key: string; component: React.ReactNode }[] = [];
+  if (features.collections) {
+    contextMenuItems.push({
+      key: 'add-to-collection',
+      component: (
+        <AddToCollectionMenuItem
+          key="add-to-collection"
+          onClick={() =>
+            openAddToCollectionModal({ props: { modelId: data.id, type: CollectionType.Model } })
+          }
+        />
+      ),
+    });
+  }
+
+  contextMenuItems.push({
+    component: (
+      <ToggleSearchableMenuItem
+        entityType="Model"
+        entityId={data.id}
+        key="toggle-searchable-menu-item"
+      />
+    ),
+    key: 'toggle-searchable-menu-item',
+  });
+
+  if (currentUser?.id === user.id) {
+    contextMenuItems.push({
+      key: 'add-to-showcase',
+      component: (
+        <AddToShowcaseMenuItem key="add-to-showcase" entityType="Model" entityId={data.id} />
+      ),
+    });
+  }
+
+  if (currentUser?.id !== user.id) {
+    contextMenuItems.push(
+      ...[
+        {
+          key: 'hide-model',
+          component: <HideModelButton key="hide-model" as="menu-item" model={data} />,
+        },
+        {
+          key: 'hide-button',
+          component: <HideUserButton key="hide-button" as="menu-item" userId={user.id} />,
+        },
+        {
+          key: 'block-button',
+          component: <BlockUserButton key="block-button" as="menu-item" userId={user.id} />,
+        },
+        reportOption,
+        reportImageOption,
+      ].filter(isDefined)
+    );
+  }
+
+  if (currentUser) contextMenuItems.splice(2, 0, blockTagsOption);
+
+  // Unshifted to the top, matching `ModelCardContextMenu` — the lookup is the item a moderator opens
+  // this menu FOR, and it is the way out to the moderator app rather than another action on the card.
+  if (currentUser?.isModerator) {
+    contextMenuItems.unshift({
+      key: 'lookup-model',
+      component: (
+        <ModeratorLookupMenuItem key="lookup-model" path={moderatorModelLookupPath(data.id)}>
+          Lookup Model
+        </ModeratorLookupMenuItem>
+      ),
+    });
+  }
+
+  if (setMenuItems) {
+    contextMenuItems = setMenuItems(data, contextMenuItems);
+  }
+
+  useEffect(() => {
+    if (!modelId || modelId !== data.id) return;
+    const elem = document.getElementById(`${modelId}`);
+    if (elem) elem.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'center' });
+  }, [modelId, data.id]);
+
+  return (
+    <ElementInView component={MasonryCard} shadow="sm" {...props} className={classes.card}>
+      <Indicator
+        disabled={!isNew && !isUpdated}
+        size={24}
+        radius="sm"
+        label={isUpdated ? 'Updated' : 'New'}
+        color="red"
+        styles={{ indicator: { zIndex: 10, transform: 'translate(5px,-5px) !important' } }}
+        style={{ opacity: isHidden ? 0.1 : undefined }}
+        withBorder
+      >
+        <Link
+          href={getModelUrl({ modelId: id, modelName: name })}
+          className={classes.link}
+          onClick={(e: React.MouseEvent<HTMLAnchorElement>) => {
+            if (!(e.ctrlKey || e.metaKey) && e.button !== 1) setLoading(true);
+          }}
+          // style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }}
+        >
+          <LoadingOverlay visible={loading} zIndex={9} loaderProps={{ variant: 'dots' }} />
+          {image && (
+            <ImageGuard2 image={image} connectType="model" connectId={id}>
+              {(safe) => (
+                <>
+                  {contextMenuItems.length > 0 && (
+                    <Menu position="left-start" withArrow offset={-5}>
+                      <Menu.Target>
+                        <LegacyActionIcon
+                          variant="transparent"
+                          p={0}
+                          onClick={(e: React.MouseEvent) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                          }}
+                          style={{
+                            width: 30,
+                            position: 'absolute',
+                            top: 10,
+                            right: 4,
+                            zIndex: 8,
+                          }}
+                        >
+                          <IconDotsVertical
+                            size={24}
+                            color="#fff"
+                            style={{ filter: `drop-shadow(0 0 2px #000)` }}
+                          />
+                        </LegacyActionIcon>
+                      </Menu.Target>
+                      <Menu.Dropdown>
+                        {contextMenuItems.map((el) => (
+                          <React.Fragment key={el.key}>{el.component}</React.Fragment>
+                        ))}
+                      </Menu.Dropdown>
+                    </Menu>
+                  )}
+                  <Group gap={4} className={classes.cardBadges}>
+                    <ImageGuard2.BlurToggle />
+                    {modelBadges}
+                  </Group>
+                  <AspectRatio ratio={1} style={{ width: '100%', overflow: 'hidden' }}>
+                    <div className={classes.blur}>
+                      <MediaHash {...image} />
+                    </div>
+                    {safe && (
+                      <EdgeMedia
+                        className={classes.image}
+                        src={image.url}
+                        name={image.name ?? image.id.toString()}
+                        alt={image.name ?? undefined}
+                        type={image.type}
+                        width={450}
+                        placeholder="empty"
+                      />
+                    )}
+                  </AspectRatio>
+                </>
+              )}
+            </ImageGuard2>
+          )}
+
+          <Stack className={classes.info} gap={8}>
+            <Group
+              mx="xs"
+              justify="space-between"
+              style={{
+                zIndex: 10,
+              }}
+            >
+              <Group gap={8}>
+                <CivitaiLinkManageButton
+                  modelId={id}
+                  modelName={name}
+                  modelType={data.type}
+                  hashes={data.hashes}
+                  tooltipProps={{
+                    position: 'right',
+                    transitionProps: {
+                      transition: 'slide-right',
+                    },
+                    variant: 'smallRounded',
+                  }}
+                >
+                  {({ color, onClick, ref, icon }) => (
+                    <LegacyActionIcon
+                      component="button"
+                      className={classes.hoverable}
+                      ref={ref}
+                      radius="lg"
+                      variant="filled"
+                      size="lg"
+                      color={color}
+                      onClick={onClick}
+                    >
+                      {icon}
+                    </LegacyActionIcon>
+                  )}
+                </CivitaiLinkManageButton>
+                {features.imageGeneration && data.canGenerate && (
+                  <HoverCard width={200} withArrow>
+                    <HoverCard.Target>
+                      <ThemeIcon className={classes.hoverable} size={38} radius="xl" color="green">
+                        <IconBrush stroke={2.5} size={22} />
+                      </ThemeIcon>
+                    </HoverCard.Target>
+                    <HoverCard.Dropdown>
+                      <Stack gap={4}>
+                        <Text size="sm" fw="bold">
+                          Available for generation
+                        </Text>
+                        <Text size="sm" c="dimmed">
+                          This resource has versions available for image generation
+                        </Text>
+                      </Stack>
+                    </HoverCard.Dropdown>
+                  </HoverCard>
+                )}
+              </Group>
+              {data.user.image && (
+                <CivitaiTooltip
+                  position="left"
+                  transitionProps={{ transition: 'slide-left' }}
+                  variant="smallRounded"
+                  label={
+                    <Text size="xs" fw={500}>
+                      {data.user.username}
+                    </Text>
+                  }
+                >
+                  <Box
+                    style={{ borderRadius: '50%' }}
+                    onClick={(e: React.MouseEvent<HTMLDivElement>) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      router.push(`/user/${data.user.username}`);
+                    }}
+                    ml="auto"
+                  >
+                    <UserAvatar
+                      size="md"
+                      user={data.user}
+                      avatarProps={{ className: classes.userAvatar }}
+                    />
+                  </Box>
+                </CivitaiTooltip>
+              )}
+            </Group>
+
+            <Stack className={classes.content} gap={6} p="xs">
+              <Group justify="start" gap={4}>
+                {modelText}
+              </Group>
+              <Group justify="space-between" gap={4}>
+                <ModelCategoryCardStats data={data} hasReview={hasReview} />
+              </Group>
+            </Stack>
+          </Stack>
+        </Link>
+      </Indicator>
+    </ElementInView>
+  );
+}
+
+/**
+ * Gated live-metrics render for ModelCategoryCard stat badges. Lives inside
+ * the ElementInView subtree so it can read visibility context and pass
+ * `useLive` into Metrics. Only subscribes + renders live values when the card
+ * is visible.
+ */
+function ModelCategoryCardStats({
+  data,
+  hasReview,
+}: {
+  data: AssociatedResourceModelCardData;
+  hasReview: boolean;
+}) {
+  const inView = useElementInView();
+  return (
+    <Metrics
+      entityType="Model"
+      entityId={data.id}
+      initial={{
+        downloadCount: data.rank.downloadCount ?? 0,
+        thumbsUpCount: data.rank.thumbsUpCount,
+        commentCount: data.rank.commentCount,
+      }}
+      useLive={inView !== false}
+    >
+      {(m) => (
+        <Group gap={4} align="center">
+          {!!m.thumbsUpCount && (
+            <IconBadge
+              className={classes.statBadge}
+              icon={
+                <Text c={hasReview ? 'success.5' : undefined} inline>
+                  <ThumbsUpIcon size={14} filled={hasReview} />
+                </Text>
+              }
+              color={hasReview ? 'success.5' : 'gray'}
+            >
+              <Text size="xs">
+                <AnimatedCount value={m.thumbsUpCount} />
+              </Text>
+            </IconBadge>
+          )}
+          {!!m.commentCount && (
+            <IconBadge className={classes.statBadge} icon={<IconMessageCircle2 size={14} />}>
+              <Text size="xs">
+                <AnimatedCount value={m.commentCount} />
+              </Text>
+            </IconBadge>
+          )}
+          <IconBadge className={classes.statBadge} icon={<IconDownload size={14} />}>
+            <Text fz={12}>
+              {data.hiddenMetrics?.downloads ? (
+                <HiddenMetricNotice size={12} />
+              ) : (
+                <AnimatedCount value={m.downloadCount ?? 0} />
+              )}
+            </Text>
+          </IconBadge>
+        </Group>
+      )}
+    </Metrics>
+  );
+}

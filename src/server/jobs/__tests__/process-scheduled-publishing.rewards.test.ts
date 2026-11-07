@@ -1,0 +1,691 @@
+import type { Prisma } from '@prisma/client';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const {
+  mockApply,
+  mockRewardedIds,
+  mockSetLastRun,
+  mockProcessEngagement,
+  mockCreateNotification,
+  mockQueueImageSearchIndexUpdate,
+  mockRefreshImageVideoCounts,
+  mockBustMvCache,
+  mockPublishDueArticles,
+  mockScanEntitiesInBackground,
+  jobDate,
+} = vi.hoisted(() => ({
+  mockApply: vi.fn(),
+  mockRewardedIds: vi.fn(),
+  mockSetLastRun: vi.fn(),
+  mockProcessEngagement: vi.fn(),
+  mockCreateNotification: vi.fn(),
+  mockQueueImageSearchIndexUpdate: vi.fn(),
+  mockRefreshImageVideoCounts: vi.fn(),
+  mockBustMvCache: vi.fn(async () => undefined),
+  mockPublishDueArticles: vi.fn(
+    async (): Promise<
+      { published: number[]; processing: number[]; failed: number[] } | undefined
+    > => undefined
+  ),
+  mockScanEntitiesInBackground: vi.fn(),
+  jobDate: { lastRun: new Date(0) },
+}));
+
+// Hand-listed rather than spread via importOriginal: the rewards barrel reaches
+// modules that build query caches from the db client at import time, so pulling the
+// real one in drops this suite to zero collected tests.
+// A tagged template or a prebuilt Prisma.Sql, as the job passes either.
+const sqlText = (q: unknown) =>
+  Array.isArray(q) ? q.join(' ') : (q as { strings: string[] }).strings.join(' ');
+
+vi.mock('~/server/rewards', () => ({ firstDailyPostReward: { apply: mockApply } }));
+vi.mock('~/server/rewards/active/firstDailyPost.reward', () => ({
+  getFirstDailyPostRewardedIds: mockRewardedIds,
+}));
+vi.mock('~/server/events', () => ({ eventEngine: { processEngagement: mockProcessEngagement } }));
+vi.mock('~/server/redis/caches', () => ({
+  dataForModelsCache: { refresh: vi.fn() },
+  userImageVideoCountCaches: { refresh: mockRefreshImageVideoCounts },
+}));
+vi.mock('~/server/services/image.service', () => ({
+  queueImageSearchIndexUpdate: mockQueueImageSearchIndexUpdate,
+}));
+vi.mock('~/server/search-index', () => ({ modelsSearchIndex: { queueUpdate: vi.fn() } }));
+vi.mock('~/server/services/model-version.service', () => ({
+  bustMvCache: mockBustMvCache,
+  publishModelVersionsWithEarlyAccess: vi.fn(),
+}));
+vi.mock('~/server/services/notification.service', () => ({
+  createNotification: mockCreateNotification,
+}));
+vi.mock('~/server/services/nsfwLevels.service', () => ({
+  updateComicNsfwLevels: vi.fn(async () => undefined),
+}));
+vi.mock('~/server/services/article-schedule.service', () => ({
+  publishDueScheduledArticles: mockPublishDueArticles,
+}));
+vi.mock('~/server/services/text-scan/submit', () => ({
+  scanEntitiesInBackground: mockScanEntitiesInBackground,
+}));
+vi.mock('~/server/jobs/job', () => ({
+  createJob: (_n: string, _c: string, fn: unknown) => fn,
+  getJobDate: async () => [jobDate.lastRun, mockSetLastRun] as const,
+}));
+
+import { processScheduledPublishing } from '~/server/jobs/process-scheduled-publishing';
+import { SearchIndexUpdateQueueAction } from '~/server/common/enums';
+import { POST_MINIMUM_SCHEDULE_MINUTES } from '~/server/common/constants';
+import { loggingMock } from '~/__tests__/mocks/logging.mock';
+import { dbMock } from '~/__tests__/mocks/db.mock';
+import { publishModelVersionsWithEarlyAccess } from '~/server/services/model-version.service';
+const mockLogToAxiom = loggingMock.logToAxiom;
+const mockDbWrite = dbMock.dbWrite;
+
+type Row = { id: number; userId: number };
+type Chapter = {
+  projectId: number;
+  position: number;
+  userId: number;
+  projectName: string;
+  chapterName: string;
+  username: string | null;
+};
+type Follower = { projectId: number; userId: number };
+
+// Read by the default transaction stub, so a test that installs its own keeps it.
+const txPosts: { scheduled: Row[]; flipped: Row[]; models: Row[]; versions: Row[] } = {
+  scheduled: [],
+  flipped: [],
+  models: [],
+  versions: [],
+};
+
+// Routed on SQL text rather than call order so adding a read doesn't shift these.
+// `flipped` is the rows the post UPDATE returns; by default every scheduled post publishes.
+const stubReads = ({
+  models = [],
+  versions = [],
+  scheduled = [],
+  newlyLive = [],
+  chapters = [],
+  followers = [],
+  flipped,
+}: {
+  models?: Row[];
+  versions?: (Row & { extras: { modelId: number } })[];
+  scheduled?: Row[];
+  newlyLive?: Row[];
+  chapters?: Chapter[];
+  followers?: Follower[];
+  flipped?: Row[];
+}) => {
+  // A scheduled post publishes only alongside its version, so posts come with one unless given.
+  if (!versions.length && scheduled.length)
+    versions = [{ id: 1, userId: scheduled[0].userId, extras: { modelId: 1 } }];
+  txPosts.scheduled = scheduled;
+  txPosts.flipped = flipped ?? scheduled;
+  txPosts.models = models;
+  txPosts.versions = versions;
+  mockDbWrite.$queryRaw.mockImplementation(async (...args: unknown[]) => {
+    const sql = sqlText(args[0]);
+    // There is no "ComicEngagement" table — prod answers 42P01. Throwing rather than
+    // returning [] keeps a revert from reading as "this project has no followers".
+    if (sql.includes('"ComicEngagement"'))
+      throw new Error('relation "ComicEngagement" does not exist');
+    if (sql.includes('"ComicProjectEngagement"')) return followers;
+    if (sql.includes('FROM "Model"') && !sql.includes('FROM "Model" m')) return models;
+    if (sql.includes("'hasEarlyAccess'")) return versions;
+    if (sql.includes('"ComicChapter"')) return chapters;
+    if (sql.includes('JOIN "ModelVersion" mv ON mv.id = p."modelVersionId"')) return scheduled;
+    if (sql.includes('FROM "Post" p')) return newlyLive;
+    return [];
+  });
+};
+
+const standaloneCall = () =>
+  mockDbWrite.$queryRaw.mock.calls.find(
+    (args) =>
+      sqlText(args[0]).includes('FROM "Post" p') &&
+      !sqlText(args[0]).includes('JOIN "ModelVersion"')
+  ) as unknown[];
+
+const runJob = () => (processScheduledPublishing as unknown as () => Promise<void>)();
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  jobDate.lastRun = new Date(0);
+  mockApply.mockResolvedValue(undefined);
+  mockRewardedIds.mockResolvedValue(new Set<number>());
+  mockDbWrite.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) =>
+    fn({
+      $executeRaw: vi.fn(),
+      $queryRaw: vi.fn(async (strings: unknown) => {
+        const sql = sqlText(strings);
+        if (sql.includes('FOR NO KEY UPDATE OF mv, p'))
+          return txPosts.scheduled.map(({ id }) => ({ postId: id, versionId: 1 }));
+        // Keyed on the RETURNING too: without it Postgres hands back no rows at all.
+        if (sql.includes('UPDATE "Post" p') && sql.includes('RETURNING p.id, p."userId"'))
+          return txPosts.flipped;
+        if (sql.includes('RETURNING mv.id')) return txPosts.versions.map(({ id }) => ({ id }));
+        if (sql.includes('UPDATE "Model"') && sql.includes('RETURNING id'))
+          return txPosts.models.map(({ id }) => ({ id }));
+        return [];
+      }),
+    })
+  );
+  mockDbWrite.image.findMany.mockResolvedValue([]);
+  stubReads({});
+});
+
+describe('processScheduledPublishing :: first daily post reward', () => {
+  it('rewards posts published by the ModelVersion schedule, which never reach the inline path', async () => {
+    stubReads({ scheduled: [{ id: 1, userId: 10 }] });
+    await runJob();
+    expect(mockApply).toHaveBeenCalledTimes(1);
+    expect(mockApply).toHaveBeenCalledWith({ postId: 1, posterId: 10 });
+  });
+
+  // The post UPDATE re-checks each post, so one taken down or moved since the select publishes
+  // nothing; paying it the reward, or queueing its images, would act on a post that is not live.
+  it('gives a scheduled post the UPDATE skipped none of the publish side effects', async () => {
+    stubReads({
+      scheduled: [
+        { id: 1, userId: 10 },
+        { id: 2, userId: 20 },
+      ],
+      flipped: [{ id: 1, userId: 10 }],
+    });
+    mockDbWrite.image.findMany.mockResolvedValue([{ id: 900 }]);
+    await runJob();
+    expect(mockApply.mock.calls).toEqual([[{ postId: 1, posterId: 10 }]]);
+    expect(
+      mockProcessEngagement.mock.calls
+        .filter(([e]) => e.entityType === 'post')
+        .map(([e]) => e.entityId)
+    ).toEqual([1]);
+    expect(mockDbWrite.image.findMany).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ where: { postId: { in: [1] } } })
+    );
+    expect(mockRefreshImageVideoCounts).toHaveBeenCalledExactlyOnceWith([10]);
+    expect(mockScanEntitiesInBackground).toHaveBeenCalledExactlyOnceWith('Post', [1]);
+  });
+
+  // The owner can change between the select and the write; the reward goes to whoever owns the
+  // post when it actually publishes, which is what the UPDATE's ownership check compared against.
+  it('pays the owner the post UPDATE returned, not the one the select read', async () => {
+    stubReads({ scheduled: [{ id: 1, userId: 10 }], flipped: [{ id: 1, userId: 11 }] });
+    await runJob();
+    expect(mockApply.mock.calls).toEqual([[{ postId: 1, posterId: 11 }]]);
+  });
+
+  // Guards a future edit, not today's code: an uncaught rollback already stops the run. The UPDATE's
+  // rows mean nothing once the transaction rolls back, so they stay its return value; a later catch
+  // added to carry the run on must not pay for, index or scan posts that never published.
+  it('keeps rolled-back posts out of the side effects even if the failure is caught', async () => {
+    stubReads({ scheduled: [{ id: 1, userId: 10 }] });
+    const txImpl = mockDbWrite.$transaction.getMockImplementation()!;
+    let flippedInTx: unknown;
+    mockDbWrite.$transaction.mockImplementation(async (...args: unknown[]) => {
+      flippedInTx = await (txImpl as (...a: unknown[]) => Promise<unknown>)(...args);
+      throw new Error('could not serialize access');
+    });
+    await runJob().catch(() => undefined);
+    // The UPDATE really returned the post inside the transaction, so its absence below is the rollback.
+    expect((flippedInTx as { flippedPosts: unknown }).flippedPosts).toEqual([
+      { id: 1, userId: 10 },
+    ]);
+    expect(mockApply).not.toHaveBeenCalled();
+    expect(mockProcessEngagement).not.toHaveBeenCalled();
+    expect(mockDbWrite.image.findMany).not.toHaveBeenCalled();
+    expect(mockRefreshImageVideoCounts).not.toHaveBeenCalled();
+    expect(mockScanEntitiesInBackground).not.toHaveBeenCalled();
+  });
+
+  // These posts are live once the transaction commits and are never selected again, so a throw in
+  // the unguarded steps after it must not cost them their text scan.
+  it('still scans the published posts when a later post-commit step throws', async () => {
+    // The post's version publishes in the same run, so its engagement is the first step that can throw.
+    stubReads({
+      scheduled: [{ id: 1, userId: 10 }],
+      versions: [{ id: 100, userId: 10, extras: { modelId: 11 } }],
+    });
+    mockProcessEngagement.mockRejectedValueOnce(new Error('event engine down'));
+    await expect(runJob()).rejects.toThrow('event engine down');
+    expect(mockScanEntitiesInBackground).toHaveBeenCalledExactlyOnceWith('Post', [1]);
+  });
+
+  it('rewards standalone scheduled posts on the day they go live', async () => {
+    stubReads({ newlyLive: [{ id: 2, userId: 20 }] });
+    await runJob();
+    expect(mockApply).toHaveBeenCalledWith({ postId: 2, posterId: 20 });
+  });
+
+  it('registers the published engagement for standalone scheduled posts too', async () => {
+    stubReads({ newlyLive: [{ id: 6, userId: 60 }] });
+    await runJob();
+    expect(mockProcessEngagement).toHaveBeenCalledWith({
+      userId: 60,
+      type: 'published',
+      entityType: 'post',
+      entityId: 6,
+    });
+  });
+
+  // The two reads can't overlap today — the flip happens after both — so this pins
+  // the guard that keeps that true if either query moves.
+  it('rewards a post once when both queries return it', async () => {
+    stubReads({ scheduled: [{ id: 3, userId: 30 }], newlyLive: [{ id: 3, userId: 30 }] });
+    await runJob();
+    expect(mockApply).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a failed reward to Axiom and keeps publishing', async () => {
+    mockApply.mockRejectedValueOnce(new Error('buzz down'));
+    stubReads({
+      newlyLive: [
+        { id: 4, userId: 40 },
+        { id: 5, userId: 50 },
+      ],
+    });
+    await runJob();
+    expect(mockApply).toHaveBeenCalledTimes(2);
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'error', postId: 4 })
+    );
+    expect(mockSetLastRun).toHaveBeenCalled();
+  });
+
+  // The ledger keys this reward on the post id and never expires it, so re-applying
+  // to a post it already paid for spends the user's daily cap and then gets refused
+  // as a duplicate — 25 Buzz never moves and the day's real post is capped.
+  it('skips posts the reward has already been granted for', async () => {
+    mockRewardedIds.mockResolvedValue(new Set([2]));
+    stubReads({
+      newlyLive: [
+        { id: 2, userId: 20 },
+        { id: 3, userId: 30 },
+      ],
+    });
+    await runJob();
+    expect(mockApply).toHaveBeenCalledTimes(1);
+    expect(mockApply).toHaveBeenCalledWith({ postId: 3, posterId: 30 });
+  });
+
+  it('checks both publish paths against the prior grants, deduped', async () => {
+    stubReads({ scheduled: [{ id: 7, userId: 70 }], newlyLive: [{ id: 7, userId: 70 }] });
+    await runJob();
+    expect(mockRewardedIds).toHaveBeenCalledWith([{ id: 7, userId: 70 }]);
+  });
+
+  // Dropping the sweep's rewards on a ClickHouse blip would lose them for good: the
+  // window only advances forward, so these posts are never reconsidered.
+  it('keeps granting, and says so, when the prior-grant lookup fails', async () => {
+    mockRewardedIds.mockRejectedValue(new Error('clickhouse down'));
+    stubReads({ newlyLive: [{ id: 8, userId: 80 }] });
+    await runJob();
+    expect(mockApply).toHaveBeenCalledWith({ postId: 8, posterId: 80 });
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'error', message: expect.stringContaining('unfiltered') })
+    );
+  });
+
+  it('warns instead of silently truncating when the sweep hits its row limit', async () => {
+    stubReads({ newlyLive: Array.from({ length: 5000 }, (_, i) => ({ id: i, userId: i })) });
+    await runJob();
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'warning', message: expect.stringContaining('row limit') })
+    );
+  });
+});
+
+describe('processScheduledPublishing :: search index reindex', () => {
+  // A standalone scheduled post goes live when the clock passes publishedAt, with no
+  // write anywhere. images_v6 gates on `p."publishedAt" <= NOW()` at pull time, so the
+  // enqueue updatePost fired at schedule time was rejected as future-dated, and
+  // Image.updatedAt never moves afterwards for the delta scan to re-derive it. If this
+  // sweep skips them the image is absent from site search permanently.
+  it('reindexes standalone scheduled posts on the day they go live', async () => {
+    stubReads({ newlyLive: [{ id: 2, userId: 20 }] });
+    mockDbWrite.image.findMany.mockResolvedValue([{ id: 900 }]);
+    await runJob();
+    expect(mockQueueImageSearchIndexUpdate).toHaveBeenCalledWith({
+      ids: [900],
+      action: SearchIndexUpdateQueueAction.Update,
+    });
+  });
+
+  it('reindexes both publish paths in one pass, deduped', async () => {
+    stubReads({ scheduled: [{ id: 1, userId: 10 }], newlyLive: [{ id: 2, userId: 20 }] });
+    mockDbWrite.image.findMany.mockResolvedValue([{ id: 901 }]);
+    await runJob();
+    expect(mockDbWrite.image.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { postId: { in: [1, 2] } } })
+    );
+    expect(mockQueueImageSearchIndexUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not enqueue when the published posts carry no images', async () => {
+    stubReads({ newlyLive: [{ id: 2, userId: 20 }] });
+    await runJob();
+    expect(mockQueueImageSearchIndexUpdate).not.toHaveBeenCalled();
+  });
+
+  // The count refresh compensates for this job publishing via raw SQL instead of
+  // updatePost, so it belongs to the posts this job actually flips. The sweep half was
+  // published by something else, which already refreshed. Widening it to `publishedPosts`
+  // would refresh up to REWARD_SWEEP_LIMIT users every minute.
+  it('keeps the count refresh to the posts this job flips', async () => {
+    stubReads({ newlyLive: [{ id: 2, userId: 20 }] });
+    mockDbWrite.image.findMany.mockResolvedValue([{ id: 902 }]);
+    await runJob();
+    expect(mockQueueImageSearchIndexUpdate).toHaveBeenCalled();
+    expect(mockRefreshImageVideoCounts).not.toHaveBeenCalled();
+  });
+});
+
+describe('processScheduledPublishing :: comic chapter notifications', () => {
+  const chapter: Chapter = {
+    projectId: 5,
+    position: 2,
+    userId: 50,
+    projectName: 'Proj',
+    chapterName: 'Ch2',
+    username: 'author',
+  };
+
+  it('notifies the project followers when a scheduled chapter goes live', async () => {
+    stubReads({
+      chapters: [chapter],
+      followers: [
+        { projectId: 5, userId: 101 },
+        { projectId: 5, userId: 102 },
+      ],
+    });
+    await runJob();
+    expect(mockCreateNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'new-comic-chapter',
+        key: 'new-comic-chapter:5:2',
+        userIds: [101, 102],
+      })
+    );
+  });
+
+  // The comics Newest feed orders by project updatedAt; without the bump a project
+  // that already has chapters never resurfaces when a scheduled one goes live.
+  it('bumps the project updatedAt when a scheduled chapter goes live', async () => {
+    stubReads({ chapters: [chapter, { ...chapter, position: 3 }] });
+    await runJob();
+    expect(mockDbWrite.comicProject.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: [5] } },
+      data: { updatedAt: expect.any(Date) },
+    });
+  });
+
+  // The follower read sits ahead of every publish side effect and outside the
+  // transaction, so a failure there takes down the whole run — after the chapters
+  // have already flipped to Published, which is what makes the loss permanent.
+  it('completes the rest of the run once a chapter batch is handled', async () => {
+    stubReads({
+      chapters: [chapter],
+      followers: [{ projectId: 5, userId: 101 }],
+      newlyLive: [{ id: 9, userId: 90 }],
+    });
+    await runJob();
+    expect(mockApply).toHaveBeenCalledWith({ postId: 9, posterId: 90 });
+    expect(mockSetLastRun).toHaveBeenCalled();
+  });
+});
+
+describe('processScheduledPublishing :: standalone sweep window', () => {
+  // The reward's dedup entry expires at UTC midnight, so a window reaching back past
+  // it would re-grant yesterday's posts on today's cap.
+  it('never reaches back past the start of the UTC day', async () => {
+    await runJob();
+    const [, windowStart] = standaloneCall() as [unknown, Date];
+    expect(windowStart.toISOString()).toBe(
+      new Date(new Date().setUTCHours(0, 0, 0, 0)).toISOString()
+    );
+  });
+
+  it('starts at the previous run when that is inside the current UTC day', async () => {
+    const startOfDay = new Date().setUTCHours(0, 0, 0, 0);
+    jobDate.lastRun = new Date(Math.max(Date.now() - 60 * 1000, startOfDay + 1));
+    await runJob();
+    const [, windowStart] = standaloneCall() as [unknown, Date];
+    expect(windowStart).toEqual(jobDate.lastRun);
+  });
+
+  // Bound as a parameter the minute count arrives as int8 and make_interval only
+  // takes int4, so the query fails to resolve the function (42883) on every run.
+  it('inlines the schedule offset rather than binding it', async () => {
+    await runJob();
+    const interval = standaloneCall().find(
+      (value) => typeof (value as Prisma.Sql)?.sql === 'string'
+    ) as Prisma.Sql;
+    expect(interval.sql).toBe('make_interval(mins => 10)');
+    expect(interval.values).toEqual([]);
+  });
+
+  // To whoever is about to give the sweep its own, larger offset: post.controller skips the
+  // inline reward for any post scheduled at least POST_MINIMUM_SCHEDULE_MINUTES out, and this
+  // sweep is then its only reward. A post created and scheduled the same minimum ahead sits
+  // only about that far past createdAt, so an offset above the minimum never pays it at all.
+  // Model and version publishes also stamp Post.publishedAt with no inline reward, so this
+  // offset decides which of their gallery posts earn it too.
+  it('offsets the sweep by no more than the schedule minimum', async () => {
+    await runJob();
+    const interval = standaloneCall().find(
+      (value) => typeof (value as Prisma.Sql)?.sql === 'string'
+    ) as Prisma.Sql;
+    const offset = Number(/mins => (\d+)/.exec(interval.sql)?.[1]);
+    expect(offset).toBeLessThanOrEqual(POST_MINIMUM_SCHEDULE_MINUTES);
+  });
+});
+
+describe('processScheduledPublishing :: lastVersionAt', () => {
+  // sync_model_to_metric skips a lastVersionAt later than the DB's NOW(); a JS timestamp from a
+  // pod clock running ahead, or a bare NOW() rounded up by the timestamp(3) column, left
+  // ModelMetric.lastVersionAt NULL and the model off the Newest feed.
+  it('stamps lastVersionAt from the database clock, not the job clock', async () => {
+    const txExecuteRaw = vi.fn();
+    mockDbWrite.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn({ $executeRaw: txExecuteRaw, $queryRaw: vi.fn().mockResolvedValue([]) })
+    );
+    stubReads({ versions: [{ id: 100, userId: 10, extras: { modelId: 42 } }] });
+
+    await runJob();
+
+    const call = txExecuteRaw.mock.calls.find((args) =>
+      sqlText(args[0]).includes('SET "lastVersionAt"')
+    );
+    expect(call).toBeDefined();
+    expect(sqlText(call![0])).toContain(`SET "lastVersionAt" = date_trunc('milliseconds', NOW())`);
+    expect((call![0] as Prisma.Sql).values.some((v) => v instanceof Date)).toBe(false);
+  });
+});
+
+describe('processScheduledPublishing :: early access after a takedown', () => {
+  // The early-access publish writes by id with no status check. A version a moderator took down
+  // after the job selected it drops out of the status-checked UPDATE, and must not be republished.
+  it('publishes early access only for versions the status-checked UPDATE published', async () => {
+    mockDbWrite.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn({
+        $executeRaw: vi.fn(),
+        $queryRaw: vi.fn(async (strings: unknown) =>
+          sqlText(strings).includes('RETURNING mv.id') ? [{ id: 101 }] : []
+        ),
+      })
+    );
+    stubReads({
+      versions: [
+        { id: 101, userId: 10, extras: { modelId: 11, hasEarlyAccess: true } },
+        { id: 102, userId: 10, extras: { modelId: 12, hasEarlyAccess: true } },
+      ] as never,
+    });
+
+    await runJob();
+
+    expect(publishModelVersionsWithEarlyAccess).toHaveBeenCalledWith(
+      expect.objectContaining({ modelVersionIds: [101] })
+    );
+  });
+
+  // A version takedown locks the version, then unpublishes its live posts, so the scheduled posts
+  // publish only after the job holds their versions and the posts themselves.
+  it('locks the posts and their versions before publishing the posts', async () => {
+    const txQueryRaw = vi.fn(async (strings: unknown) =>
+      sqlText(strings).includes('FOR NO KEY UPDATE OF mv, p') ? [{ postId: 7, versionId: 70 }] : []
+    );
+    mockDbWrite.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn({ $executeRaw: vi.fn(), $queryRaw: txQueryRaw })
+    );
+    stubReads({ scheduled: [{ id: 7, userId: 10 }] });
+
+    await runJob();
+
+    const sql = txQueryRaw.mock.calls.map(([strings]) => sqlText(strings));
+    const lock = sql.findIndex(
+      (q) =>
+        q.includes('JOIN "Post" p ON p."modelVersionId" = mv.id') &&
+        q.includes('FOR NO KEY UPDATE OF mv, p')
+    );
+    const publish = sql.findIndex((q) => q.includes('UPDATE "Post" p'));
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(publish).toBeGreaterThan(lock);
+  });
+
+  // A post a merge moved to another version while the lock waited is not among the locked pairs,
+  // and its new version is unlocked: publishing it by id alone could put it live on a version a
+  // takedown is downing. Keep the UPDATE keyed on the (post, version) pairs the lock returned.
+  it('publishes only the post and version pairs the lock returned', async () => {
+    const txQueryRaw = vi.fn(async (strings: unknown) =>
+      sqlText(strings).includes('FOR NO KEY UPDATE OF mv, p') ? [{ postId: 7, versionId: 70 }] : []
+    );
+    mockDbWrite.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn({ $executeRaw: vi.fn(), $queryRaw: txQueryRaw })
+    );
+    stubReads({
+      scheduled: [
+        { id: 7, userId: 10 },
+        { id: 8, userId: 10 },
+      ],
+    });
+
+    await runJob();
+
+    const publish = txQueryRaw.mock.calls.find(([strings]) =>
+      sqlText(strings).includes('UPDATE "Post" p')
+    );
+    expect(publish).toBeDefined();
+    const flat = publish![0] as Prisma.Sql;
+    expect(flat.text).toContain('(p.id, p."modelVersionId") IN (($1, $2))');
+    expect(flat.values.slice(0, 2)).toEqual([7, 70]);
+    expect(flat.values).not.toContain(8);
+  });
+
+  it('publishes no posts when the lock returned none of them', async () => {
+    const txQueryRaw = vi.fn().mockResolvedValue([]);
+    mockDbWrite.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn({ $executeRaw: vi.fn(), $queryRaw: txQueryRaw })
+    );
+    stubReads({ scheduled: [{ id: 7, userId: 10 }] });
+
+    await runJob();
+
+    const sql = txQueryRaw.mock.calls.map(([strings]) => sqlText(strings));
+    expect(sql.some((q) => q.includes('UPDATE "Post" p'))).toBe(false);
+    expect(mockApply).not.toHaveBeenCalled();
+    expect(mockRefreshImageVideoCounts).not.toHaveBeenCalled();
+    expect(mockScanEntitiesInBackground).not.toHaveBeenCalled();
+  });
+
+  it('publishes no early access when the UPDATE published none of them', async () => {
+    mockDbWrite.$transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn({ $executeRaw: vi.fn(), $queryRaw: vi.fn().mockResolvedValue([]) })
+    );
+    stubReads({
+      versions: [{ id: 102, userId: 10, extras: { modelId: 12, hasEarlyAccess: true } }] as never,
+    });
+
+    await runJob();
+
+    expect(publishModelVersionsWithEarlyAccess).not.toHaveBeenCalled();
+  });
+});
+
+describe('processScheduledPublishing :: model version cache busts', () => {
+  const versions = [
+    { id: 101, userId: 10, extras: { modelId: 11 } },
+    { id: 102, userId: 10, extras: { modelId: 12 } },
+  ];
+
+  // `clearAllMocks` keeps implementations, so a throwing engagement would leak into the next case.
+  beforeEach(() => {
+    mockProcessEngagement.mockReset();
+    mockBustMvCache.mockReset();
+    mockBustMvCache.mockResolvedValue(undefined);
+  });
+
+  // The versions already read Published, so a bust this run skips is never retried.
+  it.each([
+    ['a version engagement', { entityType: 'modelVersion', entityId: 101 }],
+    ['a model engagement', { entityType: 'model', entityId: 7 }],
+  ])('busts every published version when %s throws', async (_name, failing) => {
+    stubReads({ models: [{ id: 7, userId: 10 }], versions });
+    mockProcessEngagement.mockImplementation(
+      async (e: { entityType: string; entityId: number }) => {
+        if (e.entityType === failing.entityType && e.entityId === failing.entityId)
+          throw new Error('engagement down');
+      }
+    );
+
+    await expect(runJob()).rejects.toThrow('engagement down');
+    expect(mockBustMvCache.mock.calls).toEqual([
+      [101, 11],
+      [102, 12],
+    ]);
+  });
+
+  it('a failing bust is logged and the engagements still run', async () => {
+    stubReads({ versions });
+    mockBustMvCache.mockRejectedValueOnce(new Error('redis down'));
+
+    await runJob();
+
+    expect(mockBustMvCache).toHaveBeenCalledTimes(2);
+    expect(mockProcessEngagement.mock.calls.map(([e]) => e.entityId)).toEqual([101, 102]);
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({ modelVersionId: 101, error: 'redis down' })
+    );
+  });
+});
+
+describe('processScheduledPublishing :: scheduled articles', () => {
+  it('takes due articles live on every run', async () => {
+    await runJob();
+    expect(mockPublishDueArticles).toHaveBeenCalledExactlyOnceWith(expect.any(Date));
+  });
+
+  it('scans the articles it takes live or into processing', async () => {
+    mockPublishDueArticles.mockResolvedValueOnce({ published: [1], processing: [2], failed: [3] });
+    await runJob();
+    expect(mockScanEntitiesInBackground).toHaveBeenCalledExactlyOnceWith('Article', [1, 2]);
+  });
+
+  it('scans nothing when no article went live or into processing', async () => {
+    mockPublishDueArticles.mockResolvedValueOnce({ published: [], processing: [], failed: [3] });
+    await runJob();
+    expect(mockScanEntitiesInBackground).not.toHaveBeenCalled();
+  });
+
+  it('still records the run when the article go-live throws', async () => {
+    mockPublishDueArticles.mockRejectedValueOnce(new Error('article table locked'));
+    await runJob();
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'error', message: 'scheduled article go-live failed' })
+    );
+    expect(mockSetLastRun).toHaveBeenCalled();
+    expect(mockScanEntitiesInBackground).not.toHaveBeenCalled();
+  });
+});

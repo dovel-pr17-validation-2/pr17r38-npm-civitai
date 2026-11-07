@@ -1,0 +1,712 @@
+import { Anchor, Badge, Center, Group, Loader, Stack, Table, Text } from '@mantine/core';
+import { LoadMoreButton } from '~/components/LoadMoreButton/LoadMoreButton';
+import { IconHistory } from '@tabler/icons-react';
+import Link from 'next/link';
+import { useMemo } from 'react';
+import { getListingDetailHref } from '~/components/Apps/appListingCardView';
+import { DaysFromNow } from '~/components/Dates/DaysFromNow';
+import { useOptionalFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { hasAppsStoreAccess } from '~/shared/utils/app-blocks-access';
+import { trpc } from '~/utils/trpc';
+import {
+  describeBlockAction,
+  READ_SCOPE_LABELS,
+  type BlockActionDetail,
+} from '~/shared/constants/block-action-detail';
+import { APPS_STORE_HREF } from '~/shared/constants/apps-routes.constants';
+import classes from '~/components/Apps/AppActivityPanel.module.scss';
+
+/**
+ * Shared per-viewer app-activity timeline. Extracted from
+ * `src/pages/apps/activity.tsx` (W5 v0.5, when that page was `/apps/installed`) so
+ * the same interleaved feed can be reused both there (whole-account view) AND on the
+ * run-frame "Permissions & activity" drawer scoped to a single app (`appBlockId`).
+ * DRY: the humanise helpers + row shape live here, in one tested place, instead of
+ * duplicated.
+ *
+ * Two cursor-paginated tRPC queries — `blocks.listMyAppActivity` (Buzz
+ * attribution) + `blocks.listMyScopeInvocations` (scope-gated call audit) —
+ * merged into one timeline sorted by createdAt desc.
+ *
+ * `appBlockId` drill-down: BOTH queries filter SERVER-side by the optional
+ * `appBlockId` input, so each per-app feed paginates correctly (a whole-account
+ * fetch + client filter would under-report this app's Buzz behind other apps'
+ * rows on page 1). A client-side `item.appBlockId` check is kept as cheap
+ * belt-and-suspenders. When `appBlockId` is omitted the feed is whole-account —
+ * exactly the /apps/activity behaviour, unchanged.
+ *
+ * `enabled` gates the queries: pass `false` for an anonymous viewer (these
+ * procedures are `protectedProcedure`, so firing them unauthenticated just
+ * errors) — the panel then renders the friendly empty state instead.
+ */
+const ACTIVITY_STATUS_COLORS: Record<string, string> = {
+  pending: 'blue',
+  confirmed: 'green',
+  paid_out: 'green',
+  voided: 'red',
+};
+
+function ActivityStatusBadge({ status }: { status: string }) {
+  const color = ACTIVITY_STATUS_COLORS[status] ?? 'gray';
+  return (
+    <Badge size="sm" color={color} variant="light">
+      {status}
+    </Badge>
+  );
+}
+
+/**
+ * Format an activity scope + amount into a one-line "Action" cell. The
+ * v0 surface only has the subscription scope on the row — we humanise
+ * the well-known scopes and pass through anything unknown.
+ */
+export function humaniseActivityAction(scope: string): string {
+  switch (scope) {
+    case 'per_model_install':
+      return 'Spent Buzz on a per-model install';
+    case 'publisher_all_my_models':
+      return 'Spent Buzz via my publisher subscription';
+    case 'viewer_personal':
+      return 'Spent Buzz via my personal subscription';
+    case 'platform_default':
+      return 'Spent Buzz via a civitai-promoted default';
+    default:
+      return scope;
+  }
+}
+
+const SCOPE_ACTION_LABELS: Record<string, string> = {
+  'user:read:self': 'Read profile',
+  'buzz:read:self': 'Read Buzz balance',
+  'models:read:self': 'Read model',
+  'media:read:owned': 'Read media',
+  'block:settings:read': 'Read block settings',
+  'block:settings:write': 'Write block settings',
+  'ai:write:budgeted': 'Submit AI workflow',
+  'social:tip:self': 'Tip',
+  'goods:read:self': 'Read owned items',
+  'goods:purchase:self': 'Buy an item',
+  'apps:store:items:write': 'Listed an item in the App Store',
+  'social:react:self': 'Reacted to an image',
+};
+
+export function humaniseScopeInvocation(scope: string, endpoint?: string): string {
+  // Synthetic endpoints take precedence over the scope label — same
+  // scope can fan out to different user-facing verbs (block:settings:write
+  // covers both first-time saves and checkpoint pin swaps; apps:storage
+  // covers both set and delete). The endpoint string is the source of
+  // truth for what the app actually did.
+  if (endpoint?.startsWith('workflow:submit')) return 'Generated an image';
+  // The REST workflow twins (`/api/v1/blocks/workflows/*`). All FIVE routes are
+  // wrapped with `requiredScope: 'ai:write:budgeted'`, so WITHOUT an arm here
+  // their access rows fall past READ_SCOPE_LABELS into SCOPE_ACTION_LABELS and
+  // render as 'Submit AI workflow' — false for these four, and at the SDK's
+  // poll cadence roughly thirty times per generation.
+  // `===`, not a prefix: `normalizeEndpoint` strips the query string and leaves
+  // these segments literal (they are in KNOWN_STATIC_ENDPOINT_SEGMENTS), so the
+  // value is exact — and an exact match cannot silently swallow a future
+  // sibling route the way a `/workflows/` prefix would.
+  // `/workflows/submit` is deliberately ABSENT: for that one route the
+  // 'Submit AI workflow' label is TRUE, so it keeps falling through.
+  if (endpoint === '/api/v1/blocks/workflows/poll') return 'Checked an AI workflow';
+  if (endpoint === '/api/v1/blocks/workflows/estimate') return 'Priced an AI workflow';
+  if (endpoint === '/api/v1/blocks/workflows/cancel') return 'Canceled an AI workflow';
+  // `/workflows/query` — the app-subqueue read. It is a LIST, not a read of one
+  // workflow, so it is deliberately not worded like `/poll`'s 'Checked an AI
+  // workflow': the two would otherwise be indistinguishable in this column while
+  // describing very different reads (one workflow the app already knows about,
+  // versus every generation the app has ever made for this viewer).
+  // THIRD PERSON, matching the other four arms and 'Generated an image'. It read
+  // 'Listed YOUR AI workflows' until review: that was the only second-person
+  // string among them, and the possessive is redundant anyway — this column
+  // already only ever describes what an app did to THIS viewer's data.
+  if (endpoint === '/api/v1/blocks/workflows/query') return 'Listed AI workflows';
+  // The REST app-storage WRITE twins (`/api/v1/blocks/app-storage/{set,delete}`).
+  // Both routes are wrapped with `requiredScope: 'apps:storage:write'`, which is
+  // in NEITHER `READ_SCOPE_LABELS` nor `SCOPE_ACTION_LABELS` — so WITHOUT an arm
+  // here their access rows fall all the way through and render the RAW SCOPE
+  // STRING `apps:storage:write` to the viewer. That is a different failure from
+  // the workflow arms above: those rendered a WRONG label, these render no label
+  // at all.
+  //
+  // The three READ twins (`/get`, `/list`, `/quota`) deliberately have NO arm:
+  // `apps:storage:read` IS in `READ_SCOPE_LABELS`, so they already render
+  // 'Read your app storage', which is true for all three.
+  //
+  // ⚠ WHY THESE READ AS A SECOND ROW RATHER THAN A DUPLICATE. A REST write
+  // produces TWO rows: `setAppStorageValue` writes its own richer row
+  // (`endpoint: 'storage:set'`, carrying the key) which renders below as 'Wrote
+  // app-local storage', and `withBlockScope` then writes an access row for the
+  // HTTP call itself. The same write over the postMessage bridge produces only
+  // the first. Giving the access row the SAME text would render one action as two
+  // identical entries; the '(API)' suffix makes the pair read as "what the app
+  // did" plus "the call that did it". Removing the second row entirely would need
+  // a new `withBlockScope` suppression option — a middleware change on every
+  // route's audit path — and THAT is the real fix if this is judged too noisy,
+  // NOT deleting these arms.
+  //
+  // `===`, not a prefix: `normalizeEndpoint` leaves these segments literal (they
+  // are in KNOWN_STATIC_ENDPOINT_SEGMENTS), so the value is exact — and an exact
+  // match cannot silently swallow a future sibling route.
+  if (endpoint === '/api/v1/blocks/app-storage/set') return 'Wrote app-local storage (API)';
+  if (endpoint === '/api/v1/blocks/app-storage/delete') return 'Deleted app-local storage (API)';
+  // The REST per-viewer checkpoint override write. It declares NO `requiredScope`
+  // (matching the bridge, which enforces no block scope on this write), so its
+  // access row carries the `'(any-token)'` sentinel — a scope that is in NEITHER
+  // label map. WITHOUT this arm the row falls all the way through and renders the
+  // literal string `(any-token)` to the viewer: the app-storage failure in its
+  // worst form, not a wrong label but a meaningless one.
+  //
+  // Same TWO-ROW shape as the app-storage writes above, and the same reason for the
+  // '(API)' suffix: the shared body writes its own richer row
+  // (`endpoint: 'user-settings:write'`, carrying `detail.action`) which the table
+  // renders through `describeBlockAction`, and `withBlockScope` then writes the
+  // access row for the HTTP call itself. The bridge produces only the first, so
+  // identical text would render one action as two identical entries.
+  if (endpoint === '/api/v1/blocks/user-checkpoint/set')
+    return 'Saved your checkpoint choice (API)';
+  if (endpoint === 'user-settings:write') return 'Saved your block settings';
+  // Prefix (not `===`) so BOTH the bounded template written today
+  // (`storage:set`) and the historical per-key value (`storage:set:<key>`)
+  // resolve to the same label.
+  if (endpoint?.startsWith('storage:set')) return 'Wrote app-local storage';
+  if (endpoint?.startsWith('storage:delete')) return 'Deleted app-local storage';
+  // Passive READS get a friendly label from the scope→label map (W13 — no
+  // write-side change for reads). Fall through to the local write labels, then
+  // the raw scope string for anything genuinely unknown.
+  // `Object.hasOwn`, not a bare index: both maps are plain Records, so `scope` values like
+  // 'constructor' or 'toString' resolve off Object.prototype, and `??` does NOT reject a
+  // non-nullish hit — this returned `Object.prototype.constructor` (a function) and React
+  // throws on a non-string child. Unreachable from a real scope value; the guard is here
+  // because the same hazard was just fixed in analytics-bucket-labels.ts and this is its
+  // twin, sharing the same registry.
+  if (Object.hasOwn(READ_SCOPE_LABELS, scope)) return READ_SCOPE_LABELS[scope];
+  if (Object.hasOwn(SCOPE_ACTION_LABELS, scope)) return SCOPE_ACTION_LABELS[scope];
+  return scope;
+}
+
+/**
+ * Render the Detail column for a scope-invocation row: the meaningful per-row
+ * ref (workflowId, storage key, …). REST endpoints pass through unchanged.
+ *
+ * 🔴 The per-row id comes from `detail`, NOT from the endpoint string. The
+ * writers now emit a BOUNDED endpoint template (`workflow:submit`,
+ * `storage:set`, `storage:delete`) because `endpoint` is the GROUP BY key of the
+ * `topEndpoints` rollup — a per-operation id there made it unbounded and every
+ * bucket count 1. This column was doing double duty as aggregation key AND UI
+ * payload; `detail` is the column documented for per-row ids, so that is where
+ * the id is read from.
+ *
+ * The legacy endpoint tail is still parsed as a FALLBACK: no data migration was
+ * run, so historical rows keep `workflow:submit:<id>` / `storage:set:<key>` (and
+ * a pre-W13 workflow row has no `detail` at all). Dropping the parse would have
+ * silently degraded every one of those rows to "(no workflow id)".
+ */
+export function humaniseScopeEndpoint(endpoint: string, detail?: BlockActionDetail | null): string {
+  if (endpoint.startsWith('workflow:submit')) {
+    // Legacy tail (`workflow:submit:<id>`); 'pending' was the historical
+    // stand-in for "no id yet" and is not a real workflow id.
+    const legacy = endpoint.match(/^workflow:submit:(.+)$/);
+    const legacyId = legacy && legacy[1] !== 'pending' ? legacy[1] : undefined;
+    const workflowId = detail?.workflowId ?? legacyId;
+    return workflowId ? `workflow ${workflowId}` : '(no workflow id)';
+  }
+  if (endpoint.startsWith('storage:set') || endpoint.startsWith('storage:delete')) {
+    const legacy = endpoint.match(/^storage:(?:set|delete):(.+)$/);
+    const key = detail?.key ?? legacy?.[1];
+    return key ? `key "${key}"` : endpoint;
+  }
+  if (endpoint === 'user-settings:write') return '';
+  return endpoint;
+}
+
+/**
+ * The `App` cell's name — a LINK to the app's store detail for a viewer who can open
+ * it, and the pre-change plain `<Text>` for everyone else.
+ *
+ * 🔴 THE GATE IS `hasAppsStoreAccess`, AND IT IS NOT OPTIONAL POLISH. The destination
+ * `/apps/store-preview/<slug>` `getServerSideProps`-gates on exactly this predicate
+ * (via `resolveAppsPageAccess`) and returns `notFound`, and `appListings.getAppDetail`
+ * resolves a `StoreVisibilityScope` of `none` and throws NOT_FOUND. An ungated link is
+ * therefore a 404 affordance — the defect class civitai#4668 shipped and civitai#4685
+ * exists to prevent. This is `AppNameCrumb`'s solution copied rather than re-derived;
+ * see that file for the full argument.
+ *
+ * 🔴 IT READS THE FLAGS THROUGH `useOptionalFeatureFlags`, NOT `useFeatureFlags`, AND
+ * THAT IS A FAIL-CLOSED DECISION. `useFeatureFlags` THROWS outside its provider. This
+ * panel is mounted from `/apps/activity` AND from the run-frame's permissions drawer,
+ * and it is rendered in isolation under test; making it throw would turn "flags are
+ * unavailable here" into a crashed panel. The optional hook returns `null` there, and
+ * `hasAppsStoreAccess(null)` is `false` — so the absence of flags removes the link
+ * instead of granting it.
+ *
+ * The `href` comes from the CANONICAL `getListingDetailHref`, never a concatenation
+ * here: one function owns the store-detail path (and its `encodeURIComponent`), so a
+ * route change cannot leave this call site pointing at the old one.
+ *
+ * 🔴 THERE ARE THREE WAYS TO GET PLAIN TEXT, AND ALL THREE ARE DELIBERATE — the flag
+ * gate above, a NULL `slug`, and `linkable={false}`. The middle one is the copy of
+ * `AppNameCrumb` this component originally MISSED: the crumb withholds the link when the
+ * listing does not resolve, and this one only copied the flag half. The row's `appSlug`
+ * is now null exactly when the server could not resolve a real listing slug (see "the
+ * appSlug contract" in `~/server/services/blocks/user-app-surface.service`), so a null
+ * here means "there is no listing to open", not "the caller forgot".
+ */
+export function ActivityAppName({
+  name,
+  slug,
+  linkable = true,
+}: {
+  name: string;
+  /** `AppBlock.blockId`, or NULL when the row has no resolvable store listing. */
+  slug: string | null;
+  /**
+   * 🔴 `false` SUPPRESSES THE LINK REGARDLESS OF THE VIEWER'S FLAGS, and the caller that
+   * passes it is the PER-APP drill-down (the run-frame's "Permissions & activity"
+   * drawer). Two reasons, and the first is the one that matters: that drawer is mounted
+   * OVER A RUNNING FULL-PAGE APP, so a top-level `<a>` navigation destroys whatever the
+   * user was doing inside it — with no warning, from a panel they opened to READ. The
+   * second is that in drill-down mode every row is the same app, so the column is a
+   * label rather than a destination. Not a `target="_blank"`: a second mechanism for the
+   * same column is how the two renderings come to disagree.
+   */
+  linkable?: boolean;
+}) {
+  const features = useOptionalFeatureFlags();
+  const canSeeStore = hasAppsStoreAccess(features);
+
+  // Ineligible viewer, no listing slug on the row, or a caller that suppressed the link:
+  // the pre-change static text, with the same testid so nothing downstream has to branch
+  // on the gate.
+  if (!linkable || !canSeeStore || !slug) {
+    return (
+      <Text size="sm" fw={500} className="truncate" data-testid="app-activity-app-name">
+        {name}
+      </Text>
+    );
+  }
+
+  return (
+    <Anchor
+      component={Link}
+      href={getListingDetailHref(slug)}
+      size="sm"
+      fw={500}
+      className="truncate"
+      data-testid="app-activity-app-name"
+    >
+      {name}
+    </Anchor>
+  );
+}
+
+function ScopeStatusBadge({ statusCode }: { statusCode: number }) {
+  const color =
+    statusCode < 300 ? 'green' : statusCode < 400 ? 'blue' : statusCode < 500 ? 'orange' : 'red';
+  // 🔴 THE ONLY CELL VALUE THAT MEANS NOTHING WITHOUT ITS COLUMN HEADER, and the card variant
+  // hides the header. `ActivityStatusBadge`'s sibling renders words ('confirmed', 'voided');
+  // this one renders a bare integer beside a timestamp, so unlabelled it reads as a second
+  // number rather than as an outcome.
+  //
+  // ⚠️ AN `aria-label` HERE WOULD BE INERT, AND THAT WAS TRIED. Mantine's Badge renders a bare
+  // `<div>` with no role, so its computed role is `generic` — for which ARIA 1.2 declares
+  // "Name from: prohibited", i.e. every engine drops an author-supplied name. The attribute is
+  // assertable in a test while naming nothing, which is worse than no label. Visually-hidden
+  // TEXT is real content and is this repo's idiom for it (`AppsRailNav`, `GenerationTabs`,
+  // `AppListingCardSkeleton`).
+  //
+  // 🔴 `sr-only` IS LOAD-BEARING FOR THE WIDE TABLE TOO, which is not obvious. Out of flow the
+  // span contributes nothing to layout, so the ≥768 rows are unchanged — but measured by renaming
+  // the class, a VISIBLE prefix widens the Status column and takes the row from 36.19 to 48.09,
+  // failing four of the pre-existing `no-surplus` arms alongside the one that reads it directly.
+  // The trailing space is likewise load-bearing, for the cross-mount text ledger rather than for
+  // speech: the two are separate text nodes, so removing it yields `HTTP status200`.
+  return (
+    <Badge size="sm" color={color} variant="light">
+      <span className="sr-only">HTTP status </span>
+      {statusCode}
+    </Badge>
+  );
+}
+
+/**
+ * W5 v0.5: combined activity feed. Two cursor-paginated tRPC queries
+ * (block_buzz_attribution + block_scope_invocations) merged into one
+ * timeline. Both are page-by-page, so we fetch the same page on each side
+ * and merge-sort by createdAt — good enough at the page sizes the user
+ * actually sees. A scope-invocation row carries (endpoint, statusCode)
+ * instead of (amount, status); humaniseActivityAction is overloaded.
+ *
+ * `detail` (W13): a scope-invocation row carries an optional structured
+ * `BlockActionDetail` (stable action code + subject-ref ids). When present the
+ * view resolves its ids → display names (batched) and renders a human sentence;
+ * when absent (passive read / pre-W13 row) it falls back to the humanised
+ * scope+endpoint.
+ */
+type ActivityFeedRow =
+  | {
+      kind: 'buzz';
+      id: string;
+      createdAt: Date;
+      appBlockId: string;
+      appName: string;
+      /** NULL when the server could not resolve a listing slug — see the service. */
+      appSlug: string | null;
+      scope: string;
+      usdAmountCents: number;
+      status: string;
+    }
+  | {
+      kind: 'scope';
+      id: string;
+      createdAt: Date;
+      appBlockId: string;
+      appName: string;
+      /** NULL when the server could not resolve a listing slug — see the service. */
+      appSlug: string | null;
+      scope: string;
+      endpoint: string;
+      statusCode: number;
+      detail: BlockActionDetail | null;
+    };
+
+export function AppActivityPanel({
+  appBlockId,
+  enabled = true,
+}: {
+  /** When set, scopes the timeline to a single app (server-filtered scope
+   *  invocations + client-filtered Buzz rows). Omitted → whole-account feed. */
+  appBlockId?: string;
+  /** Gate the (protected) queries. Pass `false` for an anonymous viewer. */
+  enabled?: boolean;
+}) {
+  const buzz = trpc.blocks.listMyAppActivity.useInfiniteQuery(
+    { limit: 25, ...(appBlockId ? { appBlockId } : {}) },
+    { getNextPageParam: (last) => last.nextCursor ?? undefined, enabled }
+  );
+  const scopes = trpc.blocks.listMyScopeInvocations.useInfiniteQuery(
+    { limit: 25, ...(appBlockId ? { appBlockId } : {}) },
+    { getNextPageParam: (last) => last.nextCursor ?? undefined, enabled }
+  );
+
+  const items = useMemo<ActivityFeedRow[]>(() => {
+    const buzzRows: ActivityFeedRow[] =
+      buzz.data?.pages.flatMap((p) =>
+        p.items
+          // Server already filters by appBlockId (see the query above); this
+          // client check is cheap belt-and-suspenders against a stale page.
+          .filter((item) => !appBlockId || item.appBlockId === appBlockId)
+          .map<ActivityFeedRow>((item) => ({
+            kind: 'buzz',
+            id: `buzz:${item.id}`,
+            createdAt: item.createdAt,
+            appBlockId: item.appBlockId,
+            appName: item.appName,
+            appSlug: item.appSlug,
+            scope: item.scope,
+            usdAmountCents: item.usdAmountCents,
+            status: item.status,
+          }))
+      ) ?? [];
+    const scopeRows: ActivityFeedRow[] =
+      scopes.data?.pages.flatMap((p) =>
+        p.items.map<ActivityFeedRow>((item) => ({
+          kind: 'scope',
+          id: `scope:${item.id}`,
+          createdAt: item.createdAt,
+          appBlockId: item.appBlockId,
+          appName: item.appName,
+          appSlug: item.appSlug,
+          scope: item.scope,
+          endpoint: item.endpoint,
+          statusCode: item.statusCode,
+          // W13 structured per-action detail (null for a passive read / pre-W13
+          // row). Resolved to names + a sentence at render time below.
+          detail: (item as { detail?: BlockActionDetail | null }).detail ?? null,
+        }))
+      ) ?? [];
+    return [...buzzRows, ...scopeRows].sort(
+      (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
+    );
+  }, [buzz.data, scopes.data, appBlockId]);
+
+  // W13 name resolution — collect the unique subject-ref ids across the rich
+  // rows and resolve them in ONE batched round-trip each (never per-row/N+1):
+  // model versions via the existing `getVersionsByIds`, recipients via
+  // `user.getById` coalesced through the tRPC http-batch link. The view renders
+  // ids until the names settle (progressive), then swaps in @username / name.
+  //
+  // The `user.getById` fan-out is one call per DISTINCT recipient, so it can reach
+  // ~50 across the two feeds (limit 25 each) — above `TRPC_MAX_BATCH_SIZE`. That is
+  // safe, but note WHICH bound does the work: the batch link's pre-existing
+  // `maxURLLength: 2083` already splits this shape at ~22-29 operations, below the
+  // item cap, and `maxItems` (see `src/utils/trpc.ts`) is the backstop. Either way
+  // the dataloader SPLITS a wider fan-out across several requests rather than
+  // rejecting it, so no request is ever built above the server's cap. A bulk
+  // `user.getByIds` would collapse it to one query at any width and is the right
+  // follow-up; `getVersionsByIds` above is already that shape.
+  const userIds = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          items.flatMap((i) =>
+            i.kind === 'scope' && i.detail?.toUserId != null ? [i.detail.toUserId] : []
+          )
+        )
+      ),
+    [items]
+  );
+  // Version-name lookups are keyed on the (entityType==='ModelVersion', entityId)
+  // subject ref the writers actually emit — batched across all rows (no N+1).
+  const versionIds = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          items.flatMap((i) =>
+            i.kind === 'scope' &&
+            i.detail?.entityType === 'ModelVersion' &&
+            i.detail.entityId != null
+              ? [i.detail.entityId]
+              : []
+          )
+        )
+      ),
+    [items]
+  );
+
+  const versionsQuery = trpc.modelVersion.getVersionsByIds.useQuery(
+    { ids: versionIds },
+    { enabled: versionIds.length > 0 }
+  );
+  const userQueries = trpc.useQueries((t) => userIds.map((id) => t.user.getById({ id })));
+
+  const usernameById = useMemo(() => {
+    const map = new Map<number, string>();
+    userQueries.forEach((q, idx) => {
+      const username = (q.data as { username?: string | null } | undefined)?.username;
+      if (username) map.set(userIds[idx], username);
+    });
+    return map;
+  }, [userQueries, userIds]);
+
+  const versionNameById = useMemo(() => {
+    const map = new Map<number, string>();
+    (versionsQuery.data ?? []).forEach((v) => {
+      if (v?.id != null && v.name) map.set(v.id, v.name);
+    });
+    return map;
+  }, [versionsQuery.data]);
+
+  // Anonymous / disabled: the protected queries never fired — show the empty
+  // state rather than an indefinite loader.
+  if (!enabled) {
+    return <EmptyActivity />;
+  }
+
+  const isLoading = buzz.isLoading || scopes.isLoading;
+  const hasNextPage = !!(buzz.hasNextPage || scopes.hasNextPage);
+  const isFetchingNextPage = !!(buzz.isFetchingNextPage || scopes.isFetchingNextPage);
+  const loadMore = () => {
+    // Load whichever feeds still have more — usually both. Cheap; the
+    // queries are independent.
+    if (buzz.hasNextPage) void buzz.fetchNextPage();
+    if (scopes.hasNextPage) void scopes.fetchNextPage();
+  };
+
+  if (isLoading) {
+    return (
+      <Center py="xl">
+        <Loader />
+      </Center>
+    );
+  }
+  if (items.length === 0) {
+    return <EmptyActivity />;
+  }
+  return (
+    /* `classes.panel` is the QUERY CONTAINER the stacked variant is measured against — see
+       `AppActivityPanel.module.scss`. It has to sit on an ancestor of the table, not on the
+       table, because a `@container` rule resolves against the element's ancestors. */
+    <Stack gap="sm" className={classes.panel} data-testid="app-activity-panel">
+      {/* 🔴 EXPLICIT ROLES ON EXACTLY THE FOUR ELEMENTS THE CARD VARIANT RE-BOXES. HTML-AAM maps a
+          table element's role from its box, so a `display` that is not a table value leaves the
+          implicit role unspecified — and the module sets `display: block` on the table, the tbody,
+          the rows and the cells. Without these, below the breakpoint an audit feed can reach
+          assistive tech as a flat run of strings with no row boundaries. Stating them costs
+          nothing above it, where they match what the elements already are.
+          ⚠️ AND NOT ON `thead` / `th`: those were added and REMOVED. The card variant hides the
+          whole thead (`display: none`), which drops it from the accessibility tree whatever its
+          role says, and above the breakpoint its implicit roles already apply — so they were
+          inert in both variants and unassertable in either.
+          ⚠️ THE GUARD IS THE ATTRIBUTE LEDGER in `AppPermissionsActivityDrawer.browser.test.tsx`,
+          which reads all four by name — not a computed-role read, because no tier here resolves an
+          accessibility tree. What is pinned is that the attributes are present, never that a
+          screen reader agrees. */}
+      <Table className={classes.table} role="table">
+        {/* 🔴 NO COLUMN LEDGER, DELIBERATELY — this table is EXEMPT in
+            `~/components/Apps/appsWideLayout`, and the exemption is the measured outcome
+            rather than an omission. Its natural layout already renders every cell on ONE
+            line at 768/1200/1440/2560 (row height 36.19 at all four), because its
+            max-content sum ≈ the container's content width at 768: there is no surplus to
+            place at the narrow end. Every ledger that meaningfully redistributes at 2560
+            wraps a cell at 768, and the one that does NOT (`[16,12,27,25,null]`) lands
+            within ~15px per column of natural at 2560 — i.e. it buys nothing. See the
+            EXEMPT entry for the full table of measurements.
+
+            ⚠️ THAT EXEMPTION IS A CLAIM ABOUT CONTAINERS ≥768 ONLY. Below ~560px this table
+            is not a table at all — the module CSS renders each row as a card — so it is not
+            a ledger question there. A `<colgroup>` would be inert in that variant anyway. */}
+        <Table.Thead>
+          <Table.Tr>
+            <Table.Th>When</Table.Th>
+            <Table.Th>App</Table.Th>
+            <Table.Th>Action</Table.Th>
+            <Table.Th>Detail</Table.Th>
+            <Table.Th>Status</Table.Th>
+          </Table.Tr>
+        </Table.Thead>
+        <Table.Tbody role="rowgroup">
+          {items.map((item) => (
+            <Table.Tr key={item.id} role="row">
+              <Table.Td role="cell" data-activity-cell="when">
+                {/* 🔴 RELATIVE, WITH THE ABSOLUTE STAMP STILL ONE HOVER AWAY. "20m ago"
+                    is what a reader of an audit feed actually wants — the question is
+                    "was this just now?", not "what wall-clock minute was it?".
+                    `DaysFromNow` renders a `<time title dateTime>` (so the exact instant
+                    is BOTH the native hover text and machine-readable in the DOM) and
+                    returns `null` until `useIsClient` goes true, which is what keeps a
+                    relative string from being server-rendered and then hydrating to a
+                    different one.
+
+                    🔴 NO MANTINE `Tooltip` WRAPPER — it used to be here and it was a
+                    DOUBLE tooltip: `DaysFromNow`'s own `title` attribute fires the
+                    browser's native tip while Mantine floated a second one, on the same
+                    hover, showing the SAME instant in a DIFFERENT format
+                    (`Date.prototype.toString()` vs dayjs `format()`). One hover, two
+                    boxes, two spellings of one time. The `<time>` element already owns
+                    this affordance; do not re-wrap it.
+
+                    `live` — an audit feed is a tab people leave open. Without it every
+                    relative string freezes at mount and "20m ago" silently means an hour;
+                    with it each row re-renders on a 15s interval. */}
+                <Text size="xs">
+                  <DaysFromNow date={item.createdAt} live />
+                </Text>
+              </Table.Td>
+              <Table.Td role="cell" data-activity-cell="app">
+                <Group gap={6} wrap="nowrap">
+                  {/* `linkable` is FALSE in per-app drill-down (the run-frame drawer) —
+                      see the prop's own docstring: a top-level navigation out of a
+                      RUNNING full-page app is not something a read-only panel may do. */}
+                  <ActivityAppName name={item.appName} slug={item.appSlug} linkable={!appBlockId} />
+                  {/* Only when there IS a slug. The badge used to render `item.appSlug`
+                      unconditionally, which on an unresolvable row printed the AppBlock
+                      PRIMARY KEY as though it were the app's public slug. */}
+                  {item.appSlug && (
+                    <Badge size="xs" variant="outline">
+                      {item.appSlug}
+                    </Badge>
+                  )}
+                </Group>
+              </Table.Td>
+              <Table.Td role="cell" data-activity-cell="action">
+                <Text size="xs">
+                  {item.kind === 'buzz'
+                    ? humaniseActivityAction(item.scope)
+                    : item.detail
+                    ? // W13 rich mutation row — resolve ids → names + a sentence.
+                      describeBlockAction(item.detail, {
+                        username:
+                          item.detail.toUserId != null
+                            ? usernameById.get(item.detail.toUserId)
+                            : null,
+                        subjectName:
+                          item.detail.entityType === 'ModelVersion' && item.detail.entityId != null
+                            ? versionNameById.get(item.detail.entityId)
+                            : null,
+                      })
+                    : humaniseScopeInvocation(item.scope, item.endpoint)}
+                </Text>
+              </Table.Td>
+              <Table.Td role="cell" data-activity-cell="detail">
+                {item.kind === 'buzz' ? (
+                  <Text size="xs">
+                    {item.usdAmountCents > 0
+                      ? `${(item.usdAmountCents / 100).toFixed(2)} USD`
+                      : '(no cost)'}
+                  </Text>
+                ) : (
+                  <Text size="xs" style={{ fontFamily: 'ui-monospace, SFMono-Regular, monospace' }}>
+                    {/* The Action cell carries the human sentence when a rich
+                        detail is present; the Detail cell always shows the raw
+                        technical ref (workflow id / storage key / endpoint) —
+                        read off `detail`, since the endpoint is now a bounded
+                        aggregation template. */}
+                    {humaniseScopeEndpoint(item.endpoint, item.detail)}
+                  </Text>
+                )}
+              </Table.Td>
+              <Table.Td role="cell" data-activity-cell="status">
+                {item.kind === 'buzz' ? (
+                  <ActivityStatusBadge status={item.status} />
+                ) : (
+                  <ScopeStatusBadge statusCode={item.statusCode} />
+                )}
+              </Table.Td>
+            </Table.Tr>
+          ))}
+        </Table.Tbody>
+      </Table>
+      {hasNextPage && (
+        <Center>
+          <LoadMoreButton
+            variant="default"
+            size="xs"
+            loading={isFetchingNextPage}
+            onClick={loadMore}
+          />
+        </Center>
+      )}
+    </Stack>
+  );
+}
+
+/**
+ * 🔴 THE `/apps` ANCHOR IS GATED ON `hasAppsStoreAccess`, AND IT IS THE SAME 404-AFFORDANCE
+ * CLASS AS THE `App` COLUMN'S LINK ABOVE — not polish. `/apps` SSR-gates on
+ * `resolveAppsPageAccess` → `hasAppsStoreAccess` = `appListings || appBlocks ||
+ * appListingsPublicExternal`. `appBlocksPages` is NOT one of those disjuncts, while
+ * `/apps/activity` now admits `appBlocks || appBlocksPages` — so this PR's newly-admitted
+ * cohort (page-apps-only, no `appBlocks`) can reach this empty state and would be handed
+ * a link the marketplace answers `notFound` for. The CTA is omitted rather than reworded:
+ * a viewer with no store has nowhere to browse, so there is no honest destination.
+ *
+ * `useOptionalFeatureFlags`, not `useFeatureFlags`, for the reason {@link ActivityAppName}
+ * gives: this panel renders in the run-frame drawer and in isolation under test, and a
+ * throwing hook would turn "no flags here" into a crashed panel. `null` → `false` → no
+ * link, i.e. it fails CLOSED.
+ */
+function EmptyActivity() {
+  const canSeeStore = hasAppsStoreAccess(useOptionalFeatureFlags());
+  return (
+    <Center py="md">
+      <Stack align="center" gap="xs">
+        <IconHistory size={28} opacity={0.5} />
+        <Text size="sm" c="dimmed" ta="center" maw={420}>
+          No activity yet. This feed populates whenever an app runs a generation, calls a
+          scope-gated Civitai API, or sources a Buzz purchase on your behalf.
+        </Text>
+        {canSeeStore && (
+          <Anchor
+            component={Link}
+            href={APPS_STORE_HREF}
+            size="sm"
+            data-testid="apps-empty-marketplace-link"
+          >
+            Browse the marketplace
+          </Anchor>
+        )}
+      </Stack>
+    </Center>
+  );
+}

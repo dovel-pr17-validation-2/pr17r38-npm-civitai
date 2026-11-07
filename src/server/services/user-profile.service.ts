@@ -1,0 +1,621 @@
+import { Prisma } from '@prisma/client';
+import { dbRead, dbWrite } from '~/server/db/client';
+import type { EventViewer } from '~/server/events/event-access';
+import { withoutHiddenEventDecorations } from '~/server/events/event-decoration-access';
+import { kyselyWrite } from '~/server/db/kyselyDb';
+import { FLIPT_FEATURE_FLAGS, isFlipt } from '~/server/flipt/client';
+import {
+  readUserWithProfileViaKysely,
+  readUserWithProfileViaPrisma,
+} from '~/server/services/hot-reads-9.reads';
+import type {
+  GetUserProfileSchema,
+  PrivacySettingsSchema,
+  ProfileSectionSchema,
+  SetShowcaseSectionsSchema,
+  ShowcaseItemSchema,
+  ShowcaseSectionSchema,
+  UserProfileUpdateSchema,
+} from '~/server/schema/user-profile.schema';
+import {
+  customShowcaseKey,
+  customShowcaseKeyPrefix,
+  showcaseSectionTypes,
+} from '~/server/schema/user-profile.schema';
+import type { ImageMetaProps } from '~/server/schema/image.schema';
+import { ImageIngestionStatus } from '~/shared/utils/prisma/enums';
+import { isDefined } from '~/utils/type-guards';
+import { enqueueImageIngestion } from '~/server/services/image.service';
+import type { UserMeta } from '~/server/schema/user.schema';
+import { getUserBanDetails } from '~/utils/user-helpers';
+import { sanitizeProvenance } from '~/server/services/orchestrator/remix-provenance';
+import { pickClientImageColumns } from '~/server/utils/image-columns';
+import {
+  assertClientImageUrlsUsable,
+  assertClientKeysIssuedToCaller,
+} from '~/server/services/image-url-ownership';
+import {
+  throwAuthorizationError,
+  throwBadRequestError,
+  throwNotFoundError,
+} from '~/server/utils/errorHandling';
+import {
+  getUserContentOverview as getUserContentOverviewFromCache,
+  getUserContentOverviewPublic as getUserContentOverviewPublicFromCache,
+  getUserContentOverviewSfw as getUserContentOverviewSfwFromCache,
+} from '~/server/redis/caches';
+import { userUpdateCounter } from '~/server/prom/client';
+import { usersSearchIndex } from '~/server/search-index';
+import { SearchIndexUpdateQueueAction } from '~/server/common/enums';
+import type { ColorDomain } from '~/shared/constants/domain.constants';
+import { throwOnBlockedUserContent } from '~/server/services/blocklist.service';
+import { queueScamScan } from '~/server/services/text-scan/scam-scan-queue';
+
+export type UserContentOverviewVariant = 'public' | 'sfw' | 'all';
+
+export const getUserContentOverview = async ({
+  username,
+  userId,
+  variant = 'all',
+}: {
+  username?: string;
+  userId?: number;
+  variant?: UserContentOverviewVariant;
+}) => {
+  if (!username && !userId) {
+    throwBadRequestError('Either username or id must be provided');
+  }
+
+  if (!userId) {
+    const user = await dbWrite.user.findUnique({
+      where: { username },
+      select: { id: true },
+    });
+
+    if (!user) {
+      throw throwNotFoundError('User not found');
+    }
+
+    userId = user.id;
+  }
+
+  const fetchFn =
+    variant === 'public'
+      ? getUserContentOverviewPublicFromCache
+      : variant === 'sfw'
+      ? getUserContentOverviewSfwFromCache
+      : getUserContentOverviewFromCache;
+  const data = await fetchFn([userId]);
+  return data[userId];
+};
+
+/**
+ * `domain` selects which stored variant of the split profile fields (cover image /
+ * announcement / bio) the caller sees. The check must stay green vs. not-green:
+ * `civitai.red` is configured as blue's primary too, so the request's resolved color
+ * is `blue` there and a `domain === 'red'` check would never fire in production.
+ */
+export const getUserWithProfile = async ({
+  username,
+  id,
+  isModerator,
+  sessionUserId,
+  eventViewer = { id: sessionUserId, isModerator },
+  domain,
+}: GetUserProfileSchema & {
+  isModerator?: boolean;
+  sessionUserId?: number;
+  /** Who the event preview gate is asked about; the request's `eventViewerOf` where there is one. */
+  eventViewer?: EventViewer;
+  domain?: ColorDomain;
+}) => {
+  // Use write to get the latest most accurate user here since we'll need to create the profile
+  // if it doesn't exist.
+  if (!username && !id) {
+    throwBadRequestError('Either username or id must be provided');
+  }
+  const viaKysely = await isFlipt(FLIPT_FEATURE_FLAGS.KYSELY_HOT_READS_9);
+  const getUser = async () => {
+    const user = viaKysely
+      ? await readUserWithProfileViaKysely(kyselyWrite, { id, username })
+      : await readUserWithProfileViaPrisma(dbWrite, { id, username });
+
+    // Becuase this is a view, it might be slow and we prefer to get the stats in a separate query
+    // Ideally, using dbRead.
+    const stats = await dbRead.userStat.findFirst({
+      where: {
+        userId: user.id,
+      },
+      select: {
+        downloadCountAllTime: true,
+        thumbsUpCountAllTime: true,
+        followerCountAllTime: true,
+        reactionCountAllTime: true,
+        uploadCountAllTime: true,
+        generationCountAllTime: true,
+      },
+    });
+
+    const { profile } = user;
+    const userMeta = (user.meta ?? {}) as UserMeta;
+    const sameUser = sessionUserId === user.id;
+    const canEdit = !!isModerator || sameUser;
+
+    const shapeCoverImage = (coverImage: NonNullable<typeof profile>['coverImage']) => {
+      if (!coverImage) return null;
+      const needsReview =
+        coverImage.needsReview || coverImage.ingestion === ImageIngestionStatus.Blocked;
+      if (needsReview && !canEdit) return null;
+
+      return {
+        ...coverImage,
+        meta: coverImage.meta as ImageMetaProps | null,
+        metadata: coverImage.metadata as MixedObject,
+        tags: coverImage.tags.map((t) => t.tag),
+      };
+    };
+
+    const defaultCoverImage = shapeCoverImage(profile?.coverImage ?? null);
+    const sfwCoverImage = shapeCoverImage(profile?.sfwCoverImage ?? null);
+
+    const green = domain === 'green';
+    const useSfwBio = green && profile?.sfwBio != null;
+    const useSfwMessage = green && profile?.sfwMessage != null;
+    const useSfwCoverImage = green && profile?.sfwCoverImageId != null;
+
+    const creatorShopEnabled =
+      (user.settings as { creatorShop?: { enabled?: boolean } } | null)?.creatorShop?.enabled ===
+      true;
+
+    // Only the fact, never the settings blob. The tab is hidden from visitors
+    // when it is set — the book's own payload refuses the content separately, so
+    // this decides a nav item and nothing else.
+    const stickerBookHidden =
+      (user.settings as { hideStickerBook?: boolean } | null)?.hideStickerBook === true;
+
+    return {
+      ...user,
+      // Claim keys are owner-only; withheld from every other viewer, moderators included.
+      cosmetics: (await withoutHiddenEventDecorations(user.cosmetics, eventViewer)).map((c) => ({
+        ...c,
+        claimKey: sameUser ? c.claimKey : null,
+      })),
+      meta: undefined,
+      // Never leak the private settings blob; expose only whether the shop is public.
+      settings: undefined,
+      creatorShopEnabled,
+      stickerBookHidden,
+      ...getUserBanDetails({
+        meta: userMeta,
+        isModerator: isModerator ?? false,
+      }),
+      stats: stats,
+      profile: {
+        ...profile,
+        privacySettings: (profile?.privacySettings ?? {}) as PrivacySettingsSchema,
+        profileSectionsSettings: (profile?.profileSectionsSettings ?? []) as ProfileSectionSchema[],
+        showcaseItems: (profile?.showcaseItems ?? []) as ShowcaseItemSchema[],
+        showcaseSections: (profile?.showcaseSections ?? []) as ShowcaseSectionSchema[],
+        bio: (useSfwBio ? profile?.sfwBio : profile?.bio) ?? null,
+        message: (useSfwMessage ? profile?.sfwMessage : profile?.message) ?? null,
+        messageAddedAt:
+          (useSfwMessage ? profile?.sfwMessageAddedAt : profile?.messageAddedAt) ?? null,
+        coverImageId: (useSfwCoverImage ? profile?.sfwCoverImageId : profile?.coverImageId) ?? null,
+        coverImage: useSfwCoverImage ? sfwCoverImage : defaultCoverImage,
+        // Both stored variants, for the profile editor only. A visitor on the green
+        // domain must never receive the mature copy it is being shown instead of.
+        defaultBio: canEdit ? profile?.bio ?? null : null,
+        defaultMessage: canEdit ? profile?.message ?? null : null,
+        defaultMessageAddedAt: canEdit ? profile?.messageAddedAt ?? null : null,
+        defaultCoverImage: canEdit ? defaultCoverImage : null,
+        sfwBio: canEdit ? profile?.sfwBio ?? null : null,
+        sfwMessage: canEdit ? profile?.sfwMessage ?? null : null,
+        sfwMessageAddedAt: canEdit ? profile?.sfwMessageAddedAt ?? null : null,
+        sfwCoverImageId: canEdit ? profile?.sfwCoverImageId ?? null : null,
+        sfwCoverImage: canEdit ? sfwCoverImage : null,
+      },
+    };
+  };
+
+  const user = await getUser();
+
+  if (!user.profile?.userId) {
+    // First time visit to this user's profile. Create base profile:
+    await dbWrite.userProfile.upsert({
+      where: { userId: user.id },
+      create: {
+        userId: user.id,
+      },
+      // Basically we wanna avoid a
+      // racing condition where 2 users landed here and trigger
+      // this at the same time.
+      update: {},
+      select: { userId: true },
+    });
+
+    return getUser();
+  }
+
+  return user;
+};
+
+const isSameShowcaseItem = (a: ShowcaseItemSchema, b: ShowcaseItemSchema) =>
+  a.entityType === b.entityType && a.entityId === b.entityId;
+
+// Items already on the stored showcase are not re-checked: a model can be transferred away after
+// it was showcased, and refusing it would make the whole profile form unsaveable.
+export const assertShowcaseItemsOwned = async ({
+  userId,
+  isModerator,
+  showcaseItems,
+  currentShowcaseItems,
+  allowedTypes = ['Model', 'Image'],
+}: {
+  userId: number;
+  isModerator?: boolean;
+  showcaseItems: ShowcaseItemSchema[];
+  currentShowcaseItems: ShowcaseItemSchema[];
+  allowedTypes?: ShowcaseItemSchema['entityType'][];
+}) => {
+  const addedItems = showcaseItems.filter(
+    (item) => !currentShowcaseItems.some((current) => isSameShowcaseItem(current, item))
+  );
+  if (!addedItems.length) return;
+
+  if (addedItems.some((item) => !allowedTypes.includes(item.entityType)))
+    throw throwBadRequestError(`Only ${allowedTypes.join(', ')} items can be added to a showcase`);
+
+  if (isModerator) return;
+
+  const idsOf = (entityType: ShowcaseItemSchema['entityType']) => [
+    ...new Set(
+      addedItems.filter((item) => item.entityType === entityType).map((item) => item.entityId)
+    ),
+  ];
+  const imageIds = idsOf('Image');
+  const modelIds = idsOf('Model');
+  const articleIds = idsOf('Article');
+
+  // Primary, not replica: an image posted moments ago is the one most likely to be showcased.
+  const [ownedImages, ownedModels, ownedArticles] = await Promise.all([
+    imageIds.length
+      ? dbWrite.image.findMany({ where: { id: { in: imageIds }, userId }, select: { id: true } })
+      : [],
+    modelIds.length
+      ? dbWrite.model.findMany({ where: { id: { in: modelIds }, userId }, select: { id: true } })
+      : [],
+    articleIds.length
+      ? dbWrite.article.findMany({
+          where: { id: { in: articleIds }, userId },
+          select: { id: true },
+        })
+      : [],
+  ]);
+
+  if (
+    ownedImages.length !== imageIds.length ||
+    ownedModels.length !== modelIds.length ||
+    ownedArticles.length !== articleIds.length
+  )
+    throw throwAuthorizationError('You can only add your own content to your showcase');
+};
+
+const toShowcaseItems = (sections: ShowcaseSectionSchema[]): ShowcaseItemSchema[] =>
+  sections.flatMap(({ type, items }) => items.map((entityId) => ({ entityType: type, entityId })));
+
+export const setShowcaseSections = async ({
+  userId,
+  sections,
+}: SetShowcaseSectionsSchema & { userId: number }) => {
+  await throwOnBlockedUserContent(
+    sections.flatMap(({ title, button }) => [title, button?.label, button?.url]),
+    { surface: 'userProfile' }
+  );
+
+  const current = await dbWrite.userProfile.upsert({
+    where: { userId },
+    create: { userId },
+    update: {},
+    select: { showcaseSections: true },
+  });
+
+  // No moderator exemption: every item a save adds must be the saver's own. An item already
+  // stored stays even if it has since changed owner.
+  await assertShowcaseItemsOwned({
+    userId,
+    showcaseItems: toShowcaseItems(sections),
+    currentShowcaseItems: toShowcaseItems(
+      (current.showcaseSections ?? []) as ShowcaseSectionSchema[]
+    ),
+    allowedTypes: [...showcaseSectionTypes],
+  });
+
+  const updated = await dbWrite.userProfile.update({
+    where: { userId },
+    data: { showcaseSections: sections },
+    select: { showcaseSections: true },
+  });
+  // Every save. scanEntity skips the submit when the profile's combined text hashes the same as
+  // its last successful scan, or as one still in flight.
+  queueScamScan({ entityType: 'UserProfile', entityId: userId });
+
+  return updated.showcaseSections as ShowcaseSectionSchema[];
+};
+
+export const updateUserProfile = async ({
+  // profileImage,
+  isModerator,
+  socialLinks,
+  sponsorshipLinks,
+  // badgeId,
+  // nameplateId,
+  userId,
+  coverImage,
+  sfwCoverImage,
+  // leaderboardShowcase,
+  // profilePicture,
+  creatorCardStatsPreferences,
+  domain,
+  sessionUserId,
+  ...profile
+}: UserProfileUpdateSchema & {
+  userId: number;
+  isModerator?: boolean;
+  domain?: ColorDomain;
+  /** Who saved it: a moderator may save another user's profile, and is answered as a viewer. */
+  sessionUserId: number;
+}) => {
+  // Both domain variants, not just the field being edited: the SFW override and the field it
+  // overrides are independently writable and independently rendered, so checking one leaves the
+  // other as an unchecked way to put the same text on a profile page.
+  //
+  // 🔴 `isModerator` is load-bearing here, not decoration. `updateUserProfileHandler` routes a
+  // moderator to ANOTHER user's profile, and this form round-trips every stored field — so
+  // without it, a moderator clearing a spam bio is refused over a field they were not editing,
+  // and no path through this service can clear it. The guard would block the cleanup it exists
+  // to prompt.
+  await throwOnBlockedUserContent(
+    [
+      profile.bio,
+      profile.sfwBio,
+      profile.message,
+      profile.sfwMessage,
+      profile.location,
+      ...(socialLinks?.map((link) => link.url) ?? []),
+      ...(sponsorshipLinks?.map((link) => link.url) ?? []),
+    ],
+    { isModerator, surface: 'userProfile' }
+  );
+
+  // `sessionUserId` is what populates the `default*`/`sfw*` fields compared below — they are
+  // withheld from anyone who can't edit the profile. Drop it and both read back null, so every
+  // save looks like a changed announcement and re-stamps `messageAddedAt`.
+  const current = await getUserWithProfile({ id: userId, sessionUserId: userId }); // Ensures user exists && has a profile record.
+
+  // A `custom:<id>` row only places a section that exists. A user who never had the flag has
+  // none, so none of their rows survive.
+  if (profile.profileSectionsSettings) {
+    const sectionKeys = new Set(
+      ((current.profile?.showcaseSections ?? []) as ShowcaseSectionSchema[]).map((s) =>
+        customShowcaseKey(s.id)
+      )
+    );
+    profile.profileSectionsSettings = profile.profileSectionsSettings.filter(
+      ({ key }) => !key.startsWith(customShowcaseKeyPrefix) || sectionKeys.has(key as never)
+    );
+  }
+
+  if (profile.showcaseItems)
+    await assertShowcaseItemsOwned({
+      userId,
+      isModerator,
+      showcaseItems: profile.showcaseItems,
+      currentShowcaseItems: (current.profile?.showcaseItems ?? []) as ShowcaseItemSchema[],
+    });
+
+  // A cover with no `id` is created from its client url below. Checked before any write, so a
+  // refused cover leaves the whole save unapplied.
+  const newCoverUrls = [coverImage, sfwCoverImage].map((image) =>
+    image && !image.id ? image.url : null
+  );
+  await assertClientImageUrlsUsable({ urls: newCoverUrls, userId });
+  await assertClientKeysIssuedToCaller({
+    urls: newCoverUrls,
+    userId,
+    alsoIssuedTo: sessionUserId,
+  });
+
+  // We can safely update creatorCardStatsPreferences out of the transaction as it's not critical
+  if (creatorCardStatsPreferences) {
+    // Parameterised: the payload is bound, not spliced into a string literal.
+    // `JSON.stringify` escapes `"` and `\` but not `'`, so a preference value holding an
+    // apostrophe used to close the literal early and corrupt the statement — the write
+    // then failed instead of being stored. `creatorCardStatsPreferences` is
+    // `z.array(z.string()).max(3)` on `userProfileUpdateSchema`, so the strings arrive
+    // here exactly as the caller sent them.
+    await dbWrite.$executeRaw`
+        UPDATE "User"
+        SET "publicSettings" = jsonb_set(
+          "publicSettings",
+          '{creatorCardStatsPreferences}',
+          ${JSON.stringify(creatorCardStatsPreferences)}::jsonb
+        )
+        WHERE "id" = ${userId}`;
+
+    userUpdateCounter?.inc({ location: 'user-profile.service:updateProfile' });
+  }
+
+  const buildCoverImageUpdate = (image: UserProfileUpdateSchema['coverImage']) =>
+    image !== undefined && !image?.id
+      ? image === null
+        ? { disconnect: true }
+        : {
+            connectOrCreate: {
+              where: { id: image.id ?? -1 },
+              create: {
+                ...pickClientImageColumns(image),
+                meta:
+                  (sanitizeProvenance(image?.meta as Record<string, unknown> | null | undefined) as
+                    | Prisma.JsonObject
+                    | undefined) ?? Prisma.JsonNull,
+                metadata: { coverImage: true, userId },
+                userId,
+                resources: undefined,
+              },
+            },
+          }
+      : undefined;
+
+  const updatedCoverImages = await dbWrite.$transaction(
+    async (tx) => {
+      // const shouldUpdateCosmetics = badgeId !== undefined || nameplateId !== undefined;
+      // const payloadCosmeticIds: number[] = [];
+
+      // if (badgeId) payloadCosmeticIds.push(badgeId);
+      // if (nameplateId) payloadCosmeticIds.push(nameplateId);
+
+      // const shouldUpdateUser = shouldUpdateCosmetics || profileImage || leaderboardShowcase;
+
+      // if (shouldUpdateUser) {
+      //   await tx.user.update({
+      //     where: {
+      //       id: userId,
+      //     },
+      //     data: {
+      //       image: profileImage,
+      //       leaderboardShowcase,
+      //       profilePicture:
+      //         profilePicture === null
+      //           ? { delete: true }
+      //           : profilePicture
+      //           ? {
+      //               delete: true,
+      //               upsert: {
+      //                 where: { id: profilePicture.id },
+      //                 update: {
+      //                   ...profilePicture,
+      //                   userId,
+      //                 },
+      //                 create: {
+      //                   ...profilePicture,
+      //                   userId,
+      //                 },
+      //               },
+      //             }
+      //           : undefined,
+      //     },
+      //   });
+
+      //   if (shouldUpdateCosmetics) await equipCosmetic({ userId, cosmeticId: payloadCosmeticIds });
+
+      //   if (leaderboardShowcase !== undefined) {
+      //     await updateLeaderboardRank({ userIds: userId });
+      //   }
+      // }
+
+      const links = [...(socialLinks ?? []), ...(sponsorshipLinks ?? [])];
+
+      if (socialLinks !== undefined || sponsorshipLinks !== undefined) {
+        await tx.userLink.deleteMany({
+          where: {
+            userId,
+            id: {
+              not: {
+                in: links.map((l) => l.id).filter(isDefined),
+              },
+            },
+          },
+        });
+
+        const parsed = links.map(({ url, id, type }) => ({
+          type,
+          url,
+          userId,
+          id,
+        }));
+
+        const toCreate = parsed.filter((x) => !x.id);
+        const toUpdate = parsed.filter((x) => !!x.id);
+
+        if (toCreate.length) {
+          await tx.userLink.createMany({ data: toCreate });
+        }
+
+        if (toUpdate.length) {
+          await Promise.all(
+            toUpdate.map(
+              async (userLink) =>
+                await tx.userLink.updateMany({
+                  where: { id: userLink.id },
+                  data: userLink,
+                })
+            )
+          );
+        }
+      }
+
+      const updatedProfile = await tx.userProfile.update({
+        select: {
+          userId: true,
+          coverImage: { select: { id: true, url: true, ingestion: true, type: true } },
+          sfwCoverImage: { select: { id: true, url: true, ingestion: true, type: true } },
+        },
+        where: { userId },
+        data: {
+          ...profile,
+          messageAddedAt:
+            profile.message === undefined || profile.message === current?.profile?.defaultMessage
+              ? undefined
+              : profile.message
+              ? new Date()
+              : null,
+          sfwMessageAddedAt:
+            profile.sfwMessage === undefined || profile.sfwMessage === current?.profile?.sfwMessage
+              ? undefined
+              : profile.sfwMessage
+              ? new Date()
+              : null,
+          coverImage: buildCoverImageUpdate(coverImage),
+          sfwCoverImage: buildCoverImageUpdate(sfwCoverImage),
+        },
+      });
+
+      return updatedProfile;
+    },
+    {
+      timeout: 15000,
+    }
+  );
+
+  // Ingest the cover image AFTER the transaction commits. ingestImage makes a
+  // blocking external HTTP call to the image scanner; keeping it inside the
+  // interactive transaction held the txn open past its 15s timeout whenever the
+  // scanner was slow ("Transaction already closed: a commit cannot be executed
+  // on an expired transaction"). Ingestion only needs the committed Image row,
+  // not transactional atomicity with the profile write.
+  //
+  // Fire-and-forget on purpose: the profile is already saved, so a scanner
+  // outage must NOT bubble up as "error updating your profile" on a successful
+  // save. Recovery is guaranteed independently — the `trg_image_scan_queue`
+  // trigger enqueues an ImageScan JobQueue row on the Pending insert, which the
+  // `ingest-images` sweeper drains, so the cover image still gets scanned even
+  // if this inline enqueue fails.
+  const pendingCoverImages = [updatedCoverImages.coverImage, updatedCoverImages.sfwCoverImage]
+    .filter(isDefined)
+    .filter((image) => image.ingestion === ImageIngestionStatus.Pending);
+  if (pendingCoverImages.length) {
+    enqueueImageIngestion({
+      images: pendingCoverImages,
+      name: 'user-profile-cover-ingest',
+      userId,
+    });
+  }
+
+  await usersSearchIndex.queueUpdate([{ id: userId, action: SearchIndexUpdateQueueAction.Update }]);
+  if (
+    [profile.bio, profile.message, profile.sfwBio, profile.sfwMessage].some((v) => v !== undefined)
+  )
+    queueScamScan({ entityType: 'UserProfile', entityId: userId });
+
+  return getUserWithProfile({ id: userId, sessionUserId, domain });
+};

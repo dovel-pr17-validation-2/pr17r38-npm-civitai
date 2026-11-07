@@ -1,0 +1,701 @@
+import * as z from 'zod';
+import { banReasonDetails } from '~/server/common/constants';
+import { BanReasonCode, OnboardingSteps } from '~/server/common/enums';
+import { getAllQuerySchema, paginationSchema } from '~/server/schema/base.schema';
+import { userSettingsChat } from '~/server/schema/chat.schema';
+import type { ModelGallerySettingsSchema } from '~/server/schema/model.schema';
+// import { modelGallerySettingsSchema } from '~/server/schema/model.schema';
+import { featureFlagKeys, userTiers } from '~/server/services/feature-flags.service';
+import { allBrowsingLevelsFlag } from '~/shared/constants/browsingLevel.constants';
+import { NAV_KEYS } from '~/shared/constants/nav.constants';
+import {
+  USER_MENU_BADGE_ITEM_IDS,
+  USER_MENU_ITEM_IDS,
+} from '~/shared/constants/user-menu.constants';
+import {
+  ArticleEngagementType,
+  BountyEngagementType,
+  MediaType,
+  ModelEngagementType,
+  TagEngagementType,
+} from '~/shared/utils/prisma/enums';
+import {
+  usernameSchema,
+  USERNAME_MAX_LENGTH,
+  USERNAME_MIN_LENGTH,
+} from '~/shared/zod/username.schema';
+import { removeEmpty } from '~/utils/object-helpers';
+import { postgresSlugify } from '~/utils/string-helpers';
+import { stripBlockProvenanceMetadata } from '~/shared/utils/block-provenance-metadata';
+import { remixAppSlugSchema } from '~/shared/remix-apps/row.schema';
+import { REMIX_PINS_MAX } from '~/shared/remix-apps/menu';
+import {
+  commaDelimitedEnumArray,
+  commaDelimitedNumberArray,
+  numericString,
+} from '~/utils/zod-helpers';
+import { HIDDEN_APP_SLUG_MAX, HIDDEN_APPS_MAX } from '~/shared/utils/my-apps-hidden';
+
+export const userTierSchema = z.enum(userTiers);
+export type UserTier = z.infer<typeof userTierSchema>;
+
+export const userSubscriptionByBuzzTypeSchema = z.object({
+  tier: userTierSchema,
+  isMember: z.boolean(),
+  subscriptionId: z.string(),
+  status: z.string(),
+});
+
+export type UserSubscriptionByBuzzType = z.infer<typeof userSubscriptionByBuzzTypeSchema>;
+
+export const userSubscriptionsByBuzzTypeSchema = z.record(
+  z.string(),
+  userSubscriptionByBuzzTypeSchema
+);
+
+export type UserSubscriptionsByBuzzType = z.infer<typeof userSubscriptionsByBuzzTypeSchema>;
+
+export const userPageQuerySchema = z
+  .object({
+    username: z.string(),
+    id: numericString().optional(),
+  })
+  .transform((props) => {
+    // we're doing this to handle edge cases where a user hasn't finished onboarding and don't have a username
+    // when a user doesn't have a username, the url becomes `/user/null?id`
+    const username = !props.id ? postgresSlugify(props.username) : undefined;
+    return removeEmpty({ ...props, username });
+  });
+
+export const usernameInputSchema = usernameSchema
+  .min(USERNAME_MIN_LENGTH, `Your username must be at least ${USERNAME_MIN_LENGTH} characters long`)
+  .max(USERNAME_MAX_LENGTH, `Your username must be at most ${USERNAME_MAX_LENGTH} characters long`)
+  .transform((v) => v.trim());
+
+export const getUserByUsernameSchema = z.object({
+  username: usernameSchema.optional(),
+  id: z.number().optional(),
+  leaderboardId: z.string().optional(),
+});
+
+export type GetUserByUsernameSchema = z.infer<typeof getUserByUsernameSchema>;
+
+export const getAllUsersInput = getAllQuerySchema
+  .extend({
+    email: z.string(),
+    ids: commaDelimitedNumberArray(),
+    include: commaDelimitedEnumArray(['status', 'avatar']).default([]),
+    excludedUserIds: z.array(z.number()).optional(),
+    contestBanned: z.boolean().optional(),
+  })
+  .partial();
+export type GetAllUsersInput = z.infer<typeof getAllUsersInput>;
+
+export const profilePictureSchema = z.object({
+  id: z.number().optional(),
+  name: z.string().nullish(),
+  url: z
+    .url()
+    .or(z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)),
+  hash: z.string().nullish(),
+  height: z.number().nullish(),
+  width: z.number().nullish(),
+  sizeKB: z.number().optional(),
+  mimeType: z.string().optional(),
+  metadata: z
+    .looseObject({})
+    .transform((metadata) => stripBlockProvenanceMetadata(metadata))
+    .optional(),
+  type: z.enum(MediaType).default(MediaType.image),
+});
+
+export const creatorCardStatsPreferences = z.array(z.string()).max(3);
+
+export type UserPublicSettingsSchema = z.infer<typeof userPublicSettingsSchema>;
+export const userPublicSettingsSchema = z.object({
+  creatorCardStatsPreferences: creatorCardStatsPreferences.optional(),
+});
+
+export const userUpdateSchema = z.object({
+  id: z.number(),
+  username: usernameInputSchema.optional(),
+  // showNsfw: z.boolean().optional(),
+  // blurNsfw: z.boolean().optional(),
+  // browsingLevel: z.number().min(0).max(allBrowsingLevelsFlag).optional(),
+  email: z.string().email().optional(),
+  image: z.string().nullish(),
+  profilePicture: profilePictureSchema.nullish(),
+  badgeId: z.number().nullish(),
+  nameplateId: z.number().nullish(),
+  profileDecorationId: z.number().nullish(),
+  profileBackgroundId: z.number().nullish(),
+  cardDecorationId: z.number().nullish(),
+  autoplayGifs: z.boolean().optional(),
+  filePreferences: z
+    .object({
+      format: z.string().optional(),
+      size: z.string().optional(),
+      fp: z.string().optional(),
+      // Accepted but unread: the media-quality control is gone, and a cached client still
+      // sending its stored value must not 400 the whole preferences save.
+      imageFormat: z.string().optional(),
+      quantType: z.string().max(64).optional(),
+    })
+    .optional(),
+  leaderboardShowcase: z.string().nullish(),
+  userReferralCode: z.string().optional(),
+  source: z.string().optional(),
+  landingPage: z.string().optional(),
+});
+export type UserUpdateInput = z.input<typeof userUpdateSchema>;
+
+export const updateBrowsingModeSchema = z.object({
+  showNsfw: z.boolean().optional(),
+  blurNsfw: z.boolean().optional(),
+  browsingLevel: z.number().min(0).max(allBrowsingLevelsFlag).optional(),
+});
+
+export const toggleFavoriteInput = z.object({
+  modelId: z.number(),
+  modelVersionId: z.number().optional(),
+  setTo: z.boolean(),
+});
+export type ToggleFavoriteInput = z.infer<typeof toggleFavoriteInput>;
+
+export const toggleModelEngagementInput = z.object({
+  modelId: z.number(),
+  type: z.enum(ModelEngagementType).optional(),
+  // Explicit toggle direction. When provided, the server sets the engagement to
+  // exactly this state (subscribe vs unsubscribe) instead of blind-toggling off
+  // the current row — so a caller acting on a stale/errored/fabricated client
+  // view can never fire the OPPOSITE of the user's intent (e.g. silently DELETE
+  // a genuinely-ON Notify because the client briefly read it as off). Optional
+  // for backward-compat: absent → legacy blind toggle.
+  setTo: z.boolean().optional(),
+});
+export type ToggleModelEngagementInput = z.infer<typeof toggleModelEngagementInput>;
+
+// Per-visible-set engagement membership. Bounded (max 200) so the response is small +
+// index-scannable — the additive replacement for the unbounded `getEngagedModels`, which
+// returns a user's ENTIRE engagement history (a whale's 3.75 MB / 482 ms serialize froze
+// an api-primary pod). Reject (do not truncate) over-cap so callers can't silently widen it.
+export const getEngagedModelsByIdsSchema = z.object({
+  modelIds: z.array(z.number()).min(1).max(200),
+});
+export type GetEngagedModelsByIdsInput = z.infer<typeof getEngagedModelsByIdsSchema>;
+
+export const toggleFollowUserSchema = z.object({
+  targetUserId: z.number(),
+  username: usernameSchema.nullable().optional(),
+});
+export type ToggleFollowUserSchema = z.infer<typeof toggleFollowUserSchema>;
+
+export const getUserTagsSchema = z.object({ type: z.enum(TagEngagementType) });
+export type GetUserTagsSchema = z.infer<typeof getUserTagsSchema>;
+
+export const toggleBlockedTagSchema = z.object({ tagId: z.number() });
+export type ToggleBlockedTagSchema = z.infer<typeof toggleBlockedTagSchema>;
+
+export const batchBlockTagsSchema = z.object({ tagIds: z.array(z.number()) });
+export type BatchBlockTagsSchema = z.infer<typeof batchBlockTagsSchema>;
+
+export const getByUsernameSchema = z.object({ username: usernameSchema });
+
+export const getUsageLimitsSchema = z
+  .object({ ids: z.array(z.string().max(64)).max(20).optional() })
+  .optional();
+export type GetByUsernameSchema = z.infer<typeof getByUsernameSchema>;
+
+export const getUserListSchema = paginationSchema.extend({
+  username: usernameSchema,
+  type: z.enum(['following', 'followers', 'hidden', 'blocked']),
+});
+export type GetUserListSchema = z.infer<typeof getUserListSchema>;
+
+export type DeleteUserInput = z.infer<typeof deleteUserSchema>;
+export const deleteUserSchema = z.object({
+  id: z.number(),
+  username: usernameSchema.optional(),
+  removeModels: z.boolean().optional(),
+  removeImages: z.boolean().optional(),
+  /** Also delete the account's App Blocks document-store data (`remove-deleted-account-app-data`). */
+  removeAppData: z.boolean().optional(),
+});
+
+export type RestoreUserInput = z.infer<typeof restoreUserSchema>;
+export const restoreUserSchema = z.object({
+  id: z.number(),
+  username: usernameSchema,
+  email: z.string().email(),
+  restoreModels: z.boolean().optional(),
+});
+
+export type GetUserCosmeticsSchema = z.infer<typeof getUserCosmeticsSchema>;
+export const getUserCosmeticsSchema = z.object({
+  equipped: z.boolean().optional(),
+});
+
+export type GetUserArticleEngagementsInput = z.infer<typeof getUserArticleEngagementsSchema>;
+export const getUserArticleEngagementsSchema = z.object({
+  type: z.enum(ArticleEngagementType),
+});
+
+export type ToggleUserArticleEngagementsInput = z.infer<typeof toggleUserArticleEngagementSchema>;
+export const toggleUserArticleEngagementSchema = getUserArticleEngagementsSchema.extend({
+  articleId: z.number(),
+});
+
+export type GetUserBountyEngagementsInput = z.infer<typeof getUserBountyEngagementsSchema>;
+export const getUserBountyEngagementsSchema = z.object({
+  type: z.enum(BountyEngagementType),
+});
+
+export type ToggleUserBountyEngagementsInput = z.infer<typeof toggleUserBountyEngagementSchema>;
+export const toggleUserBountyEngagementSchema = getUserBountyEngagementsSchema.extend({
+  bountyId: z.number(),
+});
+
+const prohibitedSources = z.enum(['Regex', 'External']);
+export type ProhibitedSources = z.infer<typeof prohibitedSources>;
+export type ReportProhibitedRequestInput = z.infer<typeof reportProhibitedRequestSchema>;
+export const reportProhibitedRequestSchema = z.object({
+  prompt: z.string().optional(),
+  negativePrompt: z.string().optional(),
+  source: prohibitedSources.optional(),
+});
+
+export const userByReferralCodeSchema = z.object({ userReferralCode: z.string().min(3) });
+export type UserByReferralCodeSchema = z.infer<typeof userByReferralCodeSchema>;
+
+export type TourSettingsSchema = z.infer<typeof tourSettingsSchema>;
+const tourSettingsSchema = z.record(
+  z.string(),
+  z.object({
+    completed: z.boolean().optional(),
+    currentStep: z.number().optional(),
+    // How the tour ended: `closed` (X/Esc), `skipped`, or `finished` — the last one also
+    // covers a tour forced to finish because its last step's target went missing.
+    reason: z.enum(['finished', 'skipped', 'closed']).optional(),
+  })
+);
+
+const generationSettingsSchema = z.object({
+  advancedMode: z.boolean().optional(),
+});
+
+export const userAssistantPersonality = z.enum(['civbot', 'civchan']);
+export type UserAssistantPersonality = z.infer<typeof userAssistantPersonality>;
+
+export type UserSettingsInput = z.input<typeof userSettingsSchema>;
+export type UserSettingsSchema = z.infer<typeof userSettingsSchema>;
+
+/**
+ * JSON user settings plus the handful of content-preference columns on the
+ * User table that we also expose through `user.getSettings`. These columns
+ * ride the same React Query cache so mutations can patch them in-place and
+ * avoid the stale-session race the JWT/session path is prone to.
+ */
+export type UserContentSettings = UserSettingsSchema & {
+  showNsfw?: boolean;
+  blurNsfw?: boolean;
+  autoplayGifs?: boolean | null;
+};
+const navZone = z.array(z.enum(NAV_KEYS)).max(NAV_KEYS.length);
+
+/**
+ * A user's sub-nav layout. `bar` and `more` are GROUP MEMBERSHIP plus order — every item belongs
+ * to exactly one. `hidden` is visibility and is orthogonal, so an item switched off keeps its
+ * place in its group and comes back where the user left it.
+ *
+ * Bounded deliberately. This rides `User.settings`, which is Redis-cached per user and serialised
+ * into the HTML of every logged-in SSR render, so an unbounded user-writable array here is an
+ * amplification on the hot render path rather than a private preference.
+ */
+export type NavigationSettingsSchema = z.infer<typeof navigationSettingsSchema>;
+export const navigationSettingsSchema = z
+  .object({
+    bar: navZone,
+    more: navZone,
+    hidden: navZone,
+    showLabels: z.boolean().optional(),
+    keepProfileLabels: z.boolean().optional(),
+  })
+  .superRefine((value, ctx) => {
+    // A key in both groups makes "the nearest placed sibling" ambiguous during resolution and
+    // reaches React as a duplicate `key` prop. `hidden` deliberately OVERLAPS the groups — it is
+    // a visibility set, not a third group — so it is only checked against itself.
+    const grouped = [...value.bar, ...value.more];
+    if (new Set(grouped).size !== grouped.length)
+      ctx.addIssue({
+        code: 'custom',
+        message: 'A navigation item cannot appear in more than one group',
+      });
+    if (new Set(value.hidden).size !== value.hidden.length)
+      ctx.addIssue({ code: 'custom', message: 'A navigation item cannot be hidden twice' });
+  });
+
+/**
+ * Bounded and allow-listed for the same reason as
+ * `navigationSettingsSchema`: settings ride every signed-in SSR render. An object, not a bare
+ * array: `splitSettingsPatch` drops a top-level empty array, which would turn "no pins" back into
+ * the defaults.
+ */
+export const userMenuSettingsSchema = z.object({
+  // Absent until the viewer edits their pins, so a viewer who only muted a count keeps following
+  // the default pins.
+  pinned: z
+    .array(z.enum(USER_MENU_ITEM_IDS))
+    .max(USER_MENU_ITEM_IDS.length)
+    .refine((ids) => new Set(ids).size === ids.length, 'An item cannot be pinned twice')
+    .optional(),
+  // Absent for everyone who never muted a count: every count counts.
+  mutedBadges: z
+    .array(z.enum(USER_MENU_BADGE_ITEM_IDS))
+    .max(USER_MENU_BADGE_ITEM_IDS.length)
+    .refine((ids) => new Set(ids).size === ids.length, 'A count cannot be muted twice')
+    .optional(),
+});
+
+/** An object for the same reason as `userMenuSettingsSchema`: an empty pin list must survive. */
+export const remixAppsSettingsSchema = z.object({
+  pinned: z
+    .array(remixAppSlugSchema)
+    .max(REMIX_PINS_MAX)
+    .refine((slugs) => new Set(slugs).size === slugs.length, 'An app cannot be pinned twice'),
+});
+
+/** `hiddenApps` — see the key in `userSettingsSchema`. */
+export const hiddenAppsSettingSchema = z
+  .record(z.string().min(1).max(HIDDEN_APP_SLUG_MAX), z.iso.datetime())
+  .refine((m) => Object.keys(m).length <= HIDDEN_APPS_MAX, {
+    message: `At most ${HIDDEN_APPS_MAX} hidden apps`,
+  });
+
+export const userSettingsSchema = z.object({
+  newsletterDialogLastSeenAt: z.coerce.date().nullish(),
+  navigation: navigationSettingsSchema.optional(),
+  userMenu: userMenuSettingsSchema.optional(),
+  remixApps: remixAppsSettingsSchema.optional(),
+  features: z.record(z.string(), z.boolean()).optional(),
+  newsletterSubscriber: z.boolean().optional(),
+  dismissedAlerts: z.array(z.string()).optional(),
+  chat: userSettingsChat.optional(),
+  assistantPersonality: userAssistantPersonality.optional(),
+  airEmail: z.email().optional(),
+  creatorsProgramCodeOfConductAccepted: z.union([z.boolean(), z.date()]).optional(),
+  cosmeticStoreLastViewed: z.coerce.date().nullish(),
+  allowAds: z.boolean().optional(),
+  disableHidden: z.boolean().optional(),
+  // Opt-in: receive in-progress features ahead of general release. Unlike every
+  // other key here this one is PROJECTED ONTO THE SESSION (auth hub
+  // `shapeSessionUser` → `SessionUser.isEarlyAdopter` → `buildFliptContext`), so
+  // Flipt can segment on it. That projection is cached, which is why the write
+  // path re-produces the session on CHANGE — see `setUserSettingHandler`.
+  isEarlyAdopter: z.boolean().optional(),
+  // Opt-in: horizontal drag on multi-image gallery post cards. Off by default —
+  // the feed mounts hundreds of cards and each one costs an embla engine.
+  swipeGalleryCards: z.boolean().optional(),
+  // Web-push soft-ask dismissals. Server-side, not localStorage — a cache clear must not re-nag
+  // the same person. Re-ask cadence and lifetime cap are enforced client-side in PushSoftAsk.
+  pushPromptDismissedCount: z.number().optional(),
+  pushPromptDismissedAt: z.coerce.date().nullish(),
+  // Opt-in: leave blue buzz out of the header badge, which otherwise adds blue and the domain's
+  // main type into one number. Blue is granted and non-transferable, so a creator watching what
+  // they hold is reading one of the two, not the sum. NOT a filter for earned buzz — yellow and
+  // green are `purchasable`, so the remaining balance still mixes earned and bought.
+  hideBlueBuzzInHeader: z.boolean().optional(),
+  fitPostImagesToScreen: z.boolean().optional(),
+  hideFromCreatorShowcase: z.boolean().optional(),
+  // Opt-out: leave me out of every "who reacted" / "who collected" list shown to someone else (image and
+  // comment reactions, Creator Studio). Counts still include me. Filtered in SQL via HIDE_FROM_REACTION_LISTS_KEY.
+  hideFromReactionLists: z.boolean().optional(),
+  // Opt-in: list my image reactions from before "who reacted" lists launched. Read in SQL via
+  // SHOW_PRE_LAUNCH_REACTIONS_KEY; hideFromReactionLists still wins.
+  showPreLaunchReactions: z.boolean().optional(),
+  // Opt-in, per event name: list me on my team's roster (events/points/roster.ts). The durable record
+  // the Redis roster is rebuilt from; absent means hidden. Written only by event.setRosterOptIn.
+  eventRosterOptIn: z.record(z.string(), z.boolean()).optional(),
+  // Opt-in, per event name: take part in Hat Turf (events/turf). Placing needs it. Written only by
+  // hatTurf.setOptIn.
+  eventTurfOptIn: z.record(z.string(), z.boolean()).optional(),
+  // Per event name: keep Hat Turf off my images (events/turf): no new stickers, and those placed are
+  // neither drawn nor counted while it is true. Written only by hatTurf.setOwnerOff.
+  eventTurfOwnerOff: z.record(z.string(), z.boolean()).optional(),
+  // Per event name: the hat the user picked to show on their avatar (events/showcase-hat.ts); null
+  // or absent means the default, 'off' means none. Written only by event.setShowcaseHat.
+  eventShowcaseHat: z
+    .record(z.string(), z.union([z.number().int(), z.literal('off')]).nullable())
+    .optional(),
+  // "Remove from My apps" on the `/apps` home: listing slug -> ISO time of the removal. An app
+  // stays off the home until it is used after that time (`isHiddenFromHome`,
+  // shared/utils/my-apps-hidden.ts). Written only by appListings.hideMyApp / unhideMyApp, as an
+  // atomic per-slug merge/remove; capped at HIDDEN_APPS_MAX entries, oldest dropped.
+  hiddenApps: hiddenAppsSettingSchema.optional(),
+  // Opt-out: the arrival pop and idle sway on placed stickers. Animation that
+  // never ends is the kind a viewer wants a way out of, and `prefers-reduced-motion`
+  // only covers people who set it at the OS level.
+  disableStickerMotion: z.boolean().optional(),
+  // Creator opt-out: when true, the public donation-goal display (progress + collected
+  // amount) is hidden from non-owner/non-mod viewers on all of this user's models.
+  hideDonationGoals: z.boolean().optional(),
+  // The two sticker book opt-outs. Both absent means a visible book showing the
+  // stickers the creator owns; the rules are in `shared/utils/sticker-book.ts`.
+  hideStickerBook: z.boolean().optional(),
+  hidePurchasedStickers: z.boolean().optional(),
+  // Creator Controls defaults: baseline metric-privacy for all of this user's
+  // models. Effective only while the user holds a valid Creator Program
+  // membership (see server/utils/model-metric-privacy.ts).
+  hideModelBuzz: z.boolean().optional(),
+  hideModelDownloads: z.boolean().optional(),
+  hideModelGenerations: z.boolean().optional(),
+  hideDownloadsSince: z.number().optional(),
+  gallerySettings: (
+    z.object({
+      users: z.number().array().optional(),
+      tags: z.number().array().optional(),
+      level: z.number().optional(),
+    }) satisfies z.ZodType<ModelGallerySettingsSchema>
+  ).optional(),
+  tourSettings: tourSettingsSchema.optional(),
+  generation: generationSettingsSchema.optional(),
+  tosLastSeenDate: z.date().optional(),
+  tosGreenLastSeenDate: z.date().optional(),
+  tosRedLastSeenDate: z.date().optional(),
+  // sha256 of the ToS body the user last accepted, per domain. Compared against
+  // the current body hash to decide whether to re-prompt (see useToSUpdateModal).
+  tosAcceptedHash: z.string().optional(),
+  tosGreenAcceptedHash: z.string().optional(),
+  tosRedAcceptedHash: z.string().optional(),
+  preferredFiatCurrency: z.string().optional(),
+  // Creator Shop storefront settings (see docs/features/creator-shop.md).
+  creatorShop: z
+    .object({
+      enabled: z.boolean().optional(),
+      showModels: z.boolean().optional(),
+      featuredItemIds: z.array(z.number()).optional(),
+      description: z.string().nullish(),
+      coverImageId: z.number().nullish(),
+      // Ordered storefront sections with per-section visibility.
+      sections: z
+        .array(
+          z.object({
+            key: z.enum(['featured', 'cosmetics', 'resold', 'merch', 'models']),
+            visible: z.boolean(),
+          })
+        )
+        .optional(),
+    })
+    .optional(),
+});
+
+const [featureKey, ...otherKeys] = featureFlagKeys;
+export type ToggleFeatureInput = z.infer<typeof toggleFeatureInputSchema>;
+export const toggleFeatureInputSchema = z.object({
+  // Small hack, please see: https://github.com/colinhacks/zod/discussions/839#discussioncomment-6488540
+  feature: z.enum([featureKey, ...otherKeys]),
+  value: z.boolean().optional(),
+});
+
+export type SetUserSettingsInput = z.infer<typeof setUserSettingsInput>;
+export const setUserSettingsInput = z.object({
+  creatorsProgramCodeOfConductAccepted: z.date().optional(),
+  cosmeticStoreLastViewed: z.date().optional(),
+  pushPromptDismissedCount: z.number().int().min(0).optional(),
+  pushPromptDismissedAt: z.date().optional(),
+  allowAds: z.boolean().optional(),
+  isEarlyAdopter: z.boolean().optional(),
+  swipeGalleryCards: z.boolean().optional(),
+  disableStickerMotion: z.boolean().optional(),
+  hideBlueBuzzInHeader: z.boolean().optional(),
+  fitPostImagesToScreen: z.boolean().optional(),
+  hideFromCreatorShowcase: z.boolean().optional(),
+  hideFromReactionLists: z.boolean().optional(),
+  showPreLaunchReactions: z.boolean().optional(),
+  hideDonationGoals: z.boolean().optional(),
+  hideStickerBook: z.boolean().optional(),
+  hidePurchasedStickers: z.boolean().optional(),
+  hideModelBuzz: z.boolean().optional(),
+  hideModelDownloads: z.boolean().optional(),
+  hideModelGenerations: z.boolean().optional(),
+  tourSettings: tourSettingsSchema.optional(),
+  generation: generationSettingsSchema.optional(),
+  // Whole-object writes only: `splitSettingsPatch` routes this to `set`, which replaces the key
+  // outright. The modal must send every zone, not a delta.
+  navigation: navigationSettingsSchema.optional(),
+  // Whole-object writes, like `navigation`: the menu always sends the full pin order and muted counts.
+  userMenu: userMenuSettingsSchema.optional(),
+  // Whole-object writes: the Remix menu sends every pin.
+  remixApps: remixAppsSettingsSchema.optional(),
+  creatorProgramToSAccepted: z.date().optional(),
+  assistantPersonality: userAssistantPersonality.optional(),
+  tosLastSeenDate: z.date().optional(),
+  tosGreenLastSeenDate: z.date().optional(),
+  tosRedLastSeenDate: z.date().optional(),
+  tosAcceptedHash: z.string().optional(),
+  tosGreenAcceptedHash: z.string().optional(),
+  tosRedAcceptedHash: z.string().optional(),
+  preferredFiatCurrency: z.string().optional(),
+});
+
+export const dismissAlertSchema = z.object({
+  alertId: z.string(),
+  dismiss: z.boolean().default(true),
+});
+export const restoreAlertSchema = z.object({ alertId: z.string() });
+
+export type UserOnboardingSchema = z.infer<typeof userOnboardingSchema>;
+export const userOnboardingSchema = z.discriminatedUnion('step', [
+  z.object({ step: z.literal(OnboardingSteps.TOS) }),
+  z.object({ step: z.literal(OnboardingSteps.RedTOS) }),
+  z.object({
+    step: z.literal(OnboardingSteps.Profile),
+    username: usernameInputSchema,
+    // `.email()`, not a bare string: this is the only writer of `User.email` that was unvalidated,
+    // so a tRPC caller could post `x@!!!` and have it stored verbatim.
+    email: z.string().email(),
+  }),
+  z.object({ step: z.literal(OnboardingSteps.BrowsingLevels) }),
+  z.object({
+    step: z.literal(OnboardingSteps.Buzz),
+    userReferralCode: z.string().optional(),
+    source: z.string().optional(),
+    recaptchaToken: z.string(),
+    captchaDebug: z
+      .object({
+        tokenAgeMs: z.number().optional(),
+        submitAttempt: z.number().optional(),
+        widgetStatus: z.string().optional(),
+        tokenPrefix: z.string().optional(),
+        pageSessionId: z.string().optional(),
+      })
+      .optional(),
+  }),
+]);
+
+export const setLeaderboardEligbilitySchema = z.object({
+  id: z.number(),
+  setTo: z.boolean(),
+});
+export type SetLeaderboardEligibilitySchema = z.infer<typeof setLeaderboardEligbilitySchema>;
+
+export type UserScoreMeta = z.infer<typeof userScoreMetaSchema>;
+export const userScoreMetaSchema = z.object({
+  total: z.number(),
+  models: z.number().optional(),
+  articles: z.number().optional(),
+  images: z.number().optional(),
+  users: z.number().optional(),
+  reportsActioned: z.number().optional(),
+  reportsAgainst: z.number().optional(),
+  staffAwarded: z.number().optional(),
+});
+
+export const userMeta = z.object({
+  firstImage: z.date().optional(),
+  scores: userScoreMetaSchema.optional(),
+  banDetails: z
+    .object({
+      reasonCode: z.enum(BanReasonCode).optional(),
+      detailsInternal: z.string().optional(),
+      detailsExternal: z.string().optional(),
+    })
+    .optional(),
+  contestBanDetails: z
+    .object({
+      bannedAt: z.date().optional(),
+      detailsInternal: z.string().optional(),
+    })
+    .optional(),
+  membershipChangedAt: z.date().optional(),
+  strikeFlaggedForReview: z.boolean().optional(),
+  strikeFlaggedAt: z.date().optional(),
+  // Set by the moderator mute (free text) and by strike escalation (`STRIKE_MUTE_REASON`); automatic
+  // mutes leave it unset, which is how the ToS gate refuses them. Cleared with `mutedBy` as one unit
+  // by `clearedMuteFields`.
+  muteReason: z.string().optional(),
+  mutedBy: z.number().optional(),
+  imageRemoval: z.enum(['grace', 'immediate']).optional(),
+  // Read by `remove-deleted-account-app-data`.
+  appDataRemoval: z.literal('requested').optional(),
+  // Stamped at onboarding when the account ends up without a verified address. Read by
+  // `requiresEmailVerification`; see the 🔴 there for why the gate is a stamp and not a date.
+  emailVerificationRequired: z.boolean().optional(),
+  // Retry state for the Stripe scrub of a deleted account, so one account that keeps failing
+  // cannot consume every run. Removed with `customerId` once the scrub finishes.
+  gdprStripeScrub: z
+    .object({
+      attempts: z.number(),
+      lastAttemptAt: z.string(),
+      lastError: z.string().optional(),
+    })
+    .optional(),
+  // Cleared whenever a ban or deletion is applied anew.
+  tokenRevocation: z
+    .object({ confirmedAt: z.string().optional(), alertedAt: z.string().optional() })
+    .optional(),
+});
+export type UserMeta = z.infer<typeof userMeta>;
+
+export type UpdateContentSettingsInput = z.infer<typeof updateContentSettingsSchema>;
+export const updateContentSettingsSchema = z.object({
+  showNsfw: z.boolean().optional(),
+  blurNsfw: z.boolean().optional(),
+  browsingLevel: z.number().optional(),
+  disableHidden: z.boolean().optional(),
+  allowAds: z.boolean().optional(),
+  autoplayGifs: z.boolean().optional(),
+});
+
+/** A reason a moderator can ban for. A system-only reason is set by its own flow, never by hand. */
+export const handBanReasonSchema = z
+  .enum(BanReasonCode)
+  .refine((code) => !banReasonDetails[code].systemOnly, 'This reason is set only by the system');
+
+export type ToggleBanUser = z.infer<typeof toggleBanUserSchema>;
+export const toggleBanUserSchema = z.object({
+  id: z.number(),
+  reasonCode: handBanReasonSchema.optional(),
+  detailsInternal: z.string().optional(),
+  detailsExternal: z.string().optional(),
+  type: z.enum(['universal', 'contest']).default('universal').optional(),
+  removeMedia: z.boolean().optional(),
+  removeModels: z.boolean().optional(),
+  removeComments: z.boolean().optional(),
+});
+
+export type GetBanContentPreviewInput = z.infer<typeof getBanContentPreviewSchema>;
+export const getBanContentPreviewSchema = z.object({
+  userId: z.number(),
+});
+
+// Email verification schemas
+export type RequestEmailChangeInput = z.infer<typeof requestEmailChangeSchema>;
+export const requestEmailChangeSchema = z.object({
+  newEmail: z.string().email(),
+});
+
+export type VerifyEmailChangeInput = z.infer<typeof verifyEmailChangeSchema>;
+export const verifyEmailChangeSchema = z.object({
+  token: z.string().min(1),
+});
+
+export type ResendEmailVerificationInput = z.infer<typeof resendEmailVerificationSchema>;
+export const resendEmailVerificationSchema = z.object({
+  email: z.string().email(),
+});
+
+export type ValidateEmailTokenInput = z.infer<typeof validateEmailTokenSchema>;
+export const validateEmailTokenSchema = z.object({
+  token: z.string().min(1),
+});
+
+/**
+ * Bounded on purpose: this is a public endpoint taking an array, and the caller is a
+ * search page. `SearchLayout` asks for 50 hits, `CollectionSelectModal` for 20, and one
+ * InstantSearch render can issue several requests — so a real page never approaches this,
+ * and anything that does is not a search.
+ */
+export const getUserSearchHydrationSchema = z.object({
+  ids: z.array(z.number()).min(1).max(200),
+});
+export type GetUserSearchHydrationInput = z.infer<typeof getUserSearchHydrationSchema>;

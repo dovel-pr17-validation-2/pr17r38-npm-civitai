@@ -1,0 +1,971 @@
+import type { ChipProps } from '@mantine/core';
+import {
+  Badge,
+  Box,
+  Button,
+  Center,
+  Chip,
+  CloseButton,
+  Collapse,
+  Divider,
+  Group,
+  Input,
+  Loader,
+  Paper,
+  Stack,
+  Switch,
+  Text,
+  Modal,
+  UnstyledButton,
+} from '@mantine/core';
+import { Popover } from '~/components/MantineOverlays';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { trpc } from '~/utils/trpc';
+import {
+  Form,
+  InputInlineSocialLinkInput,
+  InputProfileImageUpload,
+  InputSimpleImageUpload,
+  InputText,
+  InputTextArea,
+  useForm,
+  InputSelect,
+  InputCosmeticSelect,
+  InputChipGroup,
+} from '~/libs/form';
+import type {
+  ProfileSectionSchema,
+  PrivacySettingsSchema,
+} from '~/server/schema/user-profile.schema';
+import { userProfileUpdateSchema } from '~/server/schema/user-profile.schema';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { AlertWithIcon } from '~/components/AlertWithIcon/AlertWithIcon';
+import { IconChevronDown, IconExclamationMark, IconInfoCircle } from '@tabler/icons-react';
+import {
+  constants,
+  creatorCardMaxStats,
+  creatorCardStats,
+  creatorCardStatsDefaults,
+} from '~/server/common/constants';
+import { CosmeticType, LinkType } from '~/shared/utils/prisma/enums';
+import {
+  dedupeBadgesByImage,
+  getBadgeImageUrl,
+  keepOwnedBadgeIds,
+  withUnownedBadgeIds,
+} from '~/shared/utils/badge-visibility';
+import * as z from 'zod';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
+import type { UserWithCosmetics } from '~/server/selectors/user.selector';
+import { UserAvatar } from '~/components/UserAvatar/UserAvatar';
+import { formatDate } from '~/utils/date-helpers';
+import type {
+  BadgeCosmetic,
+  CardDecorationCosmetic,
+  ContentDecorationCosmetic,
+  NamePlateCosmetic,
+  ProfileBackgroundCosmetic,
+} from '~/server/selectors/cosmetic.selector';
+import { changedCosmeticId } from '~/components/Modals/profile-cosmetic-ids';
+import { getDisplayName, titleCase } from '~/utils/string-helpers';
+import type { UserWithProfile } from '~/types/router';
+
+// Collapsed-by-default block so optional bulk pickers (badge highlight/hide)
+// don't crowd the modal for users who don't need them.
+function CollapsibleSection({
+  label,
+  description,
+  count,
+  children,
+}: {
+  label: string;
+  description: string;
+  count?: number;
+  children: React.ReactNode;
+}) {
+  const [opened, setOpened] = useState(false);
+  return (
+    <Paper withBorder radius="md" p="sm">
+      <UnstyledButton onClick={() => setOpened((o) => !o)} className="w-full">
+        <Group justify="space-between" wrap="nowrap">
+          <Stack gap={0}>
+            <Group gap={6}>
+              <Text size="sm" fw={500}>
+                {label}
+              </Text>
+              {!!count && (
+                <Badge size="xs" variant="light">
+                  {count}
+                </Badge>
+              )}
+            </Group>
+            <Text size="xs" c="dimmed">
+              {description}
+            </Text>
+          </Stack>
+          <IconChevronDown
+            size={16}
+            style={{
+              flexShrink: 0,
+              transform: opened ? 'rotate(180deg)' : undefined,
+              transition: 'transform 150ms ease',
+            }}
+          />
+        </Group>
+      </UnstyledButton>
+      <Collapse in={opened}>
+        <Box mt="sm">{children}</Box>
+      </Collapse>
+    </Paper>
+  );
+}
+import type { UserPublicSettingsSchema } from '~/server/schema/user.schema';
+import { userUpdateSchema } from '~/server/schema/user.schema';
+import { isEqual } from 'lodash-es';
+import { ProfilePictureAlert } from '../User/ProfilePictureAlert';
+import { cosmeticInputSchema } from '~/server/schema/cosmetic.schema';
+import { CreatorCardV2 } from '~/components/CreatorCard/CreatorCard';
+import { isDefined } from '~/utils/type-guards';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { useDialogContext } from '~/components/Dialog/DialogProvider';
+import { HighlightedBadgesInput } from '~/components/Profile/HighlightedBadgesInput';
+import { InputProfileSectionsSettingsInput } from '~/components/Profile/ProfileSectionsSettingsInput';
+import { InputShowcaseItemsInput } from '~/components/Profile/ShowcaseItemsInput';
+
+const schema = z.object({
+  ...userProfileUpdateSchema.shape,
+  ...userUpdateSchema.pick({
+    profilePicture: true,
+    nameplateId: true,
+    leaderboardShowcase: true,
+  }).shape,
+  badge: cosmeticInputSchema.nullish(),
+  profileImage: z.string().nullish(),
+  profileDecoration: cosmeticInputSchema.nullish(),
+  profileBackground: cosmeticInputSchema.nullish(),
+  cardDecoration: cosmeticInputSchema.nullish(),
+});
+
+const chipProps: Partial<ChipProps> = {
+  size: 'sm',
+  radius: 'xl',
+  variant: 'filled',
+  tt: 'capitalize',
+};
+
+type FormDataSchema = z.infer<typeof schema>;
+
+export default function UserProfileEditModal() {
+  const dialog = useDialogContext();
+
+  const utils = trpc.useUtils();
+  const currentUser = useCurrentUser();
+  const featureFlags = useFeatureFlags();
+
+  // Keep track of old data to compare and make only the necessary requests
+  const previousData = useRef<FormDataSchema>();
+
+  const { data: leaderboards = [], isLoading: loadingLeaderboards } =
+    trpc.leaderboard.getLeaderboards.useQuery(undefined, {
+      trpc: { context: { skipBatch: true } },
+    });
+
+  const { mutate, isPending: isUpdating } = trpc.userProfile.update.useMutation({
+    onSuccess: (data) => {
+      if (currentUser) {
+        // The update returns the profile without the showcase hat, which is read beside it.
+        utils.userProfile.get.setData({ username: currentUser.username }, (old) => ({
+          ...data,
+          showcaseHat: old?.showcaseHat ?? null,
+        }));
+        utils.userProfile.get.invalidate({ username: currentUser.username });
+      }
+      showSuccessNotification({ message: 'Profile updated successfully' });
+      dialog.onClose();
+    },
+    onError: async (error) => {
+      showErrorNotification({
+        title: 'There was an error updating your profile',
+        error: new Error(error.message),
+      });
+    },
+  });
+  const updateUserMutation = trpc.user.update.useMutation({
+    onSuccess: async () => {
+      if (currentUser) {
+        await currentUser?.refresh();
+        // Invalidate all userProfile queries since username may have changed
+        await utils.userProfile.get.invalidate();
+      }
+      dialog.onClose();
+    },
+    onError: async (error) => {
+      showErrorNotification({
+        title: 'There was an error updating your profile',
+        error: new Error(error.message),
+      });
+    },
+  });
+
+  const { isLoading: loadingProfile, data: user } = trpc.userProfile.get.useQuery(
+    { username: currentUser ? currentUser.username : '' },
+    { enabled: !!currentUser?.username }
+  );
+  // claimKey is null on anyone else's profile; this editor only ever loads the owner's.
+  const owned = useMemo(
+    () =>
+      (user?.cosmetics ?? []).flatMap(({ claimKey, ...c }) =>
+        claimKey ? [{ ...c, claimKey }] : []
+      ),
+    [user]
+  );
+
+  const allBadges = useMemo(
+    () =>
+      user
+        ? owned
+            .filter(({ cosmetic: c }) => c.type === CosmeticType.Badge)
+            .map(({ cosmetic, cosmeticId, ...c }) => ({
+              ...c,
+              ...cosmetic,
+              data: cosmetic.data as BadgeCosmetic['data'],
+            }))
+        : [],
+    [user, owned]
+  );
+  const badges = useMemo(
+    () => dedupeBadgesByImage(allBadges, (badge) => getBadgeImageUrl(badge)),
+    [allBadges]
+  );
+
+  const nameplates = useMemo(
+    () =>
+      user
+        ? owned
+            .filter(({ cosmetic: c }) => c.type === CosmeticType.NamePlate && !!c.data)
+            .map(({ cosmetic, cosmeticId, ...c }) => ({
+              ...c,
+              ...cosmetic,
+              data: cosmetic.data as NamePlateCosmetic['data'],
+            }))
+        : [],
+    [user, owned]
+  );
+
+  const decorations = useMemo(
+    () =>
+      user
+        ? owned
+            .filter(({ cosmetic: c }) => c.type === CosmeticType.ProfileDecoration && !!c.data)
+            .map(({ cosmetic, cosmeticId, ...c }) => ({
+              ...c,
+              ...cosmetic,
+              data: cosmetic.data as ContentDecorationCosmetic['data'],
+            }))
+        : [],
+    [user, owned]
+  );
+
+  const backgrounds = useMemo(
+    () =>
+      user
+        ? owned
+            .filter(({ cosmetic: c }) => c.type === CosmeticType.ProfileBackground && !!c.data)
+            .map(({ cosmetic, cosmeticId, ...c }) => ({
+              ...c,
+              ...cosmetic,
+              data: cosmetic.data as ProfileBackgroundCosmetic['data'],
+            }))
+        : [],
+    [user, owned]
+  );
+
+  const cardDecorations = useMemo(
+    () =>
+      user
+        ? owned
+            .filter(({ cosmetic: c }) => c.type === CosmeticType.CardDecoration && !!c.data)
+            .map(({ cosmetic, cosmeticId, ...c }) => ({
+              ...c,
+              ...cosmetic,
+              data: cosmetic.data as CardDecorationCosmetic['data'],
+            }))
+        : [],
+    [user, owned]
+  );
+
+  // `getLeaderboards` is already domain-scoped, so this list is whatever is visible
+  // on the current host — no second filter on `domain` belongs here.
+  const leaderboardOptions = useMemo(
+    () =>
+      leaderboards
+        .filter((board) => board.public)
+        .map(({ title, id }) => ({
+          label: titleCase(title),
+          value: id,
+        })),
+    [leaderboards]
+  );
+
+  const form = useForm({ schema, shouldUnregister: false });
+
+  const [
+    badge,
+    nameplateId,
+    profileDecoration,
+    profileBackground,
+    cardDecoration,
+    message,
+    bio,
+    sfwMessage,
+    sfwBio,
+    location,
+    profileImage,
+    profilePicture,
+    profileSectionsSettings,
+    creatorCardStatsPreferences,
+    privacySettings,
+  ] = form.watch([
+    'badge',
+    'nameplateId',
+    'profileDecoration',
+    'profileBackground',
+    'cardDecoration',
+    'message',
+    'bio',
+    'sfwMessage',
+    'sfwBio',
+    'location',
+    'profileImage',
+    'profilePicture',
+    'profileSectionsSettings',
+    'creatorCardStatsPreferences',
+    'privacySettings',
+  ]);
+  // Every owned badge, before the one-per-image dedupe: a duplicate-image badge has no tile but is owned.
+  const ownedBadgeIds = useMemo(
+    () =>
+      owned.filter(({ cosmetic: c }) => c.type === CosmeticType.Badge).map((c) => c.cosmetic.id),
+    [owned]
+  );
+  const highlightedBadgeIds = keepOwnedBadgeIds(
+    privacySettings?.highlightedBadgeIds,
+    ownedBadgeIds
+  );
+  const hiddenBadgeIds = keepOwnedBadgeIds(privacySettings?.hiddenBadgeIds, ownedBadgeIds);
+  const displayShowcase = useMemo(() => {
+    const sections = (profileSectionsSettings ?? []) as ProfileSectionSchema[];
+    return !!sections.find((s) => s.key === 'showcase' && s.enabled);
+  }, [profileSectionsSettings]);
+
+  const publicSettings = user?.publicSettings as UserPublicSettingsSchema;
+
+  useEffect(() => {
+    if (user && user?.profile) {
+      const equippedCosmetics = owned
+        .filter((c) => !!c.equippedAt)
+        .map(({ cosmetic, data, ...rest }) => ({ ...rest, ...cosmetic }));
+      const selectedBadge = equippedCosmetics.find((c) => c.type === CosmeticType.Badge);
+      const selectedNameplate = equippedCosmetics.find((c) => c.type === CosmeticType.NamePlate);
+      const selectedProfileDecoration = equippedCosmetics.find(
+        (c) => c.type === CosmeticType.ProfileDecoration
+      );
+      const selectedProfileBackground = equippedCosmetics.find(
+        (c) => c.type === CosmeticType.ProfileBackground
+      );
+      const selectedCardDecoration = equippedCosmetics.find(
+        (c) => c.type === CosmeticType.CardDecoration
+      );
+      const formData = {
+        ...user.profile,
+        // `profile.bio`/`message`/`coverImage` are resolved for the current domain, so
+        // editing them on civitai.com would write the SFW copy back over the default.
+        // The editor always works on the two stored variants.
+        bio: user.profile.defaultBio,
+        message: user.profile.defaultMessage,
+        // TODO: Fix typing at some point :grimacing:.
+        coverImage: user.profile.defaultCoverImage as unknown as FormDataSchema['coverImage'],
+        sfwCoverImage: user.profile.sfwCoverImage as unknown as FormDataSchema['sfwCoverImage'],
+        profileImage: user?.image,
+        socialLinks: (user?.links ?? [])
+          .filter((link) => link.type === LinkType.Social)
+          .map((link) => ({
+            id: link.id,
+            url: link.url,
+            type: link.type,
+          })),
+        sponsorshipLinks: (user?.links ?? [])
+          .filter((link) => link.type === LinkType.Sponsorship)
+          .map((link) => ({
+            id: link.id,
+            url: link.url,
+            type: link.type,
+          })),
+        nameplateId: selectedNameplate?.id ?? null,
+        badge: selectedBadge ?? null,
+        profileDecoration: selectedProfileDecoration ?? null,
+        profileBackground: selectedProfileBackground ?? null,
+        cardDecoration: selectedCardDecoration ?? null,
+        leaderboardShowcase: user?.leaderboardShowcase ?? null,
+        profilePicture: user.profilePicture
+          ? (user.profilePicture as FormDataSchema['profilePicture'])
+          : user.image
+          ? { url: user.image, type: 'image' as const }
+          : null,
+        creatorCardStatsPreferences:
+          publicSettings?.creatorCardStatsPreferences ?? creatorCardStatsDefaults,
+        privacySettings: user.profile.privacySettings as PrivacySettingsSchema,
+      };
+
+      if (!previousData.current) previousData.current = formData;
+
+      form.reset(formData);
+    }
+  }, [user]);
+
+  const handleClose = () => dialog.onClose();
+  const handleSubmit = (data: FormDataSchema) => {
+    const {
+      profilePicture: prevProfilePicture,
+      badge: prevBadgeId,
+      nameplateId: prevNameplateId,
+      profileDecoration: prevProfileDecorationId,
+      profileBackground: prevProfileBackgroundId,
+      cardDecoration: prevCardDecoration,
+      leaderboardShowcase: prevLeaderboardShowcase,
+      ...prevProfileData
+    } = previousData.current ?? {};
+    const {
+      profilePicture,
+      nameplateId,
+      badge,
+      profileDecoration,
+      profileBackground,
+      cardDecoration,
+      leaderboardShowcase,
+      creatorCardStatsPreferences,
+      ...profileData
+    } = data;
+
+    const shouldUpdateUser =
+      prevProfilePicture?.url !== profilePicture?.url ||
+      badge !== prevBadgeId ||
+      nameplateId !== prevNameplateId ||
+      profileDecoration !== prevProfileDecorationId ||
+      profileBackground !== prevProfileBackgroundId ||
+      changedCosmeticId(cardDecoration, prevCardDecoration) !== undefined ||
+      leaderboardShowcase !== prevLeaderboardShowcase;
+    const shouldUpdateProfile = !isEqual(prevProfileData, profileData);
+
+    if (shouldUpdateProfile) mutate({ creatorCardStatsPreferences, ...profileData });
+    if (user && shouldUpdateUser)
+      updateUserMutation.mutate({
+        id: user.id,
+        profilePicture,
+        badgeId: badge?.id ?? null,
+        nameplateId,
+        profileDecorationId: profileDecoration?.id ?? null,
+        profileBackgroundId: profileBackground?.id ?? null,
+        cardDecorationId: changedCosmeticId(cardDecoration, prevCardDecoration),
+        leaderboardShowcase,
+      });
+  };
+
+  const isLoading = loadingProfile || loadingLeaderboards;
+
+  if (!user && !isLoading) {
+    return (
+      <Stack>
+        <AlertWithIcon icon={<IconExclamationMark />} color="red">
+          Something went wrong. we could not fetch your user.
+        </AlertWithIcon>
+
+        <Center>
+          <Button variant="default" onClick={handleClose}>
+            Close
+          </Button>
+        </Center>
+      </Stack>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <Center>
+        <Loader />
+      </Center>
+    );
+  }
+
+  const loading = isUpdating || updateUserMutation.isPending;
+
+  const templateImage = profilePicture?.url ?? profileImage;
+  const userWithCosmetics: UserWithCosmetics | null = user
+    ? {
+        ...user,
+        image: templateImage || user.image,
+        cosmetics: [],
+        deletedAt: null,
+        profilePicture: {
+          ...user.profilePicture,
+          url: templateImage || user.image,
+        } as UserWithCosmetics['profilePicture'],
+      }
+    : null;
+
+  // console.log(userWithCosmetics);
+  const cosmeticOverwrites = [
+    badge ? badges.find((c) => c.id === badge.id) : undefined,
+    nameplateId ? nameplates.find((c) => c.id === nameplateId) : undefined,
+    profileDecoration ? decorations.find((c) => c.id === profileDecoration.id) : undefined,
+    profileBackground ? backgrounds.find((c) => c.id === profileBackground.id) : undefined,
+    cardDecoration ? cardDecorations.find((c) => c.id === cardDecoration.id) : undefined,
+  ].filter(isDefined);
+
+  return (
+    <Modal {...dialog} withCloseButton={false} closeOnEscape={false} withinPortal={false} size="xl">
+      <Form form={form} onSubmit={handleSubmit}>
+        <Stack>
+          <Group justify="space-between">
+            <Text fz={24} fw={590}>
+              Customize Profile
+            </Text>
+
+            <Group>
+              <Button radius="xl" size="md" loading={loading} type="submit">
+                Save Changes
+              </Button>
+              <CloseButton
+                size="md"
+                radius="xl"
+                variant="transparent"
+                ml="auto"
+                iconSize={20}
+                loading={loading}
+                onClick={() => {
+                  dialog.onClose();
+                }}
+              />
+            </Group>
+          </Group>
+          <Divider label="Profile" />
+          <Stack>
+            {userWithCosmetics && (
+              <>
+                {featureFlags.cosmeticShop ? (
+                  <Stack align="center">
+                    <CreatorCardV2
+                      user={userWithCosmetics}
+                      cosmeticOverwrites={cosmeticOverwrites}
+                      useEquippedCosmetics={false}
+                      style={{ width: '100%', maxWidth: '450px' }}
+                      statDisplayOverwrite={creatorCardStatsPreferences}
+                    />
+                  </Stack>
+                ) : (
+                  <ProfilePreview
+                    user={user}
+                    badge={badge ? badges.find((c) => c.id === badge.id) : undefined}
+                    nameplate={
+                      nameplateId ? nameplates.find((c) => c.id === nameplateId) : undefined
+                    }
+                    profileImage={profilePicture?.url ?? profileImage}
+                  />
+                )}
+              </>
+            )}
+            <Stack gap="md">
+              {featureFlags.cosmeticShop && (
+                <>
+                  <InputProfileImageUpload name="profilePicture" label="Edit avatar" />
+                  <Divider label="Showcase Stats" />
+                  <InputChipGroup name="creatorCardStatsPreferences" multiple>
+                    <Group gap={8}>
+                      {Object.values(creatorCardStats).map((type, index) => (
+                        <Chip key={index} value={type} {...chipProps}>
+                          <span>{getDisplayName(type)}</span>
+                        </Chip>
+                      ))}
+                    </Group>
+                  </InputChipGroup>
+                  {(creatorCardStatsPreferences?.length ?? 0) > creatorCardMaxStats && (
+                    <Text c="red" size="xs">
+                      A maximum of {creatorCardMaxStats} stats can be displayed
+                    </Text>
+                  )}
+                  <ProfilePictureAlert ingestion={user?.profilePicture?.ingestion} />
+                  <InputCosmeticSelect
+                    name="profileDecoration"
+                    label="Avatar decoration"
+                    shopUrl={`/shop?cosmeticTypes=${CosmeticType.ProfileDecoration}`}
+                    data={decorations}
+                    nothingFound={
+                      <Text size="xs">You don&rsquo;t have any avatar decorations yet</Text>
+                    }
+                    onShopClick={handleClose}
+                  />
+                  <InputCosmeticSelect
+                    name="profileBackground"
+                    label="Creator Card Backgrounds"
+                    shopUrl={`/shop?cosmeticTypes=${CosmeticType.ProfileBackground}`}
+                    nothingFound={
+                      <Text size="xs">You don&rsquo;t have any profile backgrounds yet</Text>
+                    }
+                    data={backgrounds}
+                    onShopClick={handleClose}
+                  />
+                  {/* No shop link: card glows are not in the shop yet. */}
+                  {cardDecorations.length > 0 && (
+                    <InputCosmeticSelect
+                      name="cardDecoration"
+                      label="Creator Card Glow"
+                      description="Select it again to turn the glow off"
+                      data={cardDecorations}
+                    />
+                  )}
+                </>
+              )}
+
+              <Switch
+                label="Show badges on profile"
+                checked={privacySettings?.showBadges !== false}
+                onChange={(e) =>
+                  form.setValue('privacySettings', {
+                    ...privacySettings,
+                    showBadges: e.currentTarget.checked,
+                  })
+                }
+              />
+              <Switch
+                label="Show what my Creator Score is made of"
+                description="Visitors see the share from models, images, articles and followers, never the score"
+                checked={privacySettings?.showScoreSplit !== false}
+                onChange={(e) =>
+                  form.setValue('privacySettings', {
+                    ...privacySettings,
+                    showScoreSplit: e.currentTarget.checked,
+                  })
+                }
+              />
+              <InputCosmeticSelect
+                name="badge"
+                label="Featured Badge"
+                shopUrl={`/shop?cosmeticTypes=${CosmeticType.Badge}`}
+                nothingFound={<Text size="xs">You don&rsquo;t have any badges yet</Text>}
+                data={badges}
+                onShopClick={handleClose}
+              />
+              <CollapsibleSection
+                label="Highlighted badges"
+                description="Pin badges to the top of your profile's badge list."
+                count={highlightedBadgeIds.length}
+              >
+                <HighlightedBadgesInput
+                  badges={allBadges}
+                  value={highlightedBadgeIds}
+                  onChange={(nextHighlighted) =>
+                    form.setValue('privacySettings', {
+                      ...privacySettings,
+                      highlightedBadgeIds: withUnownedBadgeIds(
+                        nextHighlighted,
+                        privacySettings?.highlightedBadgeIds,
+                        ownedBadgeIds
+                      ),
+                      // A pinned badge can't also be hidden.
+                      hiddenBadgeIds: withUnownedBadgeIds(
+                        hiddenBadgeIds.filter((id) => !nextHighlighted.includes(id)),
+                        privacySettings?.hiddenBadgeIds,
+                        ownedBadgeIds
+                      ),
+                    })
+                  }
+                />
+              </CollapsibleSection>
+              <CollapsibleSection
+                label="Hidden badges"
+                description="Hidden badges won't be shown on your profile."
+                count={hiddenBadgeIds.length}
+              >
+                <HighlightedBadgesInput
+                  variant="hide"
+                  badges={allBadges}
+                  value={hiddenBadgeIds}
+                  onChange={(nextHidden) =>
+                    form.setValue('privacySettings', {
+                      ...privacySettings,
+                      hiddenBadgeIds: withUnownedBadgeIds(
+                        nextHidden,
+                        privacySettings?.hiddenBadgeIds,
+                        ownedBadgeIds
+                      ),
+                      // Hiding a badge unpins it.
+                      highlightedBadgeIds: withUnownedBadgeIds(
+                        highlightedBadgeIds.filter((id) => !nextHidden.includes(id)),
+                        privacySettings?.highlightedBadgeIds,
+                        ownedBadgeIds
+                      ),
+                    })
+                  }
+                />
+              </CollapsibleSection>
+            </Stack>
+            <Stack>
+              <InputSelect
+                name="nameplateId"
+                placeholder="Select style"
+                label={
+                  <Group gap={4} wrap="nowrap">
+                    <Input.Label>Nameplate Style</Input.Label>
+                    <Popover withArrow width={300} withinPortal position="top">
+                      <Popover.Target>
+                        <Box
+                          display="inline-block"
+                          style={{ lineHeight: 0.8, cursor: 'pointer', opacity: 0.5 }}
+                        >
+                          <IconInfoCircle size={16} />
+                        </Box>
+                      </Popover.Target>
+                      <Popover.Dropdown>
+                        <Text fw={500} size="sm">
+                          Nameplates
+                        </Text>
+                        <Text size="sm">
+                          Nameplates change the appearance of your username. They can include
+                          special colors or effects. You can earn nameplates by being a subscriber
+                          or earning trophies on the site.
+                        </Text>
+                      </Popover.Dropdown>
+                    </Popover>
+                  </Group>
+                }
+                nothingFoundMessage="Your earned nameplate styles will appear here"
+                data={
+                  nameplates.map((cosmetic) => ({
+                    label: cosmetic.name,
+                    value: cosmetic.id,
+                  })) ?? []
+                }
+                clearable
+              />
+              <InputSelect
+                label="Showcase Leaderboard"
+                placeholder="Select a leaderboard"
+                description="Choose which leaderboard badge to display on your profile card"
+                name="leaderboardShowcase"
+                data={leaderboardOptions}
+                disabled={loadingLeaderboards}
+                searchable
+                clearable
+              />
+            </Stack>
+          </Stack>
+
+          <Divider label="Links" />
+          <InputInlineSocialLinkInput
+            name="socialLinks"
+            label="Social Links"
+            type={LinkType.Social}
+          />
+          <InputInlineSocialLinkInput
+            name="sponsorshipLinks"
+            label="Sponsorship Links"
+            type={LinkType.Sponsorship}
+          />
+          <Divider label="Profile Page" />
+          <InputSimpleImageUpload
+            name="coverImage"
+            label="Cover Image"
+            description={`Suggested resolution: ${constants.profile.coverImageWidth}x${constants.profile.coverImageHeight}px`}
+            aspectRatio={constants.profile.coverImageAspectRatio}
+            // Im aware ideally this should ideally be 450, but images will look better on a higher res here
+            previewWidth={constants.profile.coverImageWidth}
+          />
+          <InputTextArea
+            autosize
+            name="message"
+            description="Have something you want to share with people visiting your profile? Put it here and we'll display it at the top of your page"
+            maxLength={constants.profile.messageMaxLength}
+            labelProps={{ style: { width: '100%' } }}
+            label={
+              <Group className="w-full" justify="space-between">
+                <Text>Announcement</Text>
+                <Text size="xs">
+                  {message?.length ?? 0}/{constants.profile.messageMaxLength}
+                </Text>
+              </Group>
+            }
+          />
+          <InputTextArea
+            name="bio"
+            labelProps={{ style: { width: '100%' } }}
+            label={
+              <Group className="w-full" justify="space-between">
+                <Text>Bio</Text>
+                <Text size="xs">
+                  {bio?.length ?? 0}/{constants.profile.bioMaxLength}
+                </Text>
+              </Group>
+            }
+            autosize
+            maxLength={constants.profile.bioMaxLength}
+          />
+          <InputText
+            name="location"
+            labelProps={{ style: { width: '100%' } }}
+            label={
+              <Group className="w-full" justify="space-between">
+                <Text>Location</Text>
+                <Text size="xs">
+                  {location?.length ?? 0}/{constants.profile.locationMaxLength}
+                </Text>
+              </Group>
+            }
+            maxLength={constants.profile.locationMaxLength}
+          />
+
+          <Divider label="Civitai.com" />
+          <Text size="xs" c="dimmed">
+            Show something different to visitors on civitai.com. Anything you leave off here is
+            shown the same on every Civitai site.
+          </Text>
+          <InputSimpleImageUpload
+            name="sfwCoverImage"
+            label="Cover Image (civitai.com)"
+            description="Leave empty to use the cover image above."
+            aspectRatio={constants.profile.coverImageAspectRatio}
+            previewWidth={constants.profile.coverImageWidth}
+          />
+          <Stack gap="xs">
+            <Switch
+              label="Different announcement on civitai.com"
+              checked={sfwMessage != null}
+              onChange={(e) =>
+                form.setValue('sfwMessage', e.currentTarget.checked ? '' : null, {
+                  shouldDirty: true,
+                })
+              }
+            />
+            {sfwMessage != null && (
+              <InputTextArea
+                autosize
+                name="sfwMessage"
+                description="Leave blank to show no announcement on civitai.com."
+                maxLength={constants.profile.messageMaxLength}
+                labelProps={{ style: { width: '100%' } }}
+                label={
+                  <Group className="w-full" justify="space-between">
+                    <Text>Announcement (civitai.com)</Text>
+                    <Text size="xs">
+                      {sfwMessage.length}/{constants.profile.messageMaxLength}
+                    </Text>
+                  </Group>
+                }
+              />
+            )}
+          </Stack>
+          <Stack gap="xs">
+            <Switch
+              label="Different bio on civitai.com"
+              checked={sfwBio != null}
+              onChange={(e) =>
+                form.setValue('sfwBio', e.currentTarget.checked ? '' : null, { shouldDirty: true })
+              }
+            />
+            {sfwBio != null && (
+              <InputTextArea
+                autosize
+                name="sfwBio"
+                description="Leave blank to show no bio on civitai.com."
+                maxLength={constants.profile.bioMaxLength}
+                labelProps={{ style: { width: '100%' } }}
+                label={
+                  <Group className="w-full" justify="space-between">
+                    <Text>Bio (civitai.com)</Text>
+                    <Text size="xs">
+                      {sfwBio.length}/{constants.profile.bioMaxLength}
+                    </Text>
+                  </Group>
+                }
+              />
+            )}
+          </Stack>
+
+          {user?.profile && (
+            <InputProfileSectionsSettingsInput
+              name="profileSectionsSettings"
+              label="Page sections"
+              showcaseSections={user.profile.showcaseSections}
+              description="Drag diferent sections on your profile in order of your preference"
+            />
+          )}
+          {displayShowcase && (
+            <InputShowcaseItemsInput
+              name="showcaseItems"
+              label="Showcase Items"
+              limit={constants.profile.showcaseItemsLimit}
+              description={`Select up to ${constants.profile.showcaseItemsLimit} items to showcase on your profile. You do this via the "Add to showcase" button on models and images`}
+            />
+          )}
+          <Group justify="flex-end" align="flex-end">
+            <Button radius="xl" size="md" loading={loading} type="submit">
+              Save Changes
+            </Button>
+          </Group>
+        </Stack>
+      </Form>
+    </Modal>
+  );
+}
+
+type ProfilePreviewProps = {
+  user?: UserWithProfile;
+  badge?: BadgeCosmetic;
+  nameplate?: NamePlateCosmetic;
+  profileImage?: string | null;
+  profileDecoration?: ContentDecorationCosmetic | null;
+  profileBackground?: ProfileBackgroundCosmetic | null;
+};
+
+export function ProfilePreview({
+  // deprecated
+  user,
+  badge,
+  nameplate,
+  profileImage,
+  profileBackground,
+}: ProfilePreviewProps) {
+  if (!user) return null;
+
+  const userWithCosmetics: UserWithCosmetics = {
+    ...user,
+    image: profileImage || user.image,
+    cosmetics: [],
+    deletedAt: null,
+    profilePicture: {
+      ...user.profilePicture,
+      url: profileImage || user.image,
+    } as UserWithCosmetics['profilePicture'],
+  };
+  if (badge)
+    userWithCosmetics.cosmetics.push({ cosmetic: { ...badge, type: 'Badge' }, data: null });
+  if (nameplate)
+    userWithCosmetics.cosmetics.push({
+      cosmetic: { ...nameplate, type: 'NamePlate' },
+      data: null,
+    });
+
+  return (
+    <Stack gap={4}>
+      <Input.Label>Preview</Input.Label>
+      <Paper p="sm" withBorder>
+        <UserAvatar
+          user={userWithCosmetics}
+          size="lg"
+          subText={user.createdAt ? `Member since ${formatDate(user.createdAt)}` : ''}
+          withOverlay={!!profileBackground}
+          withUsername
+        />
+      </Paper>
+    </Stack>
+  );
+}

@@ -1,0 +1,39 @@
+import { error, redirect } from '@sveltejs/kit';
+import { dev } from '$app/environment';
+import { SYNC_PARAM } from '@civitai/auth';
+import type { RequestHandler } from './$types';
+import { normalizeEmailAddress } from '$lib/server/auth/blocklist';
+import { consumeVerificationToken } from '$lib/server/auth/email-tokens';
+import { findOrCreateUserByEmail, SystemAccountSignInError } from '$lib/server/auth/users';
+import { establishSession } from '$lib/server/auth/session';
+import { buildPostLoginRedirect } from '$lib/server/auth/redirect';
+import { buildPostLoginOriginCheck } from '$lib/server/oauth/first-party';
+import { loginsTotal } from '$lib/server/metrics';
+
+// Magic-link landing: validate + consume the token, establish the session, honor returnUrl/sync.
+export const GET: RequestHandler = async ({ url, cookies }) => {
+  const token = url.searchParams.get('token');
+  // Must be the same normalizer the send path stores with: `VerificationToken.identifier` is plain
+  // text, so lowercasing a local part the sender preserved makes every such link unmatchable.
+  const emailParam = url.searchParams.get('email');
+  const email = emailParam ? normalizeEmailAddress(emailParam) : undefined;
+  const returnUrl = url.searchParams.get('returnUrl') ?? '/';
+  const sync = url.searchParams.get(SYNC_PARAM);
+
+  if (!token || !email) error(400, 'Invalid verification link');
+
+  const valid = await consumeVerificationToken(email, token);
+  if (!valid) redirect(302, '/login?error=Verification');
+
+  const user = await findOrCreateUserByEmail(email).catch((e) => {
+    if (e instanceof SystemAccountSignInError) redirect(302, '/login?error=SystemAccount');
+    throw e;
+  });
+  await establishSession(cookies, user, { returnUrl });
+
+  // Count the successful email login (best-effort; never blocks the redirect).
+  loginsTotal.inc({ provider: 'email' });
+
+  const isAllowedOrigin = await buildPostLoginOriginCheck();
+  redirect(302, buildPostLoginRedirect(returnUrl, sync, url.origin, dev, isAllowedOrigin));
+};

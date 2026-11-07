@@ -1,0 +1,351 @@
+import type { NextApiRequest, NextApiResponse } from 'next';
+import { withAxiom } from '@civitai/next-axiom';
+import type { TRPCError } from '@trpc/server';
+import { getHTTPStatusCodeFromError } from '@trpc/server/http';
+import * as z from 'zod';
+
+import {
+  withBlockScope,
+  type BlockScopedNextApiRequest,
+} from '~/server/middleware/block-scope.middleware';
+import { runImageSearch, withoutHeldImages } from '~/server/services/image-search.service';
+import { reactTicketForImage } from '~/server/services/blocks/react-ticket.service';
+import { resolveCatalogBrowsingLevel } from '~/server/utils/block-catalog-maturity';
+import { checkBlockCatalogRateLimit } from '~/server/utils/block-catalog-rate-limit';
+import { getRegion, isRegionRestricted } from '~/server/utils/region-blocking';
+import { keysetCursorSchema } from '~/server/schema/base.schema';
+import { getNextPage, getPagination } from '~/server/utils/pagination-helpers';
+import { isTransientMeiliError } from '~/server/meilisearch/client';
+import { isClientAbortError } from '~/server/utils/errorHandling';
+import {
+  acquireBulkheadSlot,
+  BulkheadFullError,
+  HEAVY_REQUEST_CONCURRENCY,
+} from '~/server/utils/request-bulkhead';
+import { constants, IMAGE_IDS_BATCH_MAX } from '~/server/common/constants';
+import { ImageSort } from '~/server/common/enums';
+import { Flags } from '~/shared/utils/flags';
+import { MediaType, MetricTimeframe } from '~/shared/utils/prisma/enums';
+import { baseModels } from '~/shared/constants/basemodel.constants';
+import { usernameSchema } from '~/shared/zod/username.schema';
+import {
+  booleanString,
+  commaDelimitedEnumArray,
+  commaDelimitedNumberArray,
+  numericString,
+} from '~/utils/zod-helpers';
+
+export const config = {
+  api: {
+    responseLimit: false,
+  },
+};
+
+/**
+ * GET /api/v1/blocks/images
+ *
+ * Block-token-gated catalog IMAGE search for App Blocks (Phase 3 maturity
+ * clamp; GA-safety follow-up to PR #2670). The sibling of
+ * /api/v1/blocks/models — closes the /api/v1/images mature-content surface for
+ * blocks the same way blocks/models closed /api/v1/models. Returns the SAME
+ * response shape as the public /api/v1/images (it shares `runImageSearch`), so
+ * an in-block image browser can switch endpoints with minimal change. The
+ * CRITICAL difference:
+ *
+ *   The effective browsing level is AUTHORITATIVELY CLAMPED to the block
+ *   token's color-domain ceiling (`claims.maxBrowsingLevel`). A SFW-domain
+ *   (green/blue) block CANNOT fetch mature catalog images, no matter what the
+ *   client sends — there is no `nsfw` / `browsingLevel` knob on this endpoint's
+ *   schema at all, so maturity is NEVER read from the request beyond the clamp.
+ *
+ * Why Option B (a block-gated endpoint) and NOT clamping the public
+ * /api/v1/images: the public endpoint is the apex public-API contract +
+ * region/Cloudflare-shaped, so domain-clamping it would break the contract and
+ * risk cache poisoning. withBlockScope already forces `Cache-Control: private,
+ * no-store` + exact-origin CORS on this route, so there is no cache-key /
+ * cross-domain leak here.
+ *
+ * Auth: ANY valid block token (no required scope) — the SAME mode
+ * blocks/models uses. The catalog is PUBLIC, maturity-clamped data, so a
+ * declarable+grantable scope adds CLI-validator + per-app-allowedScopes
+ * friction with NO security value (this endpoint is strictly MORE restricted
+ * than the public /api/v1/images). The token is required ONLY for its signed
+ * `maxBrowsingLevel` claim (the maturity ceiling), NOT for authorization.
+ * withBlockScope still runs FULL token validation + revocation + `private,
+ * no-store` + exact-origin CORS; it just skips the per-scope check. Anon → 401.
+ * (Previously gated on `catalog:read`, retired as no-value friction.)
+ *
+ * NOTE (advisory until #2670 merges): the authoritative `maxBrowsingLevel`
+ * claim is MINTED by PR #2670. Until then every token resolves to SFW here (the
+ * safe GA posture, via the shared clamp's fail-closed branch). The red-domain
+ * unclamp path activates automatically once #2670's mint stamps the claim.
+ *
+ * Image maturity mechanism note: unlike the model endpoint (which had a
+ * separate `?nsfw=` image-list passthrough), the per-image `nsfwLevel` filter
+ * applied by the getAllImages / getAllImagesIndex / feed-search paths is driven
+ * SOLELY by `browsingLevel`. So clamping `browsingLevel` is the whole authority
+ * surface — there is no passthrough flag that could re-widen images past the
+ * clamp.
+ */
+
+// Subset of the public /api/v1/images param schema — the fields an in-block
+// image browser needs. Maturity (`nsfw` / `browsingLevel`) is intentionally
+// ABSENT: it comes ONLY from the server-side clamp, never the client.
+const blockImagesSchema = z.object({
+  limit: numericString(z.number().min(0).max(200)).default(constants.galleryFilterDefaults.limit),
+  page: numericString().optional(),
+  postId: numericString().optional(),
+  modelId: numericString().optional(),
+  modelVersionId: numericString().optional(),
+  imageId: numericString().optional(),
+  // Batch by id — `?ids=1,2,3`. The direct replacement for the `GET_IMAGES_BY_IDS`
+  // bridge message a block used to get its grid in one round trip
+  // (civitai/civitai-app-starters#429), capped at the SAME ceiling that message
+  // enforced (see IMAGE_IDS_BATCH_MAX).
+  //
+  // 🔴 `ids` IS A FILTER, NEVER A MATURITY BYPASS. It is narrowed by the same
+  // clamped `browsingLevel` every other selector on this route is: the clamp
+  // reaches the search as `ctx.browsingLevel` (resolved below from the token,
+  // never the request) and `getAllImages` applies it as its OWN independent SQL
+  // clause — `(i."nsfwLevel" & ${browsingLevel}) != 0 ...` at
+  // image.service.ts:2241 — alongside, not instead of, the `i."id" = ANY(...)`
+  // clause at :1799. Naming an id therefore cannot surface an image the block's
+  // ceiling excludes; it comes back absent, exactly as on the public route.
+  // Pinned by `blocks-ids-clamp` in `src/tests/api/v1/blocks/images-endpoint.test.ts`.
+  //
+  // Misses are reported by OMISSION — the same deliberate non-disclosure the
+  // public route documents, and the same one `BlockGatedImage` already makes.
+  ids: commaDelimitedNumberArray(
+    z.number().int().positive().array().min(1).max(IMAGE_IDS_BATCH_MAX)
+  ).optional(),
+  username: usernameSchema.optional(),
+  userId: numericString().optional(),
+  period: z.enum(MetricTimeframe).default(constants.galleryFilterDefaults.period),
+  sort: z.enum(ImageSort).default(constants.galleryFilterDefaults.sort),
+  tags: commaDelimitedNumberArray().optional(),
+  cursor: keysetCursorSchema.optional(),
+  type: z.enum(MediaType).optional(),
+  baseModels: commaDelimitedEnumArray([...baseModels]).optional(),
+  withMeta: booleanString().default(false),
+  requiringMeta: booleanString().optional(),
+  flatMeta: booleanString().optional(),
+  withTags: booleanString().default(false),
+});
+
+type Metadata = {
+  currentPage?: number;
+  pageSize?: number;
+  nextCursor?: string;
+  nextPage?: string;
+};
+
+const baseHandler = withAxiom(async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'GET') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+
+  const claims = (req as BlockScopedNextApiRequest).blockClaims;
+  if (!claims) {
+    // withBlockScope only invokes this handler with a valid block JWT; this is
+    // defense in depth.
+    res.status(401).json({ error: 'Block token required' });
+    return;
+  }
+
+  const reqParams = blockImagesSchema.safeParse(req.query);
+  if (!reqParams.success) {
+    res.status(400).json({ error: reqParams.error });
+    return;
+  }
+
+  // Per-token rate limit (keyed on the stable blockInstanceId) — bounds a block
+  // hammering this private,no-store (Cloudflare-uncacheable) catalog route onto
+  // the origin. Fail-open + generous enough that a paginating image browser
+  // never trips it (see block-catalog-rate-limit.ts). Runs BEFORE the bulkhead
+  // slot + the expensive image search. Mirrors the 429+Retry-After shape this
+  // endpoint already returns for the paging guard / bulkhead shed.
+  const rateLimit = await checkBlockCatalogRateLimit(claims.blockInstanceId);
+  if (!rateLimit.allowed) {
+    res.setHeader('Retry-After', String(rateLimit.retryAfterSeconds));
+    res.status(429).json({ error: 'Rate limit exceeded, please retry shortly.' });
+    return;
+  }
+
+  // AUTHORITATIVE clamp — maturity comes ONLY from the token's domain ceiling,
+  // then narrowed to SFW for region-restricted viewers (mirrors the public
+  // /api/v1/images region override the shared search service does NOT apply).
+  // (The schema doesn't even expose nsfw/browsingLevel, so there is nothing to
+  // read from the request; this is the single maturity authority.)
+  const regionRestricted = isRegionRestricted(getRegion(req));
+  let { browsingLevel } = resolveCatalogBrowsingLevel(claims, { regionRestricted });
+
+  const { limit, page, cursor, type, withMeta, flatMeta, withTags, ...data } = reqParams.data;
+
+  // Mirror the public endpoint's paging guard + skip math exactly.
+  let skip: number | undefined;
+  const usingPaging = page && !cursor;
+  if (usingPaging) {
+    if (page && page * limit > 1000) {
+      res
+        .status(429)
+        .json({ error: "You've requested too many pages, please use cursors instead" });
+      return;
+    }
+    ({ skip } = getPagination(limit, page));
+  }
+
+  // Per-pod heavy-image concurrency cap — same bulkhead key the public endpoint
+  // and the tRPC feed share, so block traffic can't sneak past the shed.
+  let releaseSlot: (() => void) | undefined;
+  try {
+    releaseSlot = acquireBulkheadSlot('heavy-image', HEAVY_REQUEST_CONCURRENCY);
+  } catch (e) {
+    if (e instanceof BulkheadFullError) {
+      res.setHeader('Retry-After', '2');
+      res.status(503).json({ error: 'Server busy, please retry shortly.' });
+      return;
+    }
+    throw e;
+  }
+
+  try {
+    // A minor or SFW-only model's images are served only at its gallery's held level.
+    if (data.modelId || data.modelVersionId || data.postId) {
+      // Loaded on demand: the model service's import graph is large and only this branch needs it.
+      const { getHeldGalleryLevel } = await import('~/server/services/model.service');
+      const heldLevel = await getHeldGalleryLevel(data);
+      if (heldLevel !== undefined) {
+        browsingLevel = Flags.intersection(browsingLevel, heldLevel);
+        // The search reads 0 as its default level, not as none, so an empty intersection is an empty page.
+        if (!browsingLevel) {
+          res.status(200).json({ items: [], metadata: {} });
+          return;
+        }
+      }
+    }
+
+    const { items: found, nextCursor } = await runImageSearch(
+      { limit, skip, cursor, type, withMeta, flatMeta, withTags, data },
+      {
+        // CLAMPED browsing level — never the client's. The per-image filter is
+        // driven solely by this; a SFW ceiling can never surface a mature image.
+        browsingLevel,
+        // The viewer is intentionally NOT threaded as a session user: the
+        // catalog is public + the clamp is the whole authority surface (mirrors
+        // blocks/models — don't surface owner-personalization the block never
+        // asked for).
+        user: undefined,
+        req,
+      }
+    );
+    // Images picked by id name no model, so each is held by its own post's model.
+    const items = data.imageId || data.ids?.length ? await withoutHeldImages(found) : found;
+
+    const metadata: Metadata = { nextCursor };
+    if (usingPaging) {
+      metadata.currentPage = page;
+      metadata.pageSize = limit;
+    }
+    metadata.nextPage = getNextPage({ req, ...metadata }).nextPage;
+
+    // A provenance ticket per image for a signed-in viewer, so the app may set that viewer's
+    // reaction on what it was shown (`blocks.setReactionFromApp`). Anonymous tokens get none.
+    // Per-viewer data is safe here only because `withBlockScope` forces `private, no-store`.
+    const ticketed = items.map((item) => {
+      const reactTicket = reactTicketForImage(claims, item.id);
+      return reactTicket ? { ...item, reactTicket } : item;
+    });
+
+    res.status(200).json({ items: ticketed, metadata });
+    return;
+  } catch (error) {
+    // 🔴 PARTIAL parity with the public /api/v1/images, and the split is
+    // deliberate — READ THIS BEFORE "RESTORING" ANYTHING. Until civitai#3845's
+    // TIER-1 change this handler mirrored the public endpoint's error mapping
+    // end to end. It no longer does, and the divergence is by design:
+    //
+    //   • 499 client-abort            — STILL IDENTICAL (same predicate, same exit).
+    //   • raw transient Meili → 503   — STILL IDENTICAL (same predicate, same
+    //     `{ error: <literal hint> }` body, same no-store + Retry-After).
+    //   • a TRPCError at 503          — same status and headers, DIFFERENT body:
+    //     this handler echoes the TRPCError's own message under `error`, while
+    //     the public endpoint answers 503 in place with the literal hint.
+    //   • every other TRPCError       — DIVERGED. The public endpoint delegates
+    //     to `handleEndpointError` (5xx genericized + fault-logged, `{ message }`
+    //     at 4xx); this one still serves `{ error: trpcError.message, code }`.
+    //
+    // The last two are the civitai#3845 disclosure shape, and this route keeps it
+    // ON PURPOSE for now: it is `withAxiom` + block-scope token auth, not public,
+    // so it is TIER 2 — recorded, not fixed, in
+    // `rest-error-envelope-ledger.test.ts`'s `KNOWN_UNFIXED_SAME_CLASS`. Deleting
+    // its baseline entry is what closes it; copying the public endpoint's mapping
+    // here without doing that turns the ledger red, which is the intended
+    // sequencing rather than an obstacle.
+    if (isClientAbortError(error)) {
+      if (!res.headersSent) res.status(499).end();
+      return;
+    }
+    // Transient Meili failure → retryable 503. Use the SAME `isTransientMeiliError`
+    // predicate the public /api/v1/images handler uses (NOT the old raw-SDK
+    // MeiliCallTimeoutError/MeilisearchFetchError-only branch), so the feed
+    // library's inner meilisearch-js SDK errors (MeiliSearchCommunicationError /
+    // MeiliSearchApiError / MeiliSearchTimeOutError) — the dominant 500 source on
+    // the public endpoint — are reclassified here too rather than bubbling as a
+    // hard 500 via the generic tail. no-store + Retry-After: 2 so the 503 carries
+    // the SAME retryable contract as the public endpoint — this arm is one of the
+    // two that IS still identical to it, per the note above.
+    // withBlockScope already forces `private, no-store`,
+    // but set it explicitly so the contract is self-evident at the response site.
+    if (isTransientMeiliError(error)) {
+      if (!res.headersSent) {
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Retry-After', '2');
+        res.status(503).json({ error: 'Image search is temporarily overloaded — please retry.' });
+      }
+      return;
+    }
+    const trpcError = error as TRPCError;
+    const statusCode = getHTTPStatusCodeFromError(trpcError);
+
+    // A TRPCError SERVICE_UNAVAILABLE wrapped by the service layer maps to 503 —
+    // attach the same no-store + Retry-After so the RETRYABLE contract (status +
+    // headers) is identical to the raw-error branch above.
+    //
+    // 🔴 The BODY is not identical, here or to the public endpoint. This falls
+    // through to the generic tail below and serves `{ error: trpcError.message,
+    // code }`, whereas both the raw-error branch above and the public endpoint
+    // answer 503 in place with a literal hint. That means the retry hint on THIS
+    // route is keyed `error` in both cases but its VALUE is the service's message
+    // rather than the fixed string — and, on the 4xx/5xx tail, that message can be
+    // driver-authored. That is the TIER-2 disclosure this route still carries by
+    // design; see the note at the top of this catch.
+    if (statusCode === 503 && !res.headersSent) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Retry-After', '2');
+    }
+
+    if (!res.headersSent) {
+      res.status(statusCode).json({ error: trpcError.message, code: trpcError.code });
+    }
+    return;
+  } finally {
+    releaseSlot?.();
+  }
+});
+
+// No requiredScope: any valid block token is accepted (see doc above). The
+// maturity clamp (resolveCatalogBrowsingLevel) remains the whole authority
+// surface. allowOpaqueOrigin: an UNVERIFIED block runs at an opaque origin
+// (`Origin: null`) so its direct catalog fetch needs `ACAO: null` to clear the
+// CORS preflight; safe here (public maturity-clamped data, no credentials,
+// still token-gated) — see WithBlockScopeOpts.allowOpaqueOrigin.
+export default withBlockScope(baseHandler, {
+  endpoint: 'images',
+  allowOpaqueOrigin: true,
+  // Public, maturity-clamped image catalog — the same argument as blocks/models.ts. No
+  // requiredScope, nothing viewer-scoped, nothing written; the maturity ceiling comes from
+  // the token's own signed claim, not from the approval row, so a failed approval read
+  // cannot widen what this returns.
+  onApprovalLookupFailure: 'serve',
+});

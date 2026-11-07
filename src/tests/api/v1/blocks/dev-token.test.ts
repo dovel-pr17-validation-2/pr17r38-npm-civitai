@@ -1,0 +1,2024 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+/**
+ * Handler-level coverage for POST /api/v1/blocks/dev-token — the dev/preview
+ * block-token mint (scope doc: app-blocks-dev-token-endpoint-scope.md).
+ *
+ * Asserts the security-sensitive invariants:
+ *   - mod + flag-on + owned approved page app → token with capped scopes/budget,
+ *     forced-SFW maxBrowsingLevel, self-bound sub (userId), page ctx.
+ *   - rejections: non-mod → 403, flag off → 503 (dark), not-owner → 404,
+ *     OAuth (cookie/non-personal) key → 403, missing/invalid key → 401.
+ *   - scope clamp: a scope outside the app's approved set OR in the dev-excluded
+ *     list (social:tip:self / block:settings:*) is STRIPPED.
+ *   - budget over the dev cap → capped.
+ *   - rate-limit exceeded → 429; malformed limiter → 503 (fail closed).
+ */
+
+function createMocks({
+  method = 'POST',
+  headers = {},
+  body = {},
+}: {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: unknown;
+}) {
+  const req = {
+    method,
+    headers,
+    body,
+    socket: { remoteAddress: '203.0.113.7' },
+    log: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+  } as unknown as Record<string, unknown>;
+  let statusCode = 200;
+  let payload: unknown = undefined;
+  const responseHeaders: Record<string, string> = {};
+  const res = {
+    status(code: number) {
+      statusCode = code;
+      return res;
+    },
+    json(b: unknown) {
+      payload = b;
+      return res;
+    },
+    setHeader(key: string, value: string) {
+      responseHeaders[key] = value;
+    },
+    end() {
+      return res;
+    },
+    _getStatusCode: () => statusCode,
+    _getJSONData: () => payload,
+    _getHeaders: () => responseHeaders,
+  };
+  return { req, res };
+}
+
+const {
+  mockGetSession,
+  mockIsAppBlocksEnabled,
+  mockIsAppBlocksAuthorEnabled,
+  mockSign,
+  mockSysRedis,
+  mockMultiIncr,
+  mockWithSysReadDeadline,
+  sysDeadline,
+} = vi.hoisted(() => {
+  const mockMultiIncr = {
+    value: 1,
+    malformedExec: false as unknown[] | null | false,
+    throwExec: false,
+    // #28: simulate a SILENT half-open where `.exec()` never settles (parks the
+    // handler). withSysReadDeadline must reject it within the deadline → 503.
+    hangExec: false,
+  };
+  const multiFactory = () => ({
+    set: vi.fn().mockReturnThis(),
+    incr: vi.fn().mockReturnThis(),
+    exec: vi.fn().mockImplementation(async () => {
+      if (mockMultiIncr.hangExec) return new Promise(() => {}); // never settles
+      if (mockMultiIncr.throwExec) throw new Error('redis down');
+      return mockMultiIncr.malformedExec !== false
+        ? mockMultiIncr.malformedExec
+        : ['OK', mockMultiIncr.value];
+    }),
+  });
+  // Faithful stand-in for the real withSysReadDeadline (sys-read-deadline.ts): race
+  // the wrapped promise against a rejecting timer; `<= 0` disables (no-op). A tiny
+  // default ms keeps the never-settles tests fast without fake timers.
+  const sysDeadline = { ms: 50 };
+  const mockWithSysReadDeadline = <T>(p: Promise<T>, ms = sysDeadline.ms): Promise<T> => {
+    if (!ms || ms <= 0) return p;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`sysRedis read timed out after ${ms}ms`)), ms);
+    });
+    return Promise.race([p, deadline]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  };
+  return {
+    mockGetSession: vi.fn(),
+    mockIsAppBlocksEnabled: vi.fn(),
+    mockIsAppBlocksAuthorEnabled: vi.fn(),
+    mockSign: vi.fn(),
+    mockSysRedis: {
+      multi: vi.fn(multiFactory),
+      ttl: vi.fn().mockResolvedValue(60),
+      expire: vi.fn().mockResolvedValue(1),
+    },
+    mockMultiIncr,
+    mockWithSysReadDeadline,
+    sysDeadline,
+  };
+});
+
+vi.mock('@civitai/next-axiom', () => ({ withAxiom: (fn: unknown) => fn }));
+vi.mock('~/server/auth/bearer-token', () => ({ getSessionFromBearerToken: mockGetSession }));
+vi.mock('~/server/services/app-blocks-flag', () => ({
+  isAppBlocksEnabled: mockIsAppBlocksEnabled,
+  isAppBlocksAuthorEnabled: mockIsAppBlocksAuthorEnabled,
+}));
+vi.mock('~/server/services/block-token.service', () => ({
+  BlockTokenService: { sign: mockSign },
+}));
+vi.mock('~/server/redis/client', () => ({
+  sysRedis: mockSysRedis,
+  REDIS_SYS_KEYS: { BLOCKS: { DEV_TOKEN_RATE_LIMIT: 'system:blocks:dev-token-rate-limit' } },
+  withSysReadDeadline: mockWithSysReadDeadline,
+}));
+vi.mock('~/env/server', () => ({
+  env: { BLOCK_TOKEN_PRIVATE_KEY: 'priv', BLOCK_TOKEN_PUBLIC_KEY: 'pub' },
+}));
+
+import handler from '~/pages/api/v1/blocks/dev-token';
+import { domainBrowsingCeiling } from '~/shared/constants/browsingLevel.constants';
+import { TokenScope } from '~/shared/constants/token-scope.constants';
+import { APPS_RESTRICTED_MESSAGE } from '~/shared/constants/app-submit.constants';
+import { dbMock } from '~/__tests__/mocks/db.mock';
+const mockAppBlockFindUnique = dbMock.dbWrite.appBlock.findUnique;
+const mockPublishRequestFindFirst = dbMock.dbWrite.appBlockPublishRequest.findFirst;
+
+const SFW = domainBrowsingCeiling(null);
+
+const OWNER_ID = 7;
+
+// Personal-access (user-type) key + moderator. A normal personal key carries
+// the Full scope bitmask (incl. AIServicesWrite), so ai:write:budgeted survives
+// the personal-key-ceiling clamp.
+const MOD_SESSION = {
+  user: { id: OWNER_ID, isModerator: true },
+  apiKeyId: 42,
+  subject: { type: 'apiKey', id: 42 },
+  tokenScope: TokenScope.Full,
+};
+const NONMOD_SESSION = {
+  user: { id: 8, isModerator: false },
+  apiKeyId: 43,
+  subject: { type: 'apiKey', id: 43 },
+  tokenScope: TokenScope.Full,
+};
+// OAuth token WITHOUT AppBlocksSubmit. `TokenScope.Full` deliberately EXCLUDES
+// AppBlocksSubmit (bit 25), so a "full" OAuth consent still fails the mint gate.
+const OAUTH_MOD_SESSION = {
+  user: { id: OWNER_ID, isModerator: true },
+  apiKeyId: 99,
+  subject: { type: 'oauth', id: 'client_abc' },
+  tokenScope: TokenScope.Full,
+};
+// OAuth token WITH AppBlocksSubmit + AIServicesWrite (the civitai-cli client
+// provisioned with both): mints AND keeps the budgeted-spend scope.
+const OAUTH_SUBMIT_SPEND_SESSION = {
+  user: { id: OWNER_ID, isModerator: true },
+  apiKeyId: 100,
+  subject: { type: 'oauth', id: 'civitai-cli' },
+  tokenScope: TokenScope.UserRead | TokenScope.AppBlocksSubmit | TokenScope.AIServicesWrite,
+};
+// OAuth token WITH AppBlocksSubmit but WITHOUT AIServicesWrite: mints (read/
+// estimate dev token) but the uniform spend ceiling STRIPS ai:write:budgeted.
+const OAUTH_SUBMIT_NOSPEND_SESSION = {
+  user: { id: OWNER_ID, isModerator: true },
+  apiKeyId: 101,
+  subject: { type: 'oauth', id: 'civitai-cli' },
+  tokenScope: TokenScope.UserRead | TokenScope.AppBlocksSubmit,
+};
+// A personal key deliberately scoped WITHOUT AIServicesWrite (e.g. read-only).
+const READONLY_MOD_SESSION = {
+  user: { id: OWNER_ID, isModerator: true },
+  apiKeyId: 44,
+  subject: { type: 'apiKey', id: 44 },
+  tokenScope: TokenScope.UserRead | TokenScope.ModelsRead | TokenScope.MediaRead,
+};
+
+// An approved, owned PAGE app. allowedScopes is the OAuth ceiling — set every
+// relevant bit so the OAuth-clamp doesn't drop the scopes under test (the
+// approved-snapshot + dev-allowlist are the gates we exercise here).
+function pageApp(over: Partial<Record<string, unknown>> = {}) {
+  return {
+    id: 'apb_abc',
+    blockId: 'my-page-app',
+    appId: 'appblk-my-page-app',
+    status: 'approved',
+    manifest: { page: { title: 'My Page' } },
+    approvedScopes: [
+      'models:read:self',
+      'user:read:self',
+      'ai:write:budgeted',
+      'apps:storage:read',
+    ],
+    // 0x1FFFFFF = all 25 bits → no OAuth-ceiling stripping in these tests.
+    app: { allowedScopes: 0x1ffffff, userId: OWNER_ID },
+    ...over,
+  };
+}
+
+// A pending AppBlockPublishRequest the caller owns (local-manifest mode). There
+// is NO AppBlock row + NO OauthClient yet — scopes come from the un-reviewed
+// manifest and the OAuth-ceiling clamp is SKIPPED (7f is the spend gate).
+function pendingRequest(over: Partial<Record<string, unknown>> = {}) {
+  return {
+    id: 'pubreq_01HXYZ',
+    slug: 'my-pending-app',
+    submittedByUserId: OWNER_ID,
+    manifest: {
+      page: { title: 'My Pending Page' },
+      scopes: ['models:read:self', 'user:read:self', 'ai:write:budgeted', 'apps:storage:read'],
+    },
+    ...over,
+  };
+}
+
+beforeEach(() => {
+  // Only the spend-entitlement read gets a row; other user reads keep the default.
+  dbMock.dbWrite.user.findUnique.mockImplementation((async (args: {
+    select?: Record<string, boolean>;
+  }) =>
+    Object.keys(args.select ?? {}).join() === 'muted,bannedAt'
+      ? { muted: false, bannedAt: null }
+      : undefined) as never);
+  vi.clearAllMocks();
+  mockMultiIncr.value = 1;
+  mockMultiIncr.malformedExec = false;
+  mockMultiIncr.throwExec = false;
+  mockMultiIncr.hangExec = false;
+  sysDeadline.ms = 50;
+  mockSysRedis.ttl.mockResolvedValue(60);
+  mockSysRedis.expire.mockResolvedValue(1);
+  mockIsAppBlocksEnabled.mockResolvedValue(true);
+  mockIsAppBlocksAuthorEnabled.mockImplementation(async (opts) => !!opts?.user?.isModerator);
+  mockAppBlockFindUnique.mockResolvedValue(pageApp());
+  // Default: no pending request. The local-manifest path tests set this per-case.
+  mockPublishRequestFindFirst.mockResolvedValue(null);
+  mockSign.mockResolvedValue({
+    token: 'jwt.signed.value',
+    expiresAt: '2099-01-01T00:00:00Z',
+    jti: 'j',
+  });
+});
+
+function authPost(body: unknown) {
+  return createMocks({ headers: { authorization: 'Bearer personal-key' }, body });
+}
+
+describe('POST /api/v1/blocks/dev-token', () => {
+  it('405 for non-POST', async () => {
+    const { req, res } = createMocks({ method: 'GET' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(405);
+  });
+
+  it('401 when Authorization header is missing', async () => {
+    const { req, res } = createMocks({ body: { appBlockId: 'apb_abc' } });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(401);
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('401 when the bearer key does not resolve to a session', async () => {
+    mockGetSession.mockResolvedValueOnce(null);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(401);
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('403 when an OAuth token LACKS the AppBlocksSubmit scope', async () => {
+    // TokenScope.Full excludes AppBlocksSubmit, so even a "full" OAuth consent
+    // is rejected at the mint gate (mirrors submit-version's OAuth gate).
+    mockGetSession.mockResolvedValueOnce(OAUTH_MOD_SESSION);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(403);
+    const msg = (res._getJSONData() as { message: string }).message;
+    // Actionable: tells the dev both how to fix it (personal key) and the OAuth path.
+    expect(msg).toContain('personal API key');
+    expect(msg).toContain('Apps submit scope');
+    expect(mockSign).not.toHaveBeenCalled();
+    // Rejected before flag / db / sign — no leak.
+    expect(mockIsAppBlocksEnabled).not.toHaveBeenCalled();
+    expect(mockAppBlockFindUnique).not.toHaveBeenCalled();
+  });
+
+  it('200: OAuth token WITH AppBlocksSubmit + AIServicesWrite mints a spend-capable dev token (self-bound sub)', async () => {
+    mockGetSession.mockResolvedValueOnce(OAUTH_SUBMIT_SPEND_SESSION);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign).toHaveBeenCalledTimes(1);
+    const arg = mockSign.mock.calls[0][0];
+    // Self-bound subject = the OAuth user (never settable from the body).
+    expect(arg.userId).toBe(OWNER_ID);
+    // AppBlocksSubmit gated the MINT; AIServicesWrite kept the spend scope.
+    expect(arg.scopes).toContain('ai:write:budgeted');
+    expect(arg.buzzBudget).toBe(1000);
+    // Every other belt unchanged: forced SFW + page ctx.
+    expect(arg.maxBrowsingLevel).toBe(SFW);
+    expect(arg.ctx).toEqual({ slotId: 'app.page', entityType: 'none' });
+  });
+
+  it('200: a restricted account still mints, with its read scopes but no spend scope or budget', async () => {
+    mockGetSession.mockResolvedValueOnce(OAUTH_SUBMIT_SPEND_SESSION);
+    dbMock.dbWrite.user.findUnique.mockResolvedValue({ muted: true } as never);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    const arg = mockSign.mock.calls[0][0];
+    expect(arg.scopes).toEqual(['apps:storage:read', 'models:read:self', 'user:read:self']);
+    expect(arg.buzzBudget).toBeUndefined();
+  });
+
+  it('200: a banned account mints without spend', async () => {
+    mockGetSession.mockResolvedValueOnce(OAUTH_SUBMIT_SPEND_SESSION);
+    dbMock.dbWrite.user.findUnique.mockResolvedValue({
+      muted: false,
+      bannedAt: new Date(),
+    } as never);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign.mock.calls[0][0].scopes).not.toContain('ai:write:budgeted');
+  });
+
+  it('200: an account with no row mints without spend', async () => {
+    mockGetSession.mockResolvedValueOnce(OAUTH_SUBMIT_SPEND_SESSION);
+    dbMock.dbWrite.user.findUnique.mockResolvedValue(null);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign.mock.calls[0][0].scopes).not.toContain('ai:write:budgeted');
+  });
+
+  it('200: OAuth token WITH AppBlocksSubmit but WITHOUT AIServicesWrite mints, but the uniform spend ceiling STRIPS ai:write:budgeted', async () => {
+    // Proves AppBlocksSubmit is the MINT gate, NOT a spend grant — spend stays
+    // uniformly gated by AIServicesWrite for OAuth exactly as for personal keys.
+    mockGetSession.mockResolvedValueOnce(OAUTH_SUBMIT_NOSPEND_SESSION);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    const arg = mockSign.mock.calls[0][0];
+    expect(arg.userId).toBe(OWNER_ID);
+    // Read/catalog/storage scopes survive; the budgeted-spend scope is gone.
+    expect(arg.scopes).toEqual(['apps:storage:read', 'models:read:self', 'user:read:self']);
+    expect(arg.scopes).not.toContain('ai:write:budgeted');
+    // No spend scope → no budget claim.
+    expect(arg.buzzBudget).toBeUndefined();
+    const out = res._getJSONData() as Record<string, unknown>;
+    expect(out.buzzBudget).toBeUndefined();
+  });
+
+  it('403 when the resolved user is NOT an app author (non-mod, no cohort grant)', async () => {
+    mockGetSession.mockResolvedValueOnce(NONMOD_SESSION);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(403);
+    expect(mockSign).not.toHaveBeenCalled();
+    // Denied on the authz line — never reached the enabled-flag check.
+    expect(mockIsAppBlocksEnabled).not.toHaveBeenCalled();
+  });
+
+  it('author-capable NON-MOD (cohort widening): passes the authz line into the flag check', async () => {
+    mockGetSession.mockResolvedValueOnce(NONMOD_SESSION);
+    mockIsAppBlocksAuthorEnabled.mockResolvedValueOnce(true);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    // Got PAST the authz gate — not a 403 on the author line, and the enabled
+    // kill-switch flag was consulted next.
+    expect(res._getStatusCode()).not.toBe(403);
+    expect(mockIsAppBlocksEnabled).toHaveBeenCalled();
+  });
+
+  it('403 when the mod is banned', async () => {
+    mockGetSession.mockResolvedValueOnce({
+      user: { id: 9, isModerator: true, bannedAt: new Date() },
+      apiKeyId: 44,
+      subject: { type: 'apiKey', id: 44 },
+    });
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(403);
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  describe('a system account', () => {
+    const owned = (meta: Record<string, unknown>) => ({
+      ...MOD_SESSION,
+      user: { ...MOD_SESSION.user, meta },
+    });
+
+    it('403 and nothing signed, even when an app author with an AI-services key', async () => {
+      mockGetSession.mockResolvedValueOnce(owned({ systemAccount: true }));
+      mockIsAppBlocksAuthorEnabled.mockResolvedValueOnce(true);
+      const { req, res } = authPost({ appBlockId: 'apb_abc' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(403);
+      expect(res._getJSONData()).toEqual({ message: APPS_RESTRICTED_MESSAGE });
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    it('the same session without the system-account mark mints with spend', async () => {
+      mockGetSession.mockResolvedValueOnce(owned({}));
+      mockIsAppBlocksAuthorEnabled.mockResolvedValueOnce(true);
+      const { req, res } = authPost({ appBlockId: 'apb_abc' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign.mock.calls[0][0].scopes).toContain('ai:write:budgeted');
+    });
+  });
+
+  it('503 (dark) when the App Blocks flag is OFF for the user', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockIsAppBlocksEnabled.mockResolvedValueOnce(false);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(503);
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('400 when neither appBlockId nor slug is provided', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    const { req, res } = authPost({});
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(400);
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('404 with the bare "App not found" message when the app truly does not exist', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(null);
+    const { req, res } = authPost({ appBlockId: 'apb_missing' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(404);
+    expect((res._getJSONData() as { message: string }).message).toBe('App not found');
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('404 with an ACTIONABLE no-live-deployment message when an OWNED app is not approved (pending)', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(pageApp({ status: 'pending' }));
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(404);
+    const msg = (res._getJSONData() as { message: string }).message;
+    // NOT the misleading bare message...
+    expect(msg).not.toBe('App not found');
+    // ...but an actionable one naming the block + pointing at dev:harness.
+    expect(msg).toContain("block 'my-page-app' has no live deployment");
+    expect(msg).toContain('dev:harness');
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('404 when the caller does NOT own the app (no probe oracle)', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(
+      pageApp({ app: { allowedScopes: 0x1ffffff, userId: 999 } })
+    );
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(404);
+    // A non-owner gets the bare, indistinguishable message even though the row
+    // exists and is approved — the actionable status detail is owner-only, so
+    // ownership/approval-state is never a probe oracle.
+    expect((res._getJSONData() as { message: string }).message).toBe('App not found');
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('422 when the owned app declares no page block', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(pageApp({ manifest: { scopes: [] } }));
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(422);
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('422 (approved path) when manifest.page is an ARRAY (not a plain object) — FIX 🟡-2', async () => {
+    // `typeof [] === 'object'` and `[] !== null`, so the old check ACCEPTED an
+    // array. The tightened check rejects arrays: a "declares a page block" gate
+    // must require a plain object, never attacker-supplied non-object JSON.
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(pageApp({ manifest: { page: [] } }));
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(422);
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('200 (approved path) when manifest.page is a plain object {} — still mints (FIX 🟡-2 regression guard)', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(pageApp({ manifest: { page: {} } }));
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign).toHaveBeenCalledTimes(1);
+  });
+
+  it('429 when the per-user rate limit is exceeded', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockMultiIncr.value = 31; // > RATE_LIMIT.max (30)
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(429);
+    expect(res._getHeaders()['Retry-After']).toBeDefined();
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('503 (fail closed) when the rate-limit exec() is malformed', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockMultiIncr.malformedExec = null;
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(503);
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('503 (fail closed) when the rate-limit exec() THROWS (redis incident)', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockMultiIncr.throwExec = true;
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(503);
+    // A Redis incident must never silently bypass the mint.
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('503 (fail closed) when the rate-limit exec() HANGS (#28: silent half-open never settles) — deadline-bounded, no park', async () => {
+    // The #28 root cause: a raw sysRedis MULTI on the critical path parks the
+    // handler on a silent half-open (no throw). withSysReadDeadline races the
+    // never-settling exec() against the deadline → rejects → the existing catch
+    // fails closed (503) instead of hanging ~11min to TCP keepalive.
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockMultiIncr.hangExec = true;
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never); // must RESOLVE (not hang)
+    expect(res._getStatusCode()).toBe(503);
+    // A hung limiter must never silently bypass the mint.
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('429 path does not park when the retry-after sysRedis.ttl HANGS (#28) — falls back to the window', async () => {
+    // Over the limit → the 429 path reads ttl for Retry-After. A hung ttl must not
+    // park the over-limit response: the deadline reject folds into the windowSeconds
+    // fallback so a 429 is still returned promptly.
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockMultiIncr.value = 31; // > RATE_LIMIT.max (30)
+    mockSysRedis.ttl.mockReturnValueOnce(new Promise(() => {})); // never settles
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never); // must RESOLVE
+    expect(res._getStatusCode()).toBe(429);
+    // Fallback Retry-After = RATE_LIMIT.windowSeconds (60).
+    expect(res._getHeaders()['Retry-After']).toBe('60');
+    expect(mockSign).not.toHaveBeenCalled();
+  });
+
+  it('self-heals a TTL-less rate-limit key (re-arms expiry when ttl < 0)', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockMultiIncr.value = 2; // not first hit → self-heal branch runs
+    mockSysRedis.ttl.mockResolvedValueOnce(-1); // key exists but lost its TTL
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSysRedis.expire).toHaveBeenCalledWith('system:blocks:dev-token-rate-limit:u:7', 60);
+  });
+
+  it('does NOT re-arm expiry when the window is still active (ttl >= 0)', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockMultiIncr.value = 2;
+    mockSysRedis.ttl.mockResolvedValueOnce(45); // active window — must not be extended
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSysRedis.expire).not.toHaveBeenCalled();
+  });
+
+  it('happy path: mod + owned page app → token with capped claims (self-sub, SFW, page ctx)', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+
+    expect(res._getStatusCode()).toBe(200);
+    // The bearer-JWT body must never be cached by an intermediary.
+    expect(res._getHeaders()['Cache-Control']).toBe('no-store');
+    expect(mockSign).toHaveBeenCalledTimes(1);
+    const arg = mockSign.mock.calls[0][0];
+    // Self-bound subject.
+    expect(arg.userId).toBe(OWNER_ID);
+    // Forced SFW ceiling.
+    expect(arg.maxBrowsingLevel).toBe(SFW);
+    // No request-host domain read → null advisory domain.
+    expect(arg.domain).toBeNull();
+    // Page ctx — no model binding.
+    expect(arg.ctx).toEqual({ slotId: 'app.page', entityType: 'none' });
+    // Revocable synthetic page instance id.
+    expect(arg.blockInstanceId).toBe('page_apb_abc');
+    // All of the app's approved + dev-allowed scopes, sorted.
+    expect(arg.scopes).toEqual([
+      'ai:write:budgeted',
+      'apps:storage:read',
+      'models:read:self',
+      'user:read:self',
+    ]);
+    // Budget defaulted + capped.
+    expect(arg.buzzBudget).toBe(1000);
+
+    const out = res._getJSONData() as Record<string, unknown>;
+    expect(out.token).toBe('jwt.signed.value');
+    expect(out.maxBrowsingLevel).toBe(SFW);
+    expect(out.scopes).toEqual(arg.scopes);
+  });
+
+  it('resolves by slug (blockId) too', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    const { req, res } = authPost({ slug: 'my-page-app' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockAppBlockFindUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { blockId: 'my-page-app' } })
+    );
+  });
+
+  it('STRIPS dev-excluded scopes (social:tip:self, block:settings:*) even if approved', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(
+      pageApp({
+        approvedScopes: [
+          'models:read:self',
+          'social:tip:self', // dev-excluded + page-forbidden
+          'block:settings:read', // dev-excluded
+          'apps:storage:write',
+        ],
+      })
+    );
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    const arg = mockSign.mock.calls[0][0];
+    // user:read:self is FORCE-GRANTED post-clamp (dev:live viewer identity).
+    expect(arg.scopes).toEqual(['apps:storage:write', 'models:read:self', 'user:read:self']);
+    expect(arg.scopes).not.toContain('social:tip:self');
+    expect(arg.scopes).not.toContain('block:settings:read');
+  });
+
+  it('STRIPS a requested OTHER scope that is NOT in the app approved set (user:read:self is force-granted)', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    // App approves only models:read:self; the body requests ai:write:budgeted too
+    // (which is NOT approved → stripped). user:read:self is force-granted post-
+    // clamp regardless of approval, so it is present even though the app did not
+    // approve it.
+    mockAppBlockFindUnique.mockResolvedValueOnce(pageApp({ approvedScopes: ['models:read:self'] }));
+    const { req, res } = authPost({
+      appBlockId: 'apb_abc',
+      scopes: ['models:read:self', 'ai:write:budgeted'],
+    });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    const arg = mockSign.mock.calls[0][0];
+    // ai:write:budgeted stripped (not approved); user:read:self force-granted.
+    expect(arg.scopes).toEqual(['models:read:self', 'user:read:self']);
+    expect(arg.scopes).not.toContain('ai:write:budgeted');
+  });
+
+  it('narrows scopes to the requested subset, but user:read:self is force-granted regardless of body narrowing', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    const { req, res } = authPost({
+      appBlockId: 'apb_abc',
+      scopes: ['models:read:self'], // subset of approved — excludes user:read:self
+    });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    // Body narrowing dropped everything but models:read:self; user:read:self is
+    // force-granted POST-clamp, so it survives the narrowing.
+    expect(mockSign.mock.calls[0][0].scopes).toEqual(['models:read:self', 'user:read:self']);
+  });
+
+  it('CAPS an over-cap requested budget to the dev cap', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    const { req, res } = authPost({ appBlockId: 'apb_abc', buzzBudget: 100000 });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign.mock.calls[0][0].buzzBudget).toBe(5000); // DEV_BUZZ_BUDGET_CAP
+  });
+
+  // Fix 2 (dogfood follow-up): the dev-token default budget now comes from the
+  // resolved app manifest's `page.buzzBudgetPerGen`, so a recipe/app whose budget
+  // exceeds the flat default is dev-testable WITHOUT a manual buzzBudget.
+  it('DEFAULTS the budget to the APPROVED manifest page.buzzBudgetPerGen when no explicit request', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(
+      pageApp({ manifest: { page: { title: 'X', buzzBudgetPerGen: 180 } } })
+    );
+    const { req, res } = authPost({ appBlockId: 'apb_abc' }); // NO buzzBudget
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign.mock.calls[0][0].buzzBudget).toBe(180);
+  });
+
+  // 6301 overshoots the cap without being a multiple of it. An invalid declaration is
+  // ignored by `parseManifestBuzzBudget`, so it mints the default.
+  it.each([
+    ['at the cap', 5000, 5000],
+    ['one over the cap', 5001, 5000],
+    ['far over the cap', 6301, 5000],
+    ['a non-integer', 12.5, 1000],
+    ['negative', -5, 1000],
+  ])(
+    'an approved manifest budget, %s, mints the dev token’s buzzBudget',
+    async (_l, declared, minted) => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      mockAppBlockFindUnique.mockResolvedValueOnce(
+        pageApp({ manifest: { page: { title: 'X', buzzBudgetPerGen: declared } } })
+      );
+      const { req, res } = authPost({ appBlockId: 'apb_abc' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign.mock.calls[0][0].buzzBudget).toBe(minted);
+    }
+  );
+
+  it.each([
+    [5000, 5000],
+    [5001, 5000],
+    [6301, 5000],
+  ])('an explicit requested budget of %i mints %i', async (requested, minted) => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    const { req, res } = authPost({ appBlockId: 'apb_abc', buzzBudget: requested });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign.mock.calls[0][0].buzzBudget).toBe(minted);
+  });
+
+  it('an EXPLICIT requested budget still wins over the manifest default', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(
+      pageApp({ manifest: { page: { title: 'X', buzzBudgetPerGen: 180 } } })
+    );
+    const { req, res } = authPost({ appBlockId: 'apb_abc', buzzBudget: 30 });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign.mock.calls[0][0].buzzBudget).toBe(30);
+  });
+
+  it('falls back to the flat default (1000) when the approved manifest omits buzzBudgetPerGen', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    // Default pageApp() manifest has no buzzBudgetPerGen.
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign.mock.calls[0][0].buzzBudget).toBe(1000);
+  });
+
+  it('DEFAULTS the budget to the PENDING manifest page.buzzBudgetPerGen (local-manifest mode)', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION); // personal key w/ AIServicesWrite
+    // No approved row → pending path; the pending manifest declares its own budget.
+    mockAppBlockFindUnique.mockResolvedValueOnce(null);
+    mockPublishRequestFindFirst.mockResolvedValueOnce(
+      pendingRequest({
+        manifest: {
+          page: { title: 'X', buzzBudgetPerGen: 200 },
+          scopes: ['ai:write:budgeted', 'user:read:self'],
+        },
+      })
+    );
+    const { req, res } = authPost({ slug: 'my-pending-app' }); // NO buzzBudget
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign.mock.calls[0][0].buzzBudget).toBe(200);
+  });
+
+  it('omits buzzBudget when ai:write:budgeted is not granted', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(pageApp({ approvedScopes: ['models:read:self'] }));
+    const { req, res } = authPost({ appBlockId: 'apb_abc', buzzBudget: 200 });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockSign.mock.calls[0][0].buzzBudget).toBeUndefined();
+  });
+
+  it('drops a scope outside the app OAuth ceiling', async () => {
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    // Ceiling = 0 → every bitmask-requiring scope is dropped; only the
+    // SKIP_OAUTH_CHECK apps:storage:* survives.
+    mockAppBlockFindUnique.mockResolvedValueOnce(
+      pageApp({
+        approvedScopes: ['models:read:self', 'apps:storage:read'],
+        app: { allowedScopes: 0, userId: OWNER_ID },
+      })
+    );
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    // models:read:self dropped by the 0 OAuth ceiling; apps:storage:read survives
+    // (SKIP_OAUTH_CHECK); user:read:self is force-granted POST-clamp so it is
+    // present even though the ceiling would otherwise drop it.
+    expect(mockSign.mock.calls[0][0].scopes).toEqual(['apps:storage:read', 'user:read:self']);
+  });
+
+  it('STRIPS ai:write:budgeted when the personal key lacks AIServicesWrite', async () => {
+    // The minted token can never authorize MORE spend than the dev's own key.
+    mockGetSession.mockResolvedValueOnce(READONLY_MOD_SESSION);
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    const arg = mockSign.mock.calls[0][0];
+    // Read/catalog/storage scopes survive; the budgeted-spend scope is gone.
+    expect(arg.scopes).toEqual(['apps:storage:read', 'models:read:self', 'user:read:self']);
+    expect(arg.scopes).not.toContain('ai:write:budgeted');
+    // No spend scope → no budget claim.
+    expect(arg.buzzBudget).toBeUndefined();
+    const out = res._getJSONData() as Record<string, unknown>;
+    expect(out.buzzBudget).toBeUndefined();
+  });
+
+  it('PAGE-MONEY case: OAuth dev token for an app that approves ONLY ai:write:budgeted, with a credential lacking AIServicesWrite, still mints user:read:self', async () => {
+    // The exact root-cause scenario: the page-money scaffold manifest declares
+    // ONLY ai:write:budgeted, so user:read:self is never in approvedScopes and
+    // would never be minted by the clamp → /blocks/me 403 → dev:live falls back
+    // to an anonymous viewer. The OAuth credential here also lacks AIServicesWrite,
+    // so ai:write:budgeted is stripped by the spend ceiling. The token therefore
+    // carries NO spend scope, but user:read:self IS present (force-granted) so the
+    // harness can resolve the viewer identity.
+    mockGetSession.mockResolvedValueOnce(OAUTH_SUBMIT_NOSPEND_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(
+      pageApp({ approvedScopes: ['ai:write:budgeted'] })
+    );
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    const arg = mockSign.mock.calls[0][0];
+    // Identity present; no spend (credential lacked AIServicesWrite).
+    expect(arg.scopes).toEqual(['user:read:self']);
+    expect(arg.scopes).not.toContain('ai:write:budgeted');
+    expect(arg.buzzBudget).toBeUndefined();
+    // Self-bound subject = the caller — so /blocks/me only ever returns this user.
+    expect(arg.userId).toBe(OWNER_ID);
+    const out = res._getJSONData() as Record<string, unknown>;
+    expect(out.scopes).toEqual(['user:read:self']);
+  });
+
+  it('FORCE-GRANTS user:read:self even when the app approves ONLY ai:write:budgeted (personal-key page-money app)', async () => {
+    // Same page-money manifest, but via a personal key that CAN spend
+    // (AIServicesWrite). user:read:self is added regardless, alongside the spend
+    // scope the app approved.
+    mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+    mockAppBlockFindUnique.mockResolvedValueOnce(
+      pageApp({ approvedScopes: ['ai:write:budgeted'] })
+    );
+    const { req, res } = authPost({ appBlockId: 'apb_abc' });
+    await handler(req as never, res as never);
+    expect(res._getStatusCode()).toBe(200);
+    const arg = mockSign.mock.calls[0][0];
+    expect(arg.scopes).toEqual(['ai:write:budgeted', 'user:read:self']);
+  });
+
+  // -------------------------------------------------------------------------
+  // Local-manifest mode (Phase 4): mint against a caller's OWN pending app
+  // before it is moderator-approved. Scopes come from the un-reviewed manifest,
+  // clamped by the SAME belt minus the OAuth ceiling (7f is the spend gate).
+  // -------------------------------------------------------------------------
+  describe('local-manifest mode (owned pending app)', () => {
+    // The approved lookup MUST find nothing so the pending path is reached.
+    function noApprovedRow() {
+      mockAppBlockFindUnique.mockResolvedValueOnce(null);
+    }
+
+    it('200: owned pending request + page manifest → mints from manifest.scopes (OAuth ceiling SKIPPED), spend-capable when bearer has AIServicesWrite', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION); // personal key, Full → can spend
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign).toHaveBeenCalledTimes(1);
+      const arg = mockSign.mock.calls[0][0];
+      // Self-bound subject = the caller.
+      expect(arg.userId).toBe(OWNER_ID);
+      // Granted = manifest.scopes ∩ allowlist ∩ (¬page-forbidden), + force-granted
+      // user:read:self. ai:write:budgeted survives (bearer has AIServicesWrite).
+      expect(arg.scopes).toEqual([
+        'ai:write:budgeted',
+        'apps:storage:read',
+        'models:read:self',
+        'user:read:self',
+      ]);
+      // Budget defaulted + capped; forced SFW; page ctx.
+      expect(arg.buzzBudget).toBe(1000);
+      expect(arg.maxBrowsingLevel).toBe(SFW);
+      expect(arg.ctx).toEqual({ slotId: 'app.page', entityType: 'none' });
+      // Synthetic, revocable instance id derived from the publish-request id.
+      expect(arg.blockInstanceId).toBe('page_pubreq_pubreq_01HXYZ');
+      // sign blockId = the slug; appId = the SYNTHETIC non-colliding id (audit S1).
+      // NOT `appblk-<slug>` — that would resolve to a real OauthClient on spend.
+      expect(arg.blockId).toBe('my-pending-app');
+      expect(arg.appId).toBe('pending-pubreq_01HXYZ');
+      expect(arg.appId).not.toBe('appblk-my-pending-app');
+      expect(arg.appBlockId).toBe('pubreq_01HXYZ');
+      // Ownership was enforced in the query.
+      expect(mockPublishRequestFindFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { slug: 'my-pending-app', status: 'pending', submittedByUserId: OWNER_ID },
+        })
+      );
+    });
+
+    it('200: owned pending request but bearer LACKS AIServicesWrite → ai:write:budgeted STRIPPED (7f spend gate), no budget claim', async () => {
+      mockGetSession.mockResolvedValueOnce(READONLY_MOD_SESSION);
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+
+      expect(res._getStatusCode()).toBe(200);
+      const arg = mockSign.mock.calls[0][0];
+      // ai:write:budgeted stripped by 7f; read/catalog/storage survive.
+      expect(arg.scopes).toEqual(['apps:storage:read', 'models:read:self', 'user:read:self']);
+      expect(arg.scopes).not.toContain('ai:write:budgeted');
+      expect(arg.buzzBudget).toBeUndefined();
+    });
+
+    it('R1: an un-reviewed manifest declaring ESCALATED scopes has them STRIPPED, not minted', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(
+        pendingRequest({
+          manifest: {
+            page: { title: 'evil' },
+            scopes: [
+              'models:read:self', // legit → kept
+              'social:tip:self', // dev-excluded (money OUT) → stripped
+              'block:settings:write', // dev-excluded → stripped
+              'buzz:read:self', // own-ledger read, in dev allowlist → kept
+              'totally:unknown:scope', // not a known block scope → stripped
+            ],
+          },
+        })
+      );
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+
+      expect(res._getStatusCode()).toBe(200);
+      const arg = mockSign.mock.calls[0][0];
+      // The legit reads (incl. self-bound buzz:read:self) + the force-granted
+      // user:read:self survive; the ESCALATED money/write/unknown scopes are
+      // stripped — proving the un-reviewed manifest cannot escalate past the belt.
+      expect(arg.scopes).toEqual(['buzz:read:self', 'models:read:self', 'user:read:self']);
+      expect(arg.scopes).not.toContain('social:tip:self');
+      expect(arg.scopes).not.toContain('block:settings:write');
+      expect(arg.scopes).toContain('buzz:read:self');
+      expect(arg.scopes).not.toContain('totally:unknown:scope');
+    });
+
+    it('no oracle when a pending request is owned by ANOTHER user: the foreign pending does not match the caller query, so it falls to the NO-ROW path (mints a read-only token, identical to no-row-at-all — never reveals the foreign row)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noApprovedRow();
+      // The ownership filter is in the QUERY (submittedByUserId === user.id), so a
+      // pending row owned by another user simply does not match → findFirst null.
+      // With the no-row local-manifest path live, `block == null` + no owned
+      // pending → the caller reaches the NO-ROW mint, NOT a 404. With NO body
+      // scopes the granted set is read-only (user:read:self) — INDISTINGUISHABLE
+      // from a brand-new slug, so a foreign pending row is still never an oracle.
+      mockPublishRequestFindFirst.mockResolvedValueOnce(null);
+      const { req, res } = authPost({ slug: 'someone-elses-app' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      const arg = mockSign.mock.calls[0][0];
+      // Read-only (no body scopes) → no oracle: same outcome as a slug with no row.
+      expect(arg.scopes).toEqual(['user:read:self']);
+      expect(arg.appId).toBe('local-someone-elses-app');
+    });
+
+    it('no-row mint when neither an approved row NOR an owned pending request exists (the no-row local-manifest path)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(null);
+      const { req, res } = authPost({ slug: 'no-such-app' });
+      await handler(req as never, res as never);
+      // `block == null` + no owned pending → no-row mint (read-only, no body scopes).
+      expect(res._getStatusCode()).toBe(200);
+      const arg = mockSign.mock.calls[0][0];
+      expect(arg.scopes).toEqual(['user:read:self']);
+      expect(arg.appId).toBe('local-no-such-app');
+    });
+
+    it('422 when the owned pending manifest declares NO page block', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(
+        pendingRequest({ manifest: { scopes: ['models:read:self'] } }) // no page
+      );
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(422);
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    it('422 when the owned pending manifest sets page to an ARRAY — FIX 🟡-2', async () => {
+      // On the PENDING path the manifest is developer-controlled + un-reviewed, so
+      // a dev could set `page: []` (an array is `typeof 'object'`, non-null) to
+      // satisfy the old "declares a page block" gate. The tightened check rejects
+      // it → 422, never a mint.
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(
+        pendingRequest({ manifest: { page: [], scopes: ['models:read:self'] } })
+      );
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(422);
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    it('200 when the owned pending manifest page is a plain object {} (FIX 🟡-2 regression guard)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(
+        pendingRequest({ manifest: { page: {}, scopes: ['models:read:self'] } })
+      );
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign).toHaveBeenCalledTimes(1);
+    });
+
+    it('FIX 🟡-1: emits the structured blocks.dev-token.pending-mint log with spendGranted=true (bearer has AIServicesWrite)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION); // Full → AIServicesWrite → can spend
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+
+      expect(res._getStatusCode()).toBe(200);
+      const log = (req as unknown as { log: { info: ReturnType<typeof vi.fn> } }).log;
+      expect(log.info).toHaveBeenCalledWith(
+        'blocks.dev-token.pending-mint',
+        expect.objectContaining({
+          mode: 'pending',
+          userId: OWNER_ID,
+          slug: 'my-pending-app',
+          publishRequestId: 'pubreq_01HXYZ',
+          spendGranted: true,
+        })
+      );
+      // The granted scopes are logged for forensics; the token/secret is NEVER logged.
+      const call = log.info.mock.calls.find((c) => c[0] === 'blocks.dev-token.pending-mint');
+      expect(call?.[1].scopes).toEqual([
+        'ai:write:budgeted',
+        'apps:storage:read',
+        'models:read:self',
+        'user:read:self',
+      ]);
+      expect(JSON.stringify(call?.[1])).not.toContain('jwt.signed.value');
+    });
+
+    it('FIX 🟡-1: pending-mint log reflects spendGranted=false when the bearer LACKS AIServicesWrite (7f clamp)', async () => {
+      mockGetSession.mockResolvedValueOnce(READONLY_MOD_SESSION); // no AIServicesWrite
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+
+      expect(res._getStatusCode()).toBe(200);
+      const log = (req as unknown as { log: { info: ReturnType<typeof vi.fn> } }).log;
+      const call = log.info.mock.calls.find((c) => c[0] === 'blocks.dev-token.pending-mint');
+      expect(call).toBeDefined();
+      expect(call?.[1].spendGranted).toBe(false);
+      expect(call?.[1].scopes).not.toContain('ai:write:budgeted');
+    });
+
+    it('FIX 🟡-1: the APPROVED path does NOT emit the pending-mint log', async () => {
+      // The approved path has durable AppBlock-backed audit rows, so the structured
+      // pending-mint event must not fire for it (it is pending-path-only).
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      const { req, res } = authPost({ appBlockId: 'apb_abc' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      const log = (req as unknown as { log: { info: ReturnType<typeof vi.fn> } }).log;
+      const call = log.info.mock.calls.find((c) => c[0] === 'blocks.dev-token.pending-mint');
+      expect(call).toBeUndefined();
+    });
+
+    it('an appBlockId-only request can NEVER reach the pending path (pending apps have no appBlockId)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      // approved lookup misses; no slug → pending findFirst must not be consulted.
+      mockAppBlockFindUnique.mockResolvedValueOnce(null);
+      const { req, res } = authPost({ appBlockId: 'apb_missing' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(404);
+      expect((res._getJSONData() as { message: string }).message).toBe('App not found');
+      expect(mockPublishRequestFindFirst).not.toHaveBeenCalled();
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    it('CAPS an over-cap budget on the pending path to DEV_BUZZ_BUDGET_CAP', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+      const { req, res } = authPost({ slug: 'my-pending-app', buzzBudget: 100000 });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign.mock.calls[0][0].buzzBudget).toBe(5000);
+    });
+
+    it('forced SFW + self-bound sub hold on the pending path', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+      const arg = mockSign.mock.calls[0][0];
+      expect(arg.maxBrowsingLevel).toBe(SFW);
+      expect(arg.domain).toBeNull();
+      expect(arg.userId).toBe(OWNER_ID);
+    });
+
+    it('mod-only: a NON-mod is blocked BEFORE the pending lookup', async () => {
+      mockGetSession.mockResolvedValueOnce(NONMOD_SESSION);
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(403);
+      expect(mockPublishRequestFindFirst).not.toHaveBeenCalled();
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    it('rate-limit applies to the pending path too', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      mockMultiIncr.value = 31;
+      const { req, res } = authPost({ slug: 'my-pending-app' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(429);
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    it('S1: a foreign-owned APPROVED app for the same slug does NOT pin the token appId to appblk-<slug> (no forged attribution row)', async () => {
+      // ADVERSARIAL: a mod-tier dev files a *pending* request for a slug that an
+      // APPROVED app owned by a DIFFERENT user already holds. The submit guard
+      // blocks only same-slug *pending* collisions, not pending-vs-approved, so
+      // this is reachable. The dev-token APPROVED branch is skipped (the approved
+      // row's owner != caller), so the caller falls through to the PENDING branch.
+      // Were the pending path to mint appId=`appblk-<slug>`, recordSpendAttribution
+      // would resolve the VICTIM's real OauthClient on spend and write a forged
+      // blockSpendAttribution row. (Corrected: this used to say "the #2605 payout
+      // rail reads exactly that row" — #2605 reads the PURCHASE table only, and
+      // the spend bounty is removed. The row's live consumer is the app-owner
+      // analytics dashboard; see the re-pointed GATE in dev-token.ts.)
+      // The fix mints a synthetic `pending-<pubreqId>` instead, which can never
+      // resolve to a real OauthClient.id → the attribution write is skipped.
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      // The approved lookup by blockId=slug FINDS a row — but owned by user 999,
+      // NOT the caller (OWNER_ID). The same `appId` a real approved app would hold.
+      mockAppBlockFindUnique.mockResolvedValueOnce(
+        pageApp({
+          blockId: 'contested-slug',
+          appId: 'appblk-contested-slug',
+          app: { allowedScopes: 0x1ffffff, userId: 999 },
+        })
+      );
+      // The caller DOES own a pending request for the SAME slug.
+      mockPublishRequestFindFirst.mockResolvedValueOnce(
+        pendingRequest({ id: 'pubreq_CALLER1', slug: 'contested-slug' })
+      );
+      const { req, res } = authPost({ slug: 'contested-slug' });
+      await handler(req as never, res as never);
+
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign).toHaveBeenCalledTimes(1);
+      const arg = mockSign.mock.calls[0][0];
+      // (a) The caller reached the PENDING path, not the approved branch: the
+      //     appBlockId claim is the caller's OWN pending-request id, and the
+      //     instance id is derived from it (NOT the foreign approved AppBlock.id).
+      expect(arg.appBlockId).toBe('pubreq_CALLER1');
+      expect(arg.blockInstanceId).toBe('page_pubreq_pubreq_CALLER1');
+      // (b) appId is the SYNTHETIC value — NOT the colliding appblk-<slug> that
+      //     would resolve to the foreign victim's OauthClient on spend.
+      expect(arg.appId).toBe('pending-pubreq_CALLER1');
+      expect(arg.appId).not.toBe('appblk-contested-slug');
+      // Self-bound to the caller (the spend would be the caller's own Buzz).
+      expect(arg.userId).toBe(OWNER_ID);
+    });
+
+    it('body-narrowing applies on the pending path; user:read:self still force-granted', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noApprovedRow();
+      mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+      const { req, res } = authPost({
+        slug: 'my-pending-app',
+        scopes: ['models:read:self'], // subset; excludes user:read:self
+      });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign.mock.calls[0][0].scopes).toEqual(['models:read:self', 'user:read:self']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // No-row local-manifest mode (Phase 4 — deferred): mint for a BRAND-NEW app
+  // the dev has NOT submitted. NO approved AppBlock + NO owned pending request.
+  // The scope SOURCE is the CLIENT-SUPPLIED body `scopes` (the dev's local
+  // manifest, sent by the CLI), clamped by the SAME belt minus the OAuth ceiling
+  // (7f is the spend gate). Synthetic non-resolving appId `local-<slug>` so no
+  // forged attribution row. GUARDED: never fires when an approved row exists.
+  // -------------------------------------------------------------------------
+  describe('no-row local-manifest mode (brand-new, unsubmitted app)', () => {
+    // Both server lookups MUST miss so the no-row path is reached.
+    function noRow() {
+      mockAppBlockFindUnique.mockResolvedValueOnce(null); // no approved row
+      mockPublishRequestFindFirst.mockResolvedValueOnce(null); // no owned pending
+    }
+
+    it('200: no approved row + no pending + body scopes → mints from the body scopes, appId=local-<slug>, spend-capable when bearer has AIServicesWrite', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION); // personal key, Full → can spend
+      noRow();
+      const { req, res } = authPost({
+        slug: 'brand-new-app',
+        scopes: ['ai:write:budgeted', 'user:read:self'],
+      });
+      await handler(req as never, res as never);
+
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign).toHaveBeenCalledTimes(1);
+      const arg = mockSign.mock.calls[0][0];
+      // Self-bound subject = the caller (never from the body).
+      expect(arg.userId).toBe(OWNER_ID);
+      // Granted = body.scopes ∩ allowlist ∩ (¬page-forbidden), + force-granted
+      // user:read:self. ai:write:budgeted survives (bearer has AIServicesWrite).
+      expect(arg.scopes).toContain('ai:write:budgeted');
+      expect(arg.scopes).toEqual(['ai:write:budgeted', 'user:read:self']);
+      // Budget defaulted + capped; forced SFW; page ctx.
+      expect(arg.buzzBudget).toBe(1000);
+      expect(arg.maxBrowsingLevel).toBe(SFW);
+      expect(arg.ctx).toEqual({ slotId: 'app.page', entityType: 'none' });
+      // sign blockId = the slug; SYNTHETIC non-resolving appId; synthetic ids.
+      expect(arg.blockId).toBe('brand-new-app');
+      expect(arg.appId).toBe('local-brand-new-app');
+      expect(arg.appBlockId).toBe('page_local_brand-new-app');
+      expect(arg.blockInstanceId).toBe('page_local_brand-new-app');
+    });
+
+    it('GUARD (no-shadow): an APPROVED app for the slug owned by ANOTHER user → no-row path does NOT fire → bare 404 (NOT a local mint)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      // An approved row for the slug EXISTS but is owned by user 999, not the
+      // caller. `block != null`, so the no-row branch (gated on `block == null`)
+      // must NOT fire even though the caller passes body scopes.
+      mockAppBlockFindUnique.mockResolvedValueOnce(
+        pageApp({
+          blockId: 'owned-by-someone',
+          appId: 'appblk-owned-by-someone',
+          app: { allowedScopes: 0x1ffffff, userId: 999 },
+        })
+      );
+      // No caller-owned pending request either.
+      mockPublishRequestFindFirst.mockResolvedValueOnce(null);
+      const { req, res } = authPost({
+        slug: 'owned-by-someone',
+        scopes: ['ai:write:budgeted', 'user:read:self'],
+      });
+      await handler(req as never, res as never);
+      // Bare 404 — NOT a local mint, no shadowing of a real published app.
+      expect(res._getStatusCode()).toBe(404);
+      expect((res._getJSONData() as { message: string }).message).toBe('App not found');
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    it('7f on the no-row path: bearer LACKS AIServicesWrite → ai:write:budgeted STRIPPED, no budget claim', async () => {
+      mockGetSession.mockResolvedValueOnce(READONLY_MOD_SESSION); // no AIServicesWrite
+      noRow();
+      const { req, res } = authPost({
+        slug: 'brand-new-app',
+        scopes: ['ai:write:budgeted', 'models:read:self', 'user:read:self'],
+      });
+      await handler(req as never, res as never);
+
+      expect(res._getStatusCode()).toBe(200);
+      const arg = mockSign.mock.calls[0][0];
+      // ai:write:budgeted stripped by 7f; read/catalog survive.
+      expect(arg.scopes).toEqual(['models:read:self', 'user:read:self']);
+      expect(arg.scopes).not.toContain('ai:write:budgeted');
+      expect(arg.buzzBudget).toBeUndefined();
+    });
+
+    it('R1: an un-reviewed body manifest declaring ESCALATED scopes has them STRIPPED, not minted', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noRow();
+      const { req, res } = authPost({
+        slug: 'brand-new-app',
+        scopes: [
+          'models:read:self', // legit → kept
+          'social:tip:self', // dev-excluded (money OUT) → stripped
+          'block:settings:write', // dev-excluded → stripped
+          'buzz:read:self', // own-ledger read, in dev allowlist → kept
+          'totally:unknown', // not a known block scope → stripped
+        ],
+      });
+      await handler(req as never, res as never);
+
+      expect(res._getStatusCode()).toBe(200);
+      const arg = mockSign.mock.calls[0][0];
+      // The legit reads (incl. self-bound buzz:read:self) + force-granted
+      // user:read:self survive; the ESCALATED money/write/unknown scopes are
+      // stripped — proving the un-reviewed CLIENT manifest cannot escalate.
+      expect(arg.scopes).toEqual(['buzz:read:self', 'models:read:self', 'user:read:self']);
+      expect(arg.scopes).not.toContain('social:tip:self');
+      expect(arg.scopes).not.toContain('block:settings:write');
+      expect(arg.scopes).toContain('buzz:read:self');
+      expect(arg.scopes).not.toContain('totally:unknown');
+    });
+
+    it('200: absent body scopes → a read-only token (user:read:self only), NOT a 404', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noRow();
+      const { req, res } = authPost({ slug: 'brand-new-app' }); // no scopes
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      const arg = mockSign.mock.calls[0][0];
+      // Empty source → only the force-granted read scope; no spend, no budget.
+      expect(arg.scopes).toEqual(['user:read:self']);
+      expect(arg.buzzBudget).toBeUndefined();
+      expect(arg.appId).toBe('local-brand-new-app');
+    });
+
+    it('synthetic appId never equals appblk-<slug> (no real OauthClient resolves → no attribution row)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noRow();
+      const { req, res } = authPost({
+        slug: 'brand-new-app',
+        scopes: ['ai:write:budgeted'],
+      });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      const arg = mockSign.mock.calls[0][0];
+      // The S1 protection: `local-<slug>` can never collide with the deterministic
+      // `appblk-<slug>` an approved app holds, so recordSpendAttribution misses.
+      expect(arg.appId).toBe('local-brand-new-app');
+      expect(arg.appId).not.toBe('appblk-brand-new-app');
+    });
+
+    it('CAPS an over-cap budget on the no-row path to DEV_BUZZ_BUDGET_CAP', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noRow();
+      const { req, res } = authPost({
+        slug: 'brand-new-app',
+        scopes: ['ai:write:budgeted'],
+        buzzBudget: 100000,
+      });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign.mock.calls[0][0].buzzBudget).toBe(5000);
+    });
+
+    it('forced SFW + self-bound sub hold on the no-row path', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      noRow();
+      const { req, res } = authPost({ slug: 'brand-new-app', scopes: ['models:read:self'] });
+      await handler(req as never, res as never);
+      const arg = mockSign.mock.calls[0][0];
+      expect(arg.maxBrowsingLevel).toBe(SFW);
+      expect(arg.domain).toBeNull();
+      expect(arg.userId).toBe(OWNER_ID);
+    });
+
+    it('mod-only: a NON-mod is blocked BEFORE any lookup on the no-row path', async () => {
+      mockGetSession.mockResolvedValueOnce(NONMOD_SESSION);
+      const { req, res } = authPost({ slug: 'brand-new-app', scopes: ['models:read:self'] });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(403);
+      expect(mockAppBlockFindUnique).not.toHaveBeenCalled();
+      expect(mockPublishRequestFindFirst).not.toHaveBeenCalled();
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    it('rate-limit applies to the no-row path too', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      mockMultiIncr.value = 31;
+      const { req, res } = authPost({ slug: 'brand-new-app', scopes: ['models:read:self'] });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(429);
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    it('emits the structured blocks.dev-token.local-mint log (spendGranted reflects the 7f clamp)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION); // Full → can spend
+      noRow();
+      const { req, res } = authPost({
+        slug: 'brand-new-app',
+        scopes: ['ai:write:budgeted', 'models:read:self'],
+      });
+      await handler(req as never, res as never);
+
+      expect(res._getStatusCode()).toBe(200);
+      const log = (req as unknown as { log: { info: ReturnType<typeof vi.fn> } }).log;
+      expect(log.info).toHaveBeenCalledWith(
+        'blocks.dev-token.local-mint',
+        expect.objectContaining({
+          mode: 'local',
+          userId: OWNER_ID,
+          slug: 'brand-new-app',
+          spendGranted: true,
+        })
+      );
+      const call = log.info.mock.calls.find((c) => c[0] === 'blocks.dev-token.local-mint');
+      expect(call?.[1].scopes).toEqual(['ai:write:budgeted', 'models:read:self', 'user:read:self']);
+      // The token/secret is NEVER logged.
+      expect(JSON.stringify(call?.[1])).not.toContain('jwt.signed.value');
+      // The pending-mint event must NOT fire on the no-row path.
+      const pendingCall = log.info.mock.calls.find((c) => c[0] === 'blocks.dev-token.pending-mint');
+      expect(pendingCall).toBeUndefined();
+    });
+
+    it('the local-mint log reflects spendGranted=false when the bearer LACKS AIServicesWrite', async () => {
+      mockGetSession.mockResolvedValueOnce(READONLY_MOD_SESSION);
+      noRow();
+      const { req, res } = authPost({
+        slug: 'brand-new-app',
+        scopes: ['ai:write:budgeted'],
+      });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      const log = (req as unknown as { log: { info: ReturnType<typeof vi.fn> } }).log;
+      const call = log.info.mock.calls.find((c) => c[0] === 'blocks.dev-token.local-mint');
+      expect(call).toBeDefined();
+      expect(call?.[1].spendGranted).toBe(false);
+      expect(call?.[1].scopes).not.toContain('ai:write:budgeted');
+    });
+
+    it('the APPROVED path does NOT emit the local-mint log', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      const { req, res } = authPost({ appBlockId: 'apb_abc' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      const log = (req as unknown as { log: { info: ReturnType<typeof vi.fn> } }).log;
+      const call = log.info.mock.calls.find((c) => c[0] === 'blocks.dev-token.local-mint');
+      expect(call).toBeUndefined();
+    });
+
+    it('an appBlockId-only request can NEVER reach the no-row path (it returns the bare 404)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      mockAppBlockFindUnique.mockResolvedValueOnce(null); // approved miss
+      const { req, res } = authPost({ appBlockId: 'apb_missing', scopes: ['ai:write:budgeted'] });
+      await handler(req as never, res as never);
+      // No slug → the `else if (slug)` branch is skipped entirely → bare 404.
+      expect(res._getStatusCode()).toBe(404);
+      expect((res._getJSONData() as { message: string }).message).toBe('App not found');
+      expect(mockPublishRequestFindFirst).not.toHaveBeenCalled();
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    // audit N1 + 🟡-1 (slug bounds): a malformed OR out-of-bounds slug that the
+    // OLD `min(1).max(128)` accepted but the canonical `min(3).max(40).regex(
+    // SLUG_REGEX)` rejects must 400 at body validation — BEFORE any lookup or
+    // synthetic-id construction. This makes the "`local-<slug>` can never collide
+    // with a real OauthClient.id" guarantee airtight BY CONSTRUCTION rather than
+    // by prefix-collision reasoning: a non-conforming slug never reaches the
+    // `local-<slug>` constructor at all. The bounds now MATCH the canonical app-
+    // slug schema (publish-request.schema.ts min(3).max(40)) — real app slugs are
+    // min(3).max(40).regex(SLUG_REGEX) at submit/create time, so no legitimate
+    // approved/pending slug regresses; the 'ab' (2-char) and 41-char cases below
+    // pass SLUG_REGEX shape but fail the min(3)/max(40) bound a real app can't
+    // violate.
+    it.each([
+      ['-leading', 'leading hyphen'],
+      ['trailing-', 'trailing hyphen'],
+      ['UPPER', 'uppercase'],
+      ['BadSlug', 'mixed case'],
+      ['has space', 'whitespace'],
+      ['under_score', 'underscore'],
+      ['emoji😀', 'non-alnum'],
+      ['ab', 'too short (2 chars, < min(3))'],
+      ['a'.repeat(41), 'too long (41 chars, > max(40))'],
+    ])('400 (audit N1/🟡-1) for malformed slug %p (%s) — no mint, no lookup', async (slug) => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      const { req, res } = authPost({ slug, scopes: ['models:read:self'] });
+      await handler(req as never, res as never);
+      // Rejected at step-4 body validation (zod .regex), before step-5 rate
+      // limit and BOTH server lookups — and before the synthetic-id builder.
+      expect(res._getStatusCode()).toBe(400);
+      expect((res._getJSONData() as { message: string }).message).toBe('Invalid request body');
+      expect(mockAppBlockFindUnique).not.toHaveBeenCalled();
+      expect(mockPublishRequestFindFirst).not.toHaveBeenCalled();
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * #3703 step 1 — `requestBudgetedSpend`: budgeted spend becomes an EXPLICITLY
+   * REQUESTABLE grant, with the default deliberately left at "infer".
+   *
+   * The clamp now ANDs two independent predicates: `spendEntitled` (the bearer's
+   * AIServicesWrite bit — unchanged) and `spendRequested` (this new body field,
+   * defaulted `?? true` so step 1 changes NO behaviour for existing clients).
+   *
+   * Every assertion below pins an ENUMERATED granted set. A `toContain('spend')`-
+   * style check would pass while the hazard existed in a different shape.
+   */
+  describe('requestBudgetedSpend — explicit budgeted-spend request (#3703 step 1)', () => {
+    // The approved app's snapshot minus the spend scope, in clamp output order.
+    // The bearer allowlist KEEPS apps:storage:read (unlike the tunnel allowlist).
+    const WITHOUT_SPEND = ['apps:storage:read', 'models:read:self', 'user:read:self'];
+    const WITH_SPEND = [
+      'ai:write:budgeted',
+      'apps:storage:read',
+      'models:read:self',
+      'user:read:self',
+    ];
+
+    const logOf = (req: unknown) =>
+      (req as { log: { info: ReturnType<typeof vi.fn> } }).log.info.mock.calls;
+    const eventOf = (req: unknown, name: string) =>
+      logOf(req).find((c) => c[0] === name)?.[1] as Record<string, unknown> | undefined;
+
+    it('1. entitled bearer + requestBudgetedSpend:false → the spend scope is EXCLUDED', async () => {
+      // RED at base: before step 1 the field was ignored entirely, so the granted
+      // set came back WITH_SPEND.
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION); // Full → AIServicesWrite
+      const { req, res } = authPost({ appBlockId: 'apb_abc', requestBudgetedSpend: false });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign.mock.calls[0][0].scopes).toEqual(WITHOUT_SPEND);
+      // No spend scope → no budget claim, on the token AND in the response body.
+      expect(mockSign.mock.calls[0][0].buzzBudget).toBeUndefined();
+      expect((res._getJSONData() as Record<string, unknown>).scopes).toEqual(WITHOUT_SPEND);
+    });
+
+    it('2. entitled bearer + requestBudgetedSpend:true → the spend scope is INCLUDED (not a blanket deny)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      const { req, res } = authPost({ appBlockId: 'apb_abc', requestBudgetedSpend: true });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign.mock.calls[0][0].scopes).toEqual(WITH_SPEND);
+      expect(mockSign.mock.calls[0][0].buzzBudget).toBe(1000);
+    });
+
+    it('3. NOT-entitled bearer + requestBudgetedSpend:true → EXCLUDED, and the mint SUCCEEDS (strip, never error)', async () => {
+      // Two things at once, both load-bearing:
+      //  - entitlement still binds even when the caller explicitly asks. This is the
+      //    case that catches an `&&` → `||` mutation of the ceiling.
+      //  - a denied request is a SILENT STRIP. Erroring here would be a brand-new
+      //    failure mode on the money path; every other step in the belt is a strip.
+      mockGetSession.mockResolvedValueOnce(READONLY_MOD_SESSION); // no AIServicesWrite
+      const { req, res } = authPost({ appBlockId: 'apb_abc', requestBudgetedSpend: true });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200); // NOT 400/403 — the mint succeeds
+      expect(mockSign).toHaveBeenCalledTimes(1);
+      expect(mockSign.mock.calls[0][0].scopes).toEqual(WITHOUT_SPEND);
+      expect(mockSign.mock.calls[0][0].buzzBudget).toBeUndefined();
+    });
+
+    it('4. INVARIANT GUARD (not regression coverage): the field ABSENT → the spend scope is INCLUDED', async () => {
+      // This pins the DELIBERATE step-1 default `?? true` — the "no behaviour change"
+      // half of this PR. It is an invariant guard, not a red-before-green regression
+      // test: it is green at base too, because base has no field to omit.
+      //
+      // At step 3 this expectation FLIPS to WITHOUT_SPEND. Edit it then; never delete
+      // it — the diff is the audit trail of the breaking change.
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      const { req, res } = authPost({ appBlockId: 'apb_abc' });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign.mock.calls[0][0].scopes).toEqual(WITH_SPEND);
+    });
+
+    it('the field is OPTIONAL and boolean-typed — a non-boolean is a 400 before any lookup', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      const { req, res } = authPost({
+        appBlockId: 'apb_abc',
+        requestBudgetedSpend: 'yes' as unknown as boolean,
+      });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(400);
+      expect(mockAppBlockFindUnique).not.toHaveBeenCalled();
+      expect(mockSign).not.toHaveBeenCalled();
+    });
+
+    it('applies on the PENDING path too (entitled + false → excluded)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      mockAppBlockFindUnique.mockResolvedValueOnce(null);
+      mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+      const { req, res } = authPost({ slug: 'my-pending-app', requestBudgetedSpend: false });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign.mock.calls[0][0].scopes).toEqual(WITHOUT_SPEND);
+    });
+
+    it('applies on the NO-ROW path too (entitled + false → excluded)', async () => {
+      mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+      mockAppBlockFindUnique.mockResolvedValueOnce(null);
+      mockPublishRequestFindFirst.mockResolvedValueOnce(null);
+      const { req, res } = authPost({
+        slug: 'brand-new-app',
+        scopes: ['ai:write:budgeted', 'models:read:self'],
+        requestBudgetedSpend: false,
+      });
+      await handler(req as never, res as never);
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockSign.mock.calls[0][0].scopes).toEqual(['models:read:self', 'user:read:self']);
+    });
+
+    /**
+     * 7. OBSERVABILITY — every bearer mint path emits a mint-audit event carrying
+     * BOTH the field as-received AND the derived `spendGrantBasis`.
+     *
+     * Recording both is the whole point: `spendGrantBasis:'none'` alone cannot tell
+     * "the client asked and was denied" from "the client never asked", and those
+     * mean opposite things about client adoption. The step-3 gate reads exactly this
+     * distinction, so one value cannot express it.
+     */
+    describe('mint-audit events carry requestBudgetedSpend AND spendGrantBasis', () => {
+      it('APPROVED path — emits blocks.dev-token.approved-mint, which previously emitted NOTHING', async () => {
+        // RED at base: the approved path was structurally invisible — it writes rows
+        // byte-identical to a production page mint and logged no mint event at all.
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        const { req, res } = authPost({ appBlockId: 'apb_abc', requestBudgetedSpend: true });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        const ev = eventOf(req, 'blocks.dev-token.approved-mint');
+        expect(ev).toBeDefined();
+        expect(ev).toEqual({
+          mode: 'approved',
+          userId: OWNER_ID,
+          slug: 'my-page-app',
+          appBlockId: 'apb_abc',
+          scopes: WITH_SPEND,
+          requestBudgetedSpend: true,
+          spendGranted: true,
+          spendGrantBasis: 'explicit',
+        });
+        // 🔴 No token, no secret in the audit event.
+        expect(JSON.stringify(ev)).not.toContain('jwt.signed.value');
+        // Sibling events stay path-scoped.
+        expect(eventOf(req, 'blocks.dev-token.pending-mint')).toBeUndefined();
+        expect(eventOf(req, 'blocks.dev-token.local-mint')).toBeUndefined();
+      });
+
+      it("APPROVED path — field ABSENT is recorded as ABSENT, and the basis is 'inferred'", async () => {
+        // 'inferred' is the signal the step-3 evidence gate counts: spend granted
+        // ONLY because the `?? true` default filled in for a client that never asked.
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        const { req, res } = authPost({ appBlockId: 'apb_abc' });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        const ev = eventOf(req, 'blocks.dev-token.approved-mint')!;
+        expect(ev.spendGrantBasis).toBe('inferred');
+        expect(ev.spendGranted).toBe(true);
+        // ABSENT, not an invented false/null — the three-valued signal is preserved.
+        expect('requestBudgetedSpend' in ev).toBe(false);
+      });
+
+      it("APPROVED path — asked-and-DENIED is distinguishable from never-asked (requestBudgetedSpend:true + basis 'none')", async () => {
+        // The pair that one value cannot express. Same basis as the case below,
+        // opposite meaning for adoption.
+        mockGetSession.mockResolvedValueOnce(READONLY_MOD_SESSION); // not entitled
+        const { req, res } = authPost({ appBlockId: 'apb_abc', requestBudgetedSpend: true });
+        await handler(req as never, res as never);
+        const ev = eventOf(req, 'blocks.dev-token.approved-mint')!;
+        expect(ev.requestBudgetedSpend).toBe(true); // the client DID ask
+        expect(ev.spendGranted).toBe(false); // …and was denied
+        expect(ev.spendGrantBasis).toBe('none');
+      });
+
+      it("APPROVED path — declined-spend is recorded as requestBudgetedSpend:false + basis 'none'", async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION); // entitled
+        const { req, res } = authPost({ appBlockId: 'apb_abc', requestBudgetedSpend: false });
+        await handler(req as never, res as never);
+        const ev = eventOf(req, 'blocks.dev-token.approved-mint')!;
+        expect(ev.requestBudgetedSpend).toBe(false); // the client explicitly declined
+        expect(ev.spendGranted).toBe(false);
+        expect(ev.spendGrantBasis).toBe('none');
+      });
+
+      it('PENDING path — the pre-existing event now also carries both fields', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        mockAppBlockFindUnique.mockResolvedValueOnce(null);
+        mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+        const { req, res } = authPost({ slug: 'my-pending-app', requestBudgetedSpend: true });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        const ev = eventOf(req, 'blocks.dev-token.pending-mint')!;
+        expect(ev.requestBudgetedSpend).toBe(true);
+        expect(ev.spendGrantBasis).toBe('explicit');
+        expect(ev.spendGranted).toBe(true);
+        // The approved-mint event must NOT fire on the pending path.
+        expect(eventOf(req, 'blocks.dev-token.approved-mint')).toBeUndefined();
+      });
+
+      it('NO-ROW path — the pre-existing event now also carries both fields', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        mockAppBlockFindUnique.mockResolvedValueOnce(null);
+        mockPublishRequestFindFirst.mockResolvedValueOnce(null);
+        const { req, res } = authPost({
+          slug: 'brand-new-app',
+          scopes: ['ai:write:budgeted', 'models:read:self'],
+          requestBudgetedSpend: false,
+        });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        const ev = eventOf(req, 'blocks.dev-token.local-mint')!;
+        expect(ev.requestBudgetedSpend).toBe(false);
+        expect(ev.spendGranted).toBe(false);
+        expect(ev.spendGrantBasis).toBe('none');
+        expect(eventOf(req, 'blocks.dev-token.approved-mint')).toBeUndefined();
+      });
+
+      // The three events are mutually exclusive: exactly ONE fires per mint. Asserted
+      // per path as an enumerated list (not "the other two are undefined"), so an
+      // accidental double-emit fails too.
+      const MINT_EVENTS = [
+        'blocks.dev-token.approved-mint',
+        'blocks.dev-token.pending-mint',
+        'blocks.dev-token.local-mint',
+      ];
+      const fired = (req: unknown) =>
+        (req as { log: { info: ReturnType<typeof vi.fn> } }).log.info.mock.calls
+          .map((c) => c[0] as string)
+          .filter((n) => MINT_EVENTS.includes(n));
+
+      it('exactly ONE mint-audit event fires on the APPROVED path', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        const { req, res } = authPost({ appBlockId: 'apb_abc' });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        expect(fired(req)).toEqual(['blocks.dev-token.approved-mint']);
+      });
+
+      it('exactly ONE mint-audit event fires on the PENDING path', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        mockAppBlockFindUnique.mockResolvedValueOnce(null);
+        mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+        const { req, res } = authPost({ slug: 'my-pending-app' });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        expect(fired(req)).toEqual(['blocks.dev-token.pending-mint']);
+      });
+
+      it('exactly ONE mint-audit event fires on the NO-ROW path', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        mockAppBlockFindUnique.mockResolvedValueOnce(null);
+        mockPublishRequestFindFirst.mockResolvedValueOnce(null);
+        const { req, res } = authPost({
+          slug: 'brand-new-app',
+          scopes: ['models:read:self'],
+        });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        expect(fired(req)).toEqual(['blocks.dev-token.local-mint']);
+      });
+    });
+
+    /**
+     * 7b. THE STDOUT MIRROR (#3715) — the events above are DUAL-SINKED.
+     *
+     * `req.log?.info` alone writes nothing to stdout in production: next-axiom's
+     * `Logger.sendLogs()` prints to the console ONLY when the AXIOM_* env vars are
+     * unset (dist/logger.js:198-202), so with them set the batch is POSTed to Axiom
+     * and NOTHING reaches stdout. A log store that scrapes container stdout therefore
+     * cannot see these events at all.
+     *
+     * 🔴 WHAT THE MIRROR IS FOR — it is a SHORT-WINDOW (~72h measured) forensic copy,
+     * for incident-time reads, plus a second sink that does not depend on one vendor
+     * being reachable. It is NOT the surface the #3715 adoption gate is read from: that
+     * gate asks a ROLLING 30-DAY question and is answered from Axiom (~96d retention).
+     * At ~0.8 bearer mints/day a 72h window holds ~2.4 mints, so a "30-day" query
+     * against stdout returns a near-unconditional 0. Full reasoning and the measured
+     * numbers live in `src/server/logging/mint-audit-stdout.ts`.
+     *
+     * These tests assert the stdout half. The `req.log` assertions above stay green:
+     * both sinks are required, and losing either loses a distinct capability.
+     */
+    describe('mint-audit events are ALSO mirrored to stdout (#3715)', () => {
+      // Re-declared locally (the sibling describe's copy is not in scope). The three
+      // bearer mint events, same enumerated set.
+      const MIRRORED_EVENTS = [
+        'blocks.dev-token.approved-mint',
+        'blocks.dev-token.pending-mint',
+        'blocks.dev-token.local-mint',
+      ];
+      let logSpy: ReturnType<typeof vi.spyOn>;
+
+      // Runs AFTER the file-level beforeEach (and its vi.clearAllMocks), so the spy
+      // survives into the test body.
+      beforeEach(() => {
+        logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      });
+      afterEach(() => {
+        logSpy.mockRestore();
+      });
+
+      /**
+       * Every stdout line the handler wrote, parsed back from JSON. Parsing (rather
+       * than substring-matching the raw string) is deliberate: the assertions below
+       * are about the SHAPE of the emitted object — above all whether a key is
+       * PRESENT — and a word can be present in a string for unrelated reasons.
+       */
+      const stdoutEvents = (): Record<string, unknown>[] =>
+        logSpy.mock.calls
+          .map((c: unknown[]) => c[0])
+          .filter((line: unknown): line is string => typeof line === 'string')
+          .flatMap((line: string) => {
+            try {
+              return [JSON.parse(line) as Record<string, unknown>];
+            } catch {
+              return [];
+            }
+          });
+      const mirrorOf = (name: string) => stdoutEvents().find((e) => e.event === name);
+      const mirroredNames = () =>
+        stdoutEvents()
+          .map((e) => e.event as string)
+          .filter((n) => MIRRORED_EVENTS.includes(n));
+
+      it('POSITIVE CONTROL: the stdout spy observes a real emit (a zero here would make every assertion below vacuous)', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        const { req, res } = authPost({ appBlockId: 'apb_abc' });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        // Non-zero: the spy is wired to the channel the mirror actually writes to.
+        expect(stdoutEvents().length).toBeGreaterThan(0);
+        // …and it can report an ABSENCE too: a name nothing emits must not be found.
+        expect(mirrorOf('blocks.dev-token.no-such-mint')).toBeUndefined();
+      });
+
+      it('APPROVED path — the mirror carries the SAME event name and the SAME payload as the Axiom sink', async () => {
+        // RED at base: the mirror did not exist, so nothing was written to stdout.
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        const { req, res } = authPost({ appBlockId: 'apb_abc', requestBudgetedSpend: true });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        const mirror = mirrorOf('blocks.dev-token.approved-mint');
+        expect(mirror).toEqual({
+          event: 'blocks.dev-token.approved-mint',
+          mode: 'approved',
+          userId: OWNER_ID,
+          slug: 'my-page-app',
+          appBlockId: 'apb_abc',
+          scopes: WITH_SPEND,
+          requestBudgetedSpend: true,
+          spendGranted: true,
+          spendGrantBasis: 'explicit',
+        });
+        // DUAL-SINK RELATIONSHIP: the two sinks must not drift apart. The mirror is
+        // the Axiom payload plus the `event` name — nothing added, nothing dropped.
+        const ev = eventOf(req, 'blocks.dev-token.approved-mint')!;
+        expect(mirror).toEqual({ event: 'blocks.dev-token.approved-mint', ...ev });
+        // 🔴 No token, no secret on the stdout sink either.
+        expect(JSON.stringify(mirror)).not.toContain('jwt.signed.value');
+      });
+
+      it('PENDING path — the mirror fires with the same payload as the Axiom sink', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        mockAppBlockFindUnique.mockResolvedValueOnce(null);
+        mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+        const { req, res } = authPost({ slug: 'my-pending-app', requestBudgetedSpend: true });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        const mirror = mirrorOf('blocks.dev-token.pending-mint');
+        expect(mirror).toEqual({
+          event: 'blocks.dev-token.pending-mint',
+          mode: 'pending',
+          userId: OWNER_ID,
+          slug: 'my-pending-app',
+          publishRequestId: 'pubreq_01HXYZ',
+          scopes: WITH_SPEND,
+          requestBudgetedSpend: true,
+          spendGranted: true,
+          spendGrantBasis: 'explicit',
+        });
+        const ev = eventOf(req, 'blocks.dev-token.pending-mint')!;
+        expect(mirror).toEqual({ event: 'blocks.dev-token.pending-mint', ...ev });
+        expect(JSON.stringify(mirror)).not.toContain('jwt.signed.value');
+      });
+
+      it('NO-ROW path — the mirror fires with the same payload as the Axiom sink', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        mockAppBlockFindUnique.mockResolvedValueOnce(null);
+        mockPublishRequestFindFirst.mockResolvedValueOnce(null);
+        const { req, res } = authPost({
+          slug: 'brand-new-app',
+          scopes: ['ai:write:budgeted', 'models:read:self'],
+          requestBudgetedSpend: false,
+        });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        const mirror = mirrorOf('blocks.dev-token.local-mint');
+        expect(mirror).toEqual({
+          event: 'blocks.dev-token.local-mint',
+          mode: 'local',
+          userId: OWNER_ID,
+          slug: 'brand-new-app',
+          scopes: ['models:read:self', 'user:read:self'],
+          requestBudgetedSpend: false,
+          spendGranted: false,
+          spendGrantBasis: 'none',
+        });
+        const ev = eventOf(req, 'blocks.dev-token.local-mint')!;
+        expect(mirror).toEqual({ event: 'blocks.dev-token.local-mint', ...ev });
+        expect(JSON.stringify(mirror)).not.toContain('jwt.signed.value');
+      });
+
+      it('exactly ONE mint-audit event is mirrored on the APPROVED path', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        const { req, res } = authPost({ appBlockId: 'apb_abc' });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        expect(mirroredNames()).toEqual(['blocks.dev-token.approved-mint']);
+      });
+
+      it('exactly ONE mint-audit event is mirrored on the PENDING path', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        mockAppBlockFindUnique.mockResolvedValueOnce(null);
+        mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+        const { req, res } = authPost({ slug: 'my-pending-app' });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        expect(mirroredNames()).toEqual(['blocks.dev-token.pending-mint']);
+      });
+
+      it('exactly ONE mint-audit event is mirrored on the NO-ROW path', async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        mockAppBlockFindUnique.mockResolvedValueOnce(null);
+        mockPublishRequestFindFirst.mockResolvedValueOnce(null);
+        const { req, res } = authPost({ slug: 'brand-new-app', scopes: ['models:read:self'] });
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        expect(mirroredNames()).toEqual(['blocks.dev-token.local-mint']);
+      });
+
+      /**
+       * THE THREE-VALUED SIGNAL, PINNED THROUGH THE MIRROR SPECIFICALLY.
+       *
+       * The step-3 gate distinguishes `true` (the client asked), `false` (the client
+       * explicitly declined) and KEY-OMITTED (the client never asked, so the grant was
+       * only 'inferred'). Serialising the third case as `false` or `null` would silently
+       * merge it into the second and make the gate unreadable — and JSON is exactly where
+       * an `undefined` can get coerced. Each case asserts the ENUMERATED value, and the
+       * absent case asserts key PRESENCE (`'k' in obj`), never truthiness: `false` and
+       * absent are both falsy, which is the confusion this guard exists to catch.
+       */
+      it("three-valued signal — ABSENT stays ABSENT in the mirrored JSON (basis 'inferred')", async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        const { req, res } = authPost({ appBlockId: 'apb_abc' }); // field omitted
+        await handler(req as never, res as never);
+        expect(res._getStatusCode()).toBe(200);
+        const mirror = mirrorOf('blocks.dev-token.approved-mint')!;
+        expect(mirror).toBeDefined();
+        // The KEY must not exist — not merely be falsy.
+        expect('requestBudgetedSpend' in mirror).toBe(false);
+        // The rest of the signal still arrived, so this is not an empty-payload pass.
+        expect(mirror.spendGranted).toBe(true);
+        expect(mirror.spendGrantBasis).toBe('inferred');
+        // The raw line must not smuggle it in as null either.
+        expect(JSON.stringify(mirror)).not.toContain('requestBudgetedSpend');
+      });
+
+      it("three-valued signal — FALSE serialises as false (basis 'none')", async () => {
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION); // entitled, explicitly declines
+        const { req, res } = authPost({ appBlockId: 'apb_abc', requestBudgetedSpend: false });
+        await handler(req as never, res as never);
+        const mirror = mirrorOf('blocks.dev-token.approved-mint')!;
+        expect('requestBudgetedSpend' in mirror).toBe(true);
+        expect(mirror.requestBudgetedSpend).toBe(false);
+        expect(mirror.spendGranted).toBe(false);
+        expect(mirror.spendGrantBasis).toBe('none');
+      });
+
+      it('three-valued signal — TRUE serialises as true, and asked-and-DENIED stays distinguishable from never-asked', async () => {
+        // The pair the gate must separate: basis 'none' here AND above, opposite
+        // meanings for adoption, told apart only by the as-received field.
+        mockGetSession.mockResolvedValueOnce(READONLY_MOD_SESSION); // not entitled
+        const { req, res } = authPost({ appBlockId: 'apb_abc', requestBudgetedSpend: true });
+        await handler(req as never, res as never);
+        const mirror = mirrorOf('blocks.dev-token.approved-mint')!;
+        expect('requestBudgetedSpend' in mirror).toBe(true);
+        expect(mirror.requestBudgetedSpend).toBe(true);
+        expect(mirror.spendGranted).toBe(false);
+        expect(mirror.spendGrantBasis).toBe('none');
+      });
+
+      it('three-valued signal — the mirror preserves it on the PENDING and NO-ROW paths too', async () => {
+        // Absent on the pending path…
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        mockAppBlockFindUnique.mockResolvedValueOnce(null);
+        mockPublishRequestFindFirst.mockResolvedValueOnce(pendingRequest());
+        const a = authPost({ slug: 'my-pending-app' });
+        await handler(a.req as never, a.res as never);
+        const pending = mirrorOf('blocks.dev-token.pending-mint')!;
+        expect('requestBudgetedSpend' in pending).toBe(false);
+        expect(pending.spendGrantBasis).toBe('inferred');
+
+        // …and explicit `true` on the no-row path.
+        logSpy.mockClear();
+        mockGetSession.mockResolvedValueOnce(MOD_SESSION);
+        mockAppBlockFindUnique.mockResolvedValueOnce(null);
+        mockPublishRequestFindFirst.mockResolvedValueOnce(null);
+        const b = authPost({
+          slug: 'brand-new-app',
+          scopes: ['ai:write:budgeted', 'models:read:self'],
+          requestBudgetedSpend: true,
+        });
+        await handler(b.req as never, b.res as never);
+        const local = mirrorOf('blocks.dev-token.local-mint')!;
+        expect('requestBudgetedSpend' in local).toBe(true);
+        expect(local.requestBudgetedSpend).toBe(true);
+        expect(local.spendGrantBasis).toBe('explicit');
+      });
+    });
+  });
+});

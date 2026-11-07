@@ -1,0 +1,873 @@
+import { TRPCError } from '@trpc/server';
+import dayjs from '~/shared/utils/dayjs';
+import { increaseDate } from '~/utils/date-helpers';
+import { env } from '~/env/server';
+import { POST_MINIMUM_SCHEDULE_MINUTES } from '~/server/common/constants';
+import type { Context, ProtectedContext } from '~/server/createContext';
+import { getDbWithoutLag } from '~/server/db/db-lag-helpers';
+import { eventEngine } from '~/server/events';
+import { firstDailyPostReward, imagePostedToModelReward } from '~/server/rewards';
+import type { CollectionMetadataSchema } from '~/server/schema/collection.schema';
+import type { VideoMetadata } from '~/server/schema/media.schema';
+import type {
+  AddResourceToPostImageInput,
+  CreatePostWithImagesInput,
+  PostCreateInput,
+  RemoveResourceFromPostImageInput,
+} from '~/server/schema/post.schema';
+import {
+  bulkSaveItems,
+  getCollectionById,
+  getUserCollectionPermissionsById,
+  validateContestCollectionEntry,
+} from '~/server/services/collection.service';
+import { sendMessagesToCollaborators } from '~/server/services/entity-collaborator.service';
+import { readPostAppChip } from '~/server/services/blocks/post-app-chip.service';
+import { getRequestBrowsingLevel } from '~/server/utils/browsing-level';
+import { publishModel3D } from '~/server/services/model3d.service';
+import { amIBlockedByUser } from '~/server/services/user.service';
+import { createPostOwnerCheck } from '~/server/services/image.service';
+import {
+  handleLogError,
+  throwAuthorizationError,
+  throwBadRequestError,
+  throwDbError,
+  throwNotFoundError,
+} from '~/server/utils/errorHandling';
+import { updateEntityMetric } from '~/server/utils/metric-helpers';
+import { domainSpendType } from '~/server/utils/buzz-helpers';
+import { contentRestriction } from '~/server/common/content-restriction';
+import { isSessionOrFullUserKey } from '~/server/services/oauth/enforce-token-scope';
+import { updateVimeoVideo } from '~/server/vimeo/client';
+import { getIsSafeBrowsingLevel } from '~/shared/constants/browsingLevel.constants';
+import { CollectionMode, CollectionType, EntityType } from '~/shared/utils/prisma/enums';
+import { closeAppealsDeletedByOwner } from '~/server/services/report.service';
+import { isDefined } from '~/utils/type-guards';
+import { dbRead, dbWrite } from '../db/client';
+import { dbReadFallbackCounter } from '~/server/prom/client';
+import { getHeldGalleryLevel } from '~/server/services/model.service';
+import { Flags } from '~/shared/utils/flags';
+import type { GetByIdInput } from './../schema/base.schema';
+import type {
+  AddPostTagInput,
+  GetPostTagsInput,
+  PostsQueryInput,
+  PostUpdateInput,
+  RemovePostTagInput,
+  ReorderPostImagesInput,
+  UpdatePostCollectionTagIdInput,
+  UpdatePostImageInput,
+} from './../schema/post.schema';
+import {
+  addPostImage,
+  addPostTag,
+  addResourceToPostImage,
+  createPost,
+  deletePost,
+  getPostContestCollectionDetails,
+  getPostDetail,
+  getPostResources,
+  getPostsInfinite,
+  getPostTags,
+  removePostTag,
+  removeResourceFromPostImage,
+  reorderPostImages,
+  updatePost,
+  updatePostCollectionTagId,
+  updatePostImage,
+} from './../services/post.service';
+
+export const getPostsInfiniteHandler = async ({
+  input,
+  ctx,
+}: {
+  input: PostsQueryInput;
+  ctx: Context;
+}) => {
+  try {
+    // A minor or SFW-only model's posts are served only at its gallery's held level, except to
+    // moderators, who must see what they may need to remove.
+    const heldLevel =
+      ctx.user?.isModerator && isSessionOrFullUserKey(ctx)
+        ? undefined
+        : await getHeldGalleryLevel({ ...input, postIds: input.ids });
+    if (heldLevel !== undefined) {
+      const browsingLevel = Flags.intersection(input.browsingLevel, heldLevel);
+      // The feed reads 0 as no filter, so an empty intersection is an empty page.
+      if (!browsingLevel) return { items: [], nextCursor: undefined };
+      input = { ...input, browsingLevel };
+    }
+    return await getPostsInfinite({ ...input, user: ctx.user });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const createPostHandler = async ({
+  input,
+  ctx,
+}: {
+  input: PostCreateInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    const { ip } = ctx;
+    const today = new Date();
+    // The storyline router's flag, for the one storyline write that goes through posts.
+    if ((input.storylineId || input.parentChapterId) && !ctx.features.storylines)
+      throw new TRPCError({ code: 'FORBIDDEN' });
+
+    const post = await createPost({
+      ...input,
+      userId: ctx.user.id,
+      isModerator: ctx.user.isModerator,
+    });
+    const isPublished = !!post.publishedAt;
+    const minimumScheduleTime = increaseDate(today, POST_MINIMUM_SCHEDULE_MINUTES, 'minutes');
+    const isScheduled = isPublished && dayjs(post.publishedAt).isAfter(minimumScheduleTime); // Publishing more than minimum schedule time in the future
+    const tags = post.tags.map((x) => x.name);
+    if (isScheduled) tags.push('scheduled');
+
+    await ctx.track.post({
+      type: 'Create',
+      nsfw: !getIsSafeBrowsingLevel(post.nsfwLevel),
+      postId: post.id,
+      tags,
+    });
+
+    if (isPublished && !isScheduled) {
+      await firstDailyPostReward.apply({ postId: post.id, posterId: post.user.id }, { ip });
+
+      await ctx.track.post({
+        type: 'Publish',
+        nsfw: !getIsSafeBrowsingLevel(post.nsfwLevel),
+        postId: post.id,
+        tags,
+      });
+      await eventEngine.processEngagement({
+        userId: post.user.id,
+        type: 'published',
+        entityType: 'post',
+        entityId: post.id,
+      });
+    }
+
+    return post;
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+/**
+ * The router's image input, plus what only a server caller may set: the schema has neither field,
+ * so a client value never reaches here. See `addPostImage`.
+ */
+type PostWithImagesImage = CreatePostWithImagesInput['images'][number] & {
+  generationWorkflowId?: string;
+  serverMintedUrl?: boolean;
+};
+
+/**
+ * Composite create-with-images handler for headless/agent (MCP) use.
+ *
+ * Creates the post, attaches each image in order, and optionally publishes —
+ * all server-side — to eliminate the multi-round-trip + orphan-draft window the
+ * MCP previously handled client-side. Reuses the existing createPost / addPostImage
+ * services and the full updatePostHandler publish path (rewards, tracking,
+ * collection items, contest validation) for the publish step.
+ *
+ * No single DB transaction is feasible here: createPost, addPostImage (which
+ * triggers image ingestion + cache busting), and the publish path each manage
+ * their own writes/side-effects. Instead we do best-effort sequential work and,
+ * on any failure before returning, DELETE the created post so no orphan draft
+ * remains.
+ */
+export const createPostWithImagesHandler = async ({
+  input,
+  ctx,
+}: {
+  input: Omit<CreatePostWithImagesInput, 'images'> & { images: PostWithImagesImage[] };
+  ctx: ProtectedContext;
+}) => {
+  const { images, publish, collectionId, ...createInput } = input;
+
+  // 1) Create the draft post (reuses createPostHandler for tracking + rewards
+  //    on the no-image publish path; we publish separately below once images
+  //    exist, so we always create as a draft here).
+  const post = await createPostHandler({
+    input: { ...createInput, collectionId },
+    ctx,
+  });
+
+  try {
+    // 2) Attach each image in order.
+    const sortedImages = [...images].sort((a, b) => a.index - b.index);
+    const attachedImageIds: number[] = [];
+    // createImage's own primary-DB post-owner check runs once per request per post;
+    // addPostImage keeps its existing per-image check.
+    const assertPostOwnedBy = createPostOwnerCheck();
+    for (const image of sortedImages) {
+      const attached = await addPostImage({
+        ...image,
+        postId: post.id,
+        user: ctx.user,
+        assertPostOwnedBy,
+      });
+      attachedImageIds.push(attached.id);
+    }
+
+    // 3) Optionally publish. Route through updatePostHandler so the full publish
+    //    path runs (rewards, tracking, collaborator messages, collection items,
+    //    contest validation). updatePostHandler returns void.
+    if (publish) {
+      await updatePostHandler({
+        input: { id: post.id, publishedAt: new Date(), collectionId },
+        ctx,
+      });
+    }
+
+    // Re-select the post's current persisted state so the response reflects
+    // mutations that happen after the initial create: nsfwLevel is recomputed
+    // once images are attached, and publish can adjust collectionId/publishedAt.
+    // Returning the stale create-time `post` object would be inconsistent w/ DB.
+    const current = await dbWrite.post.findUnique({
+      where: { id: post.id },
+      select: {
+        title: true,
+        detail: true,
+        modelVersionId: true,
+        collectionId: true,
+        publishedAt: true,
+        nsfwLevel: true,
+      },
+    });
+
+    return {
+      id: post.id,
+      title: current?.title ?? post.title,
+      detail: current?.detail ?? post.detail,
+      modelVersionId: current?.modelVersionId ?? post.modelVersionId,
+      collectionId: current?.collectionId ?? post.collectionId,
+      publishedAt: current?.publishedAt ?? null,
+      imageIds: attachedImageIds,
+      nsfwLevel: current?.nsfwLevel ?? post.nsfwLevel,
+    };
+  } catch (error) {
+    // Roll back the orphan draft so no empty/partial post lingers.
+    await deletePost({
+      id: post.id,
+      isModerator: ctx.user.isModerator,
+      deletedById: ctx.user.id,
+    }).catch(handleLogError);
+    if (error instanceof TRPCError) throw error;
+    throw throwDbError(error);
+  }
+};
+
+export const updatePostHandler = async ({
+  input: { collectionTagId, expectedPrice, ...input },
+  ctx,
+}: {
+  input: PostUpdateInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    const db = await getDbWithoutLag('post', input.id);
+    const post = await db.post.findFirst({
+      where: { id: input.id },
+      select: {
+        publishedAt: true,
+        collectionId: true,
+        id: true,
+        nsfwLevel: true,
+        title: true,
+        detail: true,
+      },
+    });
+
+    // Throw error if trying to reschedule a post that is already published
+    const today = new Date();
+    if (input.publishedAt && post?.publishedAt && dayjs(post.publishedAt).isBefore(today)) {
+      throw throwBadRequestError('You cannot reschedule a post that is already published');
+    }
+
+    const minimumScheduleTime = increaseDate(today, POST_MINIMUM_SCHEDULE_MINUTES, 'minutes');
+
+    // Handle publishedAt adjustment: if the client-sent date is in the past or
+    // before the minimum schedule time, publish immediately. This tolerates
+    // client clock drift and network latency on normal "Publish" clicks. The
+    // check above already blocks modifying an already-published post's date.
+    if (input.publishedAt && dayjs(input.publishedAt).isBefore(minimumScheduleTime)) {
+      input.publishedAt = today;
+    }
+
+    if (
+      input.publishedAt &&
+      !post?.publishedAt &&
+      post?.collectionId &&
+      dayjs(input.publishedAt).isAfter(minimumScheduleTime)
+    ) {
+      // Force be published right away.
+      input.publishedAt = today;
+    }
+
+    if (post && input.publishedAt && input.collectionId) {
+      // Confirm & Validate in the case of a contest collection
+      // That a submission can be made. We only do this as the user publishes
+      // Because images are ready only at this point.
+
+      // Check if user has access to the collection
+      const permissions = await getUserCollectionPermissionsById({
+        id: input.collectionId,
+        userId: ctx.user.id,
+        isModerator: ctx.user.isModerator,
+      });
+
+      if (!permissions.write && !permissions.writeReview) {
+        throw throwAuthorizationError('You cannot post to this collection');
+      }
+
+      const collection = await getCollectionById({
+        input: { id: input.collectionId },
+      });
+
+      if (collection.type !== CollectionType.Post && collection.type !== CollectionType.Image) {
+        throw throwBadRequestError(
+          'The collection you are trying to select is not a post or image collection'
+        );
+      }
+
+      if (
+        collection.tags.length > 0 &&
+        !collectionTagId &&
+        !collection.metadata?.disableTagRequired
+      ) {
+        throw throwBadRequestError('You must select an entry category for this collection');
+      }
+
+      if (collection.metadata.entriesRequireTitle && !post.title) {
+        throw throwBadRequestError('Your entry must have a title to be submitted');
+      }
+
+      if (collection.metadata.entriesRequireTools) {
+        // Check all images within this post has tools:
+        const exists = await dbRead.image.findFirst({
+          where: {
+            postId: input.id,
+            tools: { none: {} },
+          },
+        });
+
+        if (exists) throw throwBadRequestError('All images must have tools to be submitted');
+      }
+
+      if (collection.mode === CollectionMode.Contest) {
+        const postIds = collection.type === CollectionType.Post ? [input.id] : [];
+        const images =
+          collection.type === CollectionType.Image
+            ? await dbWrite.image.findMany({
+                where: { postId: post.id },
+                select: { id: true },
+              })
+            : [];
+
+        await validateContestCollectionEntry({
+          metadata: collection.metadata as CollectionMetadataSchema,
+          collectionId: collection.id,
+          userId: ctx.user.id,
+          isModerator: ctx.user.isModerator,
+          canAccessUserChallenges: ctx.features.userChallenges,
+          postIds,
+          imageIds: images.map((i) => i.id),
+        });
+      }
+    }
+
+    const updatedPost = await updatePost({
+      ...input,
+      user: ctx.user,
+      // `placement.submitStorylineContinuation`'s procedure guards, for the continuation a
+      // storyline draft submits as it is published (its rate limit is on `post.update` itself).
+      // An owner's draft is held to the owner's own standing in the service.
+      storyline: ctx.features.storylines
+        ? {
+            expectedPrice,
+            spendType: domainSpendType(ctx.features),
+            submitRefusal: contentRestriction(ctx.user),
+            // `post.update` asks a token only for MediaWrite, and a continuation spends Buzz.
+            canSpend: isSessionOrFullUserKey(ctx),
+          }
+        : undefined,
+    });
+    const collection = updatedPost.collectionId
+      ? await getCollectionById({
+          input: { id: updatedPost.collectionId },
+        })
+      : undefined;
+
+    const wasPublished = !post?.publishedAt && updatedPost.publishedAt;
+    if (wasPublished) {
+      const postTags = await db.postTag.findMany({
+        where: { postId: updatedPost.id },
+        select: { tagName: true },
+      });
+
+      const minimumScheduleTimeForPublish = increaseDate(
+        new Date(),
+        POST_MINIMUM_SCHEDULE_MINUTES,
+        'minutes'
+      );
+      const isScheduled = dayjs(updatedPost.publishedAt).isAfter(minimumScheduleTimeForPublish); // Publishing more than minimum schedule time in the future
+      const tags = postTags.map((x) => x.tagName);
+
+      if (!isScheduled) {
+        await sendMessagesToCollaborators({
+          entityId: updatedPost.id,
+          entityType: EntityType.Post,
+          userId: ctx.user.id,
+        });
+      }
+
+      // Technically, collectionPosts cannot be scheduled.
+      if (!!updatedPost?.collectionId && collection) {
+        // Create the relevant collectionItem:
+        const permissions = await getUserCollectionPermissionsById({
+          id: updatedPost.collectionId,
+          userId: ctx.user.id,
+          isModerator: ctx.user.isModerator,
+        });
+
+        if (collection.type === CollectionType.Post) {
+          await bulkSaveItems({
+            input: {
+              collectionId: updatedPost.collectionId,
+              postIds: [updatedPost.id],
+              userId: ctx.user.id,
+              tagId: collectionTagId,
+              isModerator: ctx.user.isModerator,
+              canAccessUserChallenges: ctx.features.userChallenges,
+            },
+            permissions,
+          });
+        } else if (collection.type === CollectionType.Image) {
+          // get all images with this postId. We're using DB write in case there's some lag.
+          const images = await dbWrite.image.findMany({
+            where: {
+              postId: updatedPost.id,
+            },
+            select: {
+              id: true,
+            },
+          });
+
+          if (!images.length) {
+            throw throwBadRequestError('No images found for this post');
+          }
+
+          const resp = await bulkSaveItems({
+            input: {
+              collectionId: updatedPost.collectionId,
+              imageIds: images.map((i) => i.id),
+              userId: ctx.user.id,
+              tagId: collectionTagId,
+              isModerator: ctx.user.isModerator,
+              canAccessUserChallenges: ctx.features.userChallenges,
+            },
+            permissions,
+          });
+
+          for (const imgId of resp.imageIds) {
+            await updateEntityMetric({
+              ctx,
+              entityType: 'Image',
+              entityId: imgId,
+              metricType: 'Collection',
+              amount: 1,
+            });
+          }
+        }
+      }
+
+      if (isScheduled) tags.push('scheduled');
+
+      await ctx.track.post({
+        type: 'Publish',
+        nsfw: !getIsSafeBrowsingLevel(updatedPost.nsfwLevel),
+        postId: updatedPost.id,
+        tags,
+      });
+
+      // Give reward to owner of modelVersion
+      if (updatedPost.modelVersionId) {
+        const modelVersion = await dbRead.modelVersion.findUnique({
+          where: { id: updatedPost.modelVersionId },
+        });
+
+        await imagePostedToModelReward.apply(
+          {
+            modelId: modelVersion?.modelId,
+            modelVersionId: updatedPost.modelVersionId,
+            posterId: updatedPost.userId,
+          },
+          { ip: ctx.ip }
+        );
+      }
+
+      // If the post is linked to a Model3D draft (queue-card "Post from
+      // Generation" flow), flip that draft to Published in lockstep. We
+      // swallow errors so a model3d-side hiccup doesn't block the post
+      // publish — publishModel3D is idempotent and we'll surface failures
+      // separately if it becomes a real problem.
+      if (updatedPost.model3dId) {
+        try {
+          await publishModel3D({
+            input: { id: updatedPost.model3dId },
+            user: ctx.user,
+          });
+        } catch (error) {
+          // Non-fatal: log via the standard tRPC error path but don't throw.
+          // The post is already published; the user can retry from the
+          // Model3D detail page if the draft is stuck.
+          // eslint-disable-next-line no-console
+          console.error('Failed to publish linked Model3D', {
+            postId: updatedPost.id,
+            model3dId: updatedPost.model3dId,
+            error,
+          });
+        }
+      }
+
+      if (!isScheduled) {
+        // Scheduled posts are rewarded by process-scheduled-publishing when they
+        // actually go live. Granting here would spend the daily cap on the day the
+        // post was scheduled and leave the publish day unrewarded.
+        await firstDailyPostReward.apply(
+          {
+            postId: updatedPost.id,
+            posterId: updatedPost.userId,
+          },
+          { ip: ctx.ip }
+        );
+
+        await eventEngine.processEngagement({
+          userId: updatedPost.userId,
+          type: 'published',
+          entityType: 'post',
+          entityId: updatedPost.id,
+        });
+      }
+    }
+
+    if (
+      post?.collectionId &&
+      collection?.metadata?.vimeoSupportEnabled &&
+      (post.title !== updatedPost.title || post.detail !== updatedPost.detail) &&
+      // We need title for Vimeo. This is required.
+      !!updatedPost.title &&
+      // We need the access token to update the video.
+      env.VIMEO_ACCESS_TOKEN
+    ) {
+      // UPDATE VIMEO ITEMS IF EXISTS:
+      const images = await dbWrite.image.findMany({
+        where: {
+          postId: updatedPost.id,
+        },
+        select: {
+          id: true,
+          metadata: true,
+        },
+      });
+
+      const vimeoVideoIds = images
+        .map((i) => (i.metadata as VideoMetadata).vimeoVideoId)
+        .filter(isDefined);
+
+      if (vimeoVideoIds.length) {
+        await Promise.all(
+          vimeoVideoIds.map(async (vimeoVideoId) => {
+            try {
+              await updateVimeoVideo({
+                videoId: vimeoVideoId,
+                title: updatedPost.title as string,
+                description: updatedPost.detail,
+                accessToken: env.VIMEO_ACCESS_TOKEN as string,
+              });
+            } catch (error) {
+              // Do nothing atm. We just ignore the error.
+            }
+          })
+        );
+      }
+    }
+
+    if ('storyline' in updatedPost) return { storyline: updatedPost.storyline };
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const getPostHandler = async ({ input, ctx }: { input: GetByIdInput; ctx: Context }) => {
+  try {
+    const post = await getPostDetail({ ...input, user: ctx.user });
+    if (!post) throw throwNotFoundError();
+
+    if (ctx.user && !ctx.user.isModerator) {
+      const blocked = await amIBlockedByUser({ userId: ctx.user.id, targetUserId: post.user.id });
+      if (blocked) throw throwNotFoundError();
+    }
+
+    // "Published with <app>" chip. Resolved HERE rather than inside
+    // `getPostDetail` for two reasons: this is the single tRPC read the post
+    // page actually renders from, and the chip needs the REQUEST's viewer and
+    // host to resolve a store-visibility scope and a maturity gate — both
+    // request-scoped concerns, like the block check above. `getPostDetail` has
+    // two other callers (the page's SSR gating read, which throws its result
+    // away, and `getPostEditDetail`) that would each pay for a resolution
+    // nothing renders.
+    //
+    // 🔴 AFTER the authorisation above, never before, and keyed on `post.id` —
+    // the id of the row that was actually RETURNED — never on `input.id`. The
+    // resolver takes the post as already-admitted for this viewer and does not
+    // re-derive its visibility, so handing it an unvetted id would disclose
+    // whether that post was app-published. The chip READ is fail-open (`null` on any
+    // error inside `readPostAppChip`), so a failed read cannot take the post page down.
+    // Its `viewerBrowsingLevel` argument is computed HERE, outside that try: it is a pure
+    // read of `ctx.features` and `ctx.user`, and a throw from it would fail this handler.
+    //
+    // `host` drives the store's maturity gate and is fail-closed on absence: a
+    // missing host refuses a mature app, i.e. under-links rather than over-links.
+    const publishedWithApp = await readPostAppChip({
+      postId: post.id,
+      user: ctx.user,
+      host: ctx.req?.headers?.host ?? '',
+      // The chip icon follows the store's listing-media rule, which on a red-capable host
+      // admits the viewer's opted-in levels on top of the non-red ceiling.
+      viewerBrowsingLevel: getRequestBrowsingLevel(ctx),
+    });
+
+    return { ...post, publishedWithApp };
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+// export type PostEditDetail = AsyncReturnType<typeof getPostEditHandler>;
+// export type PostEditImage = PostEditDetail['images'][0] & { previewUrl?: string };
+// export const getPostEditHandler = async ({ input, ctx }: { input: GetByIdInput; ctx: Context }) => {
+//   try {
+//     const post = await getPostEditDetail(input);
+//     if (!post) throw throwNotFoundError();
+//     const isOwnerOrModerator = post.userId === ctx.user?.id || ctx.user?.isModerator;
+//     if (!isOwnerOrModerator) throw throwAuthorizationError();
+//     return post;
+//   } catch (error) {
+//     if (error instanceof TRPCError) throw error;
+//     else throw throwDbError(error);
+//   }
+// };
+
+export const deletePostHandler = async ({
+  input,
+  ctx,
+}: {
+  input: GetByIdInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    const result = await deletePost({ ...input, deletedById: ctx.user.id });
+    if (result) {
+      // The deleter, not the content's owner: a moderator delete must not close the owner's appeal.
+      await closeAppealsDeletedByOwner({
+        entityType: EntityType.Image,
+        entityIds: result.deletedImageIds,
+        ownerId: ctx.user.id,
+      });
+      await ctx.track.post({
+        type: 'Delete',
+        nsfw: !getIsSafeBrowsingLevel(result.nsfwLevel),
+        postId: result.id,
+        tags: [],
+      });
+    }
+
+    return result;
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+// #region [post images]
+export const updatePostImageHandler = async ({
+  input,
+}: {
+  input: UpdatePostImageInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    return await updatePostImage({ ...input });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const addResourceToPostImageHandler = async ({
+  input,
+  ctx,
+}: {
+  input: AddResourceToPostImageInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    return await addResourceToPostImage({ ...input, user: ctx.user });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const removeResourceFromPostImageHandler = async ({
+  input,
+  ctx,
+}: {
+  input: RemoveResourceFromPostImageInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    return await removeResourceFromPostImage({ ...input, user: ctx.user });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const reorderPostImagesHandler = async ({
+  input,
+}: {
+  input: ReorderPostImagesInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    return await reorderPostImages({ ...input });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+// #endregion
+
+// #region [post tags]
+export const getPostTagsHandler = async ({ input }: { input: GetPostTagsInput }) => {
+  try {
+    return await getPostTags({ ...input });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const addPostTagHandler = async ({
+  input,
+  ctx,
+}: {
+  input: AddPostTagInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    const result = await addPostTag({ ...input });
+    const postFindArgs = {
+      where: {
+        id: input.id,
+      },
+      select: {
+        nsfw: true,
+        tags: {
+          select: {
+            tag: {
+              select: {
+                name: true,
+              },
+            },
+          },
+        },
+      },
+    } as const;
+    const post = await dbRead.post.findFirstOrThrow(postFindArgs).catch(() => {
+      dbReadFallbackCounter.inc({ entity: 'post', caller: 'addPostTagHandler' });
+      return dbWrite.post.findFirstOrThrow(postFindArgs);
+    });
+    await ctx.track.post({
+      type: 'Tags',
+      postId: input.id,
+      nsfw: post.nsfw,
+      tags: post.tags.map((x) => x.tag.name),
+    });
+    return result;
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const removePostTagHandler = async ({
+  input,
+}: {
+  input: RemovePostTagInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    return await removePostTag({ ...input });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+// #endregion
+
+// #region [post resources]
+export const getPostResourcesHandler = async ({ input }: { input: GetByIdInput }) => {
+  try {
+    const resources = await getPostResources({ ...input });
+
+    return resources.filter((x) => x.name !== 'vae');
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+// #endregion
+
+// #region [post for collections]
+export const getPostContestCollectionDetailsHandler = async ({
+  input,
+}: {
+  input: GetByIdInput;
+  ctx: Context;
+}) => {
+  try {
+    const items = await getPostContestCollectionDetails({ ...input });
+    return items;
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const updatePostCollectionTagIdHandler = async ({
+  input,
+}: {
+  input: UpdatePostCollectionTagIdInput;
+}) => {
+  try {
+    return updatePostCollectionTagId({ ...input });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+// #endregion

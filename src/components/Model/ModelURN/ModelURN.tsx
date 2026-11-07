@@ -1,0 +1,212 @@
+import { Code, Group, Stack, Text } from '@mantine/core';
+import { Popover, Tooltip } from '~/components/MantineOverlays';
+import { useClipboard } from '@mantine/hooks';
+import { IconCheck, IconCopy, IconInfoSquareRounded } from '@tabler/icons-react';
+import { useMemo } from 'react';
+import type { BaseModel } from '~/shared/constants/basemodel.constants';
+import type { ModelType } from '~/shared/utils/prisma/enums';
+import { stringifyAIR } from '~/shared/utils/air';
+import classes from './ModelURN.module.scss';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { DsCode, DsTooltip } from '~/components/AppLayout/ShellDs/ContentDs';
+import { ShellButton } from '~/components/AppLayout/ShellDs/ShellDs';
+
+export const ModelURN = ({
+  baseModel,
+  type,
+  modelId,
+  modelVersionId,
+  fileId,
+  fileType,
+  withCopy = true,
+  ds,
+}: Props) => {
+  const { copied, copy } = useClipboard();
+  const urn = useMemo(
+    () => stringifyAIR({ baseModel, type, modelId, id: modelVersionId, fileId, fileType }),
+    [baseModel, type, modelId, modelVersionId, fileId, fileType]
+  );
+  if (!urn) return null;
+
+  if (ds) {
+    const part = (label: string, value: number) => (
+      <DsTooltip label={withCopy && copied ? 'Copied' : label}>
+        <DsCode className={classes.code} blue onClick={withCopy ? () => copy(value) : undefined}>
+          {value}
+        </DsCode>
+      </DsTooltip>
+    );
+    return (
+      <div className="flex flex-row flex-wrap items-center justify-start gap-[calc(0.25rem*var(--mantine-scale))]">
+        <div className="flex flex-row flex-wrap items-center justify-start gap-0">
+          <DsCode className={classes.code}>civitai:</DsCode>
+          {part('Model ID', modelId)}
+          <DsCode className={classes.code}>@</DsCode>
+          {part('Version ID', modelVersionId)}
+          {fileId !== undefined && (
+            <>
+              <DsCode className={classes.code}>+</DsCode>
+              {part('File ID', fileId)}
+            </>
+          )}
+        </div>
+        {withCopy && (
+          <ShellButton
+            variant="subtle-gray"
+            icon="xs"
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              copy(urn);
+            }}
+          >
+            {copied ? <IconCheck size="20" /> : <IconCopy size="20" />}
+          </ShellButton>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <Group gap={4}>
+      <Group gap={0}>
+        <Code className={classes.code}>civitai:</Code>
+
+        {withCopy ? (
+          <CopyTooltip copied={copied} label="Model ID">
+            <Code className={classes.code} color="blue" onClick={() => copy(modelId)}>
+              {modelId}
+            </Code>
+          </CopyTooltip>
+        ) : (
+          <Tooltip label="Model ID">
+            <Code className={classes.code} color="blue">
+              {modelId}
+            </Code>
+          </Tooltip>
+        )}
+        <Code className={classes.code}>@</Code>
+        {withCopy ? (
+          <CopyTooltip copied={copied} label="Version ID">
+            <Code className={classes.code} color="blue" onClick={() => copy(modelVersionId)}>
+              {modelVersionId}
+            </Code>
+          </CopyTooltip>
+        ) : (
+          <Tooltip label="Version ID">
+            <Code className={classes.code} color="blue">
+              {modelVersionId}
+            </Code>
+          </Tooltip>
+        )}
+        {fileId !== undefined && (
+          <>
+            <Code className={classes.code}>+</Code>
+            {withCopy ? (
+              <CopyTooltip copied={copied} label="File ID">
+                <Code className={classes.code} color="blue" onClick={() => copy(fileId)}>
+                  {fileId}
+                </Code>
+              </CopyTooltip>
+            ) : (
+              <Tooltip label="File ID">
+                <Code className={classes.code} color="blue">
+                  {fileId}
+                </Code>
+              </Tooltip>
+            )}
+          </>
+        )}
+      </Group>
+      {withCopy && (
+        <LegacyActionIcon
+          size="xs"
+          onClick={(e: React.MouseEvent) => {
+            e.stopPropagation();
+            copy(urn);
+          }}
+        >
+          {copied ? <IconCheck size="20" /> : <IconCopy size="20" />}
+        </LegacyActionIcon>
+      )}
+    </Group>
+  );
+};
+
+const CopyTooltip = ({
+  copied,
+  children,
+  label,
+}: {
+  copied: boolean;
+  children: React.ReactNode;
+  label?: React.ReactNode;
+}) => (
+  <Tooltip label={copied ? 'Copied' : label ?? 'Copy'} withArrow>
+    {children}
+  </Tooltip>
+);
+
+const urnParts = [
+  { name: 'ecosystem', description: 'The resource ecosystem' },
+  { name: 'type', description: 'The resource type' },
+  { name: 'source', description: 'The resource source' },
+  { name: 'id', description: 'The resource id at the source' },
+];
+
+export function URNExplanation({ size }: { size?: number }) {
+  return (
+    <Popover width={300} withArrow withinPortal shadow="sm">
+      <Popover.Target>
+        <IconInfoSquareRounded size={size ?? 16} style={{ cursor: 'pointer', opacity: 0.7 }} />
+      </Popover.Target>
+      <Popover.Dropdown>
+        <Stack gap="xs">
+          <Text size="sm" fw={500}>
+            What is an AIR?
+          </Text>
+          <Text size="xs" lh={1.3}>
+            AIR stands for Artificial Intelligence Resource. It is a comprehensive unique
+            identifier, and is composed of the following parts:
+          </Text>
+          <Stack gap={4}>
+            {urnParts.map(({ name, description }) => (
+              <Text size="xs" key={name}>
+                <Code className={classes.code} color="blue">
+                  {name}
+                </Code>{' '}
+                {description}
+              </Text>
+            ))}
+          </Stack>
+          <Text size="xs" lh={1.3}>
+            For brevity we have opted not to show the full AIR here. To learn more about AIRs,{' '}
+            <Text
+              component="a"
+              td="underline"
+              href="https://developer.civitai.com/site/guide/air"
+              target="_blank"
+            >
+              Check out the specification
+            </Text>
+          </Text>
+        </Stack>
+      </Popover.Dropdown>
+    </Popover>
+  );
+}
+
+type Props = {
+  baseModel: BaseModel;
+  type: ModelType;
+  modelId: number;
+  modelVersionId: number;
+  /** Selected `ModelFile.id`; emitted as the AIR's `+<fileId>` segment so the
+   * identifier resolves to the variant the user picked. */
+  fileId?: number;
+  /** Primary `ModelFile.type`; lets diffusion-model checkpoints render the
+   * correct AIR type segment (`diffusionmodel`) instead of `checkpoint`. */
+  fileType?: string;
+  withCopy?: boolean;
+  /** `@civitai/components` markup in place of Mantine (`modelPageDesignSystemMarkup`). */
+  ds?: boolean;
+};

@@ -1,0 +1,2100 @@
+/* eslint-disable local-rules/no-module-scope-cache --
+ * 22 module-scope caches, every one of them keyed off REDIS_KEYS during module
+ * evaluation. This is a tracked BACKLOG, not a safe shape: it is structurally the
+ * same tripwire as the eager `capTierCache` that broke three suites at collection
+ * and turned `Unit tests` red on main (#3505 / #3506), and this module is imported
+ * far more widely than paid-access.service.ts was. Any suite that wholesale-mocks
+ * `~/server/redis/client` without `REDIS_KEYS.CACHES` and reaches this file
+ * unmocked dies during COLLECTION — the three suites in #3505 stay green only
+ * because they additionally mock this module.
+ *
+ * Disabled file-wide rather than converted here because that is 22 call-site
+ * migrations across the busiest cache module in the repo, and it wants to be its
+ * own reviewable change. The file-wide form also silences a NEW cache added here,
+ * which is accepted: a 23rd cache in this file adds no NEW tripwire, because
+ * anything reaching this module already has to mock it. A new cache in a SERVICE
+ * does add one, and that is what the rule is scoped to catch.
+ *
+ * Delete this disable once the caches below are lazy — the rule then guards them.
+ */
+import { Prisma } from '@prisma/client';
+import type { BaseModelType } from '~/server/common/constants';
+import { CacheTTL } from '~/server/common/constants';
+import type { NsfwLevel } from '~/server/common/enums';
+import { clickhouse } from '~/server/clickhouse/client';
+import { dbRead, dbWrite } from '~/server/db/client';
+import { loadKyselyDb } from '~/server/db/kyselyDb.lazy';
+import { readImageTagsViaKysely } from '~/server/redis/image-tags.reads';
+import { getDbWithoutLagBatch } from '~/server/db/db-lag-helpers';
+import { FLIPT_FEATURE_FLAGS, isFlipt } from '~/server/flipt/client';
+import { REDIS_KEYS, redis, type RedisKeyTemplateCache } from '~/server/redis/client';
+import {
+  publicDonationGoalsLookupFn,
+  type ModelVersionPublicDonationGoalCacheItem,
+} from '~/server/redis/donation-goals-cache';
+import type { ImageMetaProps } from '~/server/schema/image.schema';
+import type { ImageMetadata, VideoMetadata } from '~/server/schema/media.schema';
+import type {
+  ContentDecorationCosmetic,
+  EventDecorationCosmetic,
+} from '~/server/selectors/cosmetic.selector';
+import { isEventDecorationData } from '~/shared/constants/event-decoration.constants';
+import type { ProfileImage } from '~/server/selectors/image.selector';
+import {
+  type ImageTagComposite,
+  type ModelTagComposite,
+  modelTagCompositeSelect,
+} from '~/server/selectors/tag.selector';
+import type { EntityAccessDataType } from '~/server/services/common.service';
+import { getWithheldCosmeticIds } from '~/server/services/creator-shop-withheld';
+import type { CachedObject } from '~/server/utils/cache-helpers';
+import { createCachedObject } from '~/server/utils/cache-helpers';
+import { getImageTagRows } from '~/server/redis/image-tag-rows';
+import { L1_CACHE_BYTE_BUDGETS } from '~/server/redis/l1-cache-budget';
+import type { UserMultiplierRow, UserMultipliers } from '~/server/redis/user-multipliers';
+import { foldUserMultipliers } from '~/server/redis/user-multipliers';
+import type { BaseModel } from '~/shared/constants/basemodel.constants';
+import {
+  publicBrowsingLevelsFlag,
+  sfwBrowsingLevelsFlag,
+} from '~/shared/constants/browsingLevel.constants';
+import dayjs from '~/shared/utils/dayjs';
+import type { Availability, CosmeticSource } from '~/shared/utils/prisma/enums';
+import {
+  CosmeticEntity,
+  CosmeticType,
+  ModelStatus,
+  TagSource,
+  TagType,
+} from '~/shared/utils/prisma/enums';
+import { isDefined } from '~/utils/type-guards';
+import { styleTags, subjectTags } from '~/libs/tags';
+
+const alwaysIncludeTags = [...styleTags, ...subjectTags];
+export const tagIdsForImagesCache = createCachedObject<{
+  imageId: number;
+  tags: number[];
+}>({
+  key: REDIS_KEYS.CACHES.TAG_IDS_FOR_IMAGES,
+  idKey: 'imageId',
+  // 8h logical TTL. Measured live (2026-06-17) at ~1.7KB/key and ~16.85 GiB/shard
+  // (~50 GiB cluster-wide) — the single largest next-redis-cluster consumer, NOT
+  // the ~4.4 GiB the prior comment assumed. The default SWR tail keeps the key
+  // resident for a full extra `ttl` past staleness (physical EX 16h); on an
+  // at-cap LRU cluster that tail is mostly evicted early anyway. Trim it to 1h
+  // (physical EX 9h) to cut resident memory. Trade-off: a key re-read only after
+  // the 8h–9h band (vs 8h–16h before) is now a blocking cold-miss (the fetch
+  // lock-winner re-queries Prisma inline) instead of a stale-serve — a small,
+  // non-zero miss uptick for sparsely-accessed images. Steadily-read keys are
+  // unaffected (they revalidate at the 8h logical boundary either way).
+  ttl: CacheTTL.hour * 8,
+  staleWhileRevalidateTtl: CacheTTL.hour,
+  // L1: image tag-ids are near-static display metadata (busted on scan/tag edits);
+  // an 8h Redis TTL dwarfs the per-pod L1, which only delays a cross-pod tag edit by
+  // ≤localTtl. Not a visibility gate (feed SQL enforces that). This is the single
+  // largest driver of api-heavy's per-id Redis GET volume (feed streams distinct
+  // imageIds), so the L1 was starved at localTtl=15s/localMax=10k. Enlarged to a
+  // ~3min window + 50k hot entries so cross-user popular-image overlap + scroll-back
+  // land as L1 hits. Strictly byte-bounded (see l1-cache-budget) — the byte cap, not
+  // the entry cap, is the binding heap guard. The longer localTtl is safe here BECAUSE
+  // this value gates nothing (only delays a busted tag-list edit by ≤localTtl).
+  localTtl: 180,
+  localMax: 50000,
+  localMaxBytes: L1_CACHE_BYTE_BUDGETS.tagIdsForImages,
+  async lookupFn(imageId, fromWrite) {
+    const imageIds = Array.isArray(imageId) ? imageId : [imageId];
+    const db = fromWrite ? dbWrite : dbRead;
+
+    const imageTags = await getImageTagRows(db, imageIds);
+
+    const tagIds = imageTags.map((t) => t.tagId);
+    const tags = await tagCache.fetch(tagIds);
+
+    const hasWD: { [p: string]: boolean } = {};
+    for (const row of imageTags) {
+      const imageIdStr = row.imageId.toString();
+      hasWD[imageIdStr] ??= false;
+      if (row.source === TagSource.WD14) hasWD[imageIdStr] = true;
+    }
+    const result = imageTags.reduce((acc, { tagId, imageId, source }) => {
+      const imageIdStr = imageId.toString();
+      acc[imageIdStr] ??= { imageId, tags: [] };
+
+      const tag = tags[tagId];
+      if (!tag) return acc;
+
+      let canAdd = true;
+      if (source === TagSource.Rekognition && hasWD[imageIdStr as keyof typeof hasWD]) {
+        if (tag.type !== TagType.Moderation && tag.name && !alwaysIncludeTags.includes(tag.name)) {
+          canAdd = false;
+        }
+      }
+
+      if (canAdd) acc[imageIdStr].tags.push(tagId);
+      return acc;
+    }, {} as Record<string, { imageId: number; tags: number[] }>);
+    return result;
+  },
+});
+
+type UserCosmeticLookup = {
+  userId: number;
+  cosmetics: {
+    cosmeticId: number;
+    data: Prisma.JsonValue;
+  }[];
+};
+export const userCosmeticCache = createCachedObject<UserCosmeticLookup>({
+  key: REDIS_KEYS.CACHES.USER_COSMETICS,
+  idKey: 'userId',
+  staleWhileRevalidate: false, // To avoid delay in creator seeing new cosmetics
+  lookupFn: async (ids, fromWrite) => {
+    const goodIds = ids.filter(isDefined);
+    if (!goodIds.length) return {};
+    const db = fromWrite ? dbWrite : dbRead;
+    const equipped = await db.userCosmetic.findMany({
+      where: { userId: { in: goodIds }, equippedAt: { not: null }, equippedToId: null },
+      select: {
+        userId: true,
+        cosmeticId: true,
+        data: true,
+      },
+    });
+    // Unequip-on-withhold doesn't reach rows worn before it shipped, so filter on read too.
+    const withheld = await getWithheldCosmeticIds(
+      equipped.map((x) => x.cosmeticId),
+      db
+    );
+    const userCosmeticsRaw = equipped.filter((x) => !withheld.has(x.cosmeticId));
+    const results = userCosmeticsRaw.reduce((acc, { userId, cosmeticId, data }) => {
+      acc[userId] ??= { userId, cosmetics: [] };
+      acc[userId].cosmetics.push({ cosmeticId, data });
+      return acc;
+    }, {} as Record<number, UserCosmeticLookup>);
+    return results;
+  },
+  ttl: CacheTTL.day,
+});
+
+/**
+ * For a bulk `UserCosmetic` write that changed what users wear: re-reads their entries so reads served
+ * from this cache drop or show the change now rather than at the TTL. Batched, and never throws — the
+ * write it follows has committed.
+ */
+export async function refreshUserCosmeticCache(userIds: (number | null | undefined)[]) {
+  const ids = [...new Set(userIds.filter(isDefined))];
+  for (let i = 0; i < ids.length; i += 500)
+    await userCosmeticCache.refresh(ids.slice(i, i + 500)).catch(() => undefined);
+}
+
+export type RemovedUserCosmetic = {
+  userId: number;
+  equippedAt: Date | null;
+  equippedToId: number | null;
+};
+
+/** Owners of the removed rows that were worn by the user themselves, not placed on content. */
+export const wornUserIds = (rows: RemovedUserCosmetic[]) =>
+  rows.filter((x) => x.equippedAt && x.equippedToId === null).map((x) => x.userId);
+
+/** `refreshUserCosmeticCache` for rows a bulk write deleted: only users who were wearing one. */
+export async function refreshUserCosmeticCacheForRemoved(rows: RemovedUserCosmetic[]) {
+  await refreshUserCosmeticCache(wornUserIds(rows));
+}
+
+type UserOwnedStickerLookup = {
+  userId: number;
+  cosmeticIds: number[];
+};
+/**
+ * Sticker are owned, never equipped, so `userCosmeticCache` — which only holds
+ * equipped cosmetics — can't answer "may this user send this sticker".
+ */
+export const lookupOwnedSticker = async (ids: number[], fromWrite?: boolean) => {
+  const goodIds = ids.filter(isDefined);
+  if (!goodIds.length) return {};
+  const db = fromWrite ? dbWrite : dbRead;
+  const owned = await db.userCosmetic.findMany({
+    where: { userId: { in: goodIds }, cosmetic: { type: CosmeticType.Sticker } },
+    select: { userId: true, cosmeticId: true },
+  });
+  return owned.reduce((acc, { userId, cosmeticId }) => {
+    acc[userId] ??= { userId, cosmeticIds: [] };
+    if (!acc[userId].cosmeticIds.includes(cosmeticId)) acc[userId].cosmeticIds.push(cosmeticId);
+    return acc;
+  }, {} as Record<number, UserOwnedStickerLookup>);
+};
+
+export const userOwnedStickerCache = createCachedObject<UserOwnedStickerLookup>({
+  key: REDIS_KEYS.CACHES.USER_OWNED_STICKER,
+  idKey: 'userId',
+  staleWhileRevalidate: false,
+  lookupFn: lookupOwnedSticker,
+  // Deliberately minutes, not the day the caches around this one use: a stale
+  // entry means someone can't send an sticker they paid for, and the bulk-SQL
+  // cosmetic crons grant without surfacing whose entry to drop. Cheap to rebuild
+  // (one small row) and read once per message send.
+  ttl: 60 * 5,
+});
+
+/**
+ * Call wherever a UserCosmetic write already has the affected user ids in hand,
+ * including paths that can't grant an sticker today — a redundant delete costs
+ * nothing next to the Postgres write it follows. Paths that would need a query
+ * change to learn the ids are left to the TTL above instead.
+ */
+export async function refreshOwnedStickerCache(userIds: (number | null | undefined)[]) {
+  const ids = [...new Set(userIds.filter(isDefined))];
+  if (!ids.length) return;
+  // `refresh` is already best-effort internally; this catch is belt-and-braces
+  // because every caller runs it after a committed grant.
+  await userOwnedStickerCache.refresh(ids).catch(() => undefined);
+}
+
+type CosmeticLookup = {
+  id: number;
+  name: string;
+  type: CosmeticType;
+  data: Prisma.JsonValue;
+  source: CosmeticSource;
+  /** Absent on entries written before the column existed; read as no flags. */
+  flags?: number;
+};
+export const cosmeticCache = createCachedObject<CosmeticLookup>({
+  key: REDIS_KEYS.CACHES.COSMETICS,
+  idKey: 'id',
+  lookupFn: async (ids, fromWrite) => {
+    const goodIds = ids.filter(isDefined);
+    if (!goodIds.length) return {};
+    const db = fromWrite ? dbWrite : dbRead;
+    const cosmetics = await db.cosmetic.findMany({
+      where: { id: { in: goodIds } },
+      select: { id: true, name: true, type: true, data: true, source: true, flags: true },
+    });
+    return Object.fromEntries(cosmetics.map((x) => [x.id, x]));
+  },
+  ttl: CacheTTL.day,
+});
+
+/** A user whose profile picture is Blocked gets no entry, the same as a user with none. */
+export async function lookupProfilePictures(ids: (number | undefined)[], fromWrite?: boolean) {
+  const goodIds = ids.filter(isDefined);
+  if (!goodIds.length) return {};
+  const db = fromWrite ? dbWrite : dbRead;
+  const profilePictures = await db.$queryRaw<ProfileImage[]>`
+    SELECT
+      i.id,
+      i.name,
+      i.url,
+      i."nsfwLevel",
+      i.hash,
+      i."userId",
+      i.ingestion,
+      i.type,
+      i.width,
+      i.height,
+      i.metadata
+    FROM "User" u
+    JOIN "Image" i ON i.id = u."profilePictureId"
+    WHERE u.id IN (${Prisma.join(goodIds)})
+      AND i.ingestion <> 'Blocked'::"ImageIngestionStatus"
+  `;
+  return Object.fromEntries(profilePictures.map((x) => [x.userId, x]));
+}
+
+export const profilePictureCache = createCachedObject<ProfileImage>({
+  key: REDIS_KEYS.CACHES.PROFILE_PICTURES,
+  idKey: 'userId',
+  staleWhileRevalidate: false, // To avoid delay in creator seeing their new profile picture
+  lookupFn: (ids, fromWrite) => lookupProfilePictures(ids as (number | undefined)[], fromWrite),
+  ttl: CacheTTL.day,
+});
+
+type EntityCosmeticLookupRaw = {
+  equippedToId: number;
+  cosmeticId: number;
+  userData: Prisma.JsonValue;
+  createdById: number | null;
+};
+export const cosmeticEntityCaches = Object.fromEntries(
+  Object.values(CosmeticEntity).map((entity) => [
+    entity as CosmeticEntity,
+    createCachedObject<ContentDecorationCosmetic>({
+      key: `${REDIS_KEYS.CACHES.COSMETICS}:${entity}`,
+      idKey: 'equippedToId',
+      // Caches "no frame" for an hour while FRAME_CACHE_NEGATIVE is on. Every writer that puts a frame on content must call refresh(), which overwrites or removes the marker; one that does not stays hidden up to an hour.
+      cacheNotFound: () => isFlipt(FLIPT_FEATURE_FLAGS.FRAME_CACHE_NEGATIVE),
+      notFoundTtl: CacheTTL.hour,
+      staleWhileRevalidate: false,
+      // Lookup reads the primary, so the bust window guards no replica read; keep it minimal.
+      debounceTime: 1,
+      lookupFn: async (ids) => {
+        const entityCosmetics = await dbWrite.$queryRaw<EntityCosmeticLookupRaw[]>`
+          SELECT uc."cosmeticId", uc."equippedToId", uc."data" as "userData", c."createdById"
+          FROM "UserCosmetic" uc
+          JOIN "Cosmetic" c ON c.id = uc."cosmeticId"
+          WHERE uc."equippedToId" IN (${Prisma.join(ids as number[])})
+            AND uc."equippedToType" = '${Prisma.raw(entity)}'::"CosmeticEntity"
+            AND jsonb_typeof(c.data->'event') IS DISTINCT FROM 'string';
+        `;
+        // Unequip-on-withhold doesn't reach content decorated before it shipped, so filter on read too.
+        // Only creator cosmetics can be withheld, so a batch of shop frames costs no extra query.
+        const withheld = await getWithheldCosmeticIds(
+          entityCosmetics.filter((x) => x.createdById != null).map((x) => x.cosmeticId),
+          dbWrite
+        );
+        return Object.fromEntries(
+          entityCosmetics
+            .filter((x) => !withheld.has(x.cosmeticId))
+            .map(({ createdById: _, ...x }) => [
+              x.equippedToId,
+              // Hack here so we can fix it in the appendFn
+              x as any as ContentDecorationCosmetic,
+            ])
+        );
+      },
+      appendFn: async (records) => {
+        const rawRecords = records as any as Set<EntityCosmeticLookupRaw>;
+        const cosmeticIds = [...new Set(Array.from(rawRecords).map((x) => x.cosmeticId))];
+        const cosmetics = await cosmeticCache.fetch(cosmeticIds);
+
+        for (const record of records) {
+          const rawRecord = record as any as EntityCosmeticLookupRaw;
+          const cosmetic = cosmetics[rawRecord.cosmeticId];
+          if (!cosmetic) continue;
+
+          // Swap the id field to the cosmeticId
+          record.id = rawRecord.cosmeticId;
+          delete (record as any).cosmeticId;
+
+          // Add userData to the data field
+          record.data = cosmetic.data as ContentDecorationCosmetic['data'];
+          if (rawRecord.userData) {
+            const userData = rawRecord.userData as ContentDecorationCosmetic['data'];
+            if (userData.lights) record.data.lights = userData.lights;
+            delete (record as any).userData;
+          }
+        }
+      },
+      ttl: CacheTTL.day,
+    }),
+  ])
+) as Record<CosmeticEntity, CachedObject<ContentDecorationCosmetic>>;
+
+type EntityEventDecorationLookupRaw = {
+  equippedToId: number;
+  cosmeticId: number;
+  userId: number;
+};
+// userId is the wearer's, for the hat popover; getEventDecorationsForEntity leaves it out of what
+// it sends.
+type WornEventDecoration = EventDecorationCosmetic & { userId: number };
+/** The event decoration each entity wears, cached apart from its frame so neither displaces the other. */
+export const eventDecorationEntityCaches = Object.fromEntries(
+  Object.values(CosmeticEntity).map((entity) => [
+    entity as CosmeticEntity,
+    createCachedObject<WornEventDecoration>({
+      // v2: entries carry userId.
+      key: `${REDIS_KEYS.CACHES.COSMETICS}:event:v2:${entity}`,
+      idKey: 'equippedToId',
+      // Read on every image feed page while an event runs, and almost no entity wears one, so
+      // misses are cached too. Equip, unequip and revoke refresh, which overwrites a cached miss.
+      notFoundTtl: CacheTTL.hour,
+      staleWhileRevalidate: false,
+      // Lookup reads the primary, so the bust window guards no replica read; keep it minimal.
+      debounceTime: 1,
+      lookupFn: async (ids) => {
+        const rows = await dbWrite.$queryRaw<EntityEventDecorationLookupRaw[]>`
+          SELECT uc."cosmeticId", uc."equippedToId", uc."userId"
+          FROM "UserCosmetic" uc
+          JOIN "Cosmetic" c ON c.id = uc."cosmeticId"
+          WHERE uc."equippedToId" IN (${Prisma.join(ids as number[])})
+            AND uc."equippedToType" = '${Prisma.raw(entity)}'::"CosmeticEntity"
+            AND jsonb_typeof(c.data->'event') = 'string';
+        `;
+        const cosmetics = await cosmeticCache.fetch([...new Set(rows.map((x) => x.cosmeticId))]);
+        const result: Record<number, WornEventDecoration> = {};
+        for (const row of rows) {
+          const cosmetic = cosmetics[row.cosmeticId];
+          if (!cosmetic || !isEventDecorationData(cosmetic.data)) continue;
+          result[row.equippedToId] = {
+            id: cosmetic.id,
+            name: cosmetic.name,
+            type: cosmetic.type,
+            source: cosmetic.source,
+            data: cosmetic.data,
+            equippedToId: row.equippedToId,
+            equippedToType: entity as CosmeticEntity,
+            userId: row.userId,
+          };
+        }
+        return result;
+      },
+      ttl: CacheTTL.day,
+    }),
+  ])
+) as Record<CosmeticEntity, CachedObject<WornEventDecoration>>;
+
+// Content anyone may see, for the hat popover, which is the same for every viewer: only public ids
+// are returned, so a miss reads as not public. No stale serving, so a take-down shows within the TTL.
+// The same rules as reviewedImageWhere and the published-model checks elsewhere; change them together.
+const publicContentCache = (
+  entity: 'Image' | 'Model' | 'Article',
+  lookup: (ids: number[]) => Promise<{ id: number }[]>
+) =>
+  createCachedObject<{ id: number }>({
+    key: `${REDIS_KEYS.CACHES.COSMETICS}:event-public:${entity}`,
+    idKey: 'id',
+    ttl: 5 * 60,
+    notFoundTtl: 5 * 60,
+    staleWhileRevalidate: false,
+    lookupFn: async (ids) => Object.fromEntries((await lookup(ids)).map((row) => [row.id, row])),
+  });
+export const publicContentCaches: Partial<Record<CosmeticEntity, CachedObject<{ id: number }>>> = {
+  Image: publicContentCache(
+    'Image',
+    (ids) => dbRead.$queryRaw`
+      SELECT i.id FROM "Image" i JOIN "Post" p ON p.id = i."postId"
+      WHERE i.id IN (${Prisma.join(ids)}) AND p."publishedAt" <= now()
+        AND p.availability <> 'Private' AND NOT p."tosViolation"
+        AND i.ingestion = 'Scanned' AND i."needsReview" IS NULL AND NOT i."tosViolation"
+    `
+  ),
+  Model: publicContentCache(
+    'Model',
+    (ids) => dbRead.$queryRaw`
+      SELECT m.id FROM "Model" m
+      WHERE m.id IN (${Prisma.join(ids)}) AND m.status = 'Published'
+        AND m.availability <> 'Private' AND NOT m."tosViolation"
+    `
+  ),
+  Article: publicContentCache(
+    'Article',
+    (ids) => dbRead.$queryRaw`
+      SELECT a.id FROM "Article" a
+      WHERE a.id IN (${Prisma.join(ids)}) AND a.status = 'Published'
+        AND a.ingestion = 'Scanned' AND a.availability <> 'Private' AND NOT a."tosViolation"
+    `
+  ),
+};
+
+type CachedUserMultiplier = UserMultipliers;
+export const userMultipliersCache = createCachedObject<CachedUserMultiplier>({
+  key: REDIS_KEYS.CACHES.MULTIPLIERS_FOR_USER,
+  idKey: 'userId',
+  ttl: CacheTTL.day,
+  lookupFn: async (ids, fromWrite) => {
+    const goodIds = ids.filter(isDefined);
+    if (!goodIds.length) return {};
+
+    const db = fromWrite ? dbWrite : dbRead;
+    const rows = await db.$queryRaw<UserMultiplierRow[]>`
+      SELECT
+        u.id as "userId",
+        (u."rewardsEligibility" = 'Ineligible'::"RewardsEligibility") as "rewardsIneligible",
+        (p.metadata->>'rewardsMultiplier')::float as "rewardsMultiplier",
+        (p.metadata->>'purchasesMultiplier')::float as "purchasesMultiplier"
+      FROM "User" u
+      LEFT JOIN "CustomerSubscription" cs
+        ON cs."userId" = u.id AND cs.status IN ('active', 'trialing')
+        AND cs."currentPeriodEnd" >= now()
+      LEFT JOIN "Product" p ON p.id = cs."productId"
+      WHERE u.id IN (${Prisma.join(goodIds)});
+    `;
+
+    return foldUserMultipliers(rows);
+  },
+});
+
+type UserBasicLookup = {
+  id: number;
+  image: string | null;
+  username: string | null;
+  deletedAt: Date | null;
+};
+export const userBasicCache = createCachedObject<UserBasicLookup>({
+  key: REDIS_KEYS.CACHES.BASIC_USERS,
+  idKey: 'id',
+  lookupFn: async (ids, fromWrite) => {
+    const goodIds = ids.filter(isDefined);
+    if (!goodIds.length) return {};
+    const db = fromWrite ? dbWrite : dbRead;
+    const userBasicData = await db.user.findMany({
+      where: { id: { in: goodIds } },
+      select: {
+        id: true,
+        username: true,
+        deletedAt: true,
+        image: true,
+      },
+    });
+    return Object.fromEntries(userBasicData.map((x) => [x.id, x]));
+  },
+  ttl: CacheTTL.day,
+  // L1: username/avatar/deletedAt are cosmetic near-static fields with a 1-day Redis
+  // TTL and refresh-only invalidation (deleteBasicDataForUser). A 30s per-pod L1 is
+  // strictly fresher than what Redis already serves; the only effect is a ≤30s
+  // cross-pod delay on a rename/avatar/soft-delete propagating — imperceptible.
+  localTtl: 30,
+  localMax: 10000,
+  localMaxBytes: L1_CACHE_BYTE_BUDGETS.userBasic, // ~4MB (tiny records)
+});
+
+export type ModelVersionAccessCache = EntityAccessDataType & {
+  publishedAt: Date;
+  status: ModelStatus;
+};
+
+/**
+ * The authoritative availability read behind modelVersionAccessCache. Exported because
+ * `dontCacheFn` below means the cache is *allowed* to hold nothing for an id, and callers that
+ * gate access on the result (hasEntityAccess) must be able to resolve those ids for real rather
+ * than assume the worst.
+ */
+export async function lookupModelVersionAccess(
+  ids: number[],
+  fromWrite?: boolean
+): Promise<Record<string, ModelVersionAccessCache>> {
+  const goodIds = ids.filter(isDefined);
+  if (!goodIds.length) return {};
+  const db = fromWrite ? dbWrite : dbRead;
+  const entityAccessData = await db.$queryRaw<ModelVersionAccessCache[]>(Prisma.sql`
+    SELECT
+      mv.id AS "entityId",
+      mmv."userId" AS "userId",
+      -- Model availability prevails if it's private
+      CASE
+        WHEN mmv.availability = 'Private'
+          THEN mmv."availability"
+        ELSE mv."availability"
+      END AS "availability",
+      mv."publishedAt" AS "publishedAt",
+      mv."status" as "status"
+    FROM "ModelVersion" mv
+         JOIN "Model" mmv ON mv."modelId" = mmv.id
+    WHERE
+      mv.id IN (${Prisma.join(goodIds, ',')})
+  `);
+  return Object.fromEntries(entityAccessData.map((x) => [x.entityId, x]));
+}
+
+export const modelVersionAccessCache = createCachedObject<ModelVersionAccessCache>({
+  key: REDIS_KEYS.CACHES.ENTITY_AVAILABILITY.MODEL_VERSIONS,
+  idKey: 'entityId',
+  ttl: CacheTTL.day,
+  cacheNotFound: false,
+  dontCacheFn: (data) => {
+    // We only wanna cache public models. Otherwise, we better confirm every time. It's a safer bet.
+    // Also, only cache it if it's been published for more than an hour.
+    const oneHourAgo = dayjs().subtract(1, 'hour').toDate();
+    const isOlderThanOneHour = data.publishedAt < oneHourAgo;
+
+    return (
+      data.availability !== 'Public' ||
+      !isOlderThanOneHour ||
+      !data.publishedAt ||
+      // No point in caching stuff in testing or unpublished
+      data.status !== ModelStatus.Published
+    );
+  },
+  lookupFn: (ids, fromWrite) => lookupModelVersionAccess(ids as number[], fromWrite),
+});
+
+type TagLookup = {
+  id: number;
+  name: string;
+  type: TagType;
+  nsfwLevel: NsfwLevel;
+  unlisted?: true;
+};
+export const tagCache = createCachedObject<TagLookup>({
+  key: REDIS_KEYS.CACHES.BASIC_TAGS,
+  idKey: 'id',
+  lookupFn: async (ids, fromWrite) => {
+    const db = fromWrite ? dbWrite : dbRead;
+    const tagBasicData = await db.tag.findMany({
+      where: { id: { in: ids } },
+      select: {
+        id: true,
+        name: true,
+        nsfwLevel: true,
+        type: true,
+        unlisted: true,
+      },
+    });
+    return Object.fromEntries(
+      tagBasicData.map(({ unlisted, ...x }) => [x.id, { ...x, unlisted: unlisted || undefined }])
+    );
+  },
+  ttl: CacheTTL.day,
+  // L1: the tag catalog is a small, near-static, SHARED universe keyed by tag id, so a
+  // per-pod L1 sized to hold the hot catalog reaches a near-100% feed hit ratio and
+  // removes tagCache's per-id Redis GET fan-out. The 1d Redis TTL dwarfs a 30s L1.
+  // BEHAVIOR-AUDIT (2026-07): the value carries nsfwLevel + unlisted. Every reader was
+  // grepped — neither field feeds a HARD content-visibility gate on the feed. Readers
+  // use tag NAMES for display (getTagNamesForImages, search-index tagNames), tag id/name
+  // for category filtering (model.service), and `unlisted` ONLY in stripUnlistedTags —
+  // a non-moderator filter on the model VOTABLE-TAGS panel (a tag-label surface, not
+  // image/content visibility; the ImageTag SQL view already drops unlisted at the DB
+  // layer, and moderators bypass it). Image/model visibility is gated by the entity's
+  // OWN nsfwLevel, never the tag's. So a ≤30s L1 delay on a busted tag-level/unlisted
+  // edit is a cosmetic tag-label lag, not a moderation-visibility bug. localTtl kept
+  // conservative (30s) given that (minor) mod-adjacent surface; hit ratio is driven by
+  // catalog coverage (localMax), not localTtl. Busted per-id on mod tag-level changes
+  // (adjust-tag-level.ts) — dropped from THIS pod's L1, ≤30s cross-pod lag accepted.
+  localTtl: 30,
+  localMax: 100000,
+  localMaxBytes: L1_CACHE_BYTE_BUDGETS.basicTags,
+});
+
+export const tagCacheByName = {
+  async fetch(names: string[]): Promise<{ found: Map<string, TagLookup>; missing: string[] }> {
+    if (!names.length) return { found: new Map(), missing: [] };
+    const keys = names.map(
+      (name) => `${REDIS_KEYS.CACHES.BASIC_TAGS_BY_NAME}:${name}` as RedisKeyTemplateCache
+    );
+    const cached = await redis.packed.mGet<TagLookup>(keys);
+
+    const found = new Map<string, TagLookup>();
+    const missing: string[] = [];
+
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      const data = cached[i];
+      if (data) {
+        found.set(name, data);
+      } else {
+        missing.push(name);
+      }
+    }
+
+    return { found, missing };
+  },
+
+  async setMany(entries: Array<{ key: string; data: TagLookup }>) {
+    if (entries.length === 0) return;
+    // packed.mSet is intentionally disabled in client.ts (CROSSSLOT / format complexity),
+    // so we fan out individual SETs in parallel. Tag writes are infrequent (cache-miss
+    // backfill only), so the extra roundtrips are acceptable.
+    await Promise.all(
+      entries.map(({ key, data }) =>
+        redis.packed.set(`${REDIS_KEYS.CACHES.BASIC_TAGS_BY_NAME}:${key}`, data, {
+          EX: CacheTTL.day,
+        })
+      )
+    );
+  },
+
+  async bust(name: string) {
+    await redis.del(`${REDIS_KEYS.CACHES.BASIC_TAGS_BY_NAME}:${name}`);
+  },
+};
+
+type ModelVersionDetails = {
+  id: number;
+  name: string;
+  earlyAccessTimeFrame: number;
+  baseModel: BaseModel;
+  baseModelType: BaseModelType;
+  createdAt: Date;
+  trainingStatus: string;
+  description: string;
+  trainedWords?: string[];
+  vaeId: number | null;
+  publishedAt: Date | null;
+  status: ModelStatus;
+  covered: boolean;
+  coveredNext: boolean;
+  flags: number;
+  availability: Availability;
+  nsfwLevel: NsfwLevel;
+};
+type ModelDataCache = {
+  modelId: number;
+  hashes: string[];
+  tags: { tagId: number; name: string }[];
+  versions: ModelVersionDetails[];
+};
+export const dataForModelsCache = createCachedObject<ModelDataCache>({
+  key: REDIS_KEYS.CACHES.DATA_FOR_MODEL,
+  idKey: 'modelId',
+  ttl: CacheTTL.day,
+  cacheNotFound: false,
+  staleWhileRevalidate: false,
+  lookupFn: async (ids, fromWrite) => {
+    // refresh() passes fromWrite=true to force primary. For plain fetch() misses,
+    // fall back to the lag-aware helper so recent ModelVersion mutations don't
+    // wedge stale rows into this 1-day cache.
+    const db = fromWrite ? dbWrite : await getDbWithoutLagBatch('model', ids);
+
+    const versions = await db.$queryRaw<(ModelVersionDetails & { modelId: number })[]>`
+      SELECT
+        mv."id",
+        mv.index,
+        mv."modelId",
+        mv."name",
+        mv."earlyAccessTimeFrame",
+        mv."baseModel",
+        mv."baseModelType",
+        mv."createdAt",
+        mv."trainingStatus",
+        mv."publishedAt",
+        mv."status",
+        mv."flags",
+        mv.availability,
+        mv."nsfwLevel",
+        mv."description",
+        mv."trainedWords",
+        (SELECT rr."resourceId" FROM "RecommendedResource" rr
+         WHERE rr."sourceId" = mv.id
+           AND rr.settings->>'isLinkedComponent' = 'true'
+           AND rr.settings->>'componentType' = 'VAE'
+           AND EXISTS (SELECT 1 FROM "ModelFile" mf WHERE mf.id = (rr.settings->>'fileId')::int)
+         LIMIT 1) AS "vaeId",
+        COALESCE(gc.covered, false) AS covered,
+        COALESCE(gc."coveredNext", false) AS "coveredNext"
+      FROM "ModelVersion" mv
+      LEFT JOIN "GenerationCoverage" gc ON gc."modelVersionId" = mv.id
+      WHERE mv."modelId" IN (${Prisma.join(ids)})
+      ORDER BY mv."modelId", mv.index;
+    `;
+
+    const hashes = await db.$queryRaw<{ modelId: number; hash: string }[]>`
+      SELECT "modelId", hash
+      FROM "ModelHash"
+      WHERE
+        "modelId" IN (${Prisma.join(ids)})
+        AND "hashType" = 'SHA256'
+        AND "fileType" IN ('Model', 'Pruned Model');
+    `;
+
+    const results = versions.reduce((acc, { modelId, ...version }) => {
+      acc[modelId] ??= { modelId, hashes: [], tags: [], versions: [] };
+      acc[modelId].versions.push(version);
+      return acc;
+    }, {} as Record<number, ModelDataCache>);
+    for (const { modelId, hash } of hashes) results[modelId]?.hashes.push(hash);
+    return results;
+  },
+  appendFn: async (records) => {
+    const modelIds = [...records].map((x) => x.modelId);
+    const modelTags = await modelTagCache.fetch(modelIds);
+
+    for (const record of records) {
+      const modelTagsData = modelTags[record.modelId];
+      if (!modelTagsData) continue;
+      record.tags = modelTagsData.tags.map((x) => ({ tagId: x.id, name: x.name! }));
+    }
+  },
+});
+
+// Factory function to create user content counter caches
+const createUserContentCountCache = <T extends Record<string, any>>(
+  counterName: string,
+  queryFn: (userIds: number[], fromWrite?: boolean) => Promise<T[]>
+) => {
+  return createCachedObject<T>({
+    key: `${REDIS_KEYS.CACHES.OVERVIEW_USERS}:${counterName}`,
+    idKey: 'id',
+    ttl: CacheTTL.day,
+    cacheNotFound: false,
+    lookupFn: async (ids, fromWrite) => {
+      const goodIds = ids.filter(isDefined);
+      if (!goodIds.length) return {};
+
+      const results = await queryFn(goodIds, fromWrite);
+      return Object.fromEntries(results.map((x) => [x.id, x]));
+    },
+  });
+};
+
+// Individual cache objects for each user content counter
+type UserModelCount = { id: number; modelCount: number };
+export const userModelCountCache = createUserContentCountCache<UserModelCount>(
+  'modelCount',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "modelCount"
+    FROM "Model"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "status" = 'Published'
+      AND availability != 'Private'
+      AND ("mode" IS NULL OR "mode" != 'Archived')
+    GROUP BY "userId"
+  `
+);
+export const userModelCountSfwCache = createUserContentCountCache<UserModelCount>(
+  'modelCount:sfw',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "modelCount"
+    FROM "Model"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "status" = 'Published'
+      AND availability != 'Private'
+      AND ("mode" IS NULL OR "mode" != 'Archived')
+      AND ("nsfwLevel" & ${sfwBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+export const userModelCountPublicCache = createUserContentCountCache<UserModelCount>(
+  'modelCount:public',
+  async (userIds) => dbRead.$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "modelCount"
+    FROM "Model"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "status" = 'Published'
+      AND availability != 'Private'
+      AND ("mode" IS NULL OR "mode" != 'Archived')
+      AND ("nsfwLevel" & ${publicBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+
+type UserPostCount = { id: number; postCount: number };
+export const userPostCountCache = createUserContentCountCache<UserPostCount>(
+  'postCount',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "postCount"
+    FROM "Post"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "publishedAt" IS NOT NULL
+      AND "publishedAt" <= NOW()
+      AND availability != 'Private'
+    GROUP BY "userId"
+  `
+);
+export const userPostCountSfwCache = createUserContentCountCache<UserPostCount>(
+  'postCount:sfw',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "postCount"
+    FROM "Post"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "publishedAt" IS NOT NULL
+      AND "publishedAt" <= NOW()
+      AND availability != 'Private'
+      AND ("nsfwLevel" & ${sfwBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+export const userPostCountPublicCache = createUserContentCountCache<UserPostCount>(
+  'postCount:public',
+  async (userIds) => dbRead.$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "postCount"
+    FROM "Post"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "publishedAt" IS NOT NULL
+      AND "publishedAt" <= NOW()
+      AND availability != 'Private'
+      AND ("nsfwLevel" & ${publicBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+
+type UserModel3DCount = { id: number; model3dCount: number };
+export const userModel3DCountCache = createUserContentCountCache<UserModel3DCount>(
+  'model3dCount',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "model3dCount"
+    FROM "Model3D"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "status" = 'Published'
+      AND "deletedAt" IS NULL
+      AND availability != 'Private'
+    GROUP BY "userId"
+  `
+);
+export const userModel3DCountSfwCache = createUserContentCountCache<UserModel3DCount>(
+  'model3dCount:sfw',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "model3dCount"
+    FROM "Model3D"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "status" = 'Published'
+      AND "deletedAt" IS NULL
+      AND availability != 'Private'
+      AND ("nsfwLevel" & ${sfwBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+export const userModel3DCountPublicCache = createUserContentCountCache<UserModel3DCount>(
+  'model3dCount:public',
+  async (userIds) => dbRead.$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "model3dCount"
+    FROM "Model3D"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "status" = 'Published'
+      AND "deletedAt" IS NULL
+      AND availability != 'Private'
+      AND ("nsfwLevel" & ${publicBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+
+type UserImageVideoCount = { id: number; imageCount: number; videoCount: number };
+export const userImageVideoCountCache = createUserContentCountCache<UserImageVideoCount>(
+  'imageVideoCount',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COALESCE(SUM(IIF("type" = 'image', 1, 0)), 0)::INT as "imageCount",
+      COALESCE(SUM(IIF("type" = 'video', 1, 0)), 0)::INT as "videoCount"
+    FROM "Image"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "ingestion" = 'Scanned'
+      AND "needsReview" IS NULL
+      AND "postId" NOT IN (
+        SELECT id
+        FROM "Post"
+        WHERE "userId" IN (${Prisma.join(userIds)})
+          AND ("publishedAt" IS NULL OR availability = 'Private' OR "publishedAt" > NOW())
+      )
+    GROUP BY "userId"
+  `
+);
+export const userImageVideoCountSfwCache = createUserContentCountCache<UserImageVideoCount>(
+  'imageVideoCount:sfw',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COALESCE(SUM(IIF("type" = 'image', 1, 0)), 0)::INT as "imageCount",
+      COALESCE(SUM(IIF("type" = 'video', 1, 0)), 0)::INT as "videoCount"
+    FROM "Image"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "ingestion" = 'Scanned'
+      AND "needsReview" IS NULL
+      AND ("nsfwLevel" & ${sfwBrowsingLevelsFlag}) != 0
+      AND "postId" NOT IN (
+        SELECT id
+        FROM "Post"
+        WHERE "userId" IN (${Prisma.join(userIds)})
+          AND ("publishedAt" IS NULL OR availability = 'Private' OR "publishedAt" > NOW())
+      )
+    GROUP BY "userId"
+  `
+);
+export const userImageVideoCountPublicCache = createUserContentCountCache<UserImageVideoCount>(
+  'imageVideoCount:public',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COALESCE(SUM(IIF("type" = 'image', 1, 0)), 0)::INT as "imageCount",
+      COALESCE(SUM(IIF("type" = 'video', 1, 0)), 0)::INT as "videoCount"
+    FROM "Image"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "ingestion" = 'Scanned'
+      AND "needsReview" IS NULL
+      AND ("nsfwLevel" & ${publicBrowsingLevelsFlag}) != 0
+      AND "postId" NOT IN (
+        SELECT id
+        FROM "Post"
+        WHERE "userId" IN (${Prisma.join(userIds)})
+          AND ("publishedAt" IS NULL OR availability = 'Private' OR "publishedAt" > NOW())
+      )
+    GROUP BY "userId"
+  `
+);
+
+const userImageVideoCountVariants = [
+  userImageVideoCountCache,
+  userImageVideoCountSfwCache,
+  userImageVideoCountPublicCache,
+];
+
+/**
+ * The image/video count is cached once per browsing-level variant, and all three
+ * move together whenever a user's countable images change.
+ *
+ * `refresh` re-queries eagerly, so it is only safe once the image already
+ * satisfies the count predicate (Scanned, on a post that is published and not
+ * future-dated). Calling it mid-transition caches the pre-transition count for
+ * the full TTL — prefer `bust` on any path that can fire before the image
+ * qualifies.
+ */
+export const userImageVideoCountCaches = {
+  refresh: async (userIds: number | number[]) => {
+    await Promise.all(userImageVideoCountVariants.map((cache) => cache.refresh(userIds)));
+  },
+  // allSettled, not all: unlike refresh(), the underlying bust has no internal
+  // catch, and its cluster read rejects on a Redis stall. This runs on the
+  // scan-result webhook for every image, where a throw would fail the callback
+  // and trigger scanner redelivery against an already-committed row. A dropped
+  // bust only costs staleness until the TTL expires.
+  bust: async (userIds: number | number[]) => {
+    await Promise.allSettled(userImageVideoCountVariants.map((cache) => cache.bust(userIds)));
+  },
+};
+
+type UserArticleCount = { id: number; articleCount: number };
+export const userArticleCountCache = createUserContentCountCache<UserArticleCount>(
+  'articleCount',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "articleCount"
+    FROM "Article"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "publishedAt" IS NOT NULL
+      AND "publishedAt" <= NOW()
+      AND availability != 'Private'
+      AND status = 'Published'::"ArticleStatus"
+    GROUP BY "userId"
+  `
+);
+export const userArticleCountSfwCache = createUserContentCountCache<UserArticleCount>(
+  'articleCount:sfw',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "articleCount"
+    FROM "Article"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "publishedAt" IS NOT NULL
+      AND "publishedAt" <= NOW()
+      AND availability != 'Private'
+      AND status = 'Published'::"ArticleStatus"
+      AND ("nsfwLevel" & ${sfwBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+export const userArticleCountPublicCache = createUserContentCountCache<UserArticleCount>(
+  'articleCount:public',
+  async (userIds) => dbRead.$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "articleCount"
+    FROM "Article"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "publishedAt" IS NOT NULL
+      AND "publishedAt" <= NOW()
+      AND availability != 'Private'
+      AND status = 'Published'::"ArticleStatus"
+      AND ("nsfwLevel" & ${publicBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+
+type UserBountyCount = { id: number; bountyCount: number };
+export const userBountyCountCache = createUserContentCountCache<UserBountyCount>(
+  'bountyCount',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "bountyCount"
+    FROM "Bounty"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "startsAt" <= NOW()
+      AND availability != 'Private'
+    GROUP BY "userId"
+  `
+);
+export const userBountyCountSfwCache = createUserContentCountCache<UserBountyCount>(
+  'bountyCount:sfw',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "bountyCount"
+    FROM "Bounty"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "startsAt" <= NOW()
+      AND availability != 'Private'
+      AND ("nsfwLevel" & ${sfwBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+export const userBountyCountPublicCache = createUserContentCountCache<UserBountyCount>(
+  'bountyCount:public',
+  async (userIds) => dbRead.$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "bountyCount"
+    FROM "Bounty"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "startsAt" <= NOW()
+      AND availability != 'Private'
+      AND ("nsfwLevel" & ${publicBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+
+type UserBountyEntryCount = { id: number; bountyEntryCount: number };
+export const userBountyEntryCountCache = createUserContentCountCache<UserBountyEntryCount>(
+  'bountyEntryCount',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "bountyEntryCount"
+    FROM "BountyEntry"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+    GROUP BY "userId"
+  `
+);
+
+type UserCollectionCount = { id: number; collectionCount: number };
+export const userCollectionCountCache = createUserContentCountCache<UserCollectionCount>(
+  'collectionCount',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "collectionCount"
+    FROM "Collection"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "read" = 'Public'
+      AND availability != 'Private'
+    GROUP BY "userId"
+  `
+);
+export const userCollectionCountSfwCache = createUserContentCountCache<UserCollectionCount>(
+  'collectionCount:sfw',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "collectionCount"
+    FROM "Collection"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "read" = 'Public'
+      AND availability != 'Private'
+      AND ("nsfwLevel" & ${sfwBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+export const userCollectionCountPublicCache = createUserContentCountCache<UserCollectionCount>(
+  'collectionCount:public',
+  async (userIds) => dbRead.$queryRaw`
+    SELECT
+      "userId" as id,
+      COUNT(*)::INT as "collectionCount"
+    FROM "Collection"
+    WHERE "userId" IN (${Prisma.join(userIds)})
+      AND "read" = 'Public'
+      AND availability != 'Private'
+      AND ("nsfwLevel" & ${publicBrowsingLevelsFlag}) != 0
+    GROUP BY "userId"
+  `
+);
+
+type UserComicCount = { id: number; comicCount: number };
+export const userComicCountCache = createUserContentCountCache<UserComicCount>(
+  'comicCount',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      p."userId" as id,
+      COUNT(DISTINCT p.id)::INT as "comicCount"
+    FROM "ComicProject" p
+    WHERE p."userId" IN (${Prisma.join(userIds)})
+      AND p."status" = 'Active'
+      AND EXISTS (
+        SELECT 1 FROM "ComicChapter" c
+        WHERE c."projectId" = p.id
+          AND c."status" = 'Published'
+      )
+    GROUP BY p."userId"
+  `
+);
+export const userComicCountSfwCache = createUserContentCountCache<UserComicCount>(
+  'comicCount:sfw',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT
+      p."userId" as id,
+      COUNT(DISTINCT p.id)::INT as "comicCount"
+    FROM "ComicProject" p
+    WHERE p."userId" IN (${Prisma.join(userIds)})
+      AND p."status" = 'Active'
+      AND (p."nsfwLevel" & ${sfwBrowsingLevelsFlag}) != 0
+      AND EXISTS (
+        SELECT 1 FROM "ComicChapter" c
+        WHERE c."projectId" = p.id
+          AND c."status" = 'Published'
+      )
+    GROUP BY p."userId"
+  `
+);
+export const userComicCountPublicCache = createUserContentCountCache<UserComicCount>(
+  'comicCount:public',
+  async (userIds) => dbRead.$queryRaw`
+    SELECT
+      p."userId" as id,
+      COUNT(DISTINCT p.id)::INT as "comicCount"
+    FROM "ComicProject" p
+    WHERE p."userId" IN (${Prisma.join(userIds)})
+      AND p."status" = 'Active'
+      AND (p."nsfwLevel" & ${publicBrowsingLevelsFlag}) != 0
+      AND EXISTS (
+        SELECT 1 FROM "ComicChapter" c
+        WHERE c."projectId" = p.id
+          AND c."status" = 'Published'
+      )
+    GROUP BY p."userId"
+  `
+);
+
+type UserHasReceivedReviews = { id: number; hasReceivedReviews: boolean };
+export const userHasReceivedReviewsCache = createUserContentCountCache<UserHasReceivedReviews>(
+  'hasReceivedReviews',
+  async (userIds, fromWrite) => (fromWrite ? dbWrite : dbRead).$queryRaw`
+    SELECT DISTINCT
+      m."userId" as id,
+      true as "hasReceivedReviews"
+    FROM "Model" m
+    INNER JOIN "ResourceReview" r ON r."modelId" = m.id
+    WHERE m."userId" IN (${Prisma.join(userIds)})
+      AND r."userId" != m."userId"
+  `
+);
+
+type UserContentOverview = {
+  id: number;
+  modelCount: number;
+  imageCount: number;
+  videoCount: number;
+  postCount: number;
+  articleCount: number;
+  bountyCount: number;
+  bountyEntryCount: number;
+  hasReceivedReviews: boolean;
+  collectionCount: number;
+  comicCount: number;
+  model3dCount: number;
+};
+
+function mergeOverviewResults(
+  ids: number[],
+  modelCounts: Record<string, UserModelCount>,
+  postCounts: Record<string, UserPostCount>,
+  imageVideoCounts: Record<string, UserImageVideoCount>,
+  articleCounts: Record<string, UserArticleCount>,
+  bountyCounts: Record<string, UserBountyCount>,
+  bountyEntryCounts: Record<string, UserBountyEntryCount>,
+  collectionCounts: Record<string, UserCollectionCount>,
+  reviewFlags: Record<string, UserHasReceivedReviews>,
+  comicCounts: Record<string, UserComicCount>,
+  model3dCounts: Record<string, UserModel3DCount>
+): Record<number, UserContentOverview> {
+  return Object.fromEntries(
+    ids.map((id) => [
+      id,
+      {
+        id,
+        modelCount: modelCounts[id]?.modelCount ?? 0,
+        postCount: postCounts[id]?.postCount ?? 0,
+        imageCount: imageVideoCounts[id]?.imageCount ?? 0,
+        videoCount: imageVideoCounts[id]?.videoCount ?? 0,
+        articleCount: articleCounts[id]?.articleCount ?? 0,
+        bountyCount: bountyCounts[id]?.bountyCount ?? 0,
+        bountyEntryCount: bountyEntryCounts[id]?.bountyEntryCount ?? 0,
+        collectionCount: collectionCounts[id]?.collectionCount ?? 0,
+        comicCount: comicCounts[id]?.comicCount ?? 0,
+        hasReceivedReviews: reviewFlags[id]?.hasReceivedReviews ?? false,
+        model3dCount: model3dCounts[id]?.model3dCount ?? 0,
+      },
+    ])
+  );
+}
+
+export const getUserContentOverview = async (
+  userIds: number | number[]
+): Promise<Record<number, UserContentOverview>> => {
+  const ids = Array.isArray(userIds) ? userIds : [userIds];
+  if (!ids.length) return {};
+
+  const [
+    modelCounts,
+    postCounts,
+    imageVideoCounts,
+    articleCounts,
+    bountyCounts,
+    bountyEntryCounts,
+    collectionCounts,
+    reviewFlags,
+    comicCounts,
+    model3dCounts,
+  ] = await Promise.all([
+    userModelCountCache.fetch(ids),
+    userPostCountCache.fetch(ids),
+    userImageVideoCountCache.fetch(ids),
+    userArticleCountCache.fetch(ids),
+    userBountyCountCache.fetch(ids),
+    userBountyEntryCountCache.fetch(ids),
+    userCollectionCountCache.fetch(ids),
+    userHasReceivedReviewsCache.fetch(ids),
+    userComicCountCache.fetch(ids),
+    userModel3DCountCache.fetch(ids),
+  ]);
+
+  return mergeOverviewResults(
+    ids,
+    modelCounts,
+    postCounts,
+    imageVideoCounts,
+    articleCounts,
+    bountyCounts,
+    bountyEntryCounts,
+    collectionCounts,
+    reviewFlags,
+    comicCounts,
+    model3dCounts
+  );
+};
+
+export const getUserContentOverviewSfw = async (
+  userIds: number | number[]
+): Promise<Record<number, UserContentOverview>> => {
+  const ids = Array.isArray(userIds) ? userIds : [userIds];
+  if (!ids.length) return {};
+
+  const [
+    modelCounts,
+    postCounts,
+    imageVideoCounts,
+    articleCounts,
+    bountyCounts,
+    bountyEntryCounts,
+    collectionCounts,
+    reviewFlags,
+    comicCounts,
+    model3dCounts,
+  ] = await Promise.all([
+    userModelCountSfwCache.fetch(ids),
+    userPostCountSfwCache.fetch(ids),
+    userImageVideoCountSfwCache.fetch(ids),
+    userArticleCountSfwCache.fetch(ids),
+    userBountyCountSfwCache.fetch(ids),
+    userBountyEntryCountCache.fetch(ids), // no nsfwLevel on BountyEntry
+    userCollectionCountSfwCache.fetch(ids),
+    userHasReceivedReviewsCache.fetch(ids), // not NSFW-filtered
+    userComicCountSfwCache.fetch(ids),
+    userModel3DCountSfwCache.fetch(ids),
+  ]);
+
+  return mergeOverviewResults(
+    ids,
+    modelCounts,
+    postCounts,
+    imageVideoCounts,
+    articleCounts,
+    bountyCounts,
+    bountyEntryCounts,
+    collectionCounts,
+    reviewFlags,
+    comicCounts,
+    model3dCounts
+  );
+};
+
+export const getUserContentOverviewPublic = async (
+  userIds: number | number[]
+): Promise<Record<number, UserContentOverview>> => {
+  const ids = Array.isArray(userIds) ? userIds : [userIds];
+  if (!ids.length) return {};
+
+  const [
+    modelCounts,
+    postCounts,
+    imageVideoCounts,
+    articleCounts,
+    bountyCounts,
+    bountyEntryCounts,
+    collectionCounts,
+    reviewFlags,
+    comicCounts,
+    model3dCounts,
+  ] = await Promise.all([
+    userModelCountPublicCache.fetch(ids),
+    userPostCountPublicCache.fetch(ids),
+    userImageVideoCountPublicCache.fetch(ids),
+    userArticleCountPublicCache.fetch(ids),
+    userBountyCountPublicCache.fetch(ids),
+    userBountyEntryCountCache.fetch(ids), // no nsfwLevel on BountyEntry
+    userCollectionCountPublicCache.fetch(ids),
+    userHasReceivedReviewsCache.fetch(ids), // not NSFW-filtered
+    userComicCountPublicCache.fetch(ids),
+    userModel3DCountPublicCache.fetch(ids),
+  ]);
+
+  return mergeOverviewResults(
+    ids,
+    modelCounts,
+    postCounts,
+    imageVideoCounts,
+    articleCounts,
+    bountyCounts,
+    bountyEntryCounts,
+    collectionCounts,
+    reviewFlags,
+    comicCounts,
+    model3dCounts
+  );
+};
+
+export const userContentOverviewCache = {
+  fetch: getUserContentOverview,
+  fetchSfw: getUserContentOverviewSfw,
+  fetchPublic: getUserContentOverviewPublic,
+  refresh: async (userIds: number | number[]) => {
+    const ids = Array.isArray(userIds) ? userIds : [userIds];
+    await Promise.all([
+      userModelCountCache.refresh(ids),
+      userModelCountSfwCache.refresh(ids),
+      userModelCountPublicCache.refresh(ids),
+      userPostCountCache.refresh(ids),
+      userPostCountSfwCache.refresh(ids),
+      userPostCountPublicCache.refresh(ids),
+      userImageVideoCountCache.refresh(ids),
+      userImageVideoCountSfwCache.refresh(ids),
+      userImageVideoCountPublicCache.refresh(ids),
+      userArticleCountCache.refresh(ids),
+      userArticleCountSfwCache.refresh(ids),
+      userArticleCountPublicCache.refresh(ids),
+      userBountyCountCache.refresh(ids),
+      userBountyCountSfwCache.refresh(ids),
+      userBountyCountPublicCache.refresh(ids),
+      userBountyEntryCountCache.refresh(ids),
+      userCollectionCountCache.refresh(ids),
+      userCollectionCountSfwCache.refresh(ids),
+      userCollectionCountPublicCache.refresh(ids),
+      userHasReceivedReviewsCache.refresh(ids),
+      userComicCountCache.refresh(ids),
+      userComicCountSfwCache.refresh(ids),
+      userComicCountPublicCache.refresh(ids),
+      userModel3DCountCache.refresh(ids),
+      userModel3DCountSfwCache.refresh(ids),
+      userModel3DCountPublicCache.refresh(ids),
+    ]);
+  },
+};
+
+type ImageWithMeta = {
+  id: number;
+  meta?: ImageMetaProps | null;
+};
+
+export const imageMetaCache = createCachedObject<ImageWithMeta>({
+  key: REDIS_KEYS.CACHES.IMAGE_META,
+  idKey: 'id',
+  lookupFn: async (ids, fromWrite) => {
+    const db = fromWrite ? dbWrite : dbRead;
+    const images = await db.$queryRaw<ImageWithMeta[]>`
+      SELECT
+        i.id,
+        (CASE WHEN i."hideMeta" = TRUE THEN NULL ELSE i.meta END) as "meta"
+      FROM "Image" i
+      WHERE i.id IN (${Prisma.join(ids as number[])})
+    `;
+    return Object.fromEntries(images.map((x) => [x.id, x]));
+  },
+  // 4h logical TTL. image-meta is ~2.8KB/key; on next-redis-cluster the cache
+  // sits behind tag-ids-for-images (~16.85 GiB/shard) and post-stats (~8.2 GiB)
+  // as a top-3 consumer of an at-cap LRU cluster (3×32 GiB maxmemory, evicting
+  // ~250 keys/s/shard, ~100% used for hours — verified live 2026-06-17). The
+  // default SWR tail keeps every key resident for a full extra `ttl` past
+  // staleness (physical EX 8h). Trim it to 1h (physical EX 5h) to cut the
+  // resident set the cache wants to hold, matching tagIdsForImagesCache /
+  // postStatCache. Trade-off: a key re-read only in the 4h–5h-old band (vs
+  // 4h–8h before) is now a blocking cold-miss (the lock-winner re-queries
+  // Prisma inline on dbRead) instead of a stale-serve — but at cap those tail
+  // keys are exactly what LRU evicts first anyway, so steadily-read images are
+  // unaffected. Do NOT shorten the logical 4h ttl: that would convert the hot
+  // working set into misses and stampede dbRead.
+  ttl: CacheTTL.hour * 4,
+  staleWhileRevalidateTtl: CacheTTL.hour,
+  // Brotli-compress every value at rest (see #4588). image-meta is the ELASTIC component of the
+  // cache — its resident set swings ~5x under load and is what drives the cluster to its memory
+  // cap — and its values are prompt/generation-parameter text, i.e. highly repetitive. Measured on
+  // 336 real values sampled AT A PEAK: 3.09x, 67.6% of bytes saved. Its "under 2% of app CPU"
+  // estimate did not account for musl's per-call cost of allocating brotli's default 4 MiB window:
+  // ~4x the CPU per ~3 KB compress on our alpine image, mostly kernel time on the libuv threadpool.
+  // compressPacked bounds that by sizing the window to the value (see packedBrotliWindowBits); no
+  // app-level CPU share has been re-measured since. The codec is async, so it never blocks the
+  // event loop.
+  //
+  // ALL values, not a size threshold: measured, `> 4 KiB` saves only 47.5% of the prefix's bytes
+  // against 67.6% for everything — the ~20pp difference is the difference between clearing the cap
+  // at peak and not — and it trades away the scarce resource (memory) to protect one that is not
+  // scarce (CPU). `> 1 KiB` is within 1pp of "all"; the primitive has no threshold support anyway,
+  // so "all" is also the least code.
+  //
+  // Back-compat: entries are sentinel-tagged and the read path decodes legacy uncompressed values
+  // transparently, so this needed no key-bust. Turning it back OFF is NOT symmetric — a compressed
+  // key read through the general path throws and is evicted — so that would need one.
+  compress: true,
+  // NO per-pod L1 here (deliberate): `meta` is gated on `hideMeta`, and when an owner
+  // flips hideMeta false→true the write path calls imageMetaCache.refresh() (meta→NULL).
+  // A per-pod L1 can't observe that cross-pod refresh, so other viewers' pods would keep
+  // serving the old prompt for up to localTtl — a prompt-exposure window on a PRIVACY
+  // control. Not worth it; also the heaviest value, so its exclusion frees the most heap.
+});
+
+type ImageWithMetadata = {
+  id: number;
+  metadata?: ImageMetadata | VideoMetadata | null;
+};
+
+export const imageMetadataCache = createCachedObject<ImageWithMetadata>({
+  key: REDIS_KEYS.CACHES.IMAGE_METADATA,
+  idKey: 'id',
+  lookupFn: async (ids, fromWrite) => {
+    const db = fromWrite ? dbWrite : dbRead;
+    const images = await db.$queryRaw<ImageWithMetadata[]>`
+      SELECT
+        i.id,
+        i.metadata
+      FROM "Image" i
+      WHERE i.id IN (${Prisma.join(ids as number[])})
+    `;
+    return Object.fromEntries(images.map((x) => [x.id, x]));
+  },
+  // 4h logical TTL + 1h SWR tail (physical EX 5h) — same rationale as
+  // imageMetaCache: bound the resident set on the at-cap next-redis-cluster
+  // without shortening the freshness window.
+  ttl: CacheTTL.hour * 4,
+  staleWhileRevalidateTtl: CacheTTL.hour,
+});
+
+export const thumbnailCache = createCachedObject<{
+  id: number;
+  url: string;
+  width: number | null;
+  height: number | null;
+  nsfwLevel: NsfwLevel;
+  parentId?: number;
+}>({
+  key: REDIS_KEYS.CACHES.THUMBNAILS,
+  idKey: 'parentId',
+  lookupFn: async (ids, fromWrite) => {
+    if (ids.length === 0) return {};
+
+    const db = fromWrite ? dbWrite : dbRead;
+    const targets = await db.$queryRaw<{ thumbnailId: string }[]>`
+        SELECT
+          cast(metadata->'thumbnailId' as int) as "thumbnailId"
+        FROM "Image"
+        WHERE id IN (${Prisma.join(ids as number[])})
+          AND type = 'video'::"MediaType"
+      `;
+
+    const thumbnailIds = targets.map((x) => x.thumbnailId).filter(isDefined);
+    if (thumbnailIds.length === 0) return {};
+
+    const thumbnails = await db.$queryRaw<
+      {
+        id: number;
+        url: string;
+        width: number | null;
+        height: number | null;
+        nsfwLevel: NsfwLevel;
+        parentId: number;
+      }[]
+    >`
+        SELECT
+          id,
+          url,
+          width,
+          height,
+          "nsfwLevel",
+          cast(metadata->'parentId' as int) as "parentId"
+        FROM "Image"
+        WHERE id IN (${Prisma.join(thumbnailIds)})
+      `;
+
+    return Object.fromEntries(thumbnails.filter((x) => !!x.parentId).map((x) => [x.parentId, x]));
+  },
+  dontCacheFn: (data) => !data.nsfwLevel,
+  ttl: CacheTTL.day,
+});
+
+/** The cache is keyed by video id, so a change to a thumbnail image must refresh its parent video. */
+export async function refreshThumbnailCache(imageIds: number | number[]) {
+  const ids = Array.isArray(imageIds) ? imageIds : [imageIds];
+  if (!ids.length) return;
+
+  const parents = await dbWrite.$queryRaw<{ parentId: number | null }[]>`
+    SELECT cast(metadata->'parentId' as int) as "parentId"
+    FROM "Image"
+    WHERE id IN (${Prisma.join(ids)})
+  `;
+  const parentIds = parents.map((x) => x.parentId).filter(isDefined);
+  await thumbnailCache.refresh([...new Set([...ids, ...parentIds])]);
+}
+
+type ArticleStatLookup = {
+  articleId: number;
+  favoriteCount: number;
+  collectedCount: number;
+  commentCount: number;
+  likeCount: number;
+  dislikeCount: number;
+  heartCount: number;
+  laughCount: number;
+  cryCount: number;
+  viewCount: number;
+  tippedAmountCount: number;
+};
+
+export const articleStatCache = createCachedObject<ArticleStatLookup>({
+  key: REDIS_KEYS.CACHES.ARTICLE_STATS,
+  idKey: 'articleId',
+  ttl: CacheTTL.day,
+  cacheNotFound: false,
+  lookupFn: async (ids, fromWrite) => {
+    const db = fromWrite ? dbWrite : dbRead;
+    const articleIds = Array.isArray(ids) ? ids : [ids];
+    if (articleIds.length === 0) return {};
+
+    // Query ArticleMetric table directly for AllTime metrics
+    const stats = await db.$queryRaw<ArticleStatLookup[]>`
+      SELECT
+        "articleId",
+        "favoriteCount",
+        "collectedCount",
+        "commentCount",
+        "likeCount",
+        "dislikeCount",
+        "heartCount",
+        "laughCount",
+        "cryCount",
+        "viewCount",
+        "tippedAmountCount"
+      FROM "ArticleMetric"
+      WHERE "articleId" IN (${Prisma.join(articleIds)})
+        AND "timeframe" = 'AllTime'::"MetricTimeframe"
+    `;
+
+    return Object.fromEntries(stats.map((x) => [x.articleId, x]));
+  },
+});
+
+type PostStatLookup = {
+  postId: number;
+  commentCount: number;
+  likeCount: number;
+  dislikeCount: number;
+  heartCount: number;
+  laughCount: number;
+  cryCount: number;
+  collectedCount: number;
+};
+
+export const postStatCache = createCachedObject<PostStatLookup>({
+  key: REDIS_KEYS.CACHES.POST_STATS,
+  idKey: 'postId',
+  // 24h logical TTL. Measured live (2026-06-17) at ~8.2 GiB on next-redis-cluster
+  // (~8.6%, 3rd-largest consumer). The default SWR tail keeps the key resident a
+  // full extra `ttl` past staleness (physical EX 48h). Trim it to 1h (physical
+  // EX 25h) to cut resident memory. Same trade-off as tagIdsForImagesCache: a
+  // post re-read only after the 24h–25h band (vs 24h–48h before) becomes a
+  // blocking cold-miss (inline PostMetric query) instead of a stale-serve;
+  // steadily-read posts are unaffected.
+  ttl: CacheTTL.day,
+  staleWhileRevalidateTtl: CacheTTL.hour,
+  lookupFn: async (ids, fromWrite) => {
+    const db = fromWrite ? dbWrite : dbRead;
+    const postIds = Array.isArray(ids) ? ids : [ids];
+    if (postIds.length === 0) return {};
+
+    // Query PostMetric table directly for AllTime metrics
+    const stats = await db.$queryRaw<PostStatLookup[]>`
+      SELECT
+        "postId",
+        "commentCount",
+        "likeCount",
+        "dislikeCount",
+        "heartCount",
+        "laughCount",
+        "cryCount",
+        "collectedCount"
+      FROM "PostMetric"
+      WHERE "postId" IN (${Prisma.join(postIds)})
+        AND "timeframe" = 'AllTime'::"MetricTimeframe"
+    `;
+
+    return Object.fromEntries(stats.map((x) => [x.postId, x]));
+  },
+});
+
+type UserFollowsCacheItem = {
+  userId: number;
+  follows: number[];
+};
+export const userFollowsCache = createCachedObject<UserFollowsCacheItem>({
+  key: REDIS_KEYS.CACHES.USER_FOLLOWS,
+  idKey: 'userId',
+  lookupFn: async (ids, fromWrite) => {
+    const db = fromWrite ? dbWrite : dbRead;
+    const userFollows = await db.userEngagement.findMany({
+      where: { userId: { in: ids }, type: 'Follow' },
+      select: { userId: true, targetUserId: true },
+    });
+    const result = userFollows.reduce((acc, { userId, targetUserId }) => {
+      acc[userId] ??= { userId, follows: [] };
+      acc[userId].follows.push(targetUserId);
+      return acc;
+    }, {} as Record<number, UserFollowsCacheItem>);
+    return result;
+  },
+  ttl: CacheTTL.day,
+  staleWhileRevalidate: false,
+});
+export async function getUserFollows(userId: number) {
+  const userFollows = await userFollowsCache.fetch(userId);
+  return userFollows[userId]?.follows ?? [];
+}
+
+/**
+ * Apply one follow/unfollow to the cached set instead of re-deriving it.
+ *
+ * Every follow / hide / block toggle used to end in `userFollowsCache.refresh`,
+ * which refetches the user's ENTIRE follow set from the primary. Measured on prod
+ * (868kurkd0): 19,224 buffers and ~100 ms for a user with 130k follows, per click,
+ * three orders of magnitude above the toggle's own statements — with no
+ * single-flight in front of it.
+ *
+ * The refetch stays as the fallback rather than being replaced. It reads the
+ * PRIMARY deliberately: the replica can be behind the write that just happened, and
+ * the point of touching the cache here is that the user sees their own action.
+ *
+ * Call this ONLY where the resulting follow state is known for certain. Where it is
+ * not — an un-hide or an unblock that matched no row, which leaves a pair that may
+ * still hold a Follow — call `userFollowsCache.refresh` and take the cost.
+ */
+export async function setUserFollowCached({
+  userId,
+  targetUserId,
+  following,
+}: {
+  userId: number;
+  targetUserId: number;
+  following: boolean;
+}) {
+  const updated = await userFollowsCache.update(userId, (current) => {
+    // `indexOf` rather than a Set round trip. This runs on the single Next.js thread
+    // for the whole toggle, and the tail user's follow set is 130k elements: measured
+    // 13.9 ms to rebuild through a Set against 1.3 ms here, on a payload that costs
+    // 3.8 ms to decode and re-encode. The PK (userId, targetUserId) already makes the
+    // array duplicate-free, so the Set was buying nothing.
+    const at = current.follows.indexOf(targetUserId);
+    if (following) {
+      if (at !== -1) return current;
+      return { ...current, follows: [...current.follows, targetUserId] };
+    }
+    if (at === -1) return current;
+    return {
+      ...current,
+      follows: [...current.follows.slice(0, at), ...current.follows.slice(at + 1)],
+    };
+  });
+
+  if (!updated) await userFollowsCache.refresh(userId);
+}
+
+type ImageTagsCacheItem = {
+  imageId: number;
+  tags: ImageTagComposite[];
+};
+
+/**
+ * The rows behind `imageTagsCache`: the primary for a write-triggered refresh, the replica otherwise.
+ */
+export async function readImageTagsForImages(ids: number[], fromWrite?: boolean) {
+  const { kyselyRead, kyselyWrite } = await loadKyselyDb();
+  return readImageTagsViaKysely(fromWrite ? kyselyWrite : kyselyRead, ids);
+}
+
+export const imageTagsCache = createCachedObject<ImageTagsCacheItem>({
+  key: REDIS_KEYS.CACHES.IMAGE_TAGS,
+  idKey: 'imageId',
+  // Reduced from day to 1h — this cache ran at ~50% of next-redis-cluster
+  // (~12.7M keys/shard × ~4.2KB full tag composites) yet had a 25.5% hit ratio
+  // (misses > hits): a 24h TTL bought nothing since entries were LRU-evicted long
+  // before reuse. SWR off → effective Redis EX = 1h. (2026-06-09 redis usage audit)
+  ttl: CacheTTL.hour,
+  staleWhileRevalidate: false,
+  // L1: votable-tag composites (busted on tag votes/edits). 1h Redis TTL vs a 15s
+  // per-pod L1 → ≤15s cross-pod delay on a tag vote/edit. Display metadata + soft
+  // hidden-tag filtering, not a hard visibility gate. max 5000: ~4.2KB/key, heavy.
+  localTtl: 15,
+  localMax: 5000,
+  localMaxBytes: L1_CACHE_BYTE_BUDGETS.imageTags, // ~16MB (heaviest remaining value)
+  lookupFn: async (ids, fromWrite) => {
+    const imageTags = await readImageTagsForImages(ids, fromWrite);
+
+    const result = imageTags.reduce((acc, tag) => {
+      const { imageId, ...tagData } = tag;
+      acc[imageId] ??= { imageId, tags: [] };
+      acc[imageId].tags.push(tagData);
+      return acc;
+    }, {} as Record<number, ImageTagsCacheItem>);
+
+    return result;
+  },
+});
+
+type ModelVotableTagsCacheItem = {
+  modelId: number;
+  tags: ModelTagComposite[];
+};
+
+// Caches the STATIC, user-independent portion of `tag.getVotableTags` for models:
+// the `ModelTag` composite-view read (tagId/tagName/tagType/score/upVotes/downVotes
+// for a model's score>0 tags). This is the mirror of `imageTagsCache` for the model
+// path — the image path was already cache-backed, the model path hit the DB on every
+// call. The per-user vote (`tag.vote`) is merged UNCACHED by getVotableTags from
+// `tagsOnModelsVote`, so no per-user data lives in this cache. Busted on model tag
+// votes (addTagVotes/removeTagVotes) exactly like imageTagsCache. 1h TTL / no SWR to
+// match imageTagsCache semantics; the model tag taxonomy is edit-rare so brief
+// cross-pod aggregate staleness within the TTL is imperceptible.
+export const modelVotableTagsCache = createCachedObject<ModelVotableTagsCacheItem>({
+  key: REDIS_KEYS.CACHES.MODEL_VOTABLE_TAGS,
+  idKey: 'modelId',
+  ttl: CacheTTL.hour,
+  staleWhileRevalidate: false,
+  lookupFn: async (ids, fromWrite) => {
+    const db = fromWrite ? dbWrite : dbRead;
+
+    const modelTags = await db.modelTag.findMany({
+      where: { modelId: { in: ids }, score: { gt: 0 } },
+      select: {
+        modelId: true,
+        ...modelTagCompositeSelect,
+      },
+      orderBy: { score: 'desc' },
+    });
+
+    return modelTags.reduce((acc, tag) => {
+      const { modelId, ...tagData } = tag;
+      acc[modelId] ??= { modelId, tags: [] };
+      acc[modelId].tags.push(tagData);
+      return acc;
+    }, {} as Record<number, ModelVotableTagsCacheItem>);
+  },
+});
+
+export type {
+  DonationGoalWithTotal,
+  ModelVersionPublicDonationGoalCacheItem,
+} from '~/server/redis/donation-goals-cache';
+
+/**
+ * Read-through cache for the PUBLIC variant of a model version's donation goals, keyed by
+ * `modelVersionId`. The public variant is fully determined by the model version id (it does
+ * NOT vary by viewer), so a single shared entry is correct for every anonymous / non-owner /
+ * non-moderator caller. The privileged (owner/mod) variant — which additionally exposes
+ * inactive/draft goals — is computed fresh and NEVER routed through this cache (see
+ * `modelVersionDonationGoal`), so a draft-inclusive payload can never leak into the shared
+ * key and a cached public payload can never be served to a privileged viewer.
+ *
+ * Correctness rides on explicit writes, not TTL expiry, so the TTL (CacheTTL.hour, matching
+ * `PaidAccess`) is a backstop. Goal creation (`ensureDonationGoal`) and every donation, including the
+ * one that completes the goal (`checkDonationGoalComplete`), REFRESH the entry: one primary lookup
+ * written straight to the cache. The bulk path in `model.service.ts` BUSTS it.
+ * `staleWhileRevalidate: false` so a bust truly clears the entry rather than serving one more stale
+ * read. Known gap: refresh writes unconditionally, so a refresh whose lookup ran before a concurrent
+ * goal completion can land last and cache the goal as still open until the TTL. donateToGoal
+ * re-checks `active` on the primary, so that only affects what is displayed.
+ *
+ * `cacheNotFound: false` — a missing version is never negative-cached, so the caller always
+ * 404s fresh (matching the uncached read→primary-fallback→NOT_FOUND behavior).
+ *
+ * The lookupFn — including the security-relevant `active: true` public filter — lives in the
+ * light `donation-goals-cache` module so it can be tested against the REAL function (no mirror
+ * divergence).
+ */
+export const modelVersionPublicDonationGoalsCache =
+  createCachedObject<ModelVersionPublicDonationGoalCacheItem>({
+    key: REDIS_KEYS.CACHES.MODEL_VERSION_PUBLIC_DONATION_GOALS,
+    idKey: 'modelVersionId',
+    ttl: CacheTTL.hour,
+    staleWhileRevalidate: false,
+    cacheNotFound: false,
+    lookupFn: publicDonationGoalsLookupFn,
+  });
+
+type ModelTagCacheItem = {
+  modelId: number;
+  tagIds: number[];
+  tags: TagLookup[];
+};
+export const modelTagCache = createCachedObject<ModelTagCacheItem>({
+  key: REDIS_KEYS.CACHES.MODEL_TAGS,
+  idKey: 'modelId',
+  staleWhileRevalidate: false, // To avoid delay in creator seeing their new tags
+  lookupFn: async (ids, fromWrite) => {
+    const db = fromWrite ? dbWrite : dbRead;
+    const modelTags = await db.tagsOnModels.findMany({
+      where: { modelId: { in: ids } },
+      select: { modelId: true, tagId: true },
+    });
+    const result = modelTags.reduce((acc, { modelId, tagId }) => {
+      acc[modelId] ??= { modelId, tagIds: [] } as unknown as ModelTagCacheItem; // Hack so we don't need to store empty tags array
+      acc[modelId].tagIds.push(tagId);
+      return acc;
+    }, {} as Record<number, ModelTagCacheItem>);
+    return result;
+  },
+  appendFn: async (records) => {
+    const tagIds = [...records].flatMap((x) => x.tagIds);
+    const tags = await tagCache.fetch(tagIds);
+
+    for (const record of records) {
+      record.tags = record.tagIds.map((tagId) => tags[tagId]).filter(isDefined);
+    }
+  },
+  ttl: CacheTTL.day,
+});
+
+export type ImageResourceCacheItem = {
+  imageId: number;
+  modelVersionId: number;
+  strength: number | null;
+  detected: boolean;
+  modelId: number;
+  modelName: string;
+  modelType: string;
+  versionName: string;
+  baseModel: BaseModel;
+  poi: boolean;
+  minor: boolean;
+};
+
+type ImageResourcesCacheItem = {
+  imageId: number;
+  resources: ImageResourceCacheItem[];
+};
+
+export const imageResourcesCache = createCachedObject<ImageResourcesCacheItem>({
+  key: REDIS_KEYS.CACHES.IMAGE_RESOURCES,
+  idKey: 'imageId',
+  // Reduced from day to 8h — 68.8% hit at ~728B/key × ~7.3M keys; with SWR on,
+  // the day TTL resided for 48h, generous for a sub-average-hit cache.
+  // Effective Redis EX = 16h. (2026-06-09 redis usage audit)
+  ttl: CacheTTL.hour * 8,
+  // L1: which models an image used — attribution metadata, refresh-only on resource
+  // edits, 8h Redis TTL. A 30s per-pod L1 only delays a cross-pod resource edit by
+  // ≤30s. Not sensitive / not a visibility gate.
+  //
+  // Per-pod L1 byte budgets are centralized + ceiling-enforced in l1-cache-budget.ts
+  //   (userBasic 4 + imageResources 12 + imageTags 16 + tagIdsForImages 30 + basicTags 20
+  //   = 82MB/pod, under the 96MB ceiling; well below the >3200MB heap-headroom alert and
+  //   the 4096MB old-space limit). Byte-bounded so a per-value size spike can never blow
+  //   the cap (deterministic, deploy fleet-wide safely).
+  localTtl: 30,
+  localMax: 10000,
+  localMaxBytes: L1_CACHE_BYTE_BUDGETS.imageResources, // ~12MB
+  lookupFn: async (ids, fromWrite) => {
+    const imageIds = Array.isArray(ids) ? ids : [ids];
+    if (imageIds.length === 0) return {};
+
+    // refresh() passes fromWrite=true to force primary. For plain fetch() misses,
+    // fall back to the lag-aware helper so recent writes don't wedge stale rows.
+    // While the DataPacket replica is missing ImageResourceNew backfill, the
+    // image-resource-use-write Flipt flag forces reads to the writer.
+    const forceWrite = fromWrite || (await isFlipt(FLIPT_FEATURE_FLAGS.IMAGE_RESOURCE_USE_WRITE));
+    const db = forceWrite ? dbWrite : await getDbWithoutLagBatch('imageResource', imageIds);
+    const resources = await db.$queryRaw<ImageResourceCacheItem[]>`
+      SELECT
+        ir."imageId",
+        ir."modelVersionId",
+        ir.strength,
+        ir.detected,
+        m.id as "modelId",
+        m.name as "modelName",
+        m.type as "modelType",
+        mv.name as "versionName",
+        mv."baseModel",
+        m.poi,
+        m.minor
+      FROM "ImageResourceNew" ir
+      JOIN "ModelVersion" mv ON ir."modelVersionId" = mv.id
+      JOIN "Model" m ON mv."modelId" = m.id
+      WHERE ir."imageId" IN (${Prisma.join(imageIds)})
+    `;
+
+    // Group resources by imageId
+    const grouped = resources.reduce((acc, resource) => {
+      const { imageId } = resource;
+      acc[imageId] ??= { imageId, resources: [] };
+      acc[imageId].resources.push(resource);
+      return acc;
+    }, {} as Record<number, ImageResourcesCacheItem>);
+
+    return grouped;
+  },
+});
+
+/** Helper to get the baseModel for an image (from checkpoint resources) */
+export function getBaseModelFromResources(
+  resources: ImageResourceCacheItem[] | undefined
+): BaseModel | null {
+  if (!resources) return null;
+  const checkpoint = resources.find((r) => r.modelType === 'Checkpoint');
+  return checkpoint?.baseModel ?? null;
+}
+
+type UserDownloadItem = {
+  modelVersionId: number;
+  fileId: number;
+  lastDownloaded: number; // timestamp in ms
+};
+
+type UserDownloadsCacheItem = {
+  userId: number;
+  downloads: UserDownloadItem[];
+};
+
+export const userDownloadsCache = createCachedObject<UserDownloadsCacheItem>({
+  key: REDIS_KEYS.CACHES.USER_DOWNLOADS,
+  idKey: 'userId',
+  ttl: CacheTTL.day,
+  cacheNotFound: false,
+  lookupFn: async (userIds) => {
+    if (!clickhouse) return {};
+    if (userIds.length === 0) return {};
+
+    const results = await clickhouse.$query<{
+      userId: number;
+      modelVersionId: number;
+      fileId: number;
+      lastDownloaded: string;
+    }>`
+      SELECT
+        userId,
+        modelVersionId,
+        fileId,
+        max(lastDownloaded) as lastDownloaded
+      FROM userModelDownloads
+      WHERE userId IN (${userIds.join(',')})
+      GROUP BY userId, modelVersionId, fileId
+      ORDER BY lastDownloaded DESC
+      LIMIT 2000 BY userId
+    `;
+
+    // Group by userId
+    const grouped = results.reduce((acc, { userId, modelVersionId, fileId, lastDownloaded }) => {
+      acc[userId] ??= { userId, downloads: [] };
+      acc[userId].downloads.push({
+        modelVersionId,
+        fileId,
+        // ClickHouse returns dates as strings without timezone - append 'Z' to parse as UTC
+        lastDownloaded: new Date(lastDownloaded.replace(' ', 'T') + 'Z').getTime(),
+      });
+      return acc;
+    }, {} as Record<number, UserDownloadsCacheItem>);
+
+    return grouped;
+  },
+});

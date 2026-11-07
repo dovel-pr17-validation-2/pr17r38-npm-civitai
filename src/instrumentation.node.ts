@@ -1,0 +1,328 @@
+// Node.js-specific OpenTelemetry instrumentation
+// Using STATIC imports so Next.js can trace dependencies for standalone output
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-proto';
+import { resourceFromAttributes } from '@opentelemetry/resources';
+import { ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
+import {
+  BatchSpanProcessor,
+  ParentBasedSampler,
+  TraceIdRatioBasedSampler,
+} from '@opentelemetry/sdk-trace-node';
+import { logs } from '@opentelemetry/api-logs';
+import {
+  createOtelLoggerProvider,
+  emitOtelLog,
+  registerOtelShutdown,
+} from '@civitai/telemetry/otel-logs';
+import { setStructuredLogSink } from '~/server/logging/structured-log-sink';
+import { CredentialRedactingSpanProcessor } from '~/server/otel-redact-span-processor';
+import { trace } from '@opentelemetry/api';
+import {
+  buildOtelInstrumentations,
+  isHttpInstrumentationEnabled,
+} from '~/server/otel-instrumentations';
+import { registerCpuProfiler, registerEventLoopStallProfiler } from '~/server/cpu-profiler';
+import { registerEventLoopLongTaskDetector } from '~/server/eventloop-longtask';
+import { registerLivenessHeartbeat } from '~/server/liveness-heartbeat';
+import { registerEventLoopWatchdog } from '~/server/eventloop-watchdog';
+import { registerPyroscope } from '~/server/pyroscope';
+import { registerStandaloneApiPolicy } from '~/server/middleware/standalone-api-policy';
+import { registerEnumArrayTypeParsers } from '@civitai/db/kysely';
+import { pgDbWrite } from '~/server/db/pgDb';
+// Build this app's Kysely clients (over the existing pgDb pools) eagerly at server start, so the first
+// request that runs a @civitai/db-queries function doesn't pay client construction. @civitai/db-queries
+// functions take a client as their first argument; callers pass these. pg is not OTEL-instrumented, so
+// building the wrappers here is order-independent.
+import '~/server/db/kyselyDb';
+
+// Register pg type parsers for Postgres enum-ARRAY columns (`"SomeEnum"[]`) so the Kysely path parses them as
+// string[] instead of the raw `{a,b}` literal (see @civitai/db/kysely). Awaited here — register() awaits this
+// module, so parsers are in place before the first request query. Fail-open: a transient DB hiccup at boot
+// must not crash the server (enum arrays would just read as strings until a restart). No-op during build,
+// where pgDbWrite is undefined.
+if (pgDbWrite) {
+  try {
+    await registerEnumArrayTypeParsers(pgDbWrite);
+  } catch (err) {
+    console.error(
+      '[instrumentation.node] enum-array type-parser registration failed (fail-open):',
+      err
+    );
+  }
+}
+
+// Hand the proxy's API policy to the standalone server (scripts/trpc-server/server.cjs), which
+// applies it before `/api/v1/` routes under its `api` profile because it never runs the proxy.
+// Sets one global and nothing else, so it is a no-op under Next. That server awaits register()
+// before its first request, so this is in place by then. See ~/server/middleware/standalone-api-policy.
+registerStandaloneApiPolicy();
+
+// Arm the on-demand, signal-triggered V8 CPU profiler. Zero steady-state
+// overhead; only does work when signalled. Independent of OTEL so it is
+// always available for live incident capture. See src/server/cpu-profiler.ts.
+registerCpuProfiler();
+
+// Arm the event-loop-stall SELF-TRIGGER for the same CPU profiler. An external
+// signal can't reach a fully-pinned loop (the SIGWINCH black-hole), so this
+// watches the pod's OWN event-loop lag and auto-arms V8's (separate-thread)
+// sampler when lag crosses a threshold — the one mechanism that captures a 504
+// wave's pin. DISARMED by default (no timer, no histogram, zero overhead) unless
+// CPU_PROFILE_LAG_TRIGGER_MS is set (suggested: 1000) in the deployment
+// environment. See src/server/cpu-profiler.ts.
+registerEventLoopStallProfiler();
+
+// Arm Grafana Pyroscope CONTINUOUS wall+cpu profiling. DARK by default: a
+// complete no-op unless PYROSCOPE_ENABLED='true' (and PYROSCOPE_SERVER_ADDRESS)
+// are set on the deployment — in the dark configuration the @pyroscope/nodejs
+// package (and its eager native @datadog/pprof addon) is never even imported.
+// Async because it dynamically imports the SDK only when armed; MUST NOT be
+// awaited (fire-and-forget, like the warmer) so boot is never blocked. Any arm
+// failure (incl. the native addon failing to load) is swallowed and can never
+// crash boot. See src/server/pyroscope.ts.
+void registerPyroscope().catch((err) => {
+  console.error('[instrumentation.node] pyroscope arm failed (dark, fail-open):', err);
+});
+
+// Arm the event-loop long-task detector. DISARMED by default (no-op unless
+// EVENTLOOP_LONGTASK_THRESHOLD_MS > 0), in which case the request hot path runs
+// completely untouched (no ALS wrapper). Base armed mode adds only the
+// monitorEventLoopDelay lag gauge + a drift detector (cheap, no async_hooks).
+// Per-procedure ALS label attribution (EVENTLOOP_LONGTASK_LABELS) and async_hooks
+// stack capture (EVENTLOOP_LONGTASK_STACKS) are separate opt-in tiers for short
+// diagnostic windows — they add async-context-propagation cost and are NOT
+// enabled by base armed mode. Independent of OTEL.
+// See src/server/eventloop-longtask.ts.
+registerEventLoopLongTaskDetector();
+
+// Write an on-the-event-loop liveness heartbeat file (epoch-seconds, every 2s)
+// for an EXEC liveness probe to read. Lets the kubelet tell a busy-but-alive
+// pinned pod (loop still flushing timers) from a truly-wedged one — retiring the
+// ~15min probe-tolerance band-aid that the httpGet `/api/live` liveness needed
+// because it's served by the same saturated loop. See liveness-heartbeat.ts and
+// the liveness-probe history in the deployment manifests.
+registerLivenessHeartbeat();
+
+// Spawn the off-loop event-loop wedge detector. Everything else that watches the
+// loop — the loopstall self-trigger above, the long-task detector, /api/metrics —
+// runs ON the loop and therefore cannot report while it is pinned. This puts the
+// observer in a worker thread that reads a SharedArrayBuffer heartbeat and serves
+// its own metrics port, so a wedged main thread is still visible from outside.
+// Registered AFTER the heartbeat so the first beat is already stored when the
+// worker starts polling. DISARMED by default (no worker, no port, nothing
+// installed) unless EVENTLOOP_WATCHDOG_ENABLED='true'.
+// See src/server/eventloop-watchdog.ts.
+registerEventLoopWatchdog();
+
+// Kick the in-process route warmer (fire-and-forget). Next standalone
+// lazy-require()s each route on first hit; the dependency-only readiness probe
+// marks a pod Ready while every hot route is still cold, so the first real
+// /api/v1/images / tRPC / SSR request pays lazy-require + JIT on the single
+// loop thread → pin → 504/502/499 on every rollout. The warmer self-requests
+// the hot routes over localhost during startup and flips /api/ready's warm gate
+// only once warm (fail-open). It is OPT-IN via WARMUP_ENABLED (default FALSE —
+// runs ONLY when WARMUP_ENABLED='true', set on the production request-serving
+// workloads; elsewhere it no-ops + flips warm immediately). It self-imports
+// lazily so the fetch/route code isn't pulled into the boot path needlessly.
+//
+// CRITICAL: do NOT await this. register() must return so Next can start the
+// HTTP listener — the warmer needs that listener up to self-request, so
+// awaiting here would deadlock boot. Any import/throw is swallowed: warmup must
+// never block or crash boot.
+void import('~/server/warmup')
+  .then((m) => m.runWarmup())
+  .catch((err) => {
+    console.error('[instrumentation.node] warmup kick failed (fail-open):', err);
+  });
+
+// Attach the OTel sink to the shared structured logger.
+//
+// Registered from HERE, rather than imported by `~/server/logging/client`, because that
+// module is reachable from the client entry point — importing the bridge there bundles
+// prom-client for the browser and fails the build. This file only ever runs on the
+// server, so it is the correct place for the edge. See the note in that module.
+//
+// 🔴 This call reaches every log call site ONLY because the sink object it mutates lives
+// on `globalThis`. This file is compiled into ONE merged runtime module; the logger shim
+// is compiled into 14 of them. When the sink was a module-scope object in the shim, this
+// single call armed the one copy that happened to be merged alongside this file (which is
+// why `eventloop-longtask`, merged into this same runtime module, was the ONLY call site
+// that ever emitted) and left the other 13 permanently dark. See the header of
+// `~/server/logging/structured-log-sink`, and `scripts/check-server-graph-singletons.mjs`,
+// which fails the build if a copy of that module ever loses the globalThis pin.
+//
+// Unconditional on purpose: `emitOtelLog` is itself gated on OTEL_LOGS_ENABLED (default
+// off), so wiring it here keeps ONE gate rather than two, and its skip counter is then a
+// live positive control that the wiring exists at all.
+setStructuredLogSink(emitOtelLog);
+
+// Only enable OTEL if explicitly set AND endpoint is configured
+const OTEL_ENABLED = process.env.OTEL_ENABLED === 'true';
+const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+
+console.log('[instrumentation.node] OTEL config:', {
+  OTEL_ENABLED: process.env.OTEL_ENABLED,
+  OTEL_EXPORTER_OTLP_ENDPOINT: OTEL_ENDPOINT,
+  NODE_ENV: process.env.NODE_ENV,
+  NEXT_RUNTIME: process.env.NEXT_RUNTIME,
+  OTEL_SERVICE_NAME: process.env.OTEL_SERVICE_NAME,
+});
+
+// Skip OTEL if not explicitly enabled or no endpoint configured
+if (!OTEL_ENABLED) {
+  console.log('[instrumentation.node] OTEL disabled (OTEL_ENABLED != true)');
+} else if (!OTEL_ENDPOINT) {
+  console.log('[instrumentation.node] OTEL disabled (no OTEL_EXPORTER_OTLP_ENDPOINT)');
+} else if (process.env.NODE_ENV === 'test') {
+  console.log('[instrumentation.node] OTEL disabled (test environment)');
+} else {
+  try {
+    const serviceName = process.env.OTEL_SERVICE_NAME || process.env.SERVICE_NAME || 'civitai-app';
+
+    const resource = resourceFromAttributes({
+      [ATTR_SERVICE_NAME]: serviceName,
+    });
+
+    // Head trace sampling. Previously unset, so NodeSDK defaulted to AlwaysOn
+    // (100% of requests recorded + exported). At ~1500 req/s on a single JS
+    // thread that recording/attribute/export work is a measurable slice of
+    // main-thread CPU. Sample a fraction of root traces instead; child spans
+    // follow their parent's decision so each trace is all-or-nothing.
+    // Tune without a redeploy via OTEL_TRACES_SAMPLE_RATIO (0..1).
+    const parsedRatio = parseFloat(process.env.OTEL_TRACES_SAMPLE_RATIO ?? '');
+    const sampleRatio =
+      Number.isFinite(parsedRatio) && parsedRatio >= 0 && parsedRatio <= 1 ? parsedRatio : 0.1;
+    const ratioSampler = new TraceIdRatioBasedSampler(sampleRatio);
+    const sampler = new ParentBasedSampler({
+      root: ratioSampler,
+      // This is a PUBLIC API with no traceparent stripping at the edge, so an
+      // untrusted client could send `traceparent: ...-01` to force a sampled
+      // decision. ParentBased's default `remoteParentSampled` is AlwaysOn, which
+      // would let any client defeat the sampling cap and re-saturate CPU — the
+      // exact failure this change prevents. Apply the ratio to remote parents
+      // too. Local parents still inherit, so intra-process traces stay coherent.
+      remoteParentSampled: ratioSampler,
+    });
+    console.log(`[instrumentation.node] OTEL trace sampling ratio: ${sampleRatio}`);
+    console.log(
+      `[instrumentation.node] OTEL inbound HTTP instrumentation: ${
+        isHttpInstrumentationEnabled() ? 'on' : 'off (OTEL_HTTP_INSTRUMENTATION)'
+      }`
+    );
+
+    // Trace exporter
+    const traceExporter = new OTLPTraceExporter({
+      url: `${OTEL_ENDPOINT}/v1/traces`,
+    });
+
+    // Log exporter
+    const logExporter = new OTLPLogExporter({
+      url: `${OTEL_ENDPOINT}/v1/logs`,
+    });
+
+    // Set up the logger provider. Construction (batch sizing + the `traceBased` hazard
+    // it must never enable) lives in @civitai/telemetry so it has one home and a test;
+    // see createOtelLoggerProvider.
+    //
+    // OTEL_LOGS_EXPORT_TIMEOUT_MS bounds a single export attempt. It must stay under the
+    // workload's termination grace period minus the pre-stop drain, because shutdown
+    // flushes synchronously with respect to that budget — the default is sized for the
+    // SHORTEST grace period any of these workloads runs with, and should only be raised
+    // where the deployment is known to allow more.
+    const parsedExportTimeout = parseInt(process.env.OTEL_LOGS_EXPORT_TIMEOUT_MS ?? '', 10);
+    const exportTimeoutMillis =
+      Number.isFinite(parsedExportTimeout) && parsedExportTimeout > 0
+        ? parsedExportTimeout
+        : undefined;
+
+    const loggerProvider = createOtelLoggerProvider({
+      resource,
+      exporter: logExporter,
+      exportTimeoutMillis,
+    });
+    logs.setGlobalLoggerProvider(loggerProvider);
+
+    // Create SDK with trace processor and auto-instrumentations
+    const sdk = new NodeSDK({
+      resource,
+      sampler,
+      spanProcessor: new CredentialRedactingSpanProcessor(new BatchSpanProcessor(traceExporter)),
+      // RedisInstrumentation intentionally omitted: at ~5,400 redis ops/s it was
+      // the highest-frequency span source (~4 spans/request) and the dominant
+      // async_hooks context-propagation cost a CPU pin profile attributed to OTEL
+      // — and head sampling can't remove that (the context manager runs for every
+      // span regardless of the sampling decision). Observability tradeoff: this
+      // removes the only PER-COMMAND redis timing the app had — there is NO redis
+      // command-latency prom metric (only cache hit/miss counters). Accepted for
+      // the CPU win; if per-command redis latency is needed later, add a
+      // low-cardinality prom histogram around sendCommand (cheaper than a span —
+      // no context.with / async_hooks propagation).
+      //
+      // PrismaInstrumentation intentionally omitted for the same structural reason:
+      // it wraps every query on the hot DB path, and each query span pays the
+      // async_hooks context-propagation cost (context.with + span alloc) that head
+      // sampling can't remove — the context manager runs for every span regardless
+      // of the sampling decision. Observability tradeoff: this removes Prisma query
+      // spans, but the app's RED/latency dashboards are prom-client based
+      // (src/server/prom/client.ts), NOT OTEL spanmetrics (which aren't scraped into
+      // Prometheus), and DB pool metrics are separate labeled gauges
+      // (db/db-helpers.ts). So no dashboard depends on these spans. The custom
+      // withSpan() instrumentation on specific hot calls is unaffected.
+      // HttpInstrumentation (inbound-only) unless OTEL_HTTP_INSTRUMENTATION=off. The choice,
+      // and what turning it off does and does not remove, is documented in
+      // ~/server/otel-instrumentations.
+      instrumentations: buildOtelInstrumentations(),
+    });
+
+    sdk.start();
+    console.log(`[instrumentation.node] OTEL SDK started - traces and logs -> ${OTEL_ENDPOINT}`);
+
+    // Arm withSpan's unsampled-parent shortcut (dark until the `otel-withspan-skip-unsampled`
+    // Flipt flag is on). Dynamic, like the warmer: keeps the Flipt client out of this module's
+    // static graph, and a failure here must never affect boot — withSpan simply keeps opening
+    // spans as before. See ~/server/utils/otel-withspan-gate.
+    void import('~/server/utils/otel-withspan-gate')
+      .then((m) => {
+        m.registerWithSpanSkipUnsampledGate();
+        console.log(
+          '[instrumentation.node] withSpan skip-unsampled gate armed (flag-controlled: otel-withspan-skip-unsampled)'
+        );
+      })
+      .catch((err) => {
+        console.error('[instrumentation.node] withSpan gate registration failed (fail-open):', err);
+      });
+
+    // Test span
+    const testTracer = trace.getTracer('instrumentation-test');
+    testTracer.startActiveSpan('test-span', (span) => {
+      span.end();
+    });
+
+    // Test log
+    const logger = logs.getLogger('instrumentation-test');
+    logger.emit({
+      severityNumber: 9, // INFO
+      severityText: 'INFO',
+      body: 'OTEL instrumentation initialized',
+      attributes: { service: serviceName },
+    });
+
+    // Flush telemetry on termination.
+    //
+    // The previous form listened on SIGTERM only and awaited NEITHER promise, so the
+    // final batch raced process termination — immaterial while this pipeline carried one
+    // record per boot, a real loss path the moment it carries traffic. registerOtelShutdown
+    // adds SIGINT, awaits both shutdowns, and is idempotent across a second signal.
+    //
+    // The log line below is deliberate: whether the framework installs its own SIGTERM
+    // handler that exits before ours runs is NOT answerable by any test we can write, so
+    // its presence (or absence) in a terminating process's final output is the check.
+    registerOtelShutdown([loggerProvider, sdk], {
+      log: (message) => console.log(`[instrumentation.node] ${message}`),
+      onError: (reason) => console.error('[instrumentation.node] OTEL shutdown error:', reason),
+    });
+  } catch (error) {
+    console.error('[instrumentation.node] Failed to initialize OTEL:', error);
+  }
+}

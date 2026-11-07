@@ -1,0 +1,113 @@
+.presetCard {
+  position: relative;
+  width: 100%;
+  border-radius: var(--mantine-radius-sm);
+  border: 1px solid light-dark(var(--mantine-color-gray-2), var(--mantine-color-dark-4));
+
+  &:hover:not([disabled]) {
+    border-color: var(--mantine-color-blue-6);
+  }
+
+  &[disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+}
+
+.sendIcon {
+  background-color: var(--mantine-color-blue-5);
+  color: var(--mantine-color-white);
+  border-top-right-radius: var(--mantine-radius-sm);
+  border-bottom-right-radius: var(--mantine-radius-sm);
+}
+
+.label {
+  padding: 0 var(--mantine-spacing-xs);
+
+  &[data-checked] {
+    border: 2px solid rgb(var(--buzz-color));
+    color: rgb(var(--buzz-color));
+    background-color: light-dark(var(--mantine-color-white), var(--mantine-color-dark-7));
+  }
+}
+
+.iconWrapper {
+  display: none;
+}
+
+.chipGroup {
+  gap: 8px;
+
+  @container (max-width: theme('screens.sm')) {
+    gap: var(--mantine-spacing-md);
+  }
+}
+
+.chip {
+  &[data-checked] {
+    background-color: rgb(var(--chip-color, 255, 193, 7));
+    color: var(--mantine-color-white);
+    border-color: rgb(var(--chip-color, 255, 193, 7)); 
+  }
+}
+
+.amountChip {
+  &[data-checked] {
+    background-color: rgb(var(--chip-color, 255, 193, 7));
+    color: var(--mantine-color-white);
+    border-color: rgb(var(--chip-color, 255, 193, 7));
+    
+    &:hover {
+      background-color: rgba(var(--chip-color, 255, 193, 7), 0.9);
+    }
+  }
+
+  &:hover:not([data-checked]) {
+    background-color: light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6));
+  }
+}
+
+.currencyChip {
+  &[data-checked] {
+    background-color: rgb(var(--chip-color, 0, 0, 0));
+    color: var(--mantine-color-white);
+    border-color: rgb(var(--chip-color, 0, 0, 0));
+    
+    &:hover {
+      background-color: rgba(var(--chip-color, 0, 0, 0), 0.9);
+    }
+  }
+
+  &:hover:not([data-checked]) {
+    background-color: light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6));
+  }
+}
+
+.currencyChipLabel {
+  padding: 8px 12px;
+}
+
+.actions {
+  @container (max-width: theme('screens.sm')) {
+    flex-direction: column;
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    padding: var(--mantine-spacing-md);
+  }
+}
+
+.cancelButton {
+  @container (max-width: theme('screens.sm')) {
+    width: 100%;
+    order: 2;
+  }
+}
+
+.submitButton {
+  @container (max-width: theme('screens.sm')) {
+    width: 100%;
+    order: 1;
+  }
+}

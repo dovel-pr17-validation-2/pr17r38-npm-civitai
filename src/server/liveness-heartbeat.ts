@@ -1,0 +1,108 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  recordWatchdogHeartbeat,
+  resolveWatchdogHeartbeatMs,
+  watchdogArmed,
+} from '~/server/eventloop-watchdog';
+
+/**
+ * Liveness heartbeat for an EXEC liveness probe.
+ *
+ * The api pods run one Node process = one JS thread. Under CPU saturation the
+ * event loop pins, and an httpGet liveness probe (served by that SAME loop)
+ * times out — so the kubelet SIGKILLs a pod that is busy-but-ALIVE, which
+ * cold-restarts it and AMPLIFIES the wave (cold-start module compilation re-pins
+ * the loop → fails again → cascade). The prior mitigation just widened the probe
+ * tolerance to ~15min — a band-aid on a signal (probe-response latency) that
+ * fundamentally can't tell "busy" from "dead"; the deployment configuration's
+ * own history is the record of that, and is where the probe is defined.
+ *
+ * This writes the current epoch-SECONDS to a file every 2s, ON the event loop.
+ * A k8s EXEC liveness probe then checks the file's staleness, e.g.:
+ *   sh -c '[ $(( $(date +%s) - $(cat /tmp/heartbeat) )) -lt <threshold> ]'
+ * A pinned-but-PROGRESSING loop still flushes this 2s timer well within the
+ * threshold → stays alive (no false kill). A TRULY wedged loop (deadlock or a
+ * runaway synchronous block) stops updating the file → it goes stale → the pod
+ * is reaped. That is the correct "tolerate busy, detect dead" semantics, with a
+ * real loop-liveness signal instead of probe-latency tolerance tuning.
+ *
+ * Epoch-SECONDS (not ms) because the runner image is Alpine-based → busybox `date`
+ * has no `%N`; the probe reads seconds with `date +%s`. (Deliberately not naming a
+ * Node tag here: the exact base image is pinned in one place, the Dockerfile, and a
+ * copy of it in a comment is a copy that goes stale without anything noticing.)
+ *
+ * The same tick also stores a MILLISECOND timestamp into the event-loop watchdog's
+ * SharedArrayBuffer, which a worker thread reads to detect a wedge off-loop. One
+ * timer, two consumers at their own resolutions: the shell probe is stuck at
+ * seconds by busybox, the worker is not. When the watchdog is armed the tick rate
+ * drops to its heartbeat interval and the file write is throttled back to its own
+ * 2s cadence, so the probe's contract is unchanged.
+ *
+ * Implementation notes:
+ * - SYNC write: the whole write completes inside the timer callback, so the file
+ *   mtime/contents prove the loop actually executed this tick. An async write
+ *   would dispatch to the libuv threadpool (UV_THREADPOOL_SIZE=16) where it could
+ *   lag behind other I/O even while the loop is alive — masking loop liveness.
+ *   The payload is ~10 bytes to /tmp; cost is sub-millisecond every 2s.
+ * - Best-effort: a transient write error is swallowed (one missed tick is far
+ *   inside any sane probe threshold) so the heartbeat can never crash the process.
+ * - The timer is `unref()`d so it never keeps the process alive on its own.
+ */
+const HEARTBEAT_FILE = process.env.LIVENESS_HEARTBEAT_FILE ?? '/tmp/heartbeat';
+const HEARTBEAT_FILE_INTERVAL_MS = 2000;
+
+let started = false;
+let loggedError = false;
+
+export function registerLivenessHeartbeat() {
+  if (started) return;
+  started = true;
+
+  // Ensure the parent dir exists so the first write doesn't ENOENT. In the Alpine runtime image `/tmp`
+  // already exists (mkdir recursive is a no-op), so the probe path is unchanged; on a Windows dev box
+  // `/tmp/heartbeat` resolves to `C:\tmp\heartbeat`, whose parent doesn't exist — without this every 2s tick
+  // logged an ENOENT. Best-effort: if mkdir fails, write() below still logs the persistent failure once.
+  try {
+    fs.mkdirSync(path.dirname(HEARTBEAT_FILE), { recursive: true });
+  } catch {
+    // ignore — handled + logged by write()
+  }
+
+  const write = () => {
+    try {
+      fs.writeFileSync(HEARTBEAT_FILE, String(Math.floor(Date.now() / 1000)));
+      loggedError = false;
+    } catch (err) {
+      // best-effort — never throw from the heartbeat. But a PERSISTENT failure
+      // (read-only /tmp, disk full) makes the file go stale, which under the
+      // phase-2 exec liveness probe REAPS the pod — and this log is the only
+      // in-app signal for that. Log once at the start of each failure streak
+      // (reset on the next success) so it's greppable without spamming.
+      if (!loggedError) {
+        loggedError = true;
+        console.error(`[liveness-heartbeat] failed to write ${HEARTBEAT_FILE}:`, err);
+      }
+    }
+  };
+
+  // Write immediately so the file exists before the startup probe passes and
+  // liveness (which gates behind startup) begins checking it.
+  recordWatchdogHeartbeat();
+  write();
+
+  const tickMs = watchdogArmed
+    ? Math.min(resolveWatchdogHeartbeatMs(), HEARTBEAT_FILE_INTERVAL_MS)
+    : HEARTBEAT_FILE_INTERVAL_MS;
+
+  let lastFileWrite = Date.now();
+  const timer = setInterval(() => {
+    const now = Date.now();
+    recordWatchdogHeartbeat(now);
+    if (now - lastFileWrite >= HEARTBEAT_FILE_INTERVAL_MS) {
+      lastFileWrite = now;
+      write();
+    }
+  }, tickMs);
+  timer.unref();
+}

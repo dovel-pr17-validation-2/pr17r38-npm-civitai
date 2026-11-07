@@ -1,0 +1,1690 @@
+import type { IncomingMessage } from 'http';
+import { buildFliptContext as buildSharedFliptContext } from '@civitai/flipt/context';
+import type * as FliptClient from '~/server/flipt/client';
+import { camelCase } from 'lodash-es';
+import type { NextApiRequest } from 'next';
+import type { SessionUser } from '~/types/session';
+import { isDev } from '~/env/other';
+import type { RegionInfo } from '~/server/utils/region-blocking';
+import { getRegion, isRegionRestricted } from '~/server/utils/region-blocking';
+import { getDisplayName } from '~/utils/string-helpers';
+import { colorDomainNames, type ColorDomain } from '~/shared/constants/domain.constants';
+import { OnboardingSteps } from '~/server/common/enums';
+import { Flags } from '~/shared/utils/flags';
+import { CLASSIC_TRAINER_RETIRES_AT } from '~/shared/constants/training.constants';
+import { formatDate } from '~/utils/date-helpers';
+
+export type ServerAvailability = ColorDomain;
+
+// Parsed once at module load — env is immutable at runtime. Each color maps
+// to the set of lowercased hosts (primary + aliases) that resolve to it.
+// Used in `hasFeature` to short-circuit per-color server availability checks
+// without re-parsing CSV env vars on every flag lookup.
+const colorHostSets: Record<ColorDomain, Set<string>> = colorDomainNames.reduce((acc, color) => {
+  const hosts = new Set<string>();
+  const primary = process.env[`SERVER_DOMAIN_${color.toUpperCase()}`]?.toLowerCase();
+  if (primary) hosts.add(primary);
+  const aliasesRaw = process.env[`SERVER_DOMAIN_${color.toUpperCase()}_ALIASES`];
+  if (aliasesRaw) {
+    for (const alias of aliasesRaw.split(',')) {
+      const trimmed = alias.trim().toLowerCase();
+      if (trimmed) hosts.add(trimmed);
+    }
+  }
+  acc[color] = hosts;
+  return acc;
+}, {} as Record<ColorDomain, Set<string>>);
+
+// --------------------------
+// Feature Availability
+// --------------------------
+const envAvailability = ['dev'] as const;
+const regionAvailability = ['restricted', 'nonRestricted'] as const;
+const serverAvailability = colorDomainNames;
+export const userTiers = ['free', 'founder', 'bronze', 'silver', 'gold'] as const;
+const roleAvailablity = ['public', 'user', 'mod', 'member', 'granted', ...userTiers] as const;
+type RoleAvailability = (typeof roleAvailablity)[number];
+const featureAvailability = [
+  ...envAvailability,
+  ...regionAvailability,
+  ...serverAvailability,
+  ...roleAvailablity,
+] as const;
+// Tracks which flags an ENV override was actually APPLIED to, so Flipt is skipped for those.
+// A flag declared `availability: []` that has a `fliptKey` is never added — see `isDeclaredDark`.
+const envOverriddenFlags = new Set<string>();
+const featureFlags = createFeatureFlags({
+  canWrite: ['public'],
+  earlyAccessModel: ['public'],
+  apiKeys: ['public'],
+  apiKeyBuzzLimit: { availability: ['mod'], fliptKey: 'api-key-buzz-limit' },
+  creatorEngagementApi: { availability: ['mod'], fliptKey: 'creator-engagement-api' },
+  oauthApps: { availability: ['mod'], fliptKey: 'oauth-apps' },
+  // Landscape images cover two feed columns on /images (3+ columns). Mods only while it is reviewed.
+  masonryLandscapeSpan: { availability: ['mod'], fliptKey: 'masonry-landscape-span' },
+  // App mode of /intent/post (manifest links from approved apps). Off: every intent is open mode.
+  appPostIntent: { availability: ['mod'], fliptKey: 'app-post-intent' },
+  // Faro RUM frontend observability. Default OFF (mods only); widen the cohort via
+  // Flipt (`faro`). Runtime kill-switch for the Faro Web SDK — the FaroProvider only
+  // initialises when this flag is on AND the NEXT_PUBLIC_FARO_* build-args are set.
+  faro: { availability: ['mod'], fliptKey: 'faro' },
+  // Cohort-ramp gate for the Faro resource_timing decomposition. SEPARATE from `faro` so the
+  // network-phase measurements can be ramped by % of users at runtime (via Flipt) independently
+  // of the main RUM signals — the FaroProvider includes ResourceTimingInstrumentation only when
+  // this flag is on AND the NEXT_PUBLIC_FARO_RESOURCE_TIMING_ENABLED build-arg is set.
+  // availability ['mod'] is the Flipt-DOWN fallback (mirrors `faro`); Flipt is authoritative
+  // when the flag exists — ramp by bumping its % rollout, never all-at-once.
+  faroResourceTiming: { availability: ['mod'], fliptKey: 'faro-resource-timing' },
+  // Cohort-ramp gate for tRPC request batching (httpBatchStreamLink). Default OFF
+  // (mods only) so batching is dark until ramped via Flipt (`trpc-batching`). Batching
+  // is applied ONLY to AUTHENTICATED-browser queries — anonymous tRPC GETs stay
+  // unbatched so they remain CF edge-cacheable (verified: anon `model.getAll` GET
+  // returns cf-cache-status HIT with s-maxage=60; authed requests have edgeTTL forced
+  // to 0 in createContext, so batching them loses no edge cache). availability ['mod']
+  // is the Flipt-DOWN fallback (mirrors `faro`); Flipt is authoritative when the flag
+  // exists — ramp by bumping its % rollout, never all-at-once. See `src/utils/trpc.ts`.
+  trpcBatching: { availability: ['mod'], fliptKey: 'trpc-batching' },
+  // Rollout gate for WHEN `trpcBatching` takes effect in the browser. On: `FeatureFlagsProvider`
+  // applies it while rendering, so the first commit's queries can batch. Off: it is applied
+  // only from the provider's effect, after the first commit's queries have been sent (the
+  // previous behaviour). SEPARATE from `trpcBatching` so this timing change ramps on its own
+  // and can be turned off without turning batching off. Has no effect while `trpcBatching`
+  // is off. availability ['mod'] is the Flipt-down fallback (mirrors `trpcBatching`).
+  trpcBatchingFirstCommit: { availability: ['mod'], fliptKey: 'trpc-batching-first-commit' },
+  // One shared flush window for batched tRPC queries (`~/utils/trpc-batch-window`). ON: batchable
+  // queries wait up to 16 ms for the window and both browser clients share one batch link, so
+  // queries started a few ms apart leave as one request. The engaged-models and sale-badge
+  // batchers keep their own 80/50 ms windows (never more calls) and only send their flush with the
+  // next window. Only where batching applies (`trpcBatching` on, signed in). OFF: unchanged. `[]` =
+  // DARK and fails CLOSED when the key is absent or Flipt is down.
+  trpcUnifiedBatchWindow: { availability: [], fliptKey: 'trpc-unified-batch-window' },
+  // Show an unresolved reaction count as a "Couldn't load" badge instead of the zero it
+  // collapses to. OFF renders exactly today's behaviour: the server still marks the
+  // counts unknown, the client ignores it. The unknown state fires on every ClickHouse
+  // metric timeout (hundreds to thousands a day), so this is the kill switch if the
+  // badge proves noisier than the silent zero.
+  // No Flipt key: the `reaction-counts-unknown` flag was never created, so this is off for
+  // everyone. To ship it, create the flag (off) first, then add `fliptKey` back.
+  // 🔴 Keep `[]`, not `['mod']`: an evaluation of an absent Flipt key falls through to this
+  // static list, so `['mod']` would switch it on for every moderator at deploy, before the flag
+  // exists in Flipt. See `appListingsPublicExternal`.
+  reactionCountsUnknown: { availability: [] },
+  // Perf: emit the COMPACT wire shape for `hiddenPreferences.getHidden` (id-only
+  // arrays for the model / model3d / explicit-image sets instead of
+  // `{ id, hidden: true }` objects). `getHidden` returns a user's ENTIRE hidden
+  // set; for a whale it superjson-serializes ~12.4MB / ~1.15s SYNCHRONOUSLY on
+  // every response (incl. cache hits) — the single worst event-loop freeze in
+  // the `trpc-response-oversized` dataset (twin of `user.getEngagedModels`). The
+  // client re-expands to the legacy shape so downstream data is identical —
+  // BUT ONLY a client bundle that ships with this PR (which contains
+  // `expandHiddenPreferences`). A PRE-PR bundle reads the compact `number[]` as
+  // `{ id }[]`, gets `x.id === undefined`, and UN-HIDES the user's entire hidden
+  // set (incl. NSFW/moderated) until a hard reload.
+  //
+  // 🔴 RAMP DISCIPLINE: `availability: []` = DARK by default and FAILS CLOSED
+  // (empty availability → static eval false when Flipt is absent/down), so the
+  // Flipt `hidden-prefs-compact` threshold is the ONLY on-switch. NOT `['mod']`:
+  // that would turn compact ON for every mod the instant the server deploys,
+  // while their tabs may still run the OLD bundle → guaranteed un-hide exposure
+  // window on every deploy. Deploy dark, CONFIRM the new bundle is serving
+  // everywhere (hours — see the SPA-cache rollout pattern), THEN ramp the Flipt
+  // threshold; never ramp during/immediately-after a deploy. Instant rollback =
+  // set the threshold to 0. Verify via
+  // `trpc-response-oversized {path="hiddenPreferences.getHidden"}` serializeMs tail.
+  // (Mirrors the `genTabDeferView` / `coinbasePayments` `availability: []` precedent.)
+  hiddenPrefsCompact: { availability: [], fliptKey: 'hidden-prefs-compact' },
+  // Perf experiment: defer the generation-tab-switch remount (useDeferredValue) to fix
+  // mobile INP (p75 ~304ms, dominant phase = processing_duration; the gen-tab switch is
+  // the single hottest interaction). `availability: []` = DARK by default and fails CLOSED when
+  // the Flipt flag is absent or Flipt is down (empty availability → static eval false), so the
+  // deferral only turns on via the Flipt `gen-tab-defer-view` THRESHOLD rollout — a clean all-user
+  // A/B with NO mod segment (a mod cohort contaminated a prior A/B). NOT `['public']`: that would
+  // fail OPEN (true for 100% of users) whenever the Flipt key is missing/unreachable, defeating
+  // the A/B (no flag-off cohort) and shipping the deferral fleet-wide unmeasured. OFF =
+  // byte-identical to today. Measured via RUM `exp_gen_tab_defer_view`. Instant safe rollback.
+  genTabDeferView: { availability: [], fliptKey: 'gen-tab-defer-view' },
+  // The generator's phone layout (docs/plans/mobile-generator.md). Dark until the Flipt
+  // `mobile-generator` ramp; OFF = today's generator on phones, unchanged.
+  mobileGenerator: { availability: [], fliptKey: 'mobile-generator' },
+  // SSR-CPU trial on `/models/[id]/[[...slug]]`: when ON, the model page's below-the-fold,
+  // non-SEO sidebar sections (creator card, license/permissions, collection-showcase body) render
+  // client-side after hydration behind fixed-height placeholders. `getServerSideProps` still
+  // prefetches `user.getCreator`, so the deferred creator card mounts with real data. OFF = the
+  // page renders as before. `availability: []` = DARK by default and
+  // fails CLOSED when the Flipt key is absent or Flipt is down, so the
+  // `model-page-defer-below-fold` rollout is the only on-switch (NOT `['mod']`: the client's
+  // static fallback would switch it on for every moderator at deploy). Hydration cannot mismatch:
+  // the server render and the hydrating render read the same serialised flags. gSSP does not read
+  // the flag: its prefetches are the same in both states.
+  modelPageDeferBelowFold: { availability: [], fliptKey: 'model-page-defer-below-fold' },
+  // Opens `GET /api/page-data/images/[imageId]` (404 while off). `[]`: dark and fails CLOSED — the
+  // moderator cohort is a Flipt rollout, never this static list.
+  shellImages: { availability: [], fliptKey: 'shell-images' },
+  // Kill switch for every static shell render (`~/server/shell/shell-mode`): while off, no request
+  // gets a shell whatever its cookie says. Read with no user (entity `anonymous`), so it is one
+  // switch for everyone, never a per-user rollout. `[]`: dark, and fails CLOSED when the key is
+  // absent or Flipt is down — a shell is an optimisation, so losing it costs only CPU.
+  shellMaster: { availability: [], fliptKey: 'shell-master' },
+  // Per-user opt-in to the standalone tRPC server (routing cookie: `~/server/trpc/trpc-pool-cookie`).
+  // `[]`: dark, and fails CLOSED when the key is absent or Flipt is down.
+  trpcPoolRoute: { availability: [], fliptKey: 'trpc-pool-route' },
+  // The two-pane /user/account shell. `['mod']` is the staging cohort while it bakes — it is the
+  // static fallback only, so it decides nothing while Flipt answers; the `account-settings-v2`
+  // rollout is still the on-switch, and OFF serves the legacy single-column page byte-identically.
+  // NOT `['public']`: that reads true whenever the Flipt key is missing or Flipt is unreachable,
+  // which would cut every user over during an outage — and this page is the landing target for
+  // Stripe and Tipalti `return_url`s, so a bad cutover strands payout onboarding rather than merely
+  // looking wrong. Instant rollback = set the threshold to 0.
+  accountSettingsV2: { availability: ['mod'], fliptKey: 'account-settings-v2' },
+  // `['mod']` is the fallback only, as for `accountSettingsV2`: the `user-menu-v2` rollout
+  // decides while Flipt answers. Also gates the unclaimed-prize query in `checkNotifications`.
+  userMenuV2: { availability: ['mod'], fliptKey: 'user-menu-v2' },
+  // SSR-CPU kill switch for the page shell (header row, sub-nav tab pills, footer). When ON, the
+  // shell's buttons, links, icon buttons and grid render as plain `@civitai/components` markup
+  // (`data-civitai-ui="button"` + a CSS module that maps civitai's Mantine values onto it) instead
+  // of Mantine `Button`/`ActionIcon`/`Grid`/`Text`/`Divider`, which resolve styles per instance on
+  // every page render. Menus, popovers and hover cards in the shell stay on Mantine either way.
+  // `availability: []` = DARK and fails CLOSED when the Flipt key is absent or Flipt is down, so
+  // the `shell-design-system-markup` rollout is the only on-switch (NOT `['mod']`: the client's
+  // static fallback would switch it on for every moderator at deploy). OFF = the Mantine shell,
+  // unchanged. Hydration cannot mismatch: server and client read the same serialised flags.
+  shellDesignSystemMarkup: { availability: [], fliptKey: 'shell-design-system-markup' },
+  // Server CPU switch for the tRPC flag guards (`isFlagProtected`, `appDeveloperProcedure`). ON:
+  // a guard reads only the flag it names from `ctx.features` (lazy, once per HTTP request).
+  // OFF: it reads that flag out of the whole registry (`getFeatureFlags`), as before. Same answer
+  // per key either way; ON drops the whole-result cache's up-to-10s lag on a Flipt change. `[]` =
+  // DARK and fails CLOSED when the key is absent or Flipt is down, so OFF is the default.
+  trpcFlagGuardPerRequest: { availability: [], fliptKey: 'trpc-flag-guard-per-request' },
+  // SSR-CPU kill switch for the model page's above-the-fold UI (title row, version buttons, the
+  // version-details grid, action row and Details rows, trigger words, AIR, hash): the same
+  // `@civitai/components` markup as `shellDesignSystemMarkup`, in place of per-instance Mantine
+  // `Badge`/`Button`/`Tooltip`/`Group`/`Grid`/`Code`. Menus, popovers, hover cards and the accordion
+  // stay on Mantine. `[]`: dark and fails CLOSED, so the `model-page-design-system-markup` rollout
+  // is the only on-switch. The shared components it touches take a `ds` prop from the model page,
+  // so the flag changes nothing anywhere else.
+  modelPageDesignSystemMarkup: {
+    availability: [],
+    fliptKey: 'model-page-design-system-markup',
+  },
+  // Closed-overlay SSR fast path; behaviour: see ~/components/MantineOverlays. `[]` fails CLOSED when
+  // the key is absent or Flipt is down, so the `ssr-closed-overlay-fast-path` rollout is the only
+  // on-switch.
+  ssrClosedOverlayFastPath: {
+    availability: [],
+    fliptKey: 'ssr-closed-overlay-fast-path',
+  },
+  // Browser site search through /api/search, which applies the viewer's and the site's rules on
+  // the server, instead of straight to Meilisearch with a per-viewer token. OFF = the direct path,
+  // unchanged, so this is also the kill switch while the proxy's load on the API pods is unknown.
+  // Ramp it by percentage in Flipt. `[]`, not `['mod']`: nobody gets it until the Flipt flag
+  // exists (see `reactionCountsUnknown`).
+  siteSearchProxy: { availability: [], fliptKey: 'site-search-proxy' },
+  // Measurement switch: while ON, signed-in `/images/[imageId]` HTML renders write a capped log
+  // line (imageId, Cloudflare colo, minute) — see `~/server/logging/image-render-sample`. Read with
+  // no user (entity `anonymous`), so it is all-or-nothing, not a per-user rollout. `availability:
+  // []` = DARK by default and fails CLOSED when the key is absent or Flipt is down.
+  shellImagesRenderSample: { availability: [], fliptKey: 'shell-images-render-sample' },
+  // Serialize-perf: LAZY per-post image load on `image.getImagesAsPostsInfinite` (the #2
+  // producer of oversized/event-loop-freezing tRPC responses). Model galleries carry
+  // multi-image showcase posts (17% have >12 images; p90/p99 ≈ 20). When ON the server
+  // returns only the first `GALLERY_POST_IMAGE_SLICE` (6) images per post PLUS the true
+  // `imageCount`; the card carousel lazy-loads the remainder on approach via
+  // `trpc.image.getInfinite({ postId })`. So the gallery is NOT truncated — only the initial
+  // payload shrinks (a large cut on the heavy tail). OFF = byte-identical to today (all
+  // images inline, no `imageCount`).
+  //
+  // 🔴 SERVER-SIDE flag → STALE-CLIENT RAMP DISCIPLINE (same class as the shape-swap flags):
+  // a PRE-this-PR bundle (no lazy-load code) would render only the 6-image slice with
+  // `total = slice.length` → "6 of 6" instead of "1 of 20" until the user reloads. That's a
+  // UX-truncation regression (NOT content-unsafe; browsing-level filtering is unchanged),
+  // self-healing on reload. Hence `availability: []` = DARK by default, fails CLOSED (no
+  // slice) when Flipt is absent/down; the Flipt `gallery-lazy-post-images` THRESHOLD is the
+  // ONLY on-switch. Ramp ONLY after the new bundle is serving everywhere (confirm via RUM
+  // app_version — hours, per the SPA-cache rollout pattern); threshold-only; instant rollback =
+  // drop the threshold to 0. Supersedes the retired `imagesAsPostsPerPostCap` cap flag (which
+  // truncated the gallery and was never ramped). (Mirrors the genTabDeferView precedent.)
+  galleryLazyPostImages: { availability: [], fliptKey: 'gallery-lazy-post-images' },
+  // Serialize-perf: SLIM the per-model image count on `model.getAll` — the #1
+  // producer of oversized / event-loop-freezing tRPC responses (the
+  // `trpc-response-oversized` #3017 dataset; p90 > 1MB, ~20x the next path). When
+  // ON, the browse-feed response caps each model to `GET_ALL_IMAGES_PER_MODEL_SLIM`
+  // (6) images instead of `GET_ALL_IMAGES_PER_MODEL` (12) — a ~42% page-byte cut
+  // (the always-on per-image field trim in `model-getall-images` applies either
+  // way). The browse `ModelCard` renders only the cover, so nothing VISIBLE
+  // changes; the residual risk is browsing-level FEED-DROP: the shared image cache
+  // is ordered `postId,index` (browsing-agnostic), so a mixed-level model whose only
+  // browsing-safe image sits past index 6 could be dropped from an SFW-mode viewer's
+  // feed (`hidden.noImages`). The flag-ON path MITIGATES this by picking an
+  // nsfw-biased COVERAGE slice (`selectSlimGetAllModelImages`) instead of the naive
+  // first-6 — it keeps one image of every distinct `nsfwLevel` bit present, so any
+  // viewer with a visible image in the full set keeps one in the slice (image
+  // `nsfwLevel` is a single bit, ≤6 distinct, all fit in 6). Still `availability: []`
+  // = DARK by default and FAILS
+  // CLOSED (empty availability → static eval false when Flipt is absent/down), so
+  // the cap stays 12 (byte-identical COUNT to today) unless the Flipt
+  // `get-all-model-images-slim` threshold is ramped. Deploy dark, then ramp the
+  // threshold WHILE watching the feed-drop rate (Loki
+  // `event_name="feed_noimages_drop"`, `~/utils/faro/feedDrop`); instant rollback =
+  // set the threshold to 0. (Mirrors the galleryLazyPostImages / genTabDeferView
+  // dark-flag precedent.) No client bundle change is required (the feed already
+  // renders any-length image arrays), so this is a pure server behavior flag.
+  getAllModelImagesSlim: { availability: [], fliptKey: 'get-all-model-images-slim' },
+  // Feed impression tracking. Ships dark: this is the only new telemetry stream
+  // on the site whose volume is set by scrolling rather than by clicking, so the
+  // rollout wants a dial that does not need a deploy to turn back down. Ramp the
+  // `feed-impressions` cohort while watching the impressions table's insert rate
+  // and part count; instant rollback = set the cohort to 0, which stops the
+  // browser observing at all rather than merely dropping rows server-side.
+  feedImpressions: { availability: [], fliptKey: 'feed-impressions' },
+  // Kill switch for the /images and /videos tag bar, whose click-through was measured at
+  // 3.1% of feed pageviews and 7.3% of daily feed viewers against a 10% floor it had to
+  // clear to stay (868kv1b9m). `['public']` and NOT `[]`, which is the usual shape for a
+  // new flag: this gates something already shipped and visible to everyone, so it must
+  // fail OPEN. Dark-by-default would hide the bar the moment this deploys and again on
+  // any Flipt outage, turning a pending product decision into an accidental removal.
+  // Flipt's result overrides role checks in both directions, so a `feed-tag-bar` boolean
+  // with `enabled: false` and no rollout hides the bar for everyone, moderators included.
+  // Until that flag exists, evaluation returns null and static evaluation keeps it on.
+  feedTagBar: { availability: ['public'], fliptKey: 'feed-tag-bar' },
+  // Gates the hi-DPI `srcSet` on every surface that renders content: post detail, the model
+  // showcase and review carousels, the model gallery and the feed cards. Without it those surfaces
+  // request a width in CSS pixels and every DPR>=2 display upscales — measured 1.82x on post detail
+  // at DPR 2, 1.38x on an iPhone (ClickUp 868m36wyd). It does NOT decide the format: the viewer's
+  // media quality does, so a paying member on lossless keeps lossless at 2x. How the candidate is
+  // chosen, and why it is bounded by the source width, is in `hiDpiCandidateWidth`.
+  //
+  // `['public']` and NOT `[]` so that a Flipt outage does not visibly change the site: the flag is
+  // live and enabled, and failing open matches it. It is NOT the cheaper path — with compressed the
+  // default, flag-off is an 800px webp and flag-on a 1600px one, so failing open costs ~2.2x the
+  // bytes. That was the opposite way round before compressed became the default.
+  //
+  // 🔴 Flipt is authoritative over this static `['public']` in BOTH directions wherever the
+  // `hi-dpi-previews` key exists: `enabled: false` with no rollout IS the kill switch. The
+  // `['public']` decides only when the key is absent or Flipt is unreachable. Read the live value
+  // from Flipt — a comment cannot hold flag state (see the as-merged-note warning in
+  // `src/server/services/app-blocks-flag.ts`). An earlier note here said this key must not be
+  // created; that instruction is retired.
+  hiDpiPreviews: { availability: ['public'], fliptKey: 'hi-dpi-previews' },
+  // `availability: []` is the Flipt-down fallback, and off is the right one here: the search
+  // refinement is useless until the gated documents carry `hasActivePaidAccess`, which is a backfill
+  // and an index-settings change, not a deploy.
+  paidModelSearchFilter: { availability: [], fliptKey: 'paid-model-search-filter' },
+  articles: ['public'],
+  articleCreate: ['public'],
+  articleRatingDispute: { availability: ['user'], fliptKey: 'article-rating-dispute' },
+  // Every entity except Article, which keeps `articleRatingDispute`. Flipt-down falls back to off.
+  ratingDispute: { availability: [], fliptKey: 'rating-dispute' },
+  // The on-site appeal form (`/appeal`) and the appeal box on the banned screen.
+  siteAppealForm: { availability: ['mod'], fliptKey: 'site-appeal-form' },
+  adminTags: ['mod', 'granted'],
+  civitaiLink: ['mod', 'member'],
+  imageTraining: { availability: ['user'] },
+  videoTraining: { availability: ['public'] },
+  aiToolkitSd15: { availability: ['public'], fliptKey: 'ai-toolkit-sd15' },
+  aiToolkitSdxl: { availability: ['public'], fliptKey: 'ai-toolkit-sdxl' },
+  aiToolkitFlux: { availability: ['public'], fliptKey: 'ai-toolkit-flux' },
+  aiToolkitSd35: { availability: ['mod'] },
+  aiToolkitHunyuan: { availability: ['public'], fliptKey: 'ai-toolkit-hunyuan' },
+  aiToolkitWan: { availability: ['public'], fliptKey: 'ai-toolkit-wan' },
+  aiToolkitChroma: { availability: ['mod'] },
+  aiToolkitDefaultSd: { availability: ['mod'], fliptKey: 'ai-toolkit-default-sd' },
+  kohyaTraining: { availability: ['public'], fliptKey: 'kohya-training' },
+  qwenTraining: { availability: ['mod'] },
+  flux2Training: { availability: ['mod'], fliptKey: 'flux2-training' },
+  zimageturboTraining: { availability: ['mod'], fliptKey: 'zimage-turbo-training' },
+  zimagebaseTraining: { availability: ['mod'], fliptKey: 'zimage-base-training' },
+  fluxTwoKleinTraining: { availability: ['mod'], fliptKey: 'flux2-klein-training' },
+  // Training Studio only — the old trainer has no Flux.3 Klein entry.
+  flux3KleinTraining: { availability: ['mod'], fliptKey: 'flux3-klein-training' },
+  // Training Studio only.
+  mossImageTraining: { availability: ['mod'], fliptKey: 'moss-image-training' },
+  // Training Studio only — edit LoRAs (before/after pairs).
+  flux2KleinEditTraining: { availability: ['mod'], fliptKey: 'flux2-klein-edit-training' },
+  ltx2Training: { availability: ['mod'], fliptKey: 'ltx2-training' },
+  ltx23Training: { availability: ['mod'], fliptKey: 'ltx23-training' },
+  ltx25Training: { availability: ['public'], fliptKey: 'ltx25-training' },
+  minimaxh3Training: { availability: ['mod'], fliptKey: 'minimaxh3-training' },
+  wan22Training: { availability: ['mod'] },
+  ernieTraining: { availability: ['mod'], fliptKey: 'ernie-training' },
+  hidreamO1Training: { availability: ['mod'], fliptKey: 'hidream-o1-training' },
+  qwen21Training: { availability: ['mod'], fliptKey: 'qwen21-training' },
+  mingTraining: { availability: ['mod'], fliptKey: 'ming-training' },
+  yue2Training: { availability: ['mod'], fliptKey: 'yue2-training' },
+  animaTraining: { availability: ['mod'], fliptKey: 'anima-training' },
+  booguTraining: { availability: ['public'], fliptKey: 'boogu-training' },
+  krea2Training: { availability: ['public'], fliptKey: 'krea2-training' },
+  mageflowTraining: { availability: ['public'], fliptKey: 'mageflow-training' },
+  ideogram4Training: { availability: ['mod'] },
+  // Old trainer only — Training Studio gates ACE-Step on its own `training-studio-audio-training`.
+  audioTraining: { availability: ['mod'] },
+  trainingStudioAudioTraining: {
+    availability: ['mod'],
+    fliptKey: 'training-studio-audio-training',
+  },
+  // Steps-based training pricing + QOL inputs (steps/batchSize/sample params/continue-training).
+  // Public availability so it can be rolled out to a tester segment via Flipt; default off.
+  trainingStepsPricing: { availability: ['mod'], fliptKey: 'training-steps-pricing' },
+  // Model editor: the .com title, description and per-site covers. Reads are not flagged.
+  modelComFace: { availability: ['mod'], fliptKey: 'model-com-face' },
+  // The embedded Training Studio (/training-studio), the default trainer for whoever Flipt grants.
+  // Keep `availability: ['mod']`: it is the static fallback when the Flipt flag is missing or
+  // unreachable, and with `default: true` anything wider makes the Studio everyone's trainer.
+  trainingStudioUi: {
+    toggleable: true,
+    default: true,
+    displayName: 'Training Studio',
+    badge: 'Beta',
+    description: `Use the new Training Studio for LoRA training. Turn this off to go back to the classic trainer, which stops starting new runs on ${formatDate(
+      CLASSIC_TRAINER_RETIRES_AT,
+      'MMMM D, YYYY',
+      true
+    )}.`,
+    availability: ['mod'],
+    fliptKey: 'training-studio-ui',
+  },
+  trainingAutoLabelOrchestrator: {
+    availability: ['public'],
+    fliptKey: 'training-auto-label-orchestrator',
+  },
+  imageTrainingResults: { availability: ['user'] },
+  // Training list reads its status/epochs/cost from the orchestrator workflow instead of the
+  // stored copy. Moderators only; no Flipt flag exists for it, so widening it means creating one
+  // and adding its `fliptKey` here.
+  trainingOrchestratorState: { availability: ['mod'] },
+  trainingAutoCaption: { availability: ['public'] },
+  trainingAutoTag: { availability: ['public'] },
+  enhancedCompatibilitySdcpp: {
+    availability: ['public'],
+    fliptKey: 'enhanced-compatibility-sdcpp',
+  },
+  // Anima ControlNet kill-switch. Default ON (public + fail-open when Flipt is
+  // down); the `anima-controlnet` Flipt flag is the lever — flip it OFF to hide
+  // the Anima ControlNet input (and strip controlNets server-side) without a
+  // deploy if the orchestrator side misbehaves.
+  animaControlnet: { availability: ['public'], fliptKey: 'anima-controlnet' },
+  imageGeneration: ['public'],
+  largerGenerationImages: {
+    toggleable: true,
+    default: false,
+    displayName: 'Larger Images in Generator',
+    description: `Images displayed in the generator will be larger on small screens`,
+    availability: ['public'],
+  },
+  nativeVideoControls: {
+    toggleable: true,
+    default: false,
+    displayName: 'Native Video Controls',
+    description: `Use your browser's built-in video player controls (with a seek bar) for all videos.`,
+    availability: ['public'],
+  },
+  alternateHome: ['public'],
+  collections: ['public'],
+  collectionAiReview: { availability: ['mod'] },
+  air: {
+    toggleable: true,
+    default: true,
+    displayName: 'AI Resource Identifier',
+    description: `Show the Civitai AIR on resources for easy use within the Civitai Services API or Civitai Comfy Nodes.`,
+    availability: ['user'],
+  },
+  profileCollections: ['public'],
+  // Retired (see 868m4c2dn): the `images_v6` search index is no longer fed or served. Static
+  // availability is empty so image search is off for everyone.
+  // MEASURED 2026-10-03: the index holds 0 documents and `[]` filterable attributes. That is an
+  // observation with a date on it, NOT a consequence of `retired` — 🔴 nothing holds it that way.
+  // `retired` only stops the processor writing and syncing, so no `reset` runs to configure
+  // settings ("the index is stale for as long as it is retired",
+  // `src/server/search-index/base.search-index.ts`); an index that was set up before retirement
+  // keeps the settings and documents it had. And this one is still writable from outside the
+  // processor: `src/pages/api/mod/search/images-update.ts` writes to it without consulting
+  // `retired`, as the entry note in `src/server/meilisearch/util.ts` records. So re-measure before
+  // acting on the figures above; do not infer them from the flag.
+  // 🔴 This is NO LONGER a safe no-deploy toggle, and it fails quietly rather than loudly.
+  // Re-adding an `image-search` Flipt key here and turning that flag on would point image search
+  // at that index: filtered or sorted queries error, and the rest return zero hits.
+  // Re-enabling requires REBUILDING the index first — a full reindex of ~64M documents
+  // via `imagesSearchIndex` (`/api/mod/update-index`), which saturates the search backend for
+  // several days and badly degrades search for every other index while it runs. Measured on the
+  // last full ingestion: p95 search latency ~4.6s and p99 above 10s, sustained over six days.
+  // So: treat re-enabling as a planned project, not a flag flip.
+  imageSearch: { availability: [] },
+  // Whether the Images entry appears in the search pickers/tabs at all. Split from `imageSearch`
+  // (which gates whether image search actually RUNS) so the entry could stay visible with a
+  // "temporarily disabled for maintenance" notice while the index is retired — see 868m8yafw.
+  // Now [] : the entry is hidden from the header search, the quick-search pickers and the /search
+  // tabs, and /search/images redirects to /search/models. Set to ['public'] to show the notice again.
+  imageSearchEntry: [],
+  buzz: ['public'],
+  referralProgramV2: { availability: ['public'], fliptKey: 'referral-program-v2' },
+  assistant: {
+    toggleable: true,
+    default: true,
+    displayName: 'CivBot Assistant',
+    description: `A helpful chat assistant that can answer questions about Stable Diffusion, Civitai, and more! We're still training it, so please report any issues you find!`,
+    availability: ['user'],
+  },
+  assistantPersonality: ['bronze', 'silver', 'gold'],
+  bounties: ['blue', 'red', 'public'],
+  newsroom: ['public'],
+  safety: ['public'],
+  csamReports: isDev ? ['mod'] : ['granted'],
+  appealReports: isDev ? ['mod'] : ['granted'],
+  moderateTags: ['granted'],
+  chat: {
+    toggleable: true,
+    default: true,
+    displayName: 'Chats',
+    description: 'Send and receive DMs from users across the site.',
+    availability: ['blue', 'red', 'user'],
+  },
+  // The whole DM redesign (868kguhpy): rebuilt message surface, Inbox/Requests
+  // rail, chat settings, per-conversation controls, emoji. Mods only until it
+  // ramps; everyone else keeps the current chat, which still ships alongside it.
+  chatRedesign: { availability: ['mod'], fliptKey: 'chat-redesign' },
+  creatorsProgram: ['mod', 'granted'],
+  // Article reading typography; see ArticleBody.module.scss.
+  articleTypography: { availability: ['mod', 'granted'], fliptKey: 'article-typography' },
+  // The banking-change notice alert and modal on the Buzz dashboard. Dark until the Flipt flag is on.
+  bankingChangeNotice: { availability: [], fliptKey: 'banking-change-notice' },
+  buzzWithdrawalTransfer: ['granted'],
+  vault: ['user'],
+  membershipsV2: ['public'],
+  cosmeticShop: ['public'],
+  // Mods get it by default; unlock testers via the `creator-shop` Flipt flag.
+  creatorShop: { availability: ['mod'], fliptKey: 'creator-shop' },
+  // The /search/semantic page and its procedures. Moderators only: no Flipt flag exists for it.
+  semanticImageSearch: { availability: ['mod'] },
+  // Creator Services: sellers offer paid work, paid through Buzz escrow. `[]`, not `['mod']`, so
+  // the Flipt flag is the only on-switch, including for moderators.
+  creatorServices: { availability: [], fliptKey: 'creator-services' },
+  // Whether Creator Services Finals go to the malware scan. Read once per file by the jobs, never per
+  // user (see `isFinalsMalwareScanOn`). Off, or missing from Flipt, skips that one step; Flipt
+  // unreachable keeps it.
+  creatorServicesFinalsMalwareScan: {
+    availability: [],
+    fliptKey: 'creator-services-finals-malware-scan',
+  },
+  // Buyers attaching files to a deal. Its own switch because the rows it writes need the migration
+  // applied and every pod on a build that hides unscanned attachments from the seller.
+  creatorServicesAttachments: { availability: [], fliptKey: 'creator-services-attachments' },
+  // One flag drives both halves of creator announcements: these surfaces and the
+  // Creator Studio composer. Both apps must read the key `creator-announcements`
+  // verbatim — a flag only one side honours ships the half-visible state.
+  creatorAnnouncements: { availability: ['mod'], fliptKey: 'creator-announcements' },
+  // The post planner (docs/batch-scheduling-planner-element.md): the `post.*` planner procedures,
+  // their REST twins and both hosts. Creator Studio reads the same Flipt key.
+  postPlanner: { availability: ['mod'], fliptKey: 'post-planner', displayName: 'Post planner' },
+  batchPostScheduling: {
+    availability: ['mod'],
+    fliptKey: 'batch-post-scheduling',
+    displayName: 'Batch post scheduling',
+  },
+  postPresets: { availability: ['mod'], fliptKey: 'post-presets', displayName: 'Post presets' },
+  articleScheduling: {
+    availability: ['mod'],
+    fliptKey: 'article-scheduling',
+    displayName: 'Article scheduling',
+  },
+  // Gates CREATING stickers, seeing them in shops, and the picker. Deliberately
+  // does NOT gate rendering — a sticker already in a comment or DM must render
+  // for everyone, or flipping this off orphans content that is already out there.
+  stickers: { availability: ['mod'], fliptKey: 'stickers' },
+  // Placing a sticker on someone else's work, gated apart from owning one. The
+  // harassment surface is different in kind — a sticker in a comment is a
+  // comment; a sticker on an image is on the creator's work — so this stays with
+  // testers while stickers themselves open up. Required *in addition to*
+  // `stickers`, so placement cannot outlive the feature it belongs to.
+  stickerPlacement: { availability: ['mod'], fliptKey: 'sticker-placement' },
+  // Recording a sticker's movement over a video. Gates sending a track on create only;
+  // reads are not gated.
+  stickerVideoTracks: { availability: ['mod'], fliptKey: 'sticker-video-tracks' },
+  // The sticker book profile tab. Its own flag rather than riding `stickers`:
+  // the tab publishes what a creator owns and what their work has collected on a
+  // PUBLIC profile, which is a disclosure decision separate from whether
+  // stickers can be bought or placed at all. Gates the tab only — the book's own
+  // endpoints stay open so a creator paid for a placement does not lose the
+  // record of it if the flag goes back to testers.
+  stickerBook: { availability: ['mod'], fliptKey: 'sticker-book' },
+  // Paying to put your own image in someone else's gallery. Its own flag rather
+  // than riding `stickerPlacement`: the two surfaces open to testers on
+  // different schedules, and unlike stickers this one places arbitrary
+  // user-uploaded content on a creator's page. Gates the mutations; it does not
+  // gate rendering a gallery that already has entries, or an owner declining
+  // what is already waiting on their work.
+  remixGallery: { availability: ['mod'], fliptKey: 'remix-gallery' },
+  // Paid "Sponsored" slots on someone else's model page: a post in its gallery
+  // or a model in its Suggested Resources. Gates buying and serving; a host can
+  // still answer what is already waiting on them.
+  creatorPromotions: { availability: ['mod'], fliptKey: 'creator-promotions' },
+  // The journey page, its entry points and the tier pointer in score refusals, plus tier badge grants
+  // and their notifications (see creator-journey-flag.service.ts for the off-session evaluation).
+  creatorJourney: { availability: ['mod'], fliptKey: 'creator-journey' },
+  // Creator-built showcase sections on the profile page.
+  profileShowcases: { availability: ['mod'], fliptKey: 'profile-showcases' },
+  // Recent written reviews on the model page, between Suggested Resources and Discussion.
+  modelPageReviews: { availability: ['mod'], fliptKey: 'model-page-reviews' },
+  // Civitai's 4th Birthday (Team Hats). Only the Flipt key is used, by the event engine's access
+  // rule (src/server/events/event-access.ts), which adds the preview and launch windows. Do not gate
+  // UI on `features.birthday2026`: it knows nothing of the dates, the preview or arming. Ask
+  // `event.getAccess` (usePlayableEventDecoration) instead.
+  birthday2026: { availability: ['mod'], fliptKey: 'birthday-2026' },
+  // Read through useHatTurfFeed, which also checks the event is playable.
+  hatTurfFeedCard: { availability: ['mod'], fliptKey: 'hat-turf-feed-card' },
+  // Hat Turf on the image detail page; read through useHatTurfDetail, which also checks the event
+  // is playable and the turf is not off. Separate from the feed flag so each can roll out alone.
+  hatTurfImageDetail: { availability: ['mod'], fliptKey: 'birthday2026-turf-image-detail' },
+  // The three entry points below are gated SEPARATELY from `remixGallery` so they
+  // can be released one at a time, and each one is checked TOGETHER with it
+  // rather than instead of it. `remixGallery` gates the submit mutation, so a
+  // surface flag on while the base is off is a live button that fails on click.
+  //
+  // Turning a surface flag off removes a way IN. It does not touch a submission
+  // already made, an owner's queue, or a gallery that already has entries -
+  // that distinction is `remixGallery`'s, above.
+  //
+  // The post editor's card, under the image in the post edit view. The oldest of
+  // the three and the only one that was ever live.
+  remixGalleryPostEditor: { availability: ['mod'], fliptKey: 'remix-gallery-post-editor' },
+  // "Submit this remix" and "View original" on the shared image context menu -
+  // so feed cards and the image detail page, which render the same menu.
+  remixGalleryMenu: { availability: ['mod'], fliptKey: 'remix-gallery-menu' },
+  // The generator and the generation queue, which share one component. Routes to
+  // the post editor rather than submitting, so this one moves no Buzz on its own.
+  remixGalleryGenerator: { availability: ['mod'], fliptKey: 'remix-gallery-generator' },
+  // Gates BUILDING a pack, seeing packs in shops, and buying one. Like
+  // `stickers` it does not gate what a buyer already owns: turning it off must
+  // not strip cosmetics people paid for, only stop new packs being listed,
+  // discovered or sold.
+  cosmeticPacks: { availability: ['mod'], fliptKey: 'cosmetic-packs' },
+  // Mystery boxes: seeing, buying and opening one. Like `cosmeticPacks` it never takes back what a
+  // buyer already received.
+  mysteryBox: { availability: ['mod'], fliptKey: 'mystery-box' },
+  // Creator mystery packs: building one, and buying or opening one a creator built. On top of
+  // `creatorShop` and `cosmeticPacks` (building) and `mysteryBox` (buying and opening). Moderators
+  // only until counsel has answered on creator proceeds; no Flipt flag exists for it yet.
+  creatorMysteryPacks: { availability: ['mod'] },
+  // Perceptual near-match surfacing in creator-shop review. `availability: []` =
+  // DARK and FAILS CLOSED, and it gates the LOOKUP as well as the panel: at the
+  // current 64-bit hash width the two badges we know were imitations of official
+  // artwork sit at Hamming 17 and 22 against a corpus whose 1st percentile is 17,
+  // so the list would show mods unrelated cosmetics ahead of the real match. It
+  // stays off until the orchestrator offers a wider hash and the sweep has
+  // re-hashed the corpus into that lane.
+  cosmeticSimilarity: { availability: [], fliptKey: 'cosmetic-similarity' },
+  impersonation: isDev ? ['mod'] : ['granted'],
+  donationGoals: ['public'],
+  creatorComp: ['public'],
+  // Creator Controls account card (metric-privacy + donation-goal settings UI).
+  // `availability: []` = DARK by default and FAILS CLOSED (empty availability →
+  // static eval false when Flipt is absent/down), so the card does NOT render for
+  // anyone until the `creator-controls` Flipt flag is created + enabled. This gates
+  // ONLY the card render in the account page; the read-side metric-privacy gating
+  // (donation-goals-cache / model-metric-privacy resolvers / model.service etc.)
+  // stays active regardless so existing user settings keep applying even when the
+  // card is hidden. Instant kill-switch / widen lever = the Flipt flag. (Mirrors the
+  // `hiddenPrefsCompact` / `genTabDeferView` `availability: []` precedent.)
+  creatorControls: { availability: [], fliptKey: 'creator-controls' },
+  // Read-time gate for the Creator-Controls metric-privacy RESOLUTION (#3266): the
+  // per-request synchronous work that hides a CP member's model/version metrics —
+  // the batched `getValidCreatorMembershipMap` (a `subscriptionProductMetadataSchema`
+  // Zod parse per subscription), the owner-settings lookups, and the per-item
+  // `resolveModel/VersionHiddenMetrics`. ON for everyone (`availability: ['public']`).
+  // Its Flipt flag `model-metric-privacy-readtime` (an OFF switch for a controlled A/B
+  // of that work's request-path cost) was retired after the test, so nothing turns it
+  // off now. NOT `[]`: that would turn the privacy resolution off for everyone.
+  modelMetricPrivacyReadtime: {
+    availability: ['public'],
+  },
+  imageIndexFeed: { availability: ['public'], fliptKey: 'image-index-feed' },
+  // User-composed hubs (/hubs). `availability: []` = DARK by default and FAILS
+  // CLOSED, so the pages, the tRPC router and the nav entry all stay off until the
+  // `user-hubs` flag exists in Flipt — the flag lands separately, in the private
+  // GitOps repo. On a Flipt boolean, `enabled: true` is the NO-ROLLOUT-MATCHED
+  // fallback (on for every anonymous request), not the on-switch: the rollout is
+  // `enabled: false` plus a segment rule.
+  userHubs: { availability: [], fliptKey: 'user-hubs' },
+  // Rewrite orchestrator blob URLs to the Cloudflare-fronted proxy for RU users
+  // (their ISPs DPI-block the bare orchestration origin). `availability: []` =
+  // DARK by default and FAILS CLOSED (empty availability → static eval false when
+  // Flipt is absent/down), so the rewrite stays OFF unless the `ru-orchestrator-proxy`
+  // Flipt flag is enabled — the flag is both the on-switch at rollout AND the
+  // instant kill-switch if the proxy misbehaves. The rewrite itself additionally
+  // gates on cf-ipcountry === 'RU', so non-RU users are never affected either way.
+  // See ClickUp 868kdkv93 / 868ke4d0f. (Mirrors the `creatorControls` /
+  // `hiddenPrefsCompact` `availability: []` fail-closed precedent.)
+  ruOrchestratorProxy: { availability: [], fliptKey: 'ru-orchestrator-proxy' },
+  // Reusable text blurbs. Gates the two INSERTION paths — the toolbar control and the `//`
+  // picker — and not the node: a blurb span already in a draft must keep parsing, or turning
+  // this off would unwrap references the fan-out job still owns.
+  textBlurbs: { availability: ['mod'], fliptKey: 'text-blurbs' },
+  // Inserting cards only (paste and the Embed dialog). Stored cards and
+  // content.getEmbedAvailability serve every reader, flag or not.
+  articleCivitaiCards: ['mod'],
+  // #region [Domain Specific Features]
+  isGreen: ['public', 'green'],
+  isBlue: ['public', 'blue', 'red'],
+  isRed: ['public', 'blue', 'red'],
+  canViewNsfw: ['public', 'blue', 'red', 'nonRestricted'],
+  canBuyBuzz: ['public'],
+  // #endregion
+  // Temporarily disabled until we change ads provider -Manuel
+  announcements: ['granted'],
+  blocklists: ['granted'],
+  toolSearch: ['public'],
+  comicSearch: ['public'],
+  generationOnlyModels: ['mod', 'granted', 'gold'],
+  appTour: ['public'],
+  privateModels: ['public'],
+  auctions: ['blue', 'red', 'green', 'public'],
+  // Not public until C2: the orchestrator prices a prepare at zero, so a wider audience would be
+  // loading models for free.
+  resourceLoad: ['mod', 'granted'],
+  newOrderGame: ['blue', 'red', 'public'],
+  newOrderReset: ['granted'],
+  changelogEdit: ['granted'],
+  bugsPage: ['public'],
+  bugsEdit: ['granted'],
+  annualMemberships: ['dev'],
+  disablePayments: ['blue', 'red', 'public'],
+  prepaidMemberships: ['public'],
+  giftMemberships: { availability: ['public'], fliptKey: 'gift-memberships' },
+  buzzMemberships: { availability: ['mod'], fliptKey: 'buzz-memberships' },
+  coinbasePayments: [],
+  emerchantpayPayments: [],
+  nowpaymentPayments: [],
+  thirtyDayEarlyAccess: ['granted'],
+  datapacketRead: ['public'],
+  kinguinIframe: ['dev'],
+  serviceStatus: ['granted'],
+  cashManagement: { availability: ['granted'] },
+  auctionsMod: ['granted'],
+  // Platform-wide challenge kill-switch. Flipt is authoritative; availability ['public'] is the
+  // Flipt-DOWN / flag-absent fallback (so an outage leaves the platform ON, matching prior behavior).
+  challengePlatform: { availability: ['public'], fliptKey: 'challenge-platform-enabled' },
+  // Public user-created challenges. Flipt is the on/off kill-switch; availability ['public'] is the
+  // Flipt-DOWN / flag-absent fallback (so a Flipt outage — or deploying before the flag exists —
+  // leaves it PUBLIC). Create the `user-challenges` Flipt flag DISABLED before this deploys.
+  userChallenges: { availability: ['mod'], fliptKey: 'user-challenges' },
+  comicCreator: { availability: ['mod'], fliptKey: 'comic-creator' },
+  licensingFee: { availability: ['user'], fliptKey: 'licensing-fee' },
+  liveMetrics: { availability: ['mod'], fliptKey: 'live-metrics' },
+  strikes: ['public'],
+  prepaidBuzzTransactions: { availability: ['mod'], fliptKey: 'prepaid-buzz-transactions' },
+  buzzTransactionExport: { availability: ['public'], fliptKey: 'buzz-transaction-export' },
+  userPaymentConfiguration: {
+    availability: ['granted'],
+  },
+  articleImageScanning: ['public'],
+  generationPresets: { availability: ['public'], fliptKey: 'generation-presets' },
+  // Raw orchestrator-blob AIR resources in the generator (Training Studio
+  // "generate with this epoch" handoff) — gates both server acceptance and the
+  // /generate?air= form entry (form-graph/generation/ingestion.ts).
+  generationAirResources: { availability: ['mod'] },
+  wildcards: { availability: ['public'], fliptKey: 'wildcards' },
+  // 3D Models — split flags: feed (view/comment/review) vs generator (create).
+  // Both mod-only at launch; Flipt key allows broadening without a code change.
+  model3dFeed: { availability: ['mod'], fliptKey: 'model3d-feed' },
+  model3dGenerator: { availability: ['mod'], fliptKey: 'model3d-generator' },
+  // Gates PolyGen's v7 build, which is a `version` option rather than a
+  // model version, so generation gate rules cannot target it: off ⇒ v7 is
+  // dropped from the version options, which both hides it and makes a submitted
+  // `version: 'v7'` fail the node's schema (see `model3d/polygen.graph.ts`).
+  meshyV7Generator: { availability: ['mod'] },
+  // Same shape for Meshy v7.1.
+  meshyV71Generator: { availability: ['mod'] },
+  // Gates Krea 3's Ultra thinking mode the same way: it is a `thinkingMode`
+  // option, not a model version, so it ships dark and opens with the partner's
+  // launch. Off ⇒ Ultra is not offered and a submitted 'ultra' falls back to the
+  // default (see `image/krea3.graph.ts`).
+  krea3Ultra: { availability: ['mod'], fliptKey: 'krea3-ultra' },
+  // Retool privileged endpoints — `granted` means the moderator must carry the
+  // matching permission key in user.permissions. Endpoints lookup the key
+  // directly from `RetoolAction.privileged`, so the permission name MUST stay
+  // in sync with the camelCase flag key here.
+  retoolUpdateIdentity: ['granted'],
+  retoolToggleModerator: ['granted'],
+  // App Blocks (Phase 1) — gates the BlockSlot mount on model pages. Off by
+  // default until we ship publisher install UX + moderator approval workflow.
+  // When off, BlockSlot renders nothing and no token-issuance traffic fires.
+  appBlocks: { availability: ['mod'], fliptKey: 'app-blocks-enabled' },
+  // App Blocks W13 — dedicated App Store VISIBILITY flag, decoupled from
+  // `app-blocks-enabled` (which doubles as the block-runtime kill-switch) so the
+  // store catalog can widen to public INDEPENDENTLY of the held block-runtime GA.
+  // Store-visibility surfaces gate on `appListings || appBlocks` (client) /
+  // `isAppListingsEnabled()` which falls back to `isAppBlocksEnabled()` (server),
+  // so while the `app-listings` Flipt flag does not yet exist this resolves via
+  // the `availability: ['mod']` Flipt-down fallback (mods only) + the OR-fallback
+  // to `app-blocks-enabled` — i.e. ZERO behavior change today (the currently
+  // mod+app-dev-testers cohort keeps identical store access).
+  appListings: { availability: ['mod'], fliptKey: 'app-listings' },
+  // App Blocks — EXTERNAL-ONLY store scope. The CLIENT/SSR half of the server's
+  // `isExternalListingsPublicEnabled()` (same Flipt key), so the `/apps` page gate
+  // can admit a viewer whose ONLY qualification is this flag — without it the store
+  // is structurally unreachable for that cohort (`hasAppsStoreAccess` would be
+  // false → `notFound`) even though the server would happily serve them the offsite
+  // catalog. Read via the shared `hasAppsStoreAccess` predicate, never open-coded.
+  //
+  // 🔴 `availability: []` (DARK + fail-closed for EVERYONE, mods included), NOT
+  // `['mod']`, and that is load-bearing for the server/client seam rather than
+  // taste: an ABSENT flag makes the SERVER's async `isFlipt` return `false`, while
+  // the CLIENT's `isEnabledSync` returns `null` and falls through to this static
+  // availability. With `['mod']` a moderator's client value would be `true` against
+  // a server `false` — the two evaluations of one flag disagreeing, which is exactly
+  // the failure this entry exists to prevent. `[]` makes the static answer `false`
+  // too, so both sides are dark until Flipt says otherwise. (Mirrors the
+  // `appBlocksAgenticReview` precedent.) A mod loses nothing: they already hold
+  // `appListings`/`appBlocks`, and the server checks the privileged axis FIRST.
+  //
+  // Grants ONLY store CATALOG reachability — the server still scopes the data to
+  // `kind='offsite'` (`resolveStoreVisibilityScope` → `public-external`). It does
+  // NOT widen any block-RUNTIME surface (those stay on `appBlocks` alone).
+  appListingsPublicExternal: {
+    availability: [],
+    fliptKey: 'app-listings-public-external',
+  },
+  // App Blocks W10 — full-page apps (`/apps/run/<slug>`). A SEPARATE dark flag
+  // so the page surface enables independently of the master `app-blocks-enabled`
+  // gate. The page route + page-token mint require BOTH `appBlocks` AND
+  // `appBlocksPages`. Mod-only today; widened (Flipt segment) at W10 launch.
+  appBlocksPages: { availability: ['mod'], fliptKey: 'app-blocks-pages-enabled' },
+  // Remix Apps P1: one-tap remix apps from the Remix menu (`remixApp` router).
+  remixApps: { availability: ['mod'], fliptKey: 'remix-apps' },
+  // App Blocks — "App builders" get-started pitch, now state A of the
+  // consolidated `/apps/build` (`/apps/get-started` 301s into it). Scope A soft
+  // launch: a single marketing/funnel page that explains the platform to
+  // would-be app developers. Staged mod-only today (like `appBlocks` /
+  // `appBlocksPages`) so it deploys dark-to-public and mods can review the page
+  // live on prod. The Flipt key stays the kill-switch lever (flip it off to drop
+  // the pitch + its nav entry without a deploy).
+  //
+  // 🔴 WIDENING THIS IS NO LONGER A ONE-LINE CHANGE, and the old comment saying
+  // it was is what this replaces. Since the `/apps/build` consolidation the pitch
+  // lives behind `canAccessAppsBuild` = `hasAppsStoreAccess(features) &&
+  // (isAppDeveloper(user, …) || appBlocksGetStarted)`, so this flag is now one
+  // disjunct UNDER a store AND, not an independent gate: widening it alone gives
+  // the new cohort a `notFound` from `/apps/build` (and from `/apps/get-started`,
+  // which 301s there), no user-menu "Apps" entry, and no sub-nav — the pitch
+  // becomes unreachable by every route, silently, for exactly the audience it was
+  // widened for. Widening it therefore ALSO requires widening a store flag
+  // (`app-listings` is the intended one; `appBlocks` and
+  // `appListingsPublicExternal` are the other two disjuncts of
+  // `hasAppsStoreAccess`).
+  appBlocksGetStarted: { availability: ['mod'], fliptKey: 'app-blocks-get-started' },
+  // App Blocks — AUTHOR capability (developer soft-launch, Phase B). Grants the
+  // right to SUBMIT apps + use `dev:live` (the author surfaces + the runtime
+  // spend gate on a block-token subject). INDEPENDENT of the mod-only
+  // marketplace-visibility `appBlocks` flag ON PURPOSE: `appBlocks` widens to
+  // `public` at GA, but authoring must stay gated, so the author authz decision
+  // keys off THIS flag, never `appBlocks`. Mirrors `appBlocks` shape — staged
+  // mod-only today (`['mod']` = the Flipt-down / flag-absent fallback), widened
+  // to mods + a curated cohort via the Flipt `app-blocks-author` flag (created
+  // AFTER this merges: absent → static mod-only, identical to today).
+  appBlocksAuthor: { availability: ['mod'], fliptKey: 'app-blocks-author' },
+  // App Blocks — AGENTIC MOD CODE-REVIEW panel (P2). CLIENT gate for the
+  // `AgentReviewPanel` in the on-site review modal. `availability: []` = DARK by
+  // default and FAILS CLOSED (empty availability → static eval false when Flipt
+  // is absent/down), so the panel does NOT render for ANYONE — mods included —
+  // until the Flipt `app-blocks-agentic-review` flag is created. This mirrors the
+  // server-side `isAppBlocksAgenticReviewEnabled` fail-closed gate on the
+  // `blocks.startAgentReview` / `getAgentReview` procs, so the whole feature is
+  // inert end-to-end on merge (NOT `['mod']`: that would render the panel for
+  // mods the moment this ships, before the flag exists). The Flipt key is the
+  // only on-switch + kill-switch. (Mirrors the `hiddenPrefsCompact` /
+  // `genTabDeferView` `availability: []` precedent.)
+  appBlocksAgenticReview: { availability: [], fliptKey: 'app-blocks-agentic-review' },
+  appDeveloperRateCard: { availability: [], fliptKey: 'app-developer-rate-card' },
+  // App Assistant (on `/apps/build`); read only through `canAccessAppAssistant`. `[]` rather than
+  // `['mod']` for the `appBlocksAgenticReview` reason: client and server agree while the flag is absent.
+  appAssistant: { availability: [], fliptKey: 'app-assistant' },
+  // App Assistant read-only subagents (`dispatch_agent`). Moderators only (`['mod']`); no Flipt
+  // flag exists for it, so widening it or turning it off means creating one and adding its
+  // `fliptKey` here. Off leaves the chat's `subagents` unset, so non-mods see no change.
+  appAssistantSubagents: { availability: ['mod'] },
+  // App Assistant replies on the server runner (`apps/assistant-runner`), so a reply keeps going
+  // while the viewer is away. `[]`, not `['mod']`: dark for everyone, mods included, until the Flipt
+  // flag turns it on (after the route to the runner exists), and off again while Flipt cannot answer.
+  // Off, the page runs replies in the browser as before, `/api/apps/assistant/run-grant` refuses to
+  // start one on the runner, and the runner's token mints refuse (its kill switch).
+  appAssistantRemoteRunner: { availability: [], fliptKey: 'app-assistant-remote-runner' },
+  // Forkable apps — the fork count/list on a parent's store page, the author's "Let others fork
+  // this app's source" setting, and (with `canAccessAppAssistant`) the Fork action. `[]`: dark for
+  // everyone, mods included, until the Flipt flag exists — the client twin of the server's
+  // fail-closed `isAppBlocksForkEnabled`, so the two agree while the flag is absent. "Forked from …"
+  // attribution is not behind it.
+  appBlocksFork: { availability: [], fliptKey: 'app-blocks-fork' },
+  // App Store sub-listings — RESPONSE-SHAPE flag for the store grid: when on for the viewer AND
+  // the caller sets `includeSubListings`, `appListings.listAvailable` mixes approved sub-listing
+  // cards into the page. `[]` so it is dark for everyone, mods included, until the Flipt flag
+  // exists. Writes are NOT gated on it (they are gated by the parent's
+  // `app_sub_listing_parents` row), so items can queue for moderation while the store side is
+  // dark.
+  appStoreSubListings: { availability: [], fliptKey: 'app-store-sub-listings' },
+  // 🔴 THE PRIVATE-RUN SURFACE HAS NO ENTRY HERE, DELIBERATELY — do not "complete the
+  // set" by adding one. Its gate is the server accessor `isAppBlocksPrivateRunEnabled`
+  // (`app-blocks-flag.ts`), which reads the `app-blocks-private-run-enabled` Flipt key
+  // directly and REQUIRES a `SessionUser`, so it denies an anonymous caller by type
+  // rather than falling back to the flag's base value the way a registry entry's global
+  // evaluation would. It is therefore strictly stronger than an `availability: []` entry
+  // for the one property such an entry would buy.
+  //
+  // An entry was written here first, mirroring `appBlocksAgenticReview` above, and
+  // REMOVED after review found it had zero readers: nothing consumes
+  // `features.appBlocksPrivateRun`, while every `fliptKey`'d entry is eagerly evaluated
+  // by `computeFeatureFlags` on every SSR render sitewide. So it cost one wasm
+  // evaluation per unique (user, host, region) per cache window, on requests that have
+  // nothing to do with App Blocks, and bought nothing — the unbranched-field shape this
+  // repo's own guards forbid. Add an entry if and when a CLIENT component needs to
+  // branch on it.
+  // App Blocks — dedicated per-submission REVIEW PAGE (`/apps/review/<id>`). A
+  // flag-gated, deep-linkable full page that re-hosts the existing on-site review
+  // body (today a modal on `/apps/review`) so mods can open, share, and refresh a
+  // single submission. `availability: ['mod']` (NOT `[]`): mods get the page the
+  // moment this ships — the page is a re-host of the already-live review UI (no
+  // new capability, no unapproved-code execution beyond what the modal already
+  // does), so dogfooding on merge is the intent. A non-mod still fails closed:
+  // 'mod' availability → static false for any non-mod segment AND the page's SSR
+  // gate additionally requires `isAppReviewer`. No Flipt flag was created for it, so
+  // this static mod-only default is the whole gate.
+  // Wired like `appBlocksAgenticReview` (client reads `features.appReviewPage`,
+  // the route SSR resolver reads the same resolved flag) but staged `['mod']`
+  // rather than `[]` because it's a re-host, not a brand-new dark capability.
+  appReviewPage: { availability: ['mod'] },
+  // Metadata info button on image feed cards. `availability: []` hides it for
+  // EVERYONE, mods included — this is a probe measuring whether anyone misses
+  // it, and a cohort that still sees the button cannot report missing it.
+  // Turning it back on is the expected outcome if people complain, not a
+  // failure. Two things the person flipping it should know:
+  //   - The flag does NOT exist in flipt-state yet, so until someone creates it
+  //     there is no runtime lever at all and restoring the button means a code
+  //     change and a deploy.
+  //   - Enabling it restores the overflow it was hidden to fix (ClickUp
+  //     868krjmvv): on a featured-grid card whose four reaction counts all reach
+  //     four digits, the button wraps onto a second line. Pinned by
+  //     `ImageCard.browser.test.tsx`.
+  imageCardInfoButton: { availability: [], fliptKey: 'image-card-info-button' },
+  // Early-adopter opt-in cohort. `availability: []` means static evaluation is false, so
+  // when Flipt is UNREACHABLE (isFliptSync → null) nobody is in the cohort. NOT
+  // `['user']`/`['public']`: those would fail OPEN during a Flipt outage, which defeats the
+  // point of an opt-in.
+  //
+  // 🔴 SCOPE OF THAT PROTECTION — it covers the Flipt-DOWN case ONLY, and nothing else.
+  // Once Flipt ANSWERS, `hasFeature` returns the Flipt result and never reaches static
+  // evaluation (see the `if (fliptResult !== null) return fliptResult` branch below), so
+  // `availability: []` cannot defend against a MIS-DEFINED flag. The correctness of this
+  // cohort therefore rests on a precondition held in ANOTHER REPO:
+  //
+  //   flipt-state `civitai-app/default/features.yaml` → flag `early-adopter` MUST be
+  //   `enabled: false` with the `early-adopters` segment rollout.
+  //
+  // For a boolean flag, Flipt's `enabled` is the value returned when NO rollout matches —
+  // it is not a master switch. `enabled: true` there would hand this flag to every
+  // non-opted-in user and every anonymous request, and nothing on this side would stop it.
+  // That exact defect was caught pre-merge in flipt-state#62; the shape is now gated by
+  // `scripts/validate-flag-shape.py` in that repo, and modelled in
+  // `feature-flags.early-adopter.seam.test.ts`.
+  earlyAdopter: { availability: [], fliptKey: 'early-adopter' },
+  // Flipt-backed so the whole feature has a runtime kill switch — it moves Buzz, and
+  // `['mod', 'granted']` alone could only be changed by a deploy.
+  //
+  // `['mod', 'granted']` is the FLIPT-DOWN fallback, not the cohort: it reproduces exactly
+  // who had access before this flag was wired, so an outage cannot widen the audience. Flipt
+  // overrides it in both directions once the flag exists.
+  //
+  // NOT `availability: []`. That shape exists for flags whose server half calls the async
+  // `isFlipt` directly — an absent flag answers `false` there while the client's
+  // `isEnabledSync` answers `null` and falls through to static, so the two disagree. Every
+  // crucible gate goes through `getFeatureFlags` instead (`isFlagProtected` on every
+  // procedure, `features.crucible` in every page and the nav registry), so both sides read one
+  // value and `[]` would only strip mods of the access they have today.
+  //
+  // Local dev: `FEATURE_FLAG_CRUCIBLE=public` in `.env`, which bypasses Flipt entirely.
+  crucible: { availability: ['mod', 'granted'], fliptKey: 'crucible' },
+  // Same Flipt-down fallback and `getFeatureFlags`-only gates as `crucible` above (an outage
+  // never widens the audience).
+  //
+  // Local dev: `FEATURE_FLAG_STORYLINES=public` in `.env`, which bypasses Flipt entirely.
+  storylines: { availability: ['mod', 'granted'], fliptKey: 'storylines' },
+  // The header Buzz spend pop (rolling counter + "-N" pop-out) in place of the Buzz update toast,
+  // with the phone header change it needs (support pill and Civitai Link move into the account
+  // menu). Off = the toast and the old header. `['mod', 'granted']` is the Flipt-down fallback.
+  //
+  // Local dev: `FEATURE_FLAG_BUZZ_SPEND_POP=public` in `.env`, which bypasses Flipt entirely.
+  buzzSpendPop: { availability: ['mod', 'granted'], fliptKey: 'buzz-spend-pop' },
+  // Jev resource-intent primitive (POST /api/v1/blocks/resource-intent).
+  // DARK by construction: Flipt owns it entirely and the flag must be created
+  // default-OFF in flipt-state (separate, human-reviewed change) before any
+  // cohort is opened. isFliptSync answers false for an unknown flag or an
+  // unreachable Flipt, so an absent flag is deny-by-default.
+  resourceIntentJev: { availability: [], fliptKey: 'resource-intent-jev' },
+  // Serves the co-occurrence POOL_MERGE list instead of HYBRID_10. Read only behind
+  // `resourceIntentJev`, so it changes nothing while that is off. Dark like it.
+  resourceIntentPoolMerge: { availability: [], fliptKey: 'resource-intent-pool-merge' },
+  // Admits `kind: 'checkpoint'` (ATTACH_BM checkpoint lists). Read only behind
+  // `resourceIntentJev`, so it changes nothing while that is off. Dark like it.
+  resourceIntentCheckpoint: { availability: [], fliptKey: 'resource-intent-checkpoint' },
+  // The v1 content-tag arm (docs/resource-intent-primitive.md, "The v1_tags arm"). Read only behind
+  // `resourceIntentJev`, dark like it. `resourceIntentV1` serves it for add-ons over
+  // `resourceIntentPoolMerge`; `…V1Shadow` only records it; `…JudgeCapture` records route prompt
+  // text while a judged sample is drawn.
+  resourceIntentV1: { availability: [], fliptKey: 'resource-intent-v1' },
+  resourceIntentV1Shadow: { availability: [], fliptKey: 'resource-intent-v1-shadow' },
+  resourceIntentJudgeCapture: { availability: [], fliptKey: 'resource-intent-judge-capture' },
+  // The model page discussion's comment counts in ONE call (`comment.getVisibleCountsByModel`,
+  // the plain and the hidden view's counts together) instead of two `getVisibleCountByModel` calls,
+  // and no visible count at all when the first `comment.getAll` page holds every comment (the
+  // count then equals the loaded comments). Off = the two calls, as before. Dark like the above:
+  // Flipt owns it, and an absent key or an unreachable Flipt reads OFF.
+  commentCountsSingleCall: { availability: [], fliptKey: 'comment-counts-single-call' },
+});
+
+export const featureFlagKeys = Object.keys(featureFlags) as FeatureFlagKey[];
+
+export const getFeatureFliptKey = (key: FeatureFlagKey): string | undefined =>
+  featureFlags[key].fliptKey;
+
+// --------------------------
+// Logic
+// --------------------------
+export type FeatureAccessContext = {
+  user?: SessionUser;
+  host?: string;
+  /** Optional: `_app`'s client-side getInitialProps has no request. Every consumer already guards
+   *  a nullish req (featureAccessKey, checkRegionAccess, `req?.headers.host`). */
+  req?: NextApiRequest | IncomingMessage;
+};
+
+/**
+ * Unified region access checking that combines global restrictions with feature-specific controls
+ * Priority order: Global restrictions > Feature excludes > Feature includes
+ */
+function checkRegionAccess(
+  feature: FeatureFlag,
+  availability: FeatureAvailability[],
+  req?: NextApiRequest | IncomingMessage
+): boolean {
+  // Bypass all region checks in dev mode
+  if (isDev) {
+    return true;
+  }
+
+  // Check if feature has any region requirements
+  const regionRequirements = availability.filter((x) =>
+    regionAvailability.includes(x as (typeof regionAvailability)[number])
+  );
+  const hasFeatureRegions = !!feature.regions;
+
+  // If no region requirements at all, allow access
+  if (regionRequirements.length === 0 && !hasFeatureRegions) {
+    return true;
+  }
+
+  // Get region info (only once)
+  let region: RegionInfo | undefined;
+  if (req) {
+    region = getRegion(req);
+  }
+
+  // If region info is required but not available, deny access
+  if ((regionRequirements.length > 0 || hasFeatureRegions) && !region?.countryCode) {
+    return hasFeatureRegions ? false : true; // Only deny if feature has specific geo restrictions
+  }
+
+  if (!region) return true; // Should not happen at this point, but safe fallback
+
+  const isGloballyRestricted = isRegionRestricted(region);
+  const countryCode = region.countryCode?.toUpperCase();
+
+  // Check global region availability requirements (restricted/nonRestricted)
+  if (regionRequirements.length > 0) {
+    const globalMatch = regionRequirements.some((requirement) => {
+      return requirement === 'restricted'
+        ? isGloballyRestricted
+        : requirement === 'nonRestricted'
+        ? !isGloballyRestricted
+        : false;
+    });
+
+    // If global requirements are not met, deny access
+    if (!globalMatch) return false;
+  }
+
+  // Check feature-specific region restrictions
+  if (hasFeatureRegions && countryCode) {
+    const { include, exclude } = feature.regions!;
+
+    // CRITICAL: Global restrictions always override feature includes
+    // If region is globally restricted, deny access regardless of feature includes
+    if (isGloballyRestricted && include && include.includes(countryCode)) {
+      return false;
+    }
+
+    // Check exclude list (blacklist) - always deny if in exclude
+    if (exclude && exclude.length > 0 && exclude.includes(countryCode)) {
+      return false;
+    }
+
+    // Check include list (whitelist) - only allow if in include list when list exists
+    if (include && include.length > 0) {
+      return include.includes(countryCode);
+    }
+  }
+
+  return true;
+}
+
+// Lazy-loaded flipt module (server-only — avoids pulling ~/env/server into client bundle)
+type FliptModule = typeof FliptClient;
+let _fliptModule: FliptModule | null = null;
+let _fliptLoading: Promise<FliptModule | null> | null = null;
+
+function loadFliptModule(): Promise<FliptModule | null> {
+  if (_fliptModule) return Promise.resolve(_fliptModule);
+  if (typeof window !== 'undefined') return Promise.resolve(null);
+  if (!_fliptLoading) {
+    _fliptLoading = import('~/server/flipt/client')
+      .then((mod) => {
+        _fliptModule = mod;
+        return mod;
+      })
+      .catch((err) => {
+        console.error('[Flipt] Module load failed:', err?.message ?? err);
+        // Allow retry on next call by clearing the cached promise
+        _fliptLoading = null;
+        return null;
+      });
+  }
+  return _fliptLoading;
+}
+
+// Kick off loading immediately on server (non-blocking, just warms the import)
+if (typeof window === 'undefined') {
+  loadFliptModule();
+}
+
+export function buildFliptContext(user?: SessionUser): Record<string, string> {
+  return buildSharedFliptContext(
+    user,
+    user
+      ? {
+          // Creator Program membership is recorded as an onboarding-step bit (set on join in
+          // creator-program.service, cleared on leave) — the bit lives in the app, not the package.
+          isInCreatorProgram: String(
+            Flags.hasFlag(user.onboarding, OnboardingSteps.CreatorProgram)
+          ),
+        }
+      : undefined
+  );
+}
+
+const hasFeature = (
+  key: FeatureFlagKey,
+  { user, req, host = req?.headers.host }: FeatureAccessContext,
+  // Built once per getFeatureFlags call and threaded through — previously every
+  // flag rebuilt buildFliptContext(user) (N times/request).
+  fliptContext: Record<string, string>
+) => {
+  const feature = featureFlags[key];
+  const { availability } = feature;
+
+  // Region restrictions always apply — Flipt cannot override them.
+  // Mods and granted users bypass region restrictions as before.
+  const isMod = user?.isModerator;
+  const hasGrantedPermission = availability.includes('granted')
+    ? !!user?.permissions?.includes(key)
+    : false;
+
+  if (!(isMod || hasGrantedPermission)) {
+    const regionAccess = checkRegionAccess(feature, availability, req);
+    if (!regionAccess) return false;
+  }
+
+  // Server/domain restrictions always apply — Flipt cannot override them.
+  // Each color maps to a primary host plus an optional alias list — any of
+  // those hosts counts as "on this color". Lookup uses the precomputed
+  // `colorHostSets` so we don't re-parse env on every flag check.
+  let serverMatch = true;
+  const availableServers = availability.filter((x) =>
+    serverAvailability.includes(x as ServerAvailability)
+  );
+  if (!availableServers.length || !host) serverMatch = true;
+  else {
+    const normalizedHost = host.toLowerCase();
+    serverMatch = availableServers.some((server) =>
+      colorHostSets[server as ColorDomain]?.has(normalizedHost)
+    );
+    if (!serverMatch) return false;
+  }
+
+  // Flipt overrides role checks (both enable AND disable) — but not ENV, region, or domain.
+  // When Flipt is unavailable, fall through to static evaluation.
+  if (feature.fliptKey && !envOverriddenFlags.has(key) && _fliptModule) {
+    const fliptResult = _fliptModule.isFliptSync(
+      feature.fliptKey,
+      user ? String(user.id) : 'anonymous',
+      fliptContext
+    );
+    if (fliptResult !== null) {
+      // Opt-in: this fires once per Flipt-backed flag per evaluation, which is
+      // hundreds of lines per page load and buries everything else in the dev log.
+      if (isDev && process.env.FLIPT_DEBUG === 'true') {
+        console.log(`[Flipt] ${key} (${feature.fliptKey}) => ${fliptResult}`);
+      }
+      return fliptResult;
+    }
+    // Flipt unavailable — fall through to static evaluation below
+  }
+
+  // --- Static evaluation (used when no Flipt override or Flipt unavailable) ---
+
+  // Check environment availability
+  const envRequirement = availability.includes('dev') ? isDev : !isDeclaredDark(availability);
+
+  // Check granted access
+  const grantedAccess = availability.includes('granted')
+    ? !!user?.permissions?.includes(key)
+    : false;
+
+  // Check role availability
+  const roles = availability.filter((x) => roleAvailablity.includes(x as RoleAvailability));
+  let roleAccess = roles.length === 0 || roles.includes('public');
+  if (!roleAccess && roles.length !== 0 && !!user) {
+    if (roles.includes('user')) roleAccess = true;
+    else if (roles.includes('mod') && user.isModerator) roleAccess = true;
+    else if (!!user.tier && user.tier != 'free') {
+      if (roles.includes('member')) roleAccess = true; // Gives access to any tier
+      else if (roles.includes(user.tier as RoleAvailability)) roleAccess = true; // Gives access to specific tier
+    }
+  }
+
+  // Check basic access (env, server, roles)
+  const hasBasicAccess = envRequirement && serverMatch && (grantedAccess || roleAccess);
+  if (!hasBasicAccess) return false;
+
+  return true;
+};
+
+// Sparse payload at runtime: only `true` flags are actually present, absent keys
+// are `undefined`. Type stays as `Record<FeatureFlagKey, boolean>` so consumers
+// read `features.X` as `boolean` without coercion. Truthy checks work the same
+// way against `false` and `undefined`. Removing a flag from the registry shrinks
+// `FeatureFlagKey`, which surfaces a type error at every consumer.
+export type FeatureAccess = Record<FeatureFlagKey, boolean>;
+
+/**
+ * SINGLE per-key evaluator — the one place that decides whether a flag key is
+ * "present" (i.e. `true`) in the sparse FeatureAccess payload. BOTH the eager
+ * `computeFeatureFlags` (every key) and the per-flag lazy getter
+ * (`getFeatureFlagsLazy`, only accessed keys) call THIS, so the two paths cannot
+ * diverge — the lazy per-flag result for key X is provably the same value eager
+ * puts at X. Semantics (must match the historical inline `computeFeatureFlags`
+ * body exactly):
+ *   1. `hasFeature` false ⇒ absent (env/region/host/role + Flipt gating).
+ *   2. A toggleable flag whose `default === false` is absent at the base layer —
+ *      logged-in users get their stored choice merged client-side (via
+ *      user.getFeatureFlags), but anonymous users have no override, so a
+ *      default-off toggleable (e.g. largerGenerationImages) must stay off on bare access.
+ *   3. Otherwise present.
+ * `fliptContext` is threaded in (built once per compute via buildFliptContext)
+ * so a single lazy request reuses one context across every accessed key, exactly
+ * as eager reuses it across every key.
+ */
+function isFeatureFlagKeyPresent(
+  key: FeatureFlagKey,
+  ctx: FeatureAccessContext,
+  fliptContext: Record<string, string>
+): boolean {
+  if (!hasFeature(key, ctx, fliptContext)) return false;
+  const feature = featureFlags[key];
+  if (feature.toggleable && feature.default === false) return false;
+  return true;
+}
+
+function computeFeatureFlags(ctx: FeatureAccessContext): FeatureAccess {
+  // Build the Flipt context once and reuse for every flag (was rebuilt per flag).
+  const fliptContext = buildFliptContext(ctx.user);
+  const keys = Object.keys(featureFlags) as FeatureFlagKey[];
+  return keys.reduce<FeatureAccess>((acc, key) => {
+    // Delegate the per-key decision to the shared evaluator so eager output is
+    // byte-identical to the lazy per-flag path (same code, same order).
+    if (isFeatureFlagKeyPresent(key, ctx, fliptContext)) acc[key] = true;
+    return acc;
+  }, {} as FeatureAccess);
+}
+
+// getFeatureFlags is PURE given (user identity, host, region, live Flipt config):
+// same inputs => same FeatureAccess. It runs on every request that touches
+// ctx.features (the image feed does), evaluating ~all flags — each previously
+// rebuilding the Flipt context and calling isFliptSync. Memoize the whole result
+// with a short TTL so repeat requests from the same (user, host, region) — e.g.
+// one user scrolling the feed (many getInfinite calls) — skip the per-flag work.
+//
+// KEY COMPLETENESS IS A CORRECTNESS INVARIANT. The cache key must include EVERY
+// input hasFeature reads: user id/isModerator/tier/isEarlyAdopter/appBuilderApproved/
+// permissions, host (domain gating), and the FULL region. `isEarlyAdopter` and
+// `appBuilderApproved` are in the key for exactly this reason — both feed
+// buildFliptContext, so an entry cached before the user toggled the setting (or a
+// moderator approved/revoked their app access request) would keep the OLD cohort
+// decision for the whole TTL, which is precisely the staleness the `refreshSession`
+// after each of those writes exists to prevent.
+// Region gates compliance-sensitive
+// restricted-region features, so two different regions must NEVER share an entry
+// — the whole region object is serialized into the key to guarantee that. Live
+// Flipt config changes are bounded by the TTL (same staleness as the per-eval
+// cache in flipt/client.ts). Mutation-safety: the cached object is never handed
+// out — callers always get a shallow copy.
+const FEATURE_ACCESS_TTL_MS = 10_000;
+const FEATURE_ACCESS_MAX = 20_000;
+type FeatureAccessEntry = { value: FeatureAccess; expiresAt: number };
+let featureAccessCur = new Map<string, FeatureAccessEntry>();
+let featureAccessPrev = new Map<string, FeatureAccessEntry>();
+
+function featureAccessKey({ user, req, host = req?.headers.host }: FeatureAccessContext): string {
+  // In dev, checkRegionAccess bypasses region entirely, so it can't affect the
+  // result and is omitted from the key. Also guard a nullish req (parity with
+  // checkRegionAccess's `if (req)`) so key construction never throws.
+  const region = isDev || !req ? undefined : getRegion(req);
+  const u = user
+    ? `u:${user.id}:${user.isModerator ? 1 : 0}:${user.tier ?? 'free'}:${
+        user.isEarlyAdopter ? 1 : 0
+      }:${user.appBuilderApproved ? 1 : 0}:${(user.permissions ?? []).slice().sort().join(',')}`
+    : 'anon';
+  return `${u}|h:${host ?? ''}|r:${region ? JSON.stringify(region) : ''}`;
+}
+
+export const getFeatureFlags = (ctx: FeatureAccessContext): FeatureAccess => {
+  const now = Date.now();
+  const key = featureAccessKey(ctx);
+
+  let entry = featureAccessCur.get(key);
+  if (entry) {
+    if (entry.expiresAt > now) return { ...entry.value };
+    featureAccessCur.delete(key);
+  }
+  entry = featureAccessPrev.get(key);
+  if (entry) {
+    if (entry.expiresAt > now) {
+      featureAccessPrev.delete(key);
+      featureAccessCur.set(key, entry); // promote so hot keys survive rotation
+      return { ...entry.value };
+    }
+    featureAccessPrev.delete(key);
+  }
+
+  const value = computeFeatureFlags(ctx);
+  // Generational rotation (bounds memory to ~2x MAX without a full-clear thrash).
+  if (featureAccessCur.size >= FEATURE_ACCESS_MAX) {
+    featureAccessPrev = featureAccessCur;
+    featureAccessCur = new Map();
+  }
+  featureAccessCur.set(key, { value, expiresAt: now + FEATURE_ACCESS_TTL_MS });
+  return { ...value };
+};
+
+/**
+ * PER-FLAG lazy FeatureAccess. Accessing `features.X` evaluates ONLY key `X`
+ * (via the shared `isFeatureFlagKeyPresent`), instead of forcing a full
+ * `computeFeatureFlags` of all ~145 flags on first touch. This is the structural
+ * fix for the base tRPC chain (`applyDomainFeature`) reading a single Flipt-free
+ * flag (`canViewNsfw`) and paying for up to 64 wasm `evaluateBoolean` calls:
+ *   - reading `canViewNsfw` (no fliptKey) now evaluates ZERO Flipt flags;
+ *   - reading one fliptKey'd flag evaluates ONLY that flag (still through the
+ *     wasm eval cache in flipt/client.ts — no per-eval hit-rate regression).
+ *
+ * Correctness: the returned value for any key is identical to
+ * `getFeatureFlags(ctx)[key]` — both go through `isFeatureFlagKeyPresent`, and
+ * `fliptContext` is built once per request (memoized) exactly as eager builds it
+ * once per compute. Sparse semantics are preserved: a non-present key reads as
+ * `undefined` (property returns `undefined`, not `false`), matching the eager
+ * object where absent keys are `undefined`. Per-key results are memoized so
+ * repeat reads of the same key within a request are stable and free. Code that
+ * reads many keys (e.g. isFlagProtected) simply triggers several per-key
+ * computes — each still cheap for Flipt-free keys and eval-cached for Flipt ones.
+ *
+ * NOTE: unlike the previous implementation, this does NOT populate/read the
+ * whole-result cache in `getFeatureFlags` — that cache exists to amortize the
+ * full 145-flag compute, which is precisely the work we now avoid. Eager callers
+ * (user.getFeatureFlags, the SSR seed) still use that cache directly.
+ */
+export function getFeatureFlagsLazy(ctx: FeatureAccessContext): FeatureAccess {
+  return isLazyProtoEnabled() ? getFeatureFlagsLazyProto(ctx) : getFeatureFlagsLazyLegacy(ctx);
+}
+
+/**
+ * The `feature-flags-lazy-proto` Flipt switch, read at most once per `LAZY_PROTO_GATE_REFRESH_MS`
+ * so the per-request cost is one `Date.now()` — even the Flipt eval-cache lookup builds a key
+ * string. Global boolean (no entity, no context). `null` (unknown key, Flipt not loaded or not
+ * initialized yet) and any throw read as OFF, so the legacy object is the default and the
+ * fallback. No recursion: `isFliptSync` is the Flipt client, which never reads feature flags.
+ */
+const LAZY_PROTO_GATE_REFRESH_MS = 5_000;
+let lazyProtoGateValue = false;
+let lazyProtoGateExpiresAt = Number.NEGATIVE_INFINITY;
+function isLazyProtoEnabled(): boolean {
+  const now = Date.now();
+  if (now < lazyProtoGateExpiresAt) return lazyProtoGateValue;
+  lazyProtoGateExpiresAt = now + LAZY_PROTO_GATE_REFRESH_MS;
+  try {
+    lazyProtoGateValue =
+      !!_fliptModule &&
+      _fliptModule.isFliptSync(_fliptModule.FLIPT_FEATURE_FLAGS.FEATURE_FLAGS_LAZY_PROTO) === true;
+  } catch {
+    lazyProtoGateValue = false;
+  }
+  return lazyProtoGateValue;
+}
+
+/** Tests only: forget the cached switch read so the next call re-reads Flipt. */
+export function resetFeatureFlagsLazyGateForTests() {
+  lazyProtoGateExpiresAt = Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * The per-request object behind `feature-flags-lazy-proto`. Same contract as
+ * `getFeatureFlagsLazyLegacy` — every key reads `true | undefined`, identical to
+ * `getFeatureFlags(ctx)[key]`; memoised per object; `fliptContext` built once per object on first
+ * access; `key in obj` true for every flag key; Object.keys / spread / JSON.stringify give `{}` —
+ * but the getters live on `LazyFeatureAccess.prototype`, defined ONCE at module load, so a call
+ * allocates one small instance (plus a Map on the first read) instead of one closure and one
+ * descriptor per flag key, and the instance never leaves V8's fast-properties mode.
+ *
+ * State is in private fields: per-instance, in-object, and invisible to every reflection and copy
+ * (keys, spread, Object.assign, JSON, structuredClone, Reflect.ownKeys). It MUST stay
+ * per-instance — state on the prototype would be shared by every request.
+ *
+ * Differences a caller could observe, none of which any consumer relies on (audited when this was
+ * added): the getters are inherited, not own (`hasOwnProperty`, `Object.getOwnPropertyNames` and
+ * `getOwnPropertyDescriptor` see nothing), and the prototype is not `Object.prototype` (so
+ * `isPlainObject`-style checks — devalue, Next's props serializer, lodash — reject it). And a getter
+ * read with a receiver that is not the instance itself returns `undefined`, where the legacy
+ * object's getters — closures that ignore `this` — return the real value: `Object.create(instance).k`
+ * and `new Proxy(instance, {}).k` (a Proxy without a `get` trap passes itself as the receiver) are
+ * `undefined` here and the flag's value on the legacy object. Dormant: no consumer wraps or
+ * inherits from the object today. (A copying clone — spread, lodash `cloneDeep` — reads `undefined`
+ * on both: the legacy object's own getters are non-enumerable, so its copy is `{}`.)
+ */
+class LazyFeatureAccess {
+  readonly #ctx: FeatureAccessContext;
+  #fliptContext: Record<string, string> | undefined = undefined;
+  #memo: Map<FeatureFlagKey, boolean> | undefined = undefined;
+
+  constructor(ctx: FeatureAccessContext) {
+    this.#ctx = ctx;
+  }
+
+  static read(self: object, key: FeatureFlagKey): true | undefined {
+    if (!(#ctx in self)) return undefined;
+    const obj = self as LazyFeatureAccess;
+    let memo = obj.#memo;
+    let present = memo?.get(key);
+    if (present === undefined) {
+      obj.#fliptContext ??= buildFliptContext(obj.#ctx.user);
+      present = isFeatureFlagKeyPresent(key, obj.#ctx, obj.#fliptContext);
+      if (!memo) memo = obj.#memo = new Map();
+      memo.set(key, present);
+    }
+    return present ? true : undefined;
+  }
+}
+
+for (const key of featureFlagKeys) {
+  // Non-enumerable (the defineProperty default), getter only — as the legacy object's own getters.
+  Object.defineProperty(LazyFeatureAccess.prototype, key, {
+    get(this: object) {
+      return LazyFeatureAccess.read(this, key);
+    },
+  });
+}
+
+export function getFeatureFlagsLazyProto(ctx: FeatureAccessContext): FeatureAccess {
+  return new LazyFeatureAccess(ctx) as unknown as FeatureAccess;
+}
+
+/** The original per-request object: one getter closure defined per flag key on every call. */
+export function getFeatureFlagsLazyLegacy(ctx: FeatureAccessContext): FeatureAccess {
+  const obj = {} as FeatureAccess;
+  // Built once on first flag access and reused for every accessed key this
+  // request — mirrors eager's "build fliptContext once per compute".
+  let fliptContext: Record<string, string> | undefined;
+  // Per-key memo so a second read of the same key is stable + free (and can't
+  // re-hit Flipt). Stores the raw presence boolean; the getter maps it to the
+  // sparse `true | undefined` wire value.
+  const memo = new Map<string, boolean>();
+
+  for (const key in featureFlags) {
+    Object.defineProperty(obj, key, {
+      // Match the previous descriptor: non-enumerable (data-shape-identical to
+      // the old lazy object) with only a getter.
+      get() {
+        let present = memo.get(key);
+        if (present === undefined) {
+          if (!fliptContext) fliptContext = buildFliptContext(ctx.user);
+          present = isFeatureFlagKeyPresent(key as FeatureFlagKey, ctx, fliptContext);
+          memo.set(key, present);
+        }
+        // Sparse semantics: present ⇒ true, absent ⇒ undefined (NOT false), so
+        // `features.X === getFeatureFlags(ctx).X` holds for every key.
+        return present ? true : undefined;
+      },
+    });
+  }
+  return obj as FeatureAccess;
+}
+
+/**
+ * Whether Flipt itself decided each of `keys` for `user` right now. `false` when Flipt is not
+ * loaded or answers `null` for one of them (unavailable, or the flag unknown to it): `hasFeature`
+ * then falls back to the static rules, which for a Flipt-rolled flag are usually far narrower than
+ * the rollout, so a caller that must not mistake that fallback for a decision asks this first. A
+ * flag with no Flipt key, or one an env override pins, is decided statically and counts as decided.
+ */
+export async function isFliptDecisive(keys: FeatureFlagKey[], user: SessionUser): Promise<boolean> {
+  const flipt = await loadFliptModule();
+  if (flipt) await flipt.ensureFliptInitialized();
+  const context = buildFliptContext(user);
+  return keys.every((key) => {
+    const fliptKey = featureFlags[key].fliptKey;
+    if (!fliptKey || envOverriddenFlags.has(key)) return true;
+    return !!_fliptModule && _fliptModule.isFliptSync(fliptKey, String(user.id), context) !== null;
+  });
+}
+
+export async function getFeatureFlagsAsync(ctx: FeatureAccessContext) {
+  // Ensure Flipt module is loaded and initialized (timeout + circuit breaker in FliptSingleton)
+  const flipt = await loadFliptModule();
+  if (flipt) {
+    await flipt.ensureFliptInitialized();
+  }
+  return getFeatureFlags(ctx);
+}
+
+export const toggleableFeatures = Object.entries(featureFlags)
+  .filter(([, value]) => value.toggleable)
+  .map(([key, value]) => ({
+    key: key as FeatureFlagKey,
+    displayName: value.displayName,
+    description: value.description,
+    badge: value.badge,
+    default: value.default ?? true,
+  }));
+
+export const domainRestrictedToggleableKeys = new Set(
+  Object.entries(featureFlags)
+    .filter(([, value]) => {
+      if (!value.toggleable) return false;
+      const servers = value.availability.filter((x) =>
+        serverAvailability.includes(x as ServerAvailability)
+      );
+      return servers.length > 0;
+    })
+    .map(([key]) => key as FeatureFlagKey)
+);
+
+/** Toggleable flags whose ELIGIBILITY is decided by Flipt: the toggle only exists for users the
+ *  Flipt flag grants. The overlay withholds these keys when the host-resolved flag is off, so a
+ *  written toggle can't override the gate (the client merges overlay over host flags). */
+export const fliptGatedToggleableKeys = new Set(
+  Object.entries(featureFlags)
+    .filter(([, value]) => value.toggleable && 'fliptKey' in value && value.fliptKey)
+    .map(([key]) => key as FeatureFlagKey)
+);
+
+/** Host-level ELIGIBILITY for the Flipt-gated toggleable keys. Presence in host flags cannot
+ *  stand in for it: a Flipt segment miss drops the key for a moderator this keeps eligible, and
+ *  `isFeatureFlagKeyPresent` drops a `default: false` toggleable for everyone. */
+export function getFliptGatedEligibility(
+  ctx: FeatureAccessContext
+): Partial<Record<FeatureFlagKey, boolean>> {
+  const fliptContext = buildFliptContext(ctx.user);
+  const out: Partial<Record<FeatureFlagKey, boolean>> = {};
+  for (const key of fliptGatedToggleableKeys) {
+    // Mods stay eligible for `availability: ['mod']` keys no matter what Flipt says.
+    // Inside `hasFeature` a non-null Flipt eval short-circuits the static role check,
+    // so without this a mod's eligibility flapped with Flipt health: eval null →
+    // static fallback grants, eval false (segment miss) → the toggle they already
+    // switched on renders NotFound. Flipt segments ramp the non-mod population.
+    const modAlwaysEligible =
+      !!ctx.user?.isModerator && featureFlags[key].availability.includes('mod');
+    out[key] = modAlwaysEligible || hasFeature(key, ctx, fliptContext);
+  }
+  return out;
+}
+
+export const defaultToggleableFeatures = toggleableFeatures.reduce(
+  (acc, feature) => ({ ...acc, [feature.key]: feature.default }),
+  {} as FeatureAccess
+);
+
+/**
+ * Pure computation of the per-user toggleable-feature overlay returned by
+ * `user.getFeatureFlags`. Single source of truth shared by the tRPC resolver
+ * (`getUserFeatureFlagsHandler`) and the SSR seed in `_app` getInitialProps —
+ * keeping the SSR-injected `initialData` byte-identical to a live fetch.
+ *
+ * @param userFeatures the stored `settings.features` JSON record (toggle choices)
+ * @param hostFeatures the request's already-resolved host-level FeatureAccess
+ *   (the controller's `ctx.features`) — used to enforce domain restrictions.
+ */
+export function computeUserFeatureFlagsOverlay(
+  userFeatures: Record<string, boolean> | undefined,
+  hostFeatures: FeatureAccess,
+  /** From `getFliptGatedEligibility` — presence in `hostFeatures` cannot stand in for it (see that
+   *  helper). */
+  gatedEligibility?: Partial<Record<FeatureFlagKey, boolean>>
+): FeatureAccess {
+  const features = userFeatures ?? {};
+
+  // filter toggleable features from user settings
+  const filteredUserFeatures = Object.keys(features).reduce(
+    (acc, key) =>
+      toggleableFeatures.some((x) => x.key === key) ? { ...acc, [key]: features[key] } : acc,
+    {} as FeatureAccess
+  );
+
+  const result = {
+    ...defaultToggleableFeatures,
+    ...filteredUserFeatures,
+  } as FeatureAccess;
+
+  // Don't let toggleable defaults override domain restrictions or Flipt eligibility gates
+  for (const key of domainRestrictedToggleableKeys) {
+    if (key in result && !hostFeatures[key]) {
+      delete result[key];
+    }
+  }
+  for (const key of fliptGatedToggleableKeys) {
+    const eligible = gatedEligibility ? !!gatedEligibility[key] : !!hostFeatures[key];
+    if (key in result && !eligible) {
+      delete result[key];
+    }
+  }
+
+  return result;
+}
+
+type FeatureAvailability = (typeof featureAvailability)[number];
+export type FeatureFlagKey = keyof typeof featureFlags;
+
+type GeoRestrictions = {
+  include?: string[]; // Whitelist regions (country codes)
+  exclude?: string[]; // Blacklist regions (country codes)
+};
+
+type FeatureFlag = {
+  displayName: string;
+  description?: string;
+  availability: FeatureAvailability[];
+  toggleable: boolean;
+  default?: boolean;
+  /** Chip rendered beside the settings toggle's label (e.g. 'Beta') — presentation only. */
+  badge?: string;
+  regions?: GeoRestrictions; // Optional geo restrictions
+  fliptKey?: string; // Optional Flipt flag key for remote toggling
+};
+
+// Simplified: Support either simple arrays or objects with any FeatureFlag properties
+type FeatureFlagInput =
+  | FeatureAvailability[] // Legacy format: ['public']
+  | (Partial<FeatureFlag> & { availability: FeatureAvailability[] }); // Object with at least availability
+
+function isDeclaredDark(availability: FeatureAvailability[]) {
+  return availability.length === 0;
+}
+
+function createFeatureFlags<T extends Record<string, FeatureFlagInput>>(flags: T) {
+  const features = {} as { [K in keyof T]: FeatureFlag };
+  const envOverrides = getEnvOverrides();
+
+  for (const [key, value] of Object.entries(flags)) {
+    // Convert arrays to object format for consistency
+    const flagData = Array.isArray(value) ? { availability: value } : value;
+
+    // Build the feature flag with defaults for missing properties
+    features[key as keyof T] = {
+      displayName: getDisplayName(key), // Default display name
+      toggleable: false, // Default not toggleable
+      ...flagData, // Spread all provided properties (overrides defaults)
+    } as FeatureFlag;
+
+    // Apply ENV overrides
+    const override = envOverrides[key as FeatureFlagKey];
+    // `availability: []` plus a `fliptKey` hands the decision to Flipt alone, so no
+    // `FEATURE_FLAG_<KEY>` variable applies: it would grant the access the registry withheld, and
+    // adding the key to `envOverriddenFlags` would also stop `hasFeature` consulting Flipt,
+    // leaving the flag unreachable from the switch that owns it. A dark flag with no `fliptKey`
+    // has no other switch, so its override still applies.
+    const fliptOwnsFlag = !!flagData.fliptKey && isDeclaredDark(flagData.availability);
+    if (override && !fliptOwnsFlag) {
+      features[key as keyof T].availability = override;
+      envOverriddenFlags.add(key);
+    } else if (override && typeof window === 'undefined') {
+      // Discarding silently is the same defect one level up: an operator sets the variable, sees
+      // no effect, and has nothing to read. Module-scope, so this is once per process.
+      console.warn(
+        `[feature-flags] "${key}" is declared dark (availability: []) with fliptKey ` +
+          `"${flagData.fliptKey}", so Flipt owns it and its FEATURE_FLAG_* override is ignored. ` +
+          `Change the flag in Flipt, or set FLIPT_LOCAL_OVERRIDES=${flagData.fliptKey}=on ` +
+          `for local development.`
+      );
+    }
+  }
+
+  return features;
+}
+
+function getEnvOverrides() {
+  const processFeatureAvailability: Partial<Record<FeatureFlagKey, FeatureAvailability[]>> = {};
+  // Set flags from ENV
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith('FEATURE_FLAG_')) continue;
+    const featureKey = camelCase(key.replace('FEATURE_FLAG_', ''));
+    const availability: FeatureAvailability[] = [];
+
+    for (const x of value?.split(',') ?? []) {
+      if (featureAvailability.includes(x as FeatureAvailability))
+        availability.push(x as FeatureAvailability);
+    }
+    processFeatureAvailability[featureKey as FeatureFlagKey] = availability;
+  }
+
+  return processFeatureAvailability;
+}

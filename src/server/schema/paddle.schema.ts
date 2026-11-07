@@ -1,0 +1,58 @@
+import type { CurrencyCode } from '@paddle/paddle-js';
+import * as z from 'zod';
+import { constants } from '~/server/common/constants';
+
+const buzzPurchaseMetadataSchema = z
+  .object({
+    type: z.enum(['buzzPurchase']),
+    buzzAmount: z.coerce.number().positive(),
+    unitAmount: z.coerce.number().positive(),
+    userId: z.coerce.number().positive(),
+    buzzTransactionId: z.string().optional(),
+    // For whatever reason, paddle converts it to snake case.
+    buzz_amount: z.coerce.number().positive().optional(),
+    user_id: z.coerce.number().positive().optional(),
+    // App Blocks attribution — see
+    // src/server/schema/blocks/attribution.schema.ts. The .passthrough()
+    // below lets these flow through unmodified; listing them
+    // explicitly gives downstream metadata-builders a typed shape.
+    blockAppId: z.string().optional(),
+    blockAppBlockId: z.string().optional(),
+    blockInstanceId: z.string().optional(),
+    blockScope: z.string().optional(),
+    blockModelId: z.coerce.number().int().positive().optional(),
+  })
+  .passthrough();
+
+export type TransactionMetadataSchema = z.infer<typeof transactionMetadataSchema>;
+
+export const transactionMetadataSchema = z.discriminatedUnion('type', [buzzPurchaseMetadataSchema]);
+
+export type TransactionCreateInput = z.infer<typeof transactionCreateSchema>;
+export const transactionCreateSchema = z.object({
+  // Whole minor units, same rule as the Stripe and Coinbase routes — the purchase form's
+  // Buzz-to-cents division is the shared source of a fraction. See `coinbase.schema.ts`.
+  unitAmount: z
+    .number()
+    .int('The transaction amount must be a whole number of cents')
+    .min(constants.buzz.minChargeAmount)
+    .max(constants.buzz.maxChargeAmount),
+  currency: z
+    .string()
+    .default('USD')
+    .refine((val) => val as CurrencyCode, { error: 'Only USD is supported' }),
+  metadata: transactionMetadataSchema.optional(),
+  recaptchaToken: z.string(),
+});
+
+export type TransactionWithSubscriptionCreateInput = z.infer<
+  typeof transactionWithSubscriptionCreateSchema
+>;
+export const transactionWithSubscriptionCreateSchema = transactionCreateSchema.omit({
+  recaptchaToken: true,
+});
+
+export type UpdateSubscriptionInputSchema = z.infer<typeof updateSubscriptionInputSchema>;
+export const updateSubscriptionInputSchema = z.object({
+  priceId: z.string(),
+});

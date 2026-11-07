@@ -1,0 +1,368 @@
+import {
+  Button,
+  Center,
+  Container,
+  Group,
+  Loader,
+  Stack,
+  Text,
+  TextInput,
+  Title,
+  SimpleGrid,
+} from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import { IconBell, IconBellOff, IconPencilMinus, IconSearch } from '@tabler/icons-react';
+import { useMemo, useState } from 'react';
+import { Meta } from '~/components/Meta/Meta';
+import { NoContent } from '~/components/NoContent/NoContent';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+import {
+  useCosmeticShopQueryParams,
+  useQueryShop,
+  useQueryWishlistedShopItems,
+  useShopLastViewed,
+} from '~/components/CosmeticShop/cosmetic-shop.util';
+import type { CosmeticShopSectionMeta } from '~/server/schema/cosmetic-shop.schema';
+import { COSMETIC_SHOP_DEFAULT_PAGE_SIZE } from '~/shared/constants/cosmetic-shop.constants';
+import type { ShopFilters } from '~/components/CosmeticShop/ShopFiltersDropdown';
+import { useDebouncedValue, useDisclosure } from '@mantine/hooks';
+import { useEffect } from 'react';
+import { NotificationToggle } from '~/components/Notifications/NotificationToggle';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { OfficialShopSection } from '~/components/Shop/OfficialShopSection';
+import { ShopBrowseControls } from '~/components/Shop/ShopBrowseControls';
+import { browseShopItems } from '~/components/Shop/shop-browse';
+import Image from 'next/image';
+import { formatPriceForDisplay } from '~/utils/number-helpers';
+
+import merchProducts from '~/utils/shop/civitai-merch-products.json';
+import projectOdysseyProducts from '~/utils/shop/project-odyssey-products.json';
+import clsx from 'clsx';
+import { openUserProfileEditModal } from '~/components/Dialog/triggers/user-profile-edit';
+import { useQueryUserCosmetics } from '~/components/Cosmetics/cosmetics.util';
+import { CommunityCosmeticsSection } from '~/components/CosmeticShop/CommunityCosmeticsSection';
+import { useOwnedCosmeticIds } from '~/components/CreatorShop/Storefront/storefront.util';
+import { useSubnavBottom } from '~/hooks/useSubnavBottom';
+import { CosmeticShopSort } from '~/server/common/enums';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+
+const merchSections = {
+  civitai: {
+    bannerImage: {
+      url: '/images/shop/civitai-merch/civitai-merch-banner.png',
+      width: 2040,
+      height: 392,
+    },
+    description: '',
+    products: merchProducts,
+  },
+  projectOdyssey: {
+    bannerImage: {
+      url: '/images/shop/project-odyssey/project-odyssey-banner.png',
+      width: 2544,
+      height: 496,
+    },
+    description: '',
+    products: projectOdysseyProducts,
+  },
+} as const;
+
+export const getServerSideProps = createServerSideProps({
+  useSSG: true,
+  useSession: true,
+  resolver: async ({ ssg, features }) => {
+    if (!features?.cosmeticShop) return { notFound: true };
+
+    await ssg?.cosmeticShop.getShop.prefetch({});
+  },
+});
+
+export default function CosmeticShopMain() {
+  const { query } = useCosmeticShopQueryParams();
+  const subnavBottom = useSubnavBottom();
+  const [filters, setFilters] = useState<ShopFilters>({
+    ...(query ?? {}),
+  });
+  const [sort, setSort] = useState(CosmeticShopSort.Newest);
+  const [pageSize, setPageSize] = useState<number>(COSMETIC_SHOP_DEFAULT_PAGE_SIZE);
+  const [debouncedFilters] = useDebouncedValue({ cosmeticTypes: filters.cosmeticTypes }, 500);
+  const { cosmeticShopSections, isLoading } = useQueryShop(debouncedFilters);
+  // Initial load only: a purchase invalidates `user.getCosmetics`, and gating on
+  // the refetch would unmount every section and lose each one's page.
+  const { isLoading: loadingOwnedCosmetics } = useQueryUserCosmetics();
+  const ownedCosmeticIds = useOwnedCosmeticIds();
+  const { wishlistedIds } = useQueryWishlistedShopItems();
+  const features = useFeatureFlags();
+
+  // The sections mount only after the owned-cosmetics query settles, past the browser's own
+  // hash scroll, so a /shop#shop-section-<id> link has to scroll once they exist.
+  const sectionsReady = !isLoading && !loadingOwnedCosmetics;
+  useEffect(() => {
+    if (!sectionsReady) return;
+    document.getElementById(window.location.hash.slice(1))?.scrollIntoView();
+  }, [sectionsReady]);
+
+  const { updateLastViewed, isFetched } = useShopLastViewed();
+
+  useEffect(() => {
+    setFilters((prev) => ({ ...query, search: prev.search }));
+  }, [query]);
+
+  const communityHubShown =
+    features.creatorShop &&
+    cosmeticShopSections.some((section) => (section.meta as CosmeticShopSectionMeta).communityHub);
+  // Each official section hides itself when nothing in it matches, so with the
+  // hub off a search that finds nothing would otherwise leave a blank page.
+  const officialMatchCount = useMemo(
+    () =>
+      browseShopItems({
+        entries: cosmeticShopSections.flatMap((section) => section.items),
+        shopItemOf: (entry) => entry.shopItem,
+        filters,
+        sort,
+        ownedCosmeticIds,
+        wishlistedIds,
+      }).length,
+    [cosmeticShopSections, filters, sort, ownedCosmeticIds, wishlistedIds]
+  );
+
+  useEffect(() => {
+    if (isFetched) {
+      // Update last viewed
+      updateLastViewed();
+    }
+  }, [isFetched]);
+
+  return (
+    <>
+      <Meta
+        title="Civitai Cosmetic Shop | Created with Love & AI"
+        description="Civitai Cosmetic Shop is a place where you can find the best cosmetic products to really express youself."
+        canonical="/shop"
+      />
+      <Container size="xl" p="sm">
+        <Stack gap="xl">
+          <Stack gap={0}>
+            <Group wrap="nowrap" justify="space-between">
+              <Title>Civitai Cosmetic Shop</Title>
+
+              <Group>
+                <Button
+                  leftSection={<IconPencilMinus size={16} />}
+                  onClick={() => {
+                    openUserProfileEditModal();
+                  }}
+                  style={{ fontSize: 14, fontWeight: 600, lineHeight: 1.5 }}
+                  radius="xl"
+                  size="compact-sm"
+                >
+                  Customize profile
+                </Button>
+                <NotificationToggle type="cosmetic-shop-item-added-to-section">
+                  {({ onToggle, isEnabled, isLoading }) => (
+                    <LegacyActionIcon onClick={onToggle} loading={isLoading}>
+                      <Tooltip
+                        w={200}
+                        multiline
+                        withArrow
+                        label={`${
+                          isEnabled ? 'Do not notify me' : 'Notify me'
+                        } about new items in the shop.`}
+                      >
+                        {isEnabled ? <IconBellOff /> : <IconBell />}
+                      </Tooltip>
+                    </LegacyActionIcon>
+                  )}
+                </NotificationToggle>
+              </Group>
+            </Group>
+            <Text size="sm" c="dimmed" mb="sm">
+              Any cosmetic purchases directly contributes to Civitai ❤️
+            </Text>
+          </Stack>
+          <div
+            className="sticky z-40 -mx-2 flex flex-wrap items-center justify-end gap-2 bg-gray-0 p-2 dark:bg-dark-7"
+            style={{ top: subnavBottom }}
+          >
+            <TextInput
+              className="w-full sm:mr-auto sm:w-80"
+              radius="xl"
+              placeholder="Search names, descriptions, :sticker:"
+              aria-label="Search the shop"
+              leftSection={<IconSearch size={16} />}
+              value={filters.search ?? ''}
+              onChange={(event) => {
+                const search = event.currentTarget.value;
+                setFilters((prev) => ({ ...prev, search }));
+              }}
+            />
+            <ShopBrowseControls
+              sort={sort}
+              onSortChange={setSort}
+              pageSize={pageSize}
+              onPageSizeChange={setPageSize}
+              filters={filters}
+              setFilters={setFilters}
+            />
+          </div>
+          <div className="flex flex-col gap-6">
+            {isLoading || loadingOwnedCosmetics ? (
+              <Center p="xl">
+                <Loader />
+              </Center>
+            ) : cosmeticShopSections?.length > 0 && !communityHubShown && !officialMatchCount ? (
+              <NoContent message="No items match your search and filters." />
+            ) : cosmeticShopSections?.length > 0 ? (
+              cosmeticShopSections.map((section, index) => {
+                const meta = section.meta as CosmeticShopSectionMeta;
+                const className = clsx(index === 0 ? 'order-1' : 'order-3');
+
+                if (meta.communityHub) {
+                  return features.creatorShop ? (
+                    <CommunityCosmeticsSection
+                      key={section.id}
+                      title={section.title}
+                      description={section.description}
+                      imageUrl={section.image?.url}
+                      hideTitle={meta.hideTitle}
+                      className={className}
+                      filters={filters}
+                      sort={sort}
+                      pageSize={pageSize}
+                    />
+                  ) : null;
+                }
+
+                return (
+                  <OfficialShopSection
+                    key={section.id}
+                    section={section}
+                    filters={filters}
+                    sort={sort}
+                    pageSize={pageSize}
+                    ownedCosmeticIds={ownedCosmeticIds}
+                    wishlistedIds={wishlistedIds}
+                    className={className}
+                  />
+                );
+              })
+            ) : (
+              <NoContent message="It looks like we're still working on some changes. Please come back later." />
+            )}
+          </div>
+        </Stack>
+      </Container>
+    </>
+  );
+}
+
+const MAX_SHOWN_ITEMS = 4;
+
+function MerchShowcaseSection({
+  type,
+  className,
+}: {
+  type: keyof typeof merchSections;
+  className?: string;
+}) {
+  const [opened, { open, close }] = useDisclosure();
+  const merch = merchSections[type];
+  const displayedItems = merch.products.slice(0, MAX_SHOWN_ITEMS);
+  const collapsedItems = merch.products.slice(MAX_SHOWN_ITEMS);
+
+  return (
+    <section className={clsx('flex flex-col gap-8', className)}>
+      <div className="hidden w-full overflow-hidden rounded-[20px] md:block">
+        <Image
+          src={merch.bannerImage.url}
+          width={merch.bannerImage.width}
+          height={merch.bannerImage.height}
+          alt="banner depicting merch section"
+        />
+      </div>
+      <div className="block h-44 w-full overflow-hidden rounded-[20px] md:hidden">
+        <Image
+          src={merch.bannerImage.url}
+          className="h-full object-cover object-center"
+          width={merch.bannerImage.width}
+          height={merch.bannerImage.height}
+          alt="banner depicting merch section"
+        />
+      </div>
+      {/* <div className="flex flex-col lg:px-11">
+        <Text size={32} fw={600}>
+          The backstory
+        </Text>
+        <Text size={24} lh="40px" c="dimmed">
+          Civitai AiR is proud to present this limited edition t-shirt set by Artist Anne Horel,
+          featuring her AI generated masks. Part of her upcoming exhibition at Julie Caredda Gallery
+          in Paris, each unique design is limited to an edition of 25.
+        </Text>
+      </div> */}
+      <SimpleGrid spacing="md" cols={{ base: 1, sm: 3, lg: 4 }}>
+        {displayedItems.map((product) => (
+          <ProductItem key={product.imageUrl} {...product} />
+        ))}
+        {opened
+          ? collapsedItems.map((product) => <ProductItem key={product.imageUrl} {...product} />)
+          : null}
+      </SimpleGrid>
+      {collapsedItems.length > 0 && (
+        <Button
+          onClick={opened ? close : open}
+          color="dark.4"
+          radius="xl"
+          className="mt-auto"
+          fullWidth
+        >
+          {opened ? 'Show Less' : `View all (${collapsedItems.length} more)`}
+        </Button>
+      )}
+    </section>
+  );
+}
+
+function ProductItem({
+  name,
+  description,
+  imageUrl,
+  imageAlt,
+  hoverImageUrl,
+  price,
+  url,
+}: (typeof merchProducts)[number]) {
+  return (
+    <div key={imageUrl} className="flex flex-col gap-4 rounded-lg bg-[#2F2F2F] p-4">
+      <div className="relative mx-auto w-52 overflow-hidden rounded-lg">
+        <Image src={imageUrl} alt={imageAlt} width={1000} height={1000} />
+        {hoverImageUrl && (
+          <div className="absolute left-0 top-0 opacity-0 transition-opacity duration-300 hover:opacity-100">
+            <Image src={hoverImageUrl} alt={imageAlt} width={1000} height={1000} />
+          </div>
+        )}
+      </div>
+      <div className="flex flex-col gap-2">
+        <Text size="22px" lh={1.2} fw="bold">
+          {name}
+        </Text>
+        {description && (
+          <Text size="md" lineClamp={3}>
+            {description}
+          </Text>
+        )}
+      </div>
+      <Button
+        component="a"
+        className="mt-auto"
+        href={url}
+        rel="nofollow noreferrer"
+        target="_blank"
+        color="dark.4"
+        radius="xl"
+        fullWidth
+      >
+        ${formatPriceForDisplay(price)} - Buy Now
+      </Button>
+    </div>
+  );
+}

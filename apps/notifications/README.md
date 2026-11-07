@@ -1,0 +1,69 @@
+# apps/notifications
+
+The notification domain, in-repo. Folds the external `civitai/notification-server` repo into the
+monorepo as a peer of `apps/auth` / `apps/orchestrator-gateway`, consuming the shared `@civitai/*`
+packages instead of its own forked DB/redis/axiom plumbing. See the plan:
+[`docs/plans/notifications-monorepo-migration.md`](../../docs/plans/notifications-monorepo-migration.md).
+
+## What it does
+
+One process owns the whole notification write side:
+
+- **(A) Producer API** — `POST /notifications`, authed (shared secret, internal-only ingress).
+  Validates the [`@civitai/notifications`](../../packages/civitai-notifications) schema, filters opted-out
+  recipients against the **main DB** `UserNotificationSettings` (reachable now that we're in-repo), and
+  UPSERTs the `PendingNotification` queue row. This is net-new surface — the external server was
+  GET-only.
+- **(A2) Bulk producer** — `POST /notifications/bulk`, same auth. Takes **pre-resolved** recipients
+  and applies **no** opt-out filter; each `send-notifications` processor filters in its own SQL. This
+  is the path `src/server/jobs/send-notifications.ts` uses, and it is why a processor missing its
+  `NOT EXISTS "UserNotificationSettings"` clause is unmuteable.
+- **(B) Fan-out worker** — the ported ~5s poll loop, run as two lanes: rows with over 1000 recipients
+  (follower fan-outs) go one at a time through a bulk lane, so they never delay the rest. Claims
+  `PendingNotification` rows, fans each into
+  `Notification` + `UserNotification` rows (normal / debounced), deletes/reschedules the pending row,
+  and POSTs a realtime `notification:new` signal per affected user, bumping that user's redis unread
+  counter only if one is already cached (an uncached user is recounted from the DB on the next read).
+  It also hands the newly delivered recipients to the push dispatcher (`worker/push.ts`) and the
+  email dispatcher (`worker/email.ts`, gated on `emailNotificationTypes`; see
+  docs/features/notifications.md "Web push" and "Email").
+- **System notices** — `POST /notifications/notices` (+ `/notifications/notices/get`). Sends one
+  `system-message`, `system-announcement` or `event-reminder` to up to 50,000 users per call, with `{placeholder}` text
+  filled per recipient. Dry run by default; each recipient gets a given `sendId` at most once; every
+  `sendId` keeps an audit row (`NoticeSend`, `NoticeSendCall`: `containers/notification-db/docker-init/02_notice_send.sql`).
+  A dry run already pins the `sendId` to its type, message, url and optional push `title`, so fixing a
+  typo needs a new `sendId`; pass the old one in `excludeSendIds` so the new send skips everyone it reached.
+  Of the notice types only `event-reminder` can be pushed; the other two can't be turned off.
+  TypeScript callers use `sendSystemNotices()` from `@civitai/notifications`.
+- **Ops routes** — `GET /health` (liveness; touches no dependency, but returns 503 on a worker pod whose
+  redis commands have all failed for 60s or where either poll-loop lane has stalled for 10 min), `GET /pool-stats`
+  (notif pool snapshots), `GET /metrics` (Prometheus, private-by-XFF).
+
+The producer↔consumer contract is the `PendingNotification` table, not HTTP — so the monolith's
+existing direct writes and this app's producer API can coexist during the transition (plan R3).
+
+## Shape
+
+Node + Fastify + tsup, same as `apps/orchestrator-gateway`. `src/app.ts` is the testable Fastify
+factory; `src/server.ts` adds `listen()` + `startWorker()`. Clients are thin shims over the shared
+packages (`src/lib/server/clients/{db,redis,axiom}.ts`).
+
+## Dev
+
+```bash
+cp .env.example .env      # fill in the DB / redis / signals values
+pnpm --filter @civitai/notifications-app dev        # tsx watch (API + worker)
+pnpm --filter @civitai/notifications-app typecheck
+pnpm --filter @civitai/notifications-app build      # tsup → dist/server.js
+pnpm --filter @civitai/notifications-app test
+```
+
+Unlike the auth/gateway images, this app imports `@civitai/db`'s Prisma-backed helper, so a Docker
+build needs the generated Prisma client — the Dockerfile does a full frozen install so the root
+`postinstall` runs `db:generate` (see the Dockerfile header).
+
+## Deploy status
+
+Deployed and running in production with `WORKER_ENABLED=true` since 2026-07 — this app's worker is
+the site's sole fan-out consumer. The `.env.example` default of `false` exists so a fresh local
+checkout never races the real worker; it does not describe production.

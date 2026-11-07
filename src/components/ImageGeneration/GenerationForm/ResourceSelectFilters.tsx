@@ -1,0 +1,333 @@
+import type { ChipProps } from '@mantine/core';
+import {
+  Button,
+  Chip,
+  Divider,
+  Drawer,
+  Group,
+  Indicator,
+  ScrollArea,
+  Stack,
+  useComputedColorScheme,
+} from '@mantine/core';
+import { Popover } from '~/components/MantineOverlays';
+import { useLocalStorage } from '@mantine/hooks';
+import { IconChevronDown, IconChevronUp, IconFilter } from '@tabler/icons-react';
+import { uniq } from 'lodash-es';
+import React, { useState } from 'react';
+import { isSortAvailable } from '~/components/Filters/sort-availability';
+import { useSortAvailability } from '~/components/Filters/useSortAvailability';
+import { useResourceSelectContext } from '~/components/ImageGeneration/GenerationForm/ResourceSelectProvider';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import type {
+  ResourceFilter,
+  ResourceSort,
+} from '~/components/ImageGeneration/GenerationForm/resource-select.types';
+import {
+  resourceSort,
+  showsPricingFilter,
+} from '~/components/ImageGeneration/GenerationForm/resource-select.types';
+import { SelectMenuV2 } from '~/components/SelectMenu/SelectMenu';
+import useIsClient from '~/hooks/useIsClient';
+import { FilterButton } from '~/components/Buttons/FilterButton';
+import { useIsMobile } from '~/hooks/useIsMobile';
+import { TURBO_VARIANT_MODEL_TYPES } from '~/server/schema/model-version.schema';
+import { mobileMenuSheetZIndex, remixMenuZIndex } from '~/shared/constants/app-layout.constants';
+import type { BaseModel } from '~/shared/constants/basemodel.constants';
+import { activeBaseModels } from '~/shared/constants/basemodel.constants';
+import { ModelType } from '~/shared/utils/prisma/enums';
+import { sortByModelTypes } from '~/utils/array-helpers';
+import { getDisplayName } from '~/utils/string-helpers';
+import classes from './ResourceSelectFilters.module.scss';
+import clsx from 'clsx';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+
+const baseModelLimit = 4;
+
+export function ResourceSelectFiltersDropdown() {
+  const {
+    resources,
+    selectSource,
+    filters: selectFilters,
+    setFilters: setSelectFilters,
+    turboPinned,
+    excludeTurbo,
+  } = useResourceSelectContext();
+  const features = useFeatureFlags();
+  const canFilterLoaded = features.imageGeneration && selectSource === 'generation';
+  const canFilterTurbo =
+    !turboPinned &&
+    !excludeTurbo &&
+    (resources.length === 0 ||
+      resources.some((r) => TURBO_VARIANT_MODEL_TYPES.includes(r.type as ModelType)));
+  // `selectSource` is caller-supplied and defaults to 'generation', so this reads wider than "the
+  // generator" — several non-generator callers pass it deliberately, and the generate-price question
+  // is still the right one for them.
+  const showPaidFilter = showsPricingFilter(selectSource);
+  const colorScheme = useComputedColorScheme('dark');
+  const mobile = useIsMobile();
+  const isClient = useIsClient();
+
+  const [opened, setOpened] = useState(false);
+  const [truncateBaseModels, setTruncateBaseModels] = useLocalStorage({
+    key: 'image-filter-truncate-base-models',
+    defaultValue: false,
+  });
+
+  let resourceTypesList = sortByModelTypes(
+    [...new Set(resources?.length ? resources.map((r) => r.type) : Object.values(ModelType))].map(
+      (rt) => ({
+        modelType: rt as ModelType,
+      })
+    )
+  );
+  let baseModelsList = resources?.length
+    ? uniq(resources.flatMap((r) => (r.baseModels ?? []) as BaseModel[]))
+    : activeBaseModels;
+  if (!resourceTypesList.length)
+    resourceTypesList = Object.values(ModelType).map((rt) => ({ modelType: rt as ModelType }));
+  if (!baseModelsList.length) baseModelsList = activeBaseModels;
+
+  const displayedBaseModels = truncateBaseModels
+    ? baseModelsList.filter(
+        (bm, idx) => idx < baseModelLimit || selectFilters.baseModels.includes(bm)
+      )
+    : baseModelsList;
+
+  const filterLength =
+    (selectFilters.types.length > 0 ? 1 : 0) +
+    (selectFilters.baseModels.length > 0 ? 1 : 0) +
+    (selectFilters.loadedOnly ? 1 : 0) +
+    (canFilterTurbo && selectFilters.turboOnly ? 1 : 0) +
+    (showPaidFilter && selectFilters.hidePaid ? 1 : 0);
+
+  const clearFilters = () => {
+    const reset: Required<ResourceFilter> = {
+      types: [],
+      baseModels: [],
+      loadedOnly: false,
+      turboOnly: false,
+      hidePaid: false,
+    };
+    setSelectFilters(reset);
+  };
+
+  const chipProps: Partial<ChipProps> = {
+    size: 'sm',
+    radius: 'xl',
+    variant: 'filled',
+    classNames: classes,
+    tt: 'capitalize',
+  };
+
+  const target = (
+    <Indicator
+      offset={4}
+      label={isClient && filterLength ? filterLength : undefined}
+      size={16}
+      zIndex={10}
+      classNames={{ root: classes.indicatorRoot, indicator: classes.indicatorIndicator }}
+      disabled={!filterLength}
+      inline
+    >
+      {mobile ? (
+        <FilterButton
+          icon={IconFilter}
+          iconOnly
+          variant="default"
+          onClick={() => setOpened((o) => !o)}
+          data-expanded={opened}
+        >
+          Filters
+        </FilterButton>
+      ) : (
+        <Button
+          color="gray"
+          radius="xl"
+          variant={colorScheme === 'dark' ? 'filled' : 'light'}
+          rightSection={
+            <IconChevronDown className={clsx({ [classes.opened]: opened })} size={16} />
+          }
+          onClick={() => setOpened((o) => !o)}
+          data-expanded={opened}
+          size="compact-sm"
+        >
+          <Group gap={4} wrap="nowrap">
+            <IconFilter size={16} />
+            Filters
+          </Group>
+        </Button>
+      )}
+    </Indicator>
+  );
+
+  const dropdown = (
+    <Stack gap="lg" p="md">
+      <Stack gap="md">
+        <Divider label="Resource types" className="text-sm font-bold" />
+        <Chip.Group
+          value={selectFilters.types}
+          onChange={(rts) => setSelectFilters((f) => ({ ...f, types: rts as ModelType[] }))}
+          multiple
+        >
+          <Group gap={8} my={4}>
+            {resourceTypesList.map((rt, index) => (
+              <Chip key={index} value={rt.modelType} {...chipProps}>
+                <span>{getDisplayName(rt.modelType)}</span>
+              </Chip>
+            ))}
+          </Group>
+        </Chip.Group>
+        <Divider label="Base model" className="text-sm font-bold" />
+        <Chip.Group
+          value={selectFilters.baseModels}
+          onChange={(bms) => setSelectFilters((f) => ({ ...f, baseModels: bms as BaseModel[] }))}
+          multiple
+        >
+          {' '}
+          <Group gap={8} my={4}>
+            {displayedBaseModels.map((baseModel, index) => (
+              <Chip key={index} value={baseModel} {...chipProps}>
+                <span>{baseModel}</span>
+              </Chip>
+            ))}
+            {baseModelsList.length > baseModelLimit && (
+              <LegacyActionIcon
+                variant="transparent"
+                size="sm"
+                onClick={() => setTruncateBaseModels((prev) => !prev)}
+              >
+                {truncateBaseModels ? (
+                  <IconChevronDown strokeWidth={3} />
+                ) : (
+                  <IconChevronUp strokeWidth={3} />
+                )}
+              </LegacyActionIcon>
+            )}
+          </Group>
+        </Chip.Group>
+        {showPaidFilter && (
+          <>
+            <Divider label="Cost" className="text-sm font-bold" />
+            <Group gap={8} my={4}>
+              <Chip
+                {...chipProps}
+                checked={!!selectFilters.hidePaid}
+                onChange={(checked) => setSelectFilters((f) => ({ ...f, hidePaid: checked }))}
+              >
+                <span>Hide paid</span>
+              </Chip>
+            </Group>
+          </>
+        )}
+      </Stack>
+
+      {(canFilterLoaded || canFilterTurbo) && (
+        <Stack gap="md">
+          <Divider label="Generator" className="text-sm font-bold" />
+          <Group gap="xs">
+            {canFilterLoaded && (
+              <Chip
+                {...chipProps}
+                checked={selectFilters.loadedOnly}
+                onChange={(checked) => setSelectFilters((f) => ({ ...f, loadedOnly: checked }))}
+              >
+                <span>Loaded only</span>
+              </Chip>
+            )}
+            {canFilterTurbo && (
+              <Chip
+                {...chipProps}
+                checked={selectFilters.turboOnly}
+                onChange={(checked) => setSelectFilters((f) => ({ ...f, turboOnly: checked }))}
+              >
+                <span>Turbo only</span>
+              </Chip>
+            )}
+          </Group>
+        </Stack>
+      )}
+
+      {filterLength > 0 && (
+        <Button
+          color="gray"
+          variant={colorScheme === 'dark' ? 'filled' : 'light'}
+          onClick={clearFilters}
+          fullWidth
+        >
+          Clear all filters
+        </Button>
+      )}
+    </Stack>
+  );
+
+  if (mobile)
+    return (
+      <>
+        {target}
+        <Drawer
+          opened={opened}
+          onClose={() => setOpened(false)}
+          size="90%"
+          position="bottom"
+          zIndex={mobileMenuSheetZIndex}
+          styles={{
+            content: {
+              height: 'auto',
+              maxHeight: 'calc(100dvh - var(--header-height))',
+              overflowY: 'auto',
+            },
+            body: { padding: 0, overflowY: 'auto' },
+            header: { padding: '4px 8px' },
+            close: { height: 32, width: 32, '& > svg': { width: 24, height: 24 } },
+          }}
+        >
+          {dropdown}
+        </Drawer>
+      </>
+    );
+
+  return (
+    <Popover
+      // Portaled: the toolbar sits inside the picker's scrolling results, which would clip this
+      // tall dropdown. Portaled, it has to clear the dialog stack, as the remix menu does.
+      withinPortal
+      zIndex={remixMenuZIndex}
+      position="bottom-end"
+      shadow="md"
+      radius={12}
+      onClose={() => setOpened(false)}
+      middlewares={{ flip: true, shift: true }}
+    >
+      <Popover.Target>{target}</Popover.Target>
+      <Popover.Dropdown maw={468} p={0} w="100%">
+        <ScrollArea.Autosize type="hover" mah={'calc(90vh - var(--header-height) - 56px)'}>
+          {dropdown}
+        </ScrollArea.Autosize>
+      </Popover.Dropdown>
+    </Popover>
+  );
+}
+
+export function ResourceSelectSort() {
+  const mobile = useIsMobile();
+  const availability = useSortAvailability();
+  const { sort, setSort } = useResourceSelectContext();
+
+  // `value: x.label` — the keys here are lowercase (`relevance|popularity|newest`)
+  // and the shared predicate matches on the display label.
+  const options = Object.entries(resourceSort)
+    .map(([k, v]) => ({ label: v, value: k }))
+    .filter((x) => isSortAvailable({ type: 'models', value: x.label }, availability));
+
+  return (
+    <SelectMenuV2
+      label={resourceSort[sort]}
+      value={sort}
+      onClick={(value) => setSort(value as ResourceSort)}
+      options={options}
+      iconOnly={mobile}
+      aria-label={mobile ? `Sort: ${resourceSort[sort]}` : undefined}
+    />
+  );
+}

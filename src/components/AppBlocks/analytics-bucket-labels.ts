@@ -1,0 +1,199 @@
+import { READ_SCOPE_LABELS } from '~/shared/constants/block-action-detail';
+
+/**
+ * Human labels for the App analytics panel's two "top N" rollup cards.
+ *
+ * #3561 bounded `block_scope_invocations.endpoint` so the `topEndpoints` rollup could
+ * aggregate at all. A side effect: the internal tokens (`workflow:submit`,
+ * `storage:set`, …) went from a count-1 long tail to the TOP rows of that card, where
+ * they rendered verbatim. `topScopes` next to it had the same problem all along.
+ *
+ * 🔴 WHY THESE ARE NOT `humaniseScopeInvocation` (AppActivityPanel).
+ * That is the real near-duplicate — the Activity feed's Action-column labeller. It is
+ * endpoint-arm based and needs no `detail`, so it is the function a reader will reach
+ * for. THREE reasons it cannot serve these cards:
+ *   1. REGISTER. It names a single past event ("Generated an image"), which is wrong
+ *      against a count — "Generated an image … 245" does not read. The WRITE labels here
+ *      are plural nouns instead, so those strings differ BY DESIGN.
+ *   2. PASS-THROUGH. A substantial share of `topEndpoints` is REST paths from
+ *      `normalizeEndpoint(req.url)` (proportion not measured — it depends entirely on
+ *      what the app does), which that function has no arm for — with the exception,
+ *      since #5068, of four EXACT `/api/v1/blocks/workflows/*` paths that now have
+ *      their own arms (the fourth, `/workflows/query`, arrived with the REST
+ *      app-subqueue read). An arbitrary REST path is still unmapped and would fall to its
+ *      scope→label map and, called with no meaningful scope, yield '' — a blank row. It
+ *      also cannot distinguish the legacy per-id buckets below.
+ *   3. INCOMPLETE SYNTHETIC COVERAGE. It has arms for FOUR of the FIVE synthetic tokens
+ *      the server writes. The fifth, `post:create` (`blocks.router.ts`), has none: it
+ *      misses both label maps (`posts:write:self` is in neither) and returns the RAW
+ *      SCOPE. `ENDPOINT_LABELS` below covers all five.
+ *      ⚠ Stated as a COUNT that names the exception, deliberately. This clause has been
+ *      wrong twice: first as "already maps all four endpoint tokens", then as "maps the
+ *      synthetic endpoint tokens" — a correction that removed the falsifiable number and
+ *      KEPT the falsehood. If a sixth token is added, this count is what goes red in
+ *      review; a vaguer phrasing would not.
+ *      ⚠ Invisible on the Activity tab — `post:create` rows always carry a `detail`, so
+ *      they route to `describeBlockAction` and never reach this function. It is visible
+ *      only on the aggregate card, i.e. exactly what this module labels.
+ * (`humaniseScopeEndpoint`, the Detail-column labeller, is unsuitable for a further
+ * reason — it resolves a per-ROW id out of `detail`, which an aggregate bucket has
+ * none of. Both are pinned by tests calling the real functions.)
+ *
+ * 🔴 VOCABULARY, and where it is deliberately INCONSISTENT. The write labels are the
+ * pluralised forms of what the Activity tab already says, so one event is not named two
+ * different things across two tabs of the same page. If you change one, change it there
+ * too — `humaniseScopeInvocation` and `describeBlockAction` are the other two places
+ * these operations are named.
+ * READ scopes are the exception: `scopeBucketLabel` returns the SHARED
+ * `READ_SCOPE_LABELS` strings verbatim, which are imperative permission phrases ("Read
+ * your viewer profile"), not plural nouns. So the scopes card does mix two registers.
+ * That is a deliberate trade — reusing the shared registry keeps one source of truth and
+ * matches the Activity tab exactly, and forking it to pluralise would create the fourth
+ * vocabulary this change exists to avoid. Argument 1 above therefore holds for the write
+ * half only; do not read it as a claim about the whole card.
+ *
+ * Lives in its own module (not inside AppAnalyticsPanel.tsx) so these pure assertions
+ * run in the `unit` project; importing the panel would drag in Mantine + chart.js.
+ */
+
+/**
+ * The bounded endpoint tokens the server writes, and their labels.
+ *
+ * A `Map`, deliberately not a `Record`: an object index is prototype-reachable, so
+ * `labels['constructor']` returns a FUNCTION and a truthy check on it would hand React
+ * a non-string child. No current writer can produce such a value — the non-literal
+ * values reaching this card come from `normalizeEndpoint` and contain a `/` — but the
+ * `Record` signature was lying about it.
+ *
+ * Kept in lockstep with the server by `analytics-bucket-labels.drift.test.ts`, which
+ * greps the `recordScopeInvocation` call sites rather than trusting this comment.
+ */
+const ENDPOINT_LABELS = new Map<string, string>([
+  ['workflow:submit', 'Generations'],
+  ['storage:set', 'App-local storage writes'],
+  ['storage:delete', 'App-local storage deletes'],
+  ['user-settings:write', 'Block settings saves'],
+  // `blocks.createPostFromApp`. Bounded (no per-post tail): `endpoint` is the
+  // `topEndpoints` GROUP BY key, so the post id lives in `detail.entityId`.
+  ['post:create', 'Posts published to a profile'],
+  // `blocks.setReactionFromApp`. Bounded: the image id and reaction live in `detail`.
+  ['reaction:set', 'Reactions set on images'],
+]);
+
+/** The bounded tokens that can carry a legacy per-id / per-key tail. */
+const TAILED = /^(workflow:submit|storage:set|storage:delete):(.+)$/;
+
+/**
+ * `'pending'` is NOT a workflow id. Pre-#3561 the writer was
+ * `` `workflow:submit:${snapshot.workflowId || 'pending'}` ``, so it is the historical
+ * stand-in for "no id was captured at write time".
+ *
+ * Deliberately labelled `(no id)` — which asserts nothing about status — rather than
+ * `(pending)`, which an author reads as a workflow state. Note the row genuinely MIGHT
+ * have been in flight (`snapshot.status` can be 'pending' and still writes a 200), so the
+ * point is not that "pending is wrong about status"; it is that the field never encoded
+ * status at all, and reusing the word implies it did. `humaniseScopeEndpoint` carves out
+ * the same sentinel for the same reason; if you touch one, read the other.
+ */
+const NO_ID_SENTINEL = 'pending';
+
+/** Human label for one `topEndpoints` bucket. */
+export function endpointBucketLabel(endpoint: string): string {
+  const exact = ENDPOINT_LABELS.get(endpoint);
+  if (exact) return exact;
+
+  // Legacy rows: #3561 bounded these tokens but ran NO data migration, so a range
+  // covering older activity still yields per-id / per-key buckets. Label the operation
+  // and keep the tail so two legacy buckets stay distinguishable — they are separate
+  // rows with separate counts, and merging them here would misreport what the aggregate
+  // returned.
+  const tailed = endpoint.match(TAILED);
+  if (tailed) {
+    // No `as string` here: TAILED's alternation and ENDPOINT_LABELS are hand-kept in
+    // sync, and asserting that would be the same type dishonesty the Map above exists to
+    // remove — if a tail-capable token were ever dropped from the map, the cast would
+    // render the literal text "undefined (my-key)" with nothing catching it.
+    const base = ENDPOINT_LABELS.get(tailed[1]);
+    // 🔴 UNREACHABLE DEFENSIVE BRANCH, AND NO TEST COVERS IT. Measured: deleting this
+    // line leaves the whole suite green, because reaching it requires TAILED and
+    // ENDPOINT_LABELS to disagree and both are in this file, two lines apart. Kept
+    // because it is free and the alternative is a lying cast — but do not count it as
+    // tested, and if you ever make the two independently configurable, add a case that
+    // actually reaches it.
+    if (!base) return endpoint;
+    return tailed[2] === NO_ID_SENTINEL ? `${base} (no id)` : `${base} (${tailed[2]})`;
+  }
+
+  // Everything else is a REST path from `normalizeEndpoint(req.url)`. Passed through
+  // verbatim, and NOT claimed to be pretty. Since `KNOWN_STATIC_ENDPOINT_SEGMENTS` landed
+  // that function is allowlist-first — only the static segments of the wrapped routes
+  // survive, everything else collapses to `:id`/`:ulid`/`:uuid`/`:seg` — so a NEW row's
+  // path is bounded and no longer caller-influenced. Two caveats before you treat it as a
+  // closed set: rows written before that change were not backfilled and still hold
+  // slugs/UUIDs verbatim, and the row is
+  // written from `res.on('finish')` regardless of status code, so 4xx paths appear too.
+  // React escapes it (no injection) and the cell clamps to one line. Inventing a name for
+  // it would be worse than showing it.
+  return endpoint;
+}
+
+/**
+ * Labels for the `topScopes` card. Reads come from the shared `READ_SCOPE_LABELS`
+ * registry; the write/other scopes written at `recordScopeInvocation` call sites are
+ * added here. Pluralised to match the endpoint card's register.
+ */
+const WRITE_SCOPE_LABELS = new Map<string, string>([
+  ['ai:write:budgeted', 'AI workflow submits'],
+  ['apps:storage', 'App-local storage calls'],
+  // The scope the REST twins (`/api/v1/blocks/app-storage/{set,delete}`) write,
+  // via `withBlockScope`'s verbatim `requiredScope`. DISTINCT from the
+  // `apps:storage` row above even though both describe the same datastore,
+  // because they are written by different transports and a range spanning the
+  // REST rollout would otherwise merge a bridge bucket with a REST one and hide
+  // exactly the migration this surface exists to enable.
+  //
+  // 🔴 Its ABSENCE was a live gap, caught mechanically by this map's own drift
+  // guard the moment the routes landed — the guard's docblock names this exact
+  // shape ("adding a `requiredScope` to a route could never fail a test", which
+  // is why the guard exists). Without it the scopes card rendered the raw string
+  // `apps:storage:write`. The READ twins needed no new entry: `apps:storage:read`
+  // is already in READ_SCOPE_LABELS.
+  ['apps:storage:write', 'App-local storage writes'],
+  ['apps:storage:shared:write', 'Shared storage writes'],
+  // Document store. Its base scope `apps:storage` has no row of its own: that spelling is
+  // already the legacy bridge's telemetry label above, so the two share one bucket.
+  ['apps:storage:publish', 'Shared storage publishes'],
+  ['collections:write:self', 'Collection updates'],
+  ['user-settings:write', 'Block settings saves'],
+  // Distinct label ON PURPOSE, even though it is the same operation as the row above.
+  // `block:settings:write` is the pre-#3212 scope for that write, so a range spanning
+  // #3212 returns BOTH as separate buckets with separate counts. Giving them one
+  // identical label would produce two visually identical rows with unexplained
+  // different numbers — the exact failure the endpoint card's legacy-tail handling and
+  // its test deliberately avoid, so the two halves of this module must not disagree.
+  ['block:settings:write', 'Block settings saves (legacy scope)'],
+  ['social:tip:self', 'Tips'],
+  ['posts:write:self', 'Posts published to a profile'],
+  ['goods:purchase:self', 'Item purchases'],
+  ['apps:store:items:write', 'App Store item listings'],
+  ['social:react:self', 'Reactions set on images'],
+  // Not a scope — the middleware's literal placeholder for a route that requires only a
+  // valid block token and no particular scope (`opts.requiredScope ?? '(any-token)'`).
+  // It appears verbatim in the data, so it needs a row label.
+  ['(any-token)', 'Any-token routes (no scope required)'],
+]);
+
+/** Human label for one `topScopes` bucket. */
+export function scopeBucketLabel(scope: string): string {
+  const write = WRITE_SCOPE_LABELS.get(scope);
+  if (write) return write;
+  // READ_SCOPE_LABELS is a plain Record shared with the Activity panel, so guard the
+  // prototype the same way the Map above does implicitly.
+  if (Object.hasOwn(READ_SCOPE_LABELS, scope)) {
+    const label = READ_SCOPE_LABELS[scope];
+    if (typeof label === 'string') return label;
+  }
+  // An unmapped scope is shown as-is rather than guessed at — same reasoning as the
+  // REST-path pass-through above.
+  return scope;
+}

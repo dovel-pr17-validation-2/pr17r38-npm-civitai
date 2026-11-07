@@ -1,0 +1,78 @@
+import type { ToggleHiddenSchemaOutput } from '~/server/schema/user-preferences.schema';
+import {
+  applyClearHidden,
+  applyOptimisticHiddenToggle,
+  applyToggleSuccess,
+  EMPTY_HIDDEN_CACHE,
+  HIDDEN_KIND_TO_KEY,
+  planToggleRollback,
+} from '~/shared/hidden-preferences/compact';
+import { showErrorNotification } from '~/utils/notifications';
+import { trpc } from '~/utils/trpc';
+
+export const useToggleHiddenPreferences = () => {
+  const queryUtils = trpc.useUtils();
+  const updateHiddenPreferences = useUpdateHiddenPreferences();
+
+  return trpc.hiddenPreferences.toggleHidden.useMutation({
+    onMutate: async (args) => {
+      await queryUtils.hiddenPreferences.getHidden.cancel();
+
+      const previous = queryUtils.hiddenPreferences.getHidden.getData();
+
+      updateHiddenPreferences(args);
+
+      return { previous };
+    },
+    onSuccess: async (result, variables) => {
+      queryUtils.hiddenPreferences.getHidden.setData(undefined, (old) =>
+        applyToggleSuccess(old as any, variables, result)
+      );
+
+      // Invalidate user lists when user or blockedUser preferences change
+      if (variables.kind === 'user' || variables.kind === 'blockedUser') {
+        await queryUtils.user.getLists.invalidate();
+        await queryUtils.user.getList.invalidate();
+      }
+      if (variables.kind === 'blockedUser') await queryUtils.user.getFollowsMe.invalidate();
+    },
+    onError: async (error, _variables, context) => {
+      if (error.data?.code === 'TOO_MANY_REQUESTS') showErrorNotification({ error });
+      const plan = planToggleRollback(context?.previous as any);
+      if ('restore' in plan)
+        queryUtils.hiddenPreferences.getHidden.setData(undefined, plan.restore as any);
+      else await queryUtils.hiddenPreferences.getHidden.invalidate();
+    },
+  });
+};
+
+export const useClearHiddenPreferences = () => {
+  const queryUtils = trpc.useUtils();
+
+  return trpc.hiddenPreferences.clearHidden.useMutation({
+    onSuccess: async (_result, { kind }) => {
+      queryUtils.hiddenPreferences.getHidden.setData(
+        undefined,
+        (old) => applyClearHidden(old as never, kind) as typeof old
+      );
+      if (kind === 'model') await queryUtils.hiddenPreferences.getHiddenModels.invalidate();
+      else {
+        await queryUtils.user.getLists.invalidate();
+        await queryUtils.user.getList.invalidate();
+      }
+    },
+    onError: (error) => showErrorNotification({ error }),
+  });
+};
+
+export const useUpdateHiddenPreferences = () => {
+  const queryUtils = trpc.useUtils();
+  const updateHiddenPreferences = ({ kind, data, hidden }: ToggleHiddenSchemaOutput) => {
+    const key = HIDDEN_KIND_TO_KEY[kind];
+    queryUtils.hiddenPreferences.getHidden.setData(undefined, (old = EMPTY_HIDDEN_CACHE as any) =>
+      applyOptimisticHiddenToggle(old, key, data, hidden)
+    );
+  };
+
+  return updateHiddenPreferences;
+};

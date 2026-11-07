@@ -1,0 +1,548 @@
+import { Prisma } from '@prisma/client';
+import dayjs from '~/shared/utils/dayjs';
+import { env } from '~/env/server';
+import { dbWrite } from '~/server/db/client';
+import { pgDbRead } from '~/server/db/pgDb';
+import type { DiscordRole } from '~/server/integrations/discord';
+import { discord } from '~/server/integrations/discord';
+import { logToAxiom } from '~/server/logging/client';
+import {
+  creatorJourneyAudienceAmong,
+  isCreatorJourneyFlagReadable,
+} from '~/server/services/creator-journey-flag.service';
+import {
+  milestoneShowableUserSql,
+  toUtcTimestamp,
+} from '~/server/services/creator-milestone-exclusions';
+import { getCreatorJourneyConfig } from '~/server/services/creator-journey-config.service';
+import {
+  getMetricExcludedUserIds,
+  getMetricExcludedUserIdsOrThrow,
+} from '~/server/services/metric-excluded-users.service';
+import { scoreTierKey } from '~/shared/constants/creator-journey.constants';
+import { limitConcurrency } from '~/server/utils/concurrency-helpers';
+import { createJob } from './job';
+
+const ENTHUSIAST_ROLE_CUTOFF = 7; // days
+const CREATOR_ROLE_CUTOFF = 14; // days
+const applyDiscordActivityRoles = createJob(
+  'apply-discord-activity-roles',
+  '7 */6 * * *',
+  async () => {
+    const discordRoles = await discord.getAllRoles();
+
+    // Too Expensive...
+    // const enthusiastRole = discordRoles.find((r) => r.name === 'Enthusiast');
+    // if (enthusiastRole) {
+    //   const existingEntusiasts = await getAccountsInRole(enthusiastRole);
+
+    //   const enthusiastCutoff = dayjs().subtract(ENTHUSIAST_ROLE_CUTOFF, 'day').toDate();
+    //   const enthusiasts =
+    //     (
+    //       await dbWrite.$queryRawUnsafe<{ providerAccountId: string }[]>(`
+    //     SELECT a."providerAccountId"
+    //     FROM "Account" a
+    //     WHERE a.provider = 'discord'
+    //       AND EXISTS (
+    //         SELECT 1
+    //         FROM "Image" i
+    //         WHERE i."userId" = a."userId"
+    //           AND i."createdAt" > $1
+    //         LIMIT 1
+    //       )`, enthusiastCutoff)
+    //     )?.map((x) => x.providerAccountId) ?? [];
+
+    //   const newEntusiasts = enthusiasts.filter((u) => !existingEntusiasts.includes(u));
+    //   await addRoleToAccounts(enthusiastRole, newEntusiasts);
+
+    //   const removedEntusiasts = existingEntusiasts.filter((u) => !enthusiasts.includes(u));
+    //   await removeRoleFromAccounts(enthusiastRole, removedEntusiasts);
+    // }
+
+    const creatorRole = discordRoles.find((r) => r.name === 'Creator');
+    if (creatorRole) {
+      const existingCreators = await getAccountsInRole(creatorRole);
+
+      const creatorCutoff = dayjs().subtract(CREATOR_ROLE_CUTOFF, 'day').toDate();
+      const creator = new Set(
+        (
+          await dbWrite.model.findMany({
+            where: {
+              OR: [
+                { publishedAt: { gte: creatorCutoff } },
+                { lastVersionAt: { gte: creatorCutoff } },
+              ],
+              user: {
+                accounts: {
+                  some: { provider: 'discord' },
+                },
+              },
+            },
+            select: {
+              user: {
+                select: {
+                  accounts: {
+                    select: { providerAccountId: true },
+                    where: { provider: 'discord' },
+                  },
+                },
+              },
+            },
+          })
+        ).map((i) => i.user.accounts[0].providerAccountId) ?? []
+      );
+
+      const newCreators = [...creator].filter((u) => !existingCreators.includes(u));
+      await addRoleToAccounts(creatorRole, newCreators);
+
+      const removedCreators = existingCreators.filter((u) => !creator.has(u));
+      await removeRoleFromAccounts(creatorRole, removedCreators);
+    }
+
+    await applyDiscordCreatorJourneyRoles(discordRoles);
+  }
+);
+
+// Tiers are cumulative: a holder of a higher tier holds every lower one, as Top 10 holds Top 100.
+const CREATOR_JOURNEY_TIERS = [
+  { milestoneKey: scoreTierKey('supernova'), configField: 'supernovaRoleId' },
+  { milestoneKey: scoreTierKey('legend'), configField: 'legendRoleId' },
+  { milestoneKey: scoreTierKey('mythic'), configField: 'mythicRoleId' },
+] as const;
+
+/**
+ * Discord account IDs per tier: `standing` holds every holder in good standing (the showcase's rule),
+ * `qualifying` those of them the creator-journey flag is on for. Privacy opt-outs are deliberately not
+ * applied: the Legend role is also the key to the Legends channel, and hiding from the showcase or
+ * hiding a badge is not opting out of that.
+ */
+async function getCreatorJourneyRoleHolders(milestoneKeys: string[], now: Date) {
+  const excludedUserIds = await getMetricExcludedUserIdsOrThrow();
+  const query = await pgDbRead.cancellableQuery<{
+    milestoneKey: string;
+    userId: number;
+    providerAccountId: string;
+  }>(
+    `
+    SELECT ucm."milestoneKey", u.id AS "userId", a."providerAccountId"
+    FROM "UserCreatorMilestone" ucm
+    JOIN "User" u ON u.id = ucm."userId"
+    JOIN "Account" a ON a."userId" = u.id AND a.provider = 'discord'
+    WHERE ucm."milestoneKey" = ANY($1::text[])
+      AND ${milestoneShowableUserSql('u', { excludedUserIds: '$2', now: '$3' })}
+    `,
+    [milestoneKeys, excludedUserIds, toUtcTimestamp(now)]
+  );
+  const rows = await query.result();
+  // Checked before evaluating, so the audience below is read from the same initialised client.
+  const flagReadable = await isCreatorJourneyFlagReadable();
+  const audience = await creatorJourneyAudienceAmong(pgDbRead, [
+    ...new Set(rows.map((row) => row.userId)),
+  ]);
+
+  const tiers = new Map(
+    milestoneKeys.map((key) => [
+      key,
+      { standing: new Set<string>(), qualifying: new Set<string>() },
+    ])
+  );
+  for (const row of rows) {
+    const tier = tiers.get(row.milestoneKey);
+    tier?.standing.add(row.providerAccountId);
+    if (audience.has(row.userId)) tier?.qualifying.add(row.providerAccountId);
+  }
+  return { tiers, flagReadable };
+}
+
+export const applyDiscordCreatorJourneyRoles = async (
+  discordRoles: DiscordRole[],
+  now = new Date()
+) => {
+  const config = await getCreatorJourneyConfig();
+  // One role configured for two tiers would be granted by one pass and stripped by the other.
+  const roleIds = CREATOR_JOURNEY_TIERS.map((tier) => config[tier.configField]).filter(Boolean);
+  if (new Set(roleIds).size !== roleIds.length) {
+    logToAxiom({
+      type: 'error',
+      name: 'discord-role-sync-aborted',
+      error: { reason: 'two creator journey tiers share a role id' },
+    });
+    return;
+  }
+  const tiers = CREATOR_JOURNEY_TIERS.flatMap((tier) => {
+    const roleId = config[tier.configField];
+    const role = roleId ? discordRoles.find((r) => r.id === roleId) : undefined;
+    if (!role) {
+      logToAxiom({
+        type: 'error',
+        name: 'discord-role-sync-aborted',
+        error: {
+          reason: roleId ? 'configured role not found in guild' : 'role id not configured',
+          milestoneKey: tier.milestoneKey,
+        },
+      });
+      return [];
+    }
+    return [{ ...tier, role }];
+  });
+  if (!tiers.length) return;
+
+  const { tiers: holders, flagReadable } = await getCreatorJourneyRoleHolders(
+    tiers.map((tier) => tier.milestoneKey),
+    now
+  );
+  // Unreadable, the flag answers no for everyone but moderators, which would read as every other
+  // holder leaving at once. Holder counts sit under REVOKE_FLOOR, so withinBlastRadius would not stop it.
+  if (!flagReadable) {
+    logToAxiom({
+      type: 'error',
+      name: 'discord-role-sync-aborted',
+      error: {
+        reason: 'creator-journey flag unreadable; revoking on standing only',
+      },
+    });
+  }
+
+  for (const { milestoneKey, role } of tiers) {
+    const { standing, qualifying } = holders.get(milestoneKey) ?? {
+      standing: new Set<string>(),
+      qualifying: new Set<string>(),
+    };
+    const existing = await getAccountsInRole(role);
+
+    await addRoleToAccounts(
+      role,
+      [...qualifying].filter((id) => !existing.includes(id))
+    );
+
+    const keep = flagReadable ? qualifying : standing;
+    const removed = existing.filter((id) => !keep.has(id));
+    if (withinBlastRadius(role, removed, existing)) await removeRoleFromAccounts(role, removed);
+  }
+};
+
+// UserRank is rebuilt from every public board, but updateLeaderboardRank({ leaderboardIds }) — the hourly event
+// path — truncates it and refills it from that event's boards alone. Both leave a populated table, so row count
+// can't tell them apart; the spread of boards can (31 in prod today, 1 for an event). isLeaderboardPopulated
+// used to keep this job away from that state by accident, since it also gated the rebuild.
+const MIN_RANK_BOARDS = 3;
+
+const userRankIsNarrowed = async () => {
+  const [{ boards }] = await dbWrite.$queryRaw<{ boards: number }[]>`
+    SELECT count(DISTINCT "leaderboardId")::int AS boards FROM "UserRank"`;
+  if (boards >= MIN_RANK_BOARDS) return false;
+
+  logToAxiom({
+    type: 'error',
+    name: 'discord-role-sync-aborted',
+    error: { reason: 'UserRank covers too few boards to diff against', boards },
+  });
+  return true;
+};
+
+// Second line, for a collapse that still spans boards. Deliberately loose: the real cleanup this ships with
+// revokes 33 of 83 Top 10 holders (40%), and `leaderboardRank` is the best position across all 31 boards, so
+// the ranked-under-10 population is ~196 users — not 10.
+const REVOKE_SHARE_LIMIT = 0.5;
+const REVOKE_FLOOR = 10;
+
+const withinBlastRadius = (role: DiscordRole, revoking: string[], holders: string[]) => {
+  if (holders.length < REVOKE_FLOOR) return true;
+  if (revoking.length <= holders.length * REVOKE_SHARE_LIMIT) return true;
+
+  logToAxiom({
+    type: 'error',
+    name: 'discord-role-sync-aborted',
+    error: {
+      reason: 'revoke list too large — refusing to strip the role in bulk',
+      role: role.name,
+      revoking: revoking.length,
+      holders: holders.length,
+    },
+  });
+  return false;
+};
+
+const getLeaderboardRoles = async () => {
+  const discordRoles = await discord.getAllRoles();
+
+  const top10Role = discordRoles.find((r) => r.name === 'Top 10');
+  const top100Role = discordRoles.find((r) => r.name === 'Top 100');
+  if (!top100Role || !top10Role) {
+    logToAxiom({
+      type: 'error',
+      name: 'discord-role-sync-aborted',
+      error: {
+        reason: 'leaderboard roles not found in guild',
+        missing: [!top10Role && 'Top 10', !top100Role && 'Top 100'].filter(Boolean),
+      },
+    });
+    return null;
+  }
+
+  return { top10Role, top100Role };
+};
+
+export const applyDiscordLeaderboardRoles = async () => {
+  const roles = await getLeaderboardRoles();
+  if (!roles) return;
+  if (await userRankIsNarrowed()) return;
+  const { top10Role, top100Role } = roles;
+
+  const existingTop100 = await getAccountsInRole(top100Role);
+  const existingTop10 = await getAccountsInRole(top10Role);
+  // Covers a UserRank left over from boards populated before an account was excluded. Lenient on purpose: the
+  // boards are the primary filter.
+  const excludedUserIds = await getMetricExcludedUserIds();
+
+  // Get the top 100 users with a discord account
+  const top100 = (
+    await dbWrite.user.findMany({
+      where: {
+        id: { notIn: excludedUserIds },
+        rank: { leaderboardRank: { lte: 100 } },
+        accounts: {
+          some: { provider: 'discord' },
+        },
+      },
+      select: {
+        rank: {
+          select: {
+            leaderboardRank: true,
+          },
+        },
+        accounts: {
+          select: { providerAccountId: true },
+          where: { provider: 'discord' },
+        },
+      },
+    })
+  ).flatMap((s) =>
+    s.accounts.map((account) => ({
+      rank: s.rank?.leaderboardRank,
+      providerAccountId: account.providerAccountId,
+    }))
+  );
+
+  // Nobody ranked with a linked Discord account is not a real state — it means UserRank is empty or mid-rebuild.
+  // Continuing would read that as "everyone left the top 100" and strip the roles from every holder.
+  if (!top100.length) {
+    logToAxiom({
+      type: 'error',
+      name: 'discord-role-sync-aborted',
+      error: {
+        reason: 'no ranked users with a linked discord account',
+        holders: existingTop100.length,
+      },
+    });
+    return;
+  }
+
+  const top100Ids = new Set(top100.map((u) => u.providerAccountId));
+  const top10Ids = new Set(
+    top100.filter((u) => u.rank && u.rank <= 10).map((u) => u.providerAccountId)
+  );
+
+  // Get the new users in the top 100 and the users that are no longer in the top 100
+  const newTop100 = [...top100Ids].filter((id) => !existingTop100.includes(id));
+  await addRoleToAccounts(top100Role, newTop100);
+
+  const removedTop100 = existingTop100.filter((id) => !top100Ids.has(id));
+  if (withinBlastRadius(top100Role, removedTop100, existingTop100))
+    await removeRoleFromAccounts(top100Role, removedTop100);
+
+  // Get the new users in the top 10 and the users that are no longer in the top 10
+  const newTop10 = [...top10Ids].filter((id) => !existingTop10.includes(id));
+  await addRoleToAccounts(top10Role, newTop10);
+
+  const removedTop10 = existingTop10.filter((id) => !top10Ids.has(id));
+  if (withinBlastRadius(top10Role, removedTop10, existingTop10))
+    await removeRoleFromAccounts(top10Role, removedTop10);
+};
+
+// Grant-only sync for a single user, so linking Discord doesn't mean waiting for the nightly cron. Removals stay
+// with the cron: a link should never strip a role because our rank data happens to be mid-refresh.
+export const syncUserDiscordLeaderboardRoles = async (userId: number) => {
+  const roles = await getLeaderboardRoles();
+  if (!roles) return;
+  const { top10Role, top100Role } = roles;
+
+  const user = await dbWrite.user.findUnique({
+    where: { id: userId },
+    select: {
+      rank: { select: { leaderboardRank: true } },
+      accounts: {
+        select: { providerAccountId: true },
+        where: { provider: 'discord' },
+      },
+    },
+  });
+
+  const rank = user?.rank?.leaderboardRank;
+  const providerAccountIds = user?.accounts.map((a) => a.providerAccountId) ?? [];
+  if (!providerAccountIds.length || !rank || rank > 100) return;
+  if ((await getMetricExcludedUserIds()).includes(userId)) return;
+
+  await addRoleToAccounts(top100Role, providerAccountIds);
+  if (rank <= 10) await addRoleToAccounts(top10Role, providerAccountIds);
+};
+
+const applyDiscordPaidRoles = createJob('apply-discord-paid-roles', '*/10 * * * *', async () => {
+  const discordRoles = await discord.getAllRoles();
+
+  const supporterRole = discordRoles.find((r) => r.name === 'Supporter');
+  const donatorRole = discordRoles.find((r) => r.name === 'Donator');
+
+  // Process Supporter and Donator roles in parallel
+  await Promise.all([
+    // Apply the Supporter Role
+    (async () => {
+      if (!supporterRole) return;
+
+      const existingSupporters = await getAccountsInRole(supporterRole);
+
+      // Get current supporters using optimized direct join query
+      const supporters = new Set(
+        (
+          await dbWrite.$queryRaw<{ providerAccountId: string }[]>`
+            SELECT DISTINCT a."providerAccountId"
+            FROM "CustomerSubscription" cs
+            JOIN "Account" a ON a."userId" = cs."userId" AND a.provider = 'discord'
+            WHERE cs.status IN ('active', 'trialing')
+          `
+        )?.map((s) => s.providerAccountId) ?? []
+      );
+
+      const newSupporters = [...supporters].filter((u) => !existingSupporters.includes(u));
+      await addRoleToAccounts(supporterRole, newSupporters);
+
+      const expiredSupporters = existingSupporters.filter((u) => !supporters.has(u));
+      await removeRoleFromAccounts(supporterRole, expiredSupporters);
+    })(),
+
+    // Apply the Donator Role
+    (async () => {
+      if (!donatorRole) return;
+
+      const existingDonators = await getAccountsInRole(donatorRole);
+
+      // Get current donators using optimized direct join query
+      const donatorCutoff = dayjs().subtract(1, 'month').toDate();
+      const donators = new Set(
+        (
+          await dbWrite.$queryRaw<{ providerAccountId: string }[]>`
+            SELECT DISTINCT a."providerAccountId"
+            FROM "Purchase" p
+            JOIN "Account" a ON a."userId" = p."userId" AND a.provider = 'discord'
+            WHERE p."createdAt" > ${donatorCutoff}
+            AND p."priceId" = ${env.STRIPE_DONATE_ID}
+          `
+        )?.map((s) => s.providerAccountId) ?? []
+      );
+
+      const newDonators = [...donators].filter((u) => !existingDonators.includes(u));
+      await addRoleToAccounts(donatorRole, newDonators);
+
+      const removedDonators = existingDonators.filter((u) => !donators.has(u));
+      await removeRoleFromAccounts(donatorRole, removedDonators);
+    })(),
+  ]);
+});
+
+export const applyDiscordRoles = [applyDiscordActivityRoles, applyDiscordPaidRoles];
+
+// #region [utilities]
+const getAccountsInRole = async (role: DiscordRole) => {
+  const roleValue = JSON.stringify([role.name]);
+  return (
+    (
+      await dbWrite.$queryRaw<{ providerAccountId: string }[]>`
+      SELECT
+        "providerAccountId"
+      FROM "Account"
+      WHERE
+          provider = 'discord'
+      AND metadata -> 'roles' @> ${roleValue}::jsonb`
+    )?.map((x) => x.providerAccountId) ?? []
+  );
+};
+
+// Our metadata is a record of what Discord accepted, so only the accounts Discord actually accepted may be
+// written. Recording a role we failed to apply is unrecoverable: the next run reads it back as already-granted
+// and never retries.
+const applyToDiscord = async (
+  role: DiscordRole,
+  providerAccountIds: string[],
+  action: 'add' | 'remove'
+) => {
+  const applied: string[] = [];
+  let notInGuild = 0;
+  const errors: string[] = [];
+
+  const tasks = providerAccountIds.map((providerAccountId) => async () => {
+    try {
+      const ok =
+        action === 'add'
+          ? await discord.addRoleToUser(providerAccountId, role.id)
+          : await discord.removeRoleFromUser(providerAccountId, role.id);
+      if (ok) applied.push(providerAccountId);
+      else notInGuild++;
+    } catch (e) {
+      errors.push(e instanceof Error ? e.message : String(e));
+    }
+  });
+  await limitConcurrency(tasks, 10);
+
+  if (notInGuild || errors.length) {
+    logToAxiom({
+      type: 'warn',
+      name: 'discord-role-sync',
+      // civitai-prod is at its column cap, so `error` is the only top-level container new fields can go in.
+      error: {
+        role: role.name,
+        action,
+        requested: providerAccountIds.length,
+        applied: applied.length,
+        notInGuild,
+        failed: errors.length,
+        errors: [...new Set(errors)].slice(0, 5),
+      },
+    });
+  }
+
+  return applied;
+};
+
+const addRoleToAccounts = async (role: DiscordRole, providerAccountIds: string[]) => {
+  if (providerAccountIds.length === 0) return;
+  const granted = await applyToDiscord(role, providerAccountIds, 'add');
+  if (granted.length === 0) return;
+
+  const roleValue = JSON.stringify([role.name]);
+  await dbWrite.$executeRaw`
+    UPDATE "Account"
+    SET metadata = jsonb_set(
+      metadata,
+      '{roles}',
+      (COALESCE(metadata->'roles', '[]'::jsonb) - ${role.name}::text) || ${roleValue}::jsonb,
+      true
+    )
+    WHERE provider = 'discord' AND "providerAccountId" IN (${Prisma.join(granted)})`;
+};
+
+const removeRoleFromAccounts = async (role: DiscordRole, providerAccountIds: string[]) => {
+  if (providerAccountIds.length === 0) return;
+  const revoked = await applyToDiscord(role, providerAccountIds, 'remove');
+  if (revoked.length === 0) return;
+
+  await dbWrite.$executeRaw`
+    UPDATE "Account"
+    SET metadata = jsonb_set(
+      metadata,
+      '{roles}',
+      COALESCE(metadata->'roles', '[]'::jsonb) - ${role.name}::text,
+      true
+    )
+    WHERE provider = 'discord' AND "providerAccountId" IN (${Prisma.join(revoked)})`;
+};
+// #endregion

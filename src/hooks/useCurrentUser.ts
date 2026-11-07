@@ -1,0 +1,24 @@
+import type { CurrentUser } from '~/components/CivitaiWrapped/CivitaiSessionProvider';
+import { useCivitaiSessionContext } from '~/components/CivitaiWrapped/CivitaiSessionProvider';
+import { AuthorizationError } from '~/utils/errorHandling';
+
+export function useCurrentUser() {
+  const user = useCivitaiSessionContext();
+  return user.type === 'authed' ? (user as CurrentUser) : null;
+}
+
+export function useCurrentUserRequired() {
+  const currentUser = useCurrentUser();
+  if (!currentUser) throw new AuthorizationError();
+  return currentUser;
+}
+
+// export const useIsSameUser = (username?: string | string[]) => {
+//   const currentUser = useCurrentUser();
+//   if (!username || !currentUser) return false;
+//   return (
+//     !!currentUser &&
+//     postgresSlugify(currentUser.username) ===
+//       postgresSlugify(typeof username === 'string' ? username : username[0])
+//   );
+// };

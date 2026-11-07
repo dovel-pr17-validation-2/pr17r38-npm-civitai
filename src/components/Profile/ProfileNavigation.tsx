@@ -1,0 +1,156 @@
+import React from 'react';
+import {
+  IconAssembly,
+  IconBook,
+  IconBook2,
+  IconBookmark,
+  IconCategory,
+  IconCube,
+  IconLayoutList,
+  IconPencilMinus,
+  IconPhoto,
+  IconShoppingBag,
+  IconSticker,
+  IconTrophy,
+  IconVideo,
+} from '@tabler/icons-react';
+import { useRouter } from 'next/router';
+import { useProfileAchievements } from '~/components/CreatorJourney/useProfileAchievements';
+import { trpc } from '~/utils/trpc';
+import type { DataItem } from '~/components/HomeContentToggle/HomeStyleSegmentedControl';
+import { HomeStyleSegmentedControl } from '~/components/HomeContentToggle/HomeStyleSegmentedControl';
+import homeStyleClasses from '~/components/HomeContentToggle/HomeStyleSegmentedControl.module.css';
+import { useCurrentUserSettings } from '~/components/UserSettings/hooks';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { getDisplayName, postgresSlugify } from '~/utils/string-helpers';
+
+type ProfileNavigationProps = {
+  username: string;
+};
+
+const overviewPath = '[username]';
+
+export const ProfileNavigation = ({ username }: ProfileNavigationProps) => {
+  const router = useRouter();
+  const features = useFeatureFlags();
+  const currentUser = useCurrentUser();
+  const settings = useCurrentUserSettings();
+  const isProfileOwner =
+    !!currentUser && postgresSlugify(currentUser.username) === postgresSlugify(username);
+  const isModerator = currentUser?.isModerator ?? false;
+
+  const {
+    data: userOverview,
+    isInitialLoading,
+    isRefetching,
+  } = trpc.userProfile.overview.useQuery({ username });
+  const { data: user } = trpc.userProfile.get.useQuery({ username });
+  const { count: achievementCount } = useProfileAchievements(user?.id);
+
+  const activePath = router.pathname.split('/').pop() || overviewPath;
+  const baseUrl = `/user/${username}`;
+
+  const opts: Record<string, DataItem> = {
+    [overviewPath]: {
+      url: `${baseUrl}/`,
+      icon: (props) => <IconAssembly {...props} />,
+      label: 'Overview',
+    },
+    models: {
+      url: `${baseUrl}/models`,
+      icon: (props) => <IconCategory {...props} />,
+      count: userOverview?.modelCount ?? 0,
+      disabled: !!user?.bannedAt,
+    },
+    posts: {
+      url: `${baseUrl}/posts`,
+      icon: (props) => <IconLayoutList {...props} />,
+      count: userOverview?.postCount ?? 0,
+      disabled: !!user?.bannedAt,
+    },
+    images: {
+      url: `${baseUrl}/images`,
+      icon: (props) => <IconPhoto {...props} />,
+      count: userOverview?.imageCount ?? 0,
+      disabled: !!user?.bannedAt,
+    },
+    videos: {
+      url: `${baseUrl}/videos`,
+      icon: (props) => <IconVideo {...props} />,
+      count: userOverview?.videoCount ?? 0,
+      disabled: !!user?.bannedAt,
+    },
+    '3d-models': {
+      url: `${baseUrl}/3d-models`,
+      icon: (props) => <IconCube {...props} />,
+      label: getDisplayName('3d-models'),
+      count: userOverview?.model3dCount ?? 0,
+      disabled: !features.model3dFeed || !!user?.bannedAt,
+    },
+    articles: {
+      url: `${baseUrl}/articles`,
+      icon: (props) => <IconPencilMinus {...props} />,
+      count: userOverview?.articleCount ?? 0,
+      disabled: !features.articles || !!user?.bannedAt,
+    },
+    comics: {
+      url: `${baseUrl}/comics`,
+      icon: (props) => <IconBook {...props} />,
+      count: userOverview?.comicCount ?? 0,
+      disabled: !features.comicCreator || !!user?.bannedAt,
+    },
+    storylines: {
+      url: `${baseUrl}/storylines`,
+      icon: (props) => <IconBook2 {...props} />,
+      disabled: !features.storylines || !!user?.bannedAt,
+    },
+    achievements: {
+      url: `${baseUrl}/achievements`,
+      icon: (props) => <IconTrophy {...props} />,
+      label: 'Achievements',
+      count: achievementCount,
+      // Zero when the flag is off for the viewer, so this also hides it then.
+      disabled: achievementCount === 0 || !!user?.bannedAt,
+    },
+    collections: {
+      url: `${baseUrl}/collections`,
+      icon: (props) => <IconBookmark {...props} />,
+      count: userOverview?.collectionCount ?? 0,
+      disabled: !!user?.bannedAt,
+    },
+    'sticker-book': {
+      url: `${baseUrl}/sticker-book`,
+      icon: (props) => <IconSticker {...props} />,
+      label: 'Sticker Book',
+      // Hidden from visitors when the creator hid it, the same way a disabled
+      // shop is — the owner and moderators keep the tab. The book's own payload
+      // withholds the content independently; this only decides the nav item.
+      disabled:
+        !features.stickerBook ||
+        !!user?.bannedAt ||
+        (!isProfileOwner && !isModerator && !!user?.stickerBookHidden),
+    },
+    shop: {
+      url: `${baseUrl}/shop`,
+      icon: (props) => <IconShoppingBag {...props} />,
+      label: 'Shop',
+      className: homeStyleClasses.tabHighlight,
+      // A disabled shop is hidden from everyone but its owner (and moderators,
+      // who need to review/fix shops regardless of publish state).
+      disabled:
+        !features.creatorShop ||
+        !!user?.bannedAt ||
+        (!isProfileOwner && !isModerator && !user?.creatorShopEnabled),
+    },
+  };
+
+  return (
+    <HomeStyleSegmentedControl
+      data={opts}
+      value={activePath}
+      loading={isInitialLoading || isRefetching}
+      keepLabels={settings.navigation?.keepProfileLabels}
+    />
+  );
+};

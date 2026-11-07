@@ -1,0 +1,223 @@
+import { BuzzClientAccount, TransactionType } from '@civitai/orchestration-client';
+import * as z from 'zod';
+import { imageSelectTrainingFilterSchema } from '~/components/ImageGeneration/GenerationForm/resource-select.types';
+import { constants } from '~/server/common/constants';
+import { infiniteQuerySchema } from '~/server/schema/base.schema';
+import { colorDomainNames } from '~/shared/constants/domain.constants';
+import { ModelFileVisibility, TrainingStatus } from '~/shared/utils/prisma/enums';
+
+export type TrainingResultsV1 = z.infer<typeof trainingResultsV1Schema>;
+export const trainingResultsV1Schema = z.object({
+  version: z.literal(1).nullish(),
+  start_time: z.string().nullish(),
+  submittedAt: z.string().nullish(),
+  end_time: z.string().nullish(),
+  attempts: z.number().nullish(),
+  jobId: z.string().nullish(),
+  transactionId: z.string().nullish(),
+  history: z
+    .array(
+      z.object({
+        jobId: z.string().optional(), // nb: this is an old reference prior to 10/26/23
+        time: z.string(),
+        status: z.enum(TrainingStatus),
+        message: z.string().nullish(),
+      })
+    )
+    .nullish(),
+  epochs: z
+    .array(
+      z.object({
+        epoch_number: z.number(),
+        model_url: z.string(),
+        sample_images: z
+          .array(
+            z.object({
+              image_url: z.string(),
+              prompt: z.string(),
+            })
+          )
+          .optional(),
+      })
+    )
+    .nullish(),
+});
+
+export type TrainingResultsV2 = z.infer<typeof trainingResultsV2Schema>;
+export const trainingResultsV2Schema = z.object({
+  version: z.literal(2),
+  submittedAt: z.string(),
+  startedAt: z.string().nullish(),
+  completedAt: z.string().nullish(),
+  workflowId: z.string(),
+  transactionData: z.array(
+    z.object({
+      id: z.string().nullish(),
+      amount: z.number(),
+      accountType: z.enum(BuzzClientAccount).nullish(),
+      type: z.enum(TransactionType),
+    })
+  ),
+  history: z.array(
+    z.object({
+      time: z.string(),
+      status: z.enum(TrainingStatus),
+    })
+  ),
+  // error_type: z.enum(['user', 'system']).nullish(),
+  // error_message: z.string().nullish()
+  epochs: z.array(
+    z.object({
+      epochNumber: z.number(),
+      modelUrl: z.string(),
+      modelSize: z.number(),
+      // '' holds the slot of a sample that failed, keeping indices aligned with the prompts.
+      sampleImages: z.array(z.union([z.url(), z.literal('')])),
+    })
+  ),
+  sampleImagesPrompts: z.array(z.string()),
+
+  // `epochs[].epochNumber` are stored with this ALREADY added, so a continuation continues the
+  // source run's numbering instead of restarting at 1.
+  epochOffset: z.number().int().nonnegative().optional(),
+
+  // Added to v2 in case we parse an old file. Might be useful.
+  jobId: z.string().optional(),
+});
+
+// // as usual, this doesn't work. probably because version doesn't exist for v1
+// export const trainingResultsSchema = z.discriminatedUnion('version', [
+//   trainingResultsV1Schema,
+//   trainingResultsV2Schema,
+// ]);
+
+export type TrainingResults = z.infer<typeof trainingResultsSchema>;
+export const trainingResultsSchema = z.union([trainingResultsV1Schema, trainingResultsV2Schema]);
+
+export type ModelFileMetadata = z.infer<typeof modelFileMetadataSchema>;
+export const modelFileMetadataSchema = z.object({
+  format: z.enum(constants.modelFileFormats).nullish(),
+  size: z.enum(constants.modelFileSizes).nullish(),
+  fp: z.string().max(64).nullish(),
+  quantType: z.string().max(64).nullish(),
+  isRequired: z.boolean().nullish(),
+  labelType: z.enum(constants.autoLabel.labelTypes).nullish(),
+  ownRights: z.boolean().nullish(),
+  shareDataset: z.boolean().nullish(),
+  numImages: z.number().nullish(),
+  numCaptions: z.number().nullish(), // this should be named numLabels, but it's too late now
+  // The domain color the training data was last uploaded under. Set server-side (never trusted from
+  // the client) so the paid submit can refuse an NSFW dataset prepared on red being paid for on green.
+  uploadDomain: z.enum(colorDomainNames).nullish(),
+  selectedEpochUrl: z.url().nullish(),
+  trainingResults: trainingResultsSchema.nullish(),
+  bountyId: z.number().nullish(),
+  bountyEntryId: z.number().nullish(),
+});
+
+export type ModelFileInput = z.infer<typeof modelFileSchema>;
+export const modelFileSchema = z.object({
+  id: z.number().optional(),
+  name: z.string(),
+  url: z.url().min(1, 'You must select a file'),
+  sizeKB: z.number(),
+  type: z.enum(constants.modelFileTypes),
+  format: z.enum(constants.modelFileFormats).optional(),
+  visibility: z.enum(ModelFileVisibility).optional(),
+  metadata: modelFileMetadataSchema.optional(),
+});
+
+export type ModelFileCreateInput = z.infer<typeof modelFileCreateSchema>;
+export const modelFileCreateSchema = z.object({
+  name: z.string(),
+  overrideName: z.string().max(1000).optional(),
+  url: z.url().min(1, 'You must select a file'),
+  sizeKB: z.number(),
+  type: z.enum(constants.modelFileTypes),
+  modelVersionId: z.number(),
+  visibility: z.enum(ModelFileVisibility).optional(),
+  metadata: modelFileMetadataSchema.optional(),
+  backend: z.string().optional(),
+  s3Path: z.string().optional(),
+});
+
+export type ModelFileUpdateInput = z.infer<typeof modelFileUpdateSchema>;
+export const modelFileUpdateSchema = z.object({
+  id: z.number(),
+  name: z.string().optional(),
+  overrideName: z.string().max(1000).nullish(),
+  url: z.url().min(1, 'You must select a file').optional(),
+  sizeKB: z.number().optional(),
+  type: z.enum(constants.modelFileTypes).optional(),
+  modelVersionId: z.number().optional(), // nb: this should probably not be an option here
+  visibility: z.enum(ModelFileVisibility).optional(),
+  metadata: modelFileMetadataSchema.optional(),
+  backend: z.string().optional(),
+  s3Path: z.string().optional(),
+});
+
+export type ModelFileUpsertInput = z.infer<typeof modelFileUpsertSchema>;
+export const modelFileUpsertSchema = z.union([
+  modelFileCreateSchema.extend({ id: z.undefined() }),
+  modelFileUpdateSchema,
+]);
+
+// Type for linked components (used by FilesProvider and Files)
+export type LinkedComponent = {
+  recommendedResourceId?: number;
+  componentType: ModelFileComponentType;
+  modelId: number;
+  modelName: string;
+  versionId: number;
+  versionName: string;
+  fileId: number;
+  fileName: string;
+  sizeKB?: number;
+  /** The ModelFile.type of the linked file (e.g. 'Model', 'Negative') — used for download URLs */
+  fileType?: string;
+  /** The ModelFile.metadata of the linked file (format/size/fp) — used for download URLs */
+  fileMetadata?: { format?: string | null; size?: string | null; fp?: string | null };
+  isRequired?: boolean;
+};
+
+export type RecentTrainingDataInput = z.infer<typeof recentTrainingDataSchema>;
+export const recentTrainingDataSchema = infiniteQuerySchema.merge(imageSelectTrainingFilterSchema);
+
+export const hasOfficialFileOfSizeSchema = z.object({
+  size: z.number().int().positive(), // bytes (client file.size)
+});
+export type HasOfficialFileOfSizeInput = z.infer<typeof hasOfficialFileOfSizeSchema>;
+
+/**
+ * Pick the most complete training file from a list.
+ * When duplicate 'Training Data' files exist for a model version, this selects
+ * the one with the richest trainingResults metadata rather than relying on
+ * arbitrary DB ordering.
+ */
+export function pickBestTrainingFile<T extends { metadata: unknown }>(files: T[]): T | undefined {
+  if (files.length <= 1) return files[0];
+
+  let best: T | undefined;
+  let bestScore = -1;
+
+  for (const file of files) {
+    const meta = file.metadata as ModelFileMetadata | null;
+    const tr = meta?.trainingResults;
+    let score = 0;
+    if (tr) {
+      score += 1; // has trainingResults at all
+      if ('workflowId' in tr && tr.workflowId) score += 2;
+      if ('history' in tr && tr.history && tr.history.length > 0) score += 1;
+      if ('epochs' in tr && tr.epochs && tr.epochs.length > 0) score += 2;
+      if ('submittedAt' in tr && tr.submittedAt) score += 1;
+      if ('startedAt' in tr && tr.startedAt) score += 1;
+      if ('completedAt' in tr && tr.completedAt) score += 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = file;
+    }
+  }
+
+  return best;
+}

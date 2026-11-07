@@ -1,0 +1,327 @@
+# Generation Gating — Rules Model
+
+> Status: **Implemented — the single gating system.** The legacy
+> `generation:ecosystem-config` gating matrix (disabled / mod-only / testing
+> ecosystems + IDs, `nsfwIds`, `disabledWorkflows`) has been **removed**; all
+> gating now lives in one normalized **rules** store (sysRedis hash
+> `generation:gate-rules:by-id`, one field per rule).
+> Each rule names **who keeps access** (`availableTo`) + **how it appears to
+> everyone else** (`presentation`) + any mix of ecosystem / workflow /
+> modelVersion targets. The self-hosted toggle is kept as its own feature.
+>
+> Supersedes the "descriptor-form" idea in
+> [generation-gating-consolidation.md](./generation-gating-consolidation.md).
+
+## As built
+
+- **Resolver** — [`src/shared/generation/gates.ts`](../../src/shared/generation/gates.ts):
+  `gateRuleSchema` (+ `GateRule` via `z.infer`), `applicableRulesFor` (server,
+  `availableTo` filter), `rulesToStates` / `mergeGateStates` / `pickStrongerGate`
+  (graph, no user). **Positive "available to" framing** — `moderators` /
+  `testers` / `members` / `nobody` (the named tier keeps access, everyone else is
+  gated), matching the old "testers enabled, others hidden". 3 resolved states
+  `hidden`/`disabled`/`memberOnly`, precedence `hidden > disabled > memberOnly`;
+  `memberOnly` (upsell) derives only from `availableTo: members` + `disabled`.
+- **Store + API** — one sysRedis hash, `generation:gate-rules:by-id`, field = rule
+  id, so saving or deleting one rule never rewrites the others. Mod endpoints
+  `getGateRules` / `saveGateRule` / `deleteGateRule`;
+  `getGenerationConfig` returns the user's applicable rules (fail-open `[]`).
+  Entries are parsed **one at a time** and unreadable ones dropped, so one bad
+  rule — an unknown presentation from a newer build, say — cannot silence the rest.
+- **Migration from the legacy array** — rules used to be one JSON array in the
+  `system:features` hash field `generation:gate-rules`. The first read, save or
+  delete that finds no `generation:gate-rules:migrated` marker copies the array
+  into the hash (`hSetNX`, so a rule already in the hash wins), then sets the
+  marker. Never delete the marker: a rerun would restore every rule deleted since. The legacy array is left in place as a
+  backup and never read again. A pod still on the previous build writes only the
+  array, so gate-rule edits made mid-rollout after the copy are lost.
+- **Graph (generator UI + submit)** — `GenerationCtx.gateRules` (+ `selfHostedMode`),
+  populated by both ext builders. The ecosystem + workflow nodes merge the
+  self-hosted toggle + rules into one per-item state map; the model node drops
+  the version IDs no picker offers (`unselectableVersionIds`). Node refines
+  enforce `hidden` and `memberOnly` (and the self-hosted toggle) on submit.
+- **`disabled` is selectable** — the one state that leaves an item in the
+  pickers and valid in the graph. `whatIf` and the generate button are blocked
+  client-side (`useDisabledGates`), and `validateInput` refuses the request
+  server-side (`gatedSelectionRefusal`, with the user's real membership) — so
+  the form explains itself instead of the item vanishing.
+- **Site-wide `canGenerate`** — `getResourceCanGenerate` blocks **only on the
+  `hidden` state** (`canGenerateBlockedTargets`, via `getCanGenerateHiddenGates`):
+  membership is ignored (no tier lookup — `isMember: true` drops member rules),
+  so model pages / search / the API hard-block a resource only when a rule hides
+  its ecosystem or version.
+- **Pickers** — `BaseModelInput` / `WorkflowPicker` read one per-item state;
+  `FormFooter` resolves the selected ecosystem's state (members-only reuses the
+  existing upsell + CTA).
+- **Mod UI** — on `/moderator/generation-config`, a "Gate rules" list of compact
+  read-only cards (below the two status cards, above "Generator messages"); a
+  card's edit icon or "Add rule" opens the editor in a modal.
+- **`experimental` presentation** — gates nothing and only annotates; see
+  "`experimental` — a rule that gates nothing" below. It replaced the
+  `experimentalEcosystems` list, and with it the whole
+  `generation:ecosystem-config` store (schema, service, mod endpoints and form
+  are gone; `resolveTestingAccess` is what's left of the read).
+- **Standalone announcements are NOT gate rules** — pricing, maintenance and the
+  like are [generator messages](./generator-messages.md), a separate store
+  rendered above the submit row.
+
+**Kept (not folded into rules):** the self-hosted toggle (`selfHostedMode` +
+`SELF_HOSTED_ECOSYSTEM_KEYS`) and the `generation-testing` Flipt flag (resolves
+the `testers` tier).
+
+## Why
+
+Gating is a sparse matrix today: `target` (ecosystem / modelVersion / workflow)
+× `state` (disabled / modOnly / testing / memberOnly / experimental / nsfw), and
+every cell is its own list (`disabledEcosystems`, `modOnlyIds`, …, ~10 lists and
+growing). Adding `memberOnly` ecosystems means another list + UI field + resolver
+branch. Normalizing to rules makes a new state/target a **registry entry**, and
+gives one store + one UI.
+
+Honest scope note: this is primarily an **extensibility / maintainability** win
+(a future gate is one registry line; one mod UI instead of N fields). Raw line
+count today is roughly neutral — the lists become rules + a registry, not less
+code. The payoff is every change _after_ this one.
+
+## Data model
+
+A rule is two independent axes — **who** it gates and **how** the gated item is
+presented — over a target value:
+
+```ts
+type GateTarget = 'ecosystem' | 'modelVersion' | 'workflow';
+
+// WHO keeps access — everyone else is gated. Positive ("available to") framing:
+// the named tier is exempt, everyone else gets the presentation below.
+type GateAvailableTo = 'moderators' | 'testers' | 'members' | 'nobody';
+
+// HOW a gated item is presented to a gated user. These are DISTINCT — `disabled`
+// is always shown, `hidden` is always removed. The mod chooses per rule.
+type GatePresentation =
+  | 'disabled' // STILL SHOWN and still SELECTABLE — badged, with a message saying
+  //              it's off right now; whatIf and submit refuse it. `members` turns
+  //              this into `memberOnly`, which IS unselectable.
+  | 'hidden' //   Removed from the picker. Use only when it shouldn't be
+  //              advertised at all — because hidden reads as "the feature is gone".
+  | 'experimental'; // NOT A GATE — fully usable, just annotated with the
+//              "Experimental Build" alert. See below.
+
+// A rule is ONE gate config (who + how + message) with any number of targets
+// attached to it — not one row per item.
+type GateRule = {
+  id: string; // stable id (for editing)
+  name: string; // mod-facing name, e.g. "Maintenance window", "Premium tier"
+  availableTo: GateAvailableTo;
+  presentation: GatePresentation;
+  // OPTIONAL extra copy layered on the state's standard badge/alert (for
+  // `members` + `disabled`, the client also renders the Become-a-member CTA).
+  message?: string;
+  // attach any number of targets:
+  ecosystems: string[];
+  workflows: string[];
+  modelVersionIds: number[];
+};
+```
+
+The rules store (see **Store + API** above) is now the **only** gating store — the old `generation:ecosystem-config` gating lists
+have been removed. `GateTarget` is just the union of the three attach-lists.
+
+## The two axes (the declarative core)
+
+`presentation` is data on the rule — you pick hide vs show-disabled per rule.
+`availableTo` is the only thing that needs evaluating per user (does this rule
+GATE the user, i.e. are they outside the exempt tier):
+
+```ts
+const isGatedFor: Record<GateAvailableTo, (u: GateUserCtx) => boolean> = {
+  moderators: (u) => !u.isModerator,
+  testers: (u) => !u.hasTestingAccess, // mods always have testing access
+  members: (u) => !u.isMember && !u.isModerator, // mods + members keep access
+  nobody: () => true, // kill-switch (mods included)
+};
+// GateUserCtx = { isModerator; isMember; hasTestingAccess }
+```
+
+For `presentation: 'disabled'`, the badge **message** derives from `availableTo`
+(`members` → "members only" + upsell, else → "currently unavailable") — reusing
+the machinery the self-hosted toggle already has.
+
+### `disabled` (shown) vs `hidden` — the distinction you flagged
+
+These are two different things, and the model keeps them separate:
+
+- **`disabled` is shown.** A mod disables `img2img` for everyone → users still see
+  it in the picker, greyed, with "currently unavailable." They know it exists and
+  is coming back. **This is the normal way to gate.**
+- **`hidden` is removed.** Reserved for things that shouldn't be advertised at
+  all (mod-only, internal testing, NSFW on green). Looks "gone" — which is fine
+  _for those cases_, wrong for a temporary disable.
+
+So `disabled ≠ hidden` ever. A mod picks which per rule.
+
+Example rules (each one gate, many targets):
+
+```ts
+// Maintenance: disable some workflows + an ecosystem for everyone, keep visible:
+{ id: 'r1', name: 'Maintenance', availableTo: 'nobody', presentation: 'disabled',
+  message: 'Down for maintenance — back shortly.',
+  workflows: ['img2img', 'img2img:upscale'], ecosystems: ['Flux1'], modelVersionIds: [] }
+
+// Premium tier: members keep access; free users see greyed + upsell:
+{ id: 'r2', name: 'Premium', availableTo: 'members', presentation: 'disabled',
+  message: 'Available to members.', // CTA added automatically because `members`
+  ecosystems: ['Flux2'], workflows: [], modelVersionIds: [987] }
+
+// Internal: only mods see it; everyone else has it removed entirely:
+{ id: 'r3', name: 'Internal', availableTo: 'moderators', presentation: 'hidden',
+  ecosystems: ['SecretX'], workflows: [], modelVersionIds: [] }
+```
+
+### `experimental` — a rule that gates nothing
+
+`presentation: 'experimental'` rides on the same rule card (so a mod can flag an
+ecosystem, a workflow or a set of version IDs in one place) but is **not** a
+gate: the target stays visible and selectable, and the only effect is the
+"Experimental Build" alert in the generator form.
+
+It is therefore kept **out of the state machine entirely** — `rulesToStates`
+skips these rules, so they can never reach a picker's hidden/disabled set, the
+node refines, or `canGenerate`. The form reads them separately with
+`experimentalTargets(rules)`. A rule's `message` replaces the alert's body copy.
+
+**`availableTo` does not apply.** It names who keeps _access_, and an
+experimental rule grants none — so there is nobody to exempt, and
+`applicableRulesFor` passes these rules through for every user. The mod UI hides
+the field for this presentation and pins the stored value to `nobody`. (It was
+briefly the other way: the audience filter ran, which made the field read as
+"who does _not_ see the warning" — an inversion nobody would guess from the
+label.)
+
+The static `experimental` base-model flags (`isEcosystemExperimental`) still
+apply and are unioned in. The Redis-backed `experimentalEcosystems` list this
+replaced is gone — see "Migration".
+
+The markers and alerts read the rules from a client store that
+`ExperimentalRulesSync` fills. **The generator root must mount it** —
+`BaseGenerationForm` does. A
+root without it renders no flask and no alert, with no error.
+
+The alert cannot be dismissed: it shows for as long as the selection hits its
+target.
+
+## Resolved state — three states, per item
+
+A rule's `(availableTo, presentation)` resolves, for a given user, to one of
+**three client states** (`memberOnly` is its own state — it's only off for
+non-members, so calling it "disabled" is wrong):
+
+```ts
+type GateState = 'hidden' | 'disabled' | 'memberOnly';
+type GateResolution = { state: GateState; message?: string };
+//   hidden     → removed from the picker
+//   disabled   → still SELECTABLE, badged; whatIf + submit refuse it, and the
+//                form body carries the "currently unavailable" alert
+//   memberOnly → shown greyed and unselectable, standard members-only UI
+//                INCLUDING the upsell alert + Become-a-member CTA (same as the
+//                self-hosted system)
+
+// presentation 'hidden'                       → 'hidden'
+// presentation 'disabled' + availableTo members → 'memberOnly'
+// presentation 'disabled' + any other tier    → 'disabled'
+```
+
+> **Site-wide `canGenerate`** (model pages / search / API) blocks on `hidden`
+> ONLY, and ignores membership there to avoid a per-resource tier lookup. What
+> happens to disabled / members-only targets instead: see "As built".
+
+A target can match multiple rules; precedence is the most-restrictive state:
+**`hidden` > `disabled` > `memberOnly`** — so a globally-down item never upsells.
+
+**Messaging is additive.** The state's standard UI always renders — the
+disabled/members-only badge, and for `memberOnly` the **upsell alert + CTA we
+already show today** (`SelfHostedBlockedAlert`). A rule's `message` is _optional
+extra copy layered on top_; it never replaces the standard badge/alert/CTA.
+
+## Architecture — rules live in the graph context
+
+The generator gating is applied in **one place: the generation graph**, which
+runs both client-side (the picker) and server-side (submit validation). Instead
+of the server pre-resolving per-user gated lists and shipping those, we ship the
+**rules** and let the graph resolve them. (Site-wide `canGenerate` resolves its
+blocking rules separately — see "As built".)
+
+1. **Shared resolver** — the `GateRule` / `GateState` types + the
+   rules→states resolver live in a shared module (`src/shared/generation/gates.ts`),
+   since the graph is shared.
+2. **Server returns the user's _applicable_ rules** — `getGenerationConfig`
+   includes `gateRules: GateRule[]`, with **`availableTo` evaluated server-side**
+   (authoritative; the granular tiers never leave the server).
+3. **`GenerationCtx.gateRules`** carries them into the graph (alongside the
+   self-hosted toggle fields, which the nodes merge in).
+4. **The graph nodes apply them.** The ecosystem / workflow / model nodes resolve
+   each item to a `GateState` and act: `hidden` → drop from `compatibleEcosystems`;
+   `memberOnly` → keep, put `{ state, message }` in node `meta`, and reject in the
+   `output` refine (so submit is blocked client- and server-side); `disabled` →
+   keep and accept, because it is refused at the request instead.
+5. **Picker + footer read node `meta`** — badge from `state`; `memberOnly` shows
+   the existing `syncAccount(…/pricing)` CTA (`SelfHostedBlockedAlert`'s button).
+
+**Key simplification:** because the server already filtered by `availableTo`, the
+graph never needs the user's tier context — each applicable rule maps to a state
+purely from its own `(availableTo, presentation)`. So the resolver splits:
+
+- **server**: `applicableRulesFor(allRules, user)` — the `availableTo` filter.
+- **shared/graph**: `rulesToStates(applicableRules)` → `Map<value, GateResolution>` —
+  no user needed.
+
+The graph nodes resolve `ctx.gateRules` into per-item state, and the pickers read
+node `meta`. `BaseModelInput`'s badge + the `FormFooter` alert use the per-item
+`GateState` + `message`; the member-only CTA is reused as-is.
+
+> `experimental` remains separate (an annotation, not a gate) — see above.
+
+## Moderator UI
+
+A **list of compact read-only cards** on `/moderator/generation-config`. A card
+shows the presentation badge, name, outcome, message and every target by name;
+its edit icon (or **Add rule**) opens the editor in a modal, and its delete icon
+confirms before calling `deleteGateRule`. The editor has:
+
+- **One `Rule` dropdown** of whole outcomes, grouped by presentation — "Hidden
+  from everyone except moderators", "Members only — greyed out with a
+  Become-a-member CTA", "Experimental warning — usable, nothing blocked", and so
+  on. `(presentation, availableTo)` stay orthogonal in storage; the select
+  encodes the pair as `presentation:availableTo` and splits it on change.
+  Two dropdowns each stated half of an inverted condition, which the reader then
+  had to compose — the flattened list says the outcome outright. `experimental`
+  is one entry, not four, because it has no exempt tier to vary.
+- **Message** field — optional extra copy on top of the standard badge/alert
+  (replaces the body copy for `experimental`).
+- Three target inputs — **ecosystems**, **workflows**, **model version IDs**.
+
+> Nine options today. Each gating presentation contributes one entry per tier and
+> `experimental` exactly one, so the list grows as gates × tiers.
+
+## Migration (deploy cutover)
+
+The ecosystem-config cutover had **no auto-migration**. The legacy
+`generation:ecosystem-config` gating lists were removed in code; production
+gating is recreated as **rules by hand** (through the mod UI) before/at deploy,
+so it's a clean switch.
+
+`experimentalEcosystems` — the last field in that store — went the same way when
+the `experimental` presentation landed: whatever ecosystems were flagged there
+must be **re-entered as an `experimental` rule** (available to `nobody`), or they
+silently stop warning. The `generation:ecosystem-config` hash field is now dead
+and can be deleted.
+
+## Folding in the self-hosted toggle (still deferred)
+
+The self-hosted toggle (`selfHostedMode` + `SELF_HOSTED_ECOSYSTEM_KEYS` +
+`getSelfHostedDisabledEcosystems` + `SelfHostedGenerationStatusCard`) is kept as
+its own feature. It's expressible as one rule
+(`{ availableTo: 'members', presentation: 'disabled', ecosystems: SELF_HOSTED_ECOSYSTEM_KEYS }`),
+but the set is **code** knowledge (orchestrator engine routing), not a mod
+opinion — so folding it in cleanly wants a `@self-hosted` target-group reference
+that expands at resolve time, rather than a hand-maintained list. Out of scope
+for now.

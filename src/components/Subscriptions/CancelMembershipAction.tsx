@@ -1,0 +1,132 @@
+import type { ButtonProps } from '@mantine/core';
+import { Button, Image, Loader, Modal, Text } from '@mantine/core';
+import { Menu } from '~/components/MantineOverlays';
+import { useCallback } from 'react';
+import { useDialogContext } from '~/components/Dialog/DialogProvider';
+import { dialogStore } from '~/components/Dialog/dialogStore';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
+import { useMutatePaddle } from '~/components/Paddle/util';
+import { CancelMembershipBenefitsModal } from '~/components/Stripe/MembershipChangePrevention';
+import { useActiveSubscription } from '~/components/Stripe/memberships.util';
+import { useQueryVault, useQueryVaultItems } from '~/components/Vault/vault.util';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { formatKBytes } from '~/utils/number-helpers';
+
+export function CancelMembershipAction({
+  label = 'Cancel membership',
+  variant = 'menu-item',
+  onFinish,
+  icon,
+  buttonProps,
+}: Props) {
+  const currentUser = useCurrentUser();
+
+  const { refreshSubscription } = useMutatePaddle();
+  const { vault } = useQueryVault();
+  const { subscription } = useActiveSubscription({ checkWhenInBadState: true });
+
+  const handleRefresh = useCallback(async () => {
+    try {
+      await refreshSubscription();
+      await currentUser?.refresh();
+      onFinish?.();
+    } catch {
+      onFinish?.();
+      window.location.reload();
+    }
+  }, [currentUser, onFinish, refreshSubscription]);
+
+  const handleClick = useCallback(
+    async (e: React.MouseEvent<HTMLElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!subscription) return;
+
+      dialogStore.trigger({
+        component: CancelMembershipBenefitsModal,
+        props: {
+          onContinue: handleRefresh,
+        },
+      });
+    },
+    [handleRefresh, subscription]
+  );
+
+  return variant === 'menu-item' ? (
+    <Menu.Item leftSection={icon} onClick={handleClick}>
+      {label}
+    </Menu.Item>
+  ) : (
+    <Button className="capitalize" {...buttonProps} leftSection={icon} onClick={handleClick}>
+      {label}
+    </Button>
+  );
+}
+
+type Props = {
+  onFinish?: VoidFunction;
+  label?: string;
+  icon?: React.ReactNode;
+} & (
+  | { variant?: 'menu-item'; buttonProps?: never }
+  | { variant?: 'button'; buttonProps: Omit<ButtonProps, 'children' | 'icon' | 'onClick'> }
+);
+
+export const VaultStorageDowngrade = () => {
+  const dialog = useDialogContext();
+  const handleClose = dialog.onClose;
+  const { vault, isLoading: vaultLoading } = useQueryVault();
+  const { items, isLoading: loadingVaultItems, pagination } = useQueryVaultItems();
+  const shownItems = items.filter((i) => !!i.coverImageUrl).slice(0, 3);
+
+  return (
+    <Modal {...dialog} size="md" title="Civitai Vault" radius="md">
+      {vaultLoading || loadingVaultItems ? (
+        <div className="flex items-center justify-center p-4">
+          <Loader />
+        </div>
+      ) : (
+        <div className="flex flex-col items-start gap-4">
+          <div className="flex w-full flex-nowrap justify-center gap-2">
+            {shownItems.map((item) => (
+              <Image
+                key={item.id}
+                src={item.coverImageUrl}
+                alt="Model Image"
+                radius="lg"
+                w={100}
+                h={100}
+              />
+            ))}
+          </div>
+          <div className="flex flex-col gap-0">
+            <Text align="center">
+              You have{' '}
+              <Text component="span" fw="bold">
+                {formatKBytes(vault?.usedStorageKb ?? 0)}
+              </Text>{' '}
+              of storage used and{' '}
+              <Text component="span" fw="bold">
+                {pagination?.totalItems?.toLocaleString() ?? 0} models
+              </Text>{' '}
+              stored on your Vault. Canceling this membership may reduce your available Vault
+              storage, and if the new storage limit is exceeded, your Vault will be frozen.
+            </Text>
+            <Text c="dimmed" align="center">
+              You will have a 7 day grace period to download models from your Vault if it becomes
+              frozen.
+            </Text>
+          </div>
+
+          <div className="flex w-full flex-nowrap justify-center gap-2">
+            <Link href="/user/vault" passHref legacyBehavior>
+              <Button component="a" onClick={handleClose} radius="xl">
+                Go to my Vault
+              </Button>
+            </Link>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+};

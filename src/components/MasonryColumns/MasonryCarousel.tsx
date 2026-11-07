@@ -1,0 +1,87 @@
+import type { MasonryRenderItemProps } from '~/components/MasonryColumns/masonry.types';
+import { useMasonryContext } from '~/components/MasonryColumns/MasonryProvider';
+import { Embla } from '~/components/EmblaCarousel/EmblaCarousel';
+import clsx from 'clsx';
+
+type Props<TData> = {
+  data: TData[];
+  render: React.ComponentType<
+    Omit<MasonryRenderItemProps<TData>, 'width' | 'height'> & { height?: number }
+  >;
+  extra?: React.ReactNode;
+  height?: number;
+  itemId?: (data: TData) => string | number;
+  id?: string | number;
+  empty?: React.ReactNode;
+  itemWrapperProps?: React.HTMLAttributes<HTMLDivElement>;
+  viewportClassName?: string;
+};
+
+export function MasonryCarousel<TData>({
+  data,
+  render: RenderComponent,
+  extra,
+  height,
+  itemId,
+  id,
+  empty,
+  itemWrapperProps,
+  viewportClassName,
+}: Props<TData>) {
+  const { columnCount, columnWidth, maxSingleColumnWidth } = useMasonryContext();
+
+  const totalItems = data.length + (extra ? 1 : 0);
+
+  return data.length ? (
+    <Embla
+      key={id}
+      // Allowance matches the page gutter (left) and full bleed (top); the layer hangs hats into it.
+      hatLayer
+      className={clsx(
+        '[--event-decoration-allowance-top:36px] [--event-decoration-allowance:16px] [--event-decoration-grow:1] md:[--event-decoration-allowance:36px]',
+        viewportClassName
+      )}
+      align={totalItems <= columnCount ? 'start' : 'end'}
+      withControls={totalItems > columnCount ? true : false}
+      slidesToScroll={columnCount}
+      controlSize={32}
+      // height={columnCount === 1 ? maxSingleColumnWidth : '100%'}
+      loop
+      style={{
+        width: columnCount === 1 ? maxSingleColumnWidth : '100%',
+        maxWidth: '100%',
+        margin: '0 auto',
+        minHeight: height,
+      }}
+    >
+      <Embla.Viewport>
+        <Embla.Container className="-ml-4 flex">
+          {data.map((item, index) => {
+            const key = itemId ? itemId(item) : index;
+            return (
+              <Embla.Slide
+                {...itemWrapperProps}
+                key={key}
+                id={key.toString()}
+                index={index}
+                className={clsx('pl-4', columnCount > 1 ? 'flex-[0_0_336px]' : 'flex-[0_0_100%]')}
+              >
+                <RenderComponent index={index} data={item} height={height} />
+              </Embla.Slide>
+            );
+          })}
+          {extra && (
+            <Embla.Slide
+              index={data.length}
+              className={clsx('pl-4', columnCount > 1 ? 'flex-[0_0_336px]' : 'flex-[0_0_100%]')}
+            >
+              {extra}
+            </Embla.Slide>
+          )}
+        </Embla.Container>
+      </Embla.Viewport>
+    </Embla>
+  ) : (
+    <div style={{ height: columnWidth }}>{empty}</div>
+  );
+}

@@ -1,0 +1,406 @@
+import * as z from 'zod';
+import type { BuzzAccountType, BuzzApiAccountType } from '~/shared/constants/buzz.constants';
+import {
+  BuzzTypes,
+  TransactionType,
+  buzzAccountTypes,
+  buzzApiAccountTypes,
+  buzzConstants,
+  buzzSpendTypes,
+} from '~/shared/constants/buzz.constants';
+import { constants } from '~/server/common/constants';
+import { formatDate } from '~/utils/date-helpers';
+import { coerceUtcDate } from '~/utils/zod-helpers';
+
+const buzzAccountTypeFromApiValueSchema = z
+  .enum([...buzzApiAccountTypes, ...buzzApiAccountTypes.map((type) => type.toLowerCase())])
+  .transform((type) => BuzzTypes.toClientType(type as BuzzApiAccountType));
+
+export const buzzServiceDate = coerceUtcDate();
+
+export function preprocessAccountType(value: unknown) {
+  return typeof value === 'string' ? value?.toLowerCase() : undefined;
+}
+
+export type GetUserBuzzAccountSchema = z.infer<typeof getUserBuzzAccountSchema>;
+export const getUserBuzzAccountSchema = z.object({
+  // This is the user id
+  accountId: z.number().min(0),
+  accountType: z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes).optional()),
+  accountTypes: z.array(z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes))).optional(),
+});
+
+export type GetEarnPotentialSchema = z.infer<typeof getEarnPotentialSchema>;
+export const getEarnPotentialSchema = z.object({
+  userId: z.number().min(0).optional(),
+  username: z.string().optional(),
+});
+
+export type GetUserBuzzTransactionsSchema = z.infer<typeof getUserBuzzTransactionsSchema>;
+export const getUserBuzzTransactionsSchema = z.object({
+  // accountId: z.number(),
+  type: z.enum(TransactionType).optional(),
+  cursor: z.date().optional(),
+  start: z.date().nullish(),
+  end: z.date().nullish(),
+  limit: z.number().min(1).max(200).optional(),
+  descending: z.boolean().optional(),
+  accountType: z.enum(buzzAccountTypes).optional(),
+});
+
+const userTransactionFilters = {
+  type: z.enum(TransactionType).optional(),
+  start: z.date(),
+  end: z.date(),
+  accountTypes: z
+    .array(z.enum(buzzSpendTypes))
+    .min(1)
+    .default([...buzzSpendTypes]),
+};
+
+export type GetUserBuzzTransactionsMultiSchema = z.infer<typeof getUserBuzzTransactionsMultiSchema>;
+export const getUserBuzzTransactionsMultiSchema = z.object({
+  ...userTransactionFilters,
+  // `date|transactionId` — the sort key needs the tie-break, since bursts of
+  // generation transactions routinely share a second.
+  cursor: z.string().optional(),
+  limit: z.number().int().min(1).max(200).optional(),
+});
+
+export type ExportUserBuzzTransactionsSchema = z.infer<typeof exportUserBuzzTransactionsSchema>;
+export const exportUserBuzzTransactionsSchema = z.object(userTransactionFilters);
+
+export const buzzTransactionDetails = z
+  .object({
+    user: z.string().optional(),
+    entityId: z.number().optional(),
+    entityType: z.string().optional(),
+    url: z.string().optional(),
+    toAccountType: z.enum(buzzAccountTypes).optional(),
+  })
+  .passthrough();
+
+export type BuzzTransactionDetails = z.infer<typeof buzzTransactionDetails>;
+
+// export type GetBuzzTransactionResponse = z.infer<typeof getBuzzTransactionResponse>;
+export const getBuzzTransactionResponse = z.object({
+  date: buzzServiceDate,
+  // The buzz service returns a NAME for the transaction types it knows and the raw enum NUMBER for the
+  // ones it doesn't — LicenseFee (27) and AppAuthorFee (28) are the live cases. ClickHouse spells
+  // its unnamed members differently; see `fromClickhouseTransactionType`. Collapsing every numeric
+  // value to Tip labelled each daily license-fee payout as "Tip" on the Buzz Dashboard, which is all
+  // a fee-earning creator saw.
+  type: z.any().transform((value): TransactionType => {
+    const numeric = /^\d+$/.test(String(value)) ? Number(value) : null;
+    if (numeric === null) return TransactionType[value as keyof typeof TransactionType];
+    // Reverse-mapped name exists => it's a real enum value. Unknown numbers keep the old Tip fallback
+    // rather than rendering blank.
+    return TransactionType[numeric] != null ? numeric : TransactionType.Tip;
+  }),
+  fromAccountId: z.coerce.number(),
+  toAccountId: z.coerce.number(),
+  fromAccountType: z.preprocess(preprocessAccountType, buzzAccountTypeFromApiValueSchema),
+  toAccountType: z.preprocess(preprocessAccountType, buzzAccountTypeFromApiValueSchema),
+  amount: z.coerce.number(),
+  description: z.coerce.string().nullish(),
+  details: buzzTransactionDetails.nullish(),
+  externalTransactionId: z.string().nullish(),
+});
+
+export type GetUserBuzzTransactionsResponse = z.infer<typeof getUserBuzzTransactionsResponse>;
+export const getUserBuzzTransactionsResponse = z.object({
+  cursor: buzzServiceDate.nullish(),
+  transactions: getBuzzTransactionResponse.array(),
+});
+
+export const buzzTransactionSchema = z.object({
+  // To user id (0 is central bank)
+  fromAccountType: z.enum(buzzAccountTypes).optional(),
+  toAccountType: z.enum(buzzAccountTypes).optional(),
+  toAccountId: z.number().optional(),
+  type: z.enum(TransactionType),
+  amount: z.number().min(1),
+  description: z.string().trim().max(100).nonempty().nullish(),
+  details: z.looseObject({}).nullish(),
+  entityId: z.number().optional(),
+  entityType: z.string().optional(),
+  externalTransactionId: z.string().optional(),
+});
+
+export type CreateBuzzTransactionInput = z.infer<typeof createBuzzTransactionInput>;
+export const createBuzzTransactionInput = buzzTransactionSchema.superRefine((data, ctx) => {
+  if (
+    data.type === TransactionType.Tip &&
+    ((data.entityId && !data.entityType) || (!data.entityId && data.entityType))
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'Please provide both the entityId and entityType',
+      path: ['entityId'],
+    });
+    ctx.addIssue({
+      code: 'custom',
+      message: 'Please provide both the entityId and entityType',
+      path: ['entityType'],
+    });
+  }
+});
+
+export type CompleteStripeBuzzPurchaseTransactionInput = z.infer<
+  typeof completeStripeBuzzPurchaseTransactionInput
+>;
+
+export const completeStripeBuzzPurchaseTransactionInput = z.object({
+  amount: z.number().min(1),
+  stripePaymentIntentId: z.string(),
+  details: z.object({}).passthrough().nullish(),
+});
+
+export type UserBuzzTransactionInputSchema = z.infer<typeof userBuzzTransactionInputSchema>;
+
+export const userBuzzTransactionInputSchema = buzzTransactionSchema
+  .omit({
+    type: true,
+  })
+  .check((ctx) => {
+    if (
+      ctx.value.entityType &&
+      ['Image', 'Model', 'Article', 'ComicProject', 'ComicChapter', 'Model3D'].includes(
+        ctx.value.entityType
+      ) &&
+      ctx.value.amount > buzzConstants.maxTipAmount
+    ) {
+      ctx.issues.push({
+        code: 'custom',
+        message: `Your generosity abounds. Unfortunately you're attempting to tip more buzz than allowed in a single transaction`,
+        input: ctx.value,
+      });
+    }
+
+    if (
+      (ctx.value.entityId && !ctx.value.entityType) ||
+      (!ctx.value.entityId && ctx.value.entityType)
+    ) {
+      ctx.issues.push({
+        code: 'custom',
+        message: 'Please provide both the entityId and entityType',
+        input: ctx.value,
+        path: ['entityId'],
+      });
+      ctx.issues.push({
+        code: 'custom',
+        message: 'Please provide both the entityId and entityType',
+        input: ctx.value,
+        path: ['entityType'],
+      });
+    }
+  });
+
+export const getBuzzAccountSchema = z.object({
+  accountId: z.number(),
+  accountType: z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes).optional()),
+  accountTypes: z.array(z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes))).optional(),
+});
+
+export type GetBuzzAccountSchema = z.infer<typeof getBuzzAccountSchema>;
+
+export const getBuzzAccountTransactionsSchema =
+  getUserBuzzTransactionsSchema.merge(getBuzzAccountSchema);
+export type GetBuzzAccountTransactionsSchema = z.infer<typeof getBuzzAccountTransactionsSchema>;
+
+export const compensationSources = ['compensation', 'licenseFee', 'tip'] as const;
+export type CompensationSource = (typeof compensationSources)[number];
+
+export type GetDailyBuzzCompensationInput = z.infer<typeof getDailyBuzzCompensationInput>;
+export const getDailyBuzzCompensationInput = z.object({
+  userId: z.number().optional(),
+  date: z.coerce.date(),
+  accountType: z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes)).optional(),
+  source: z.enum(compensationSources).default('compensation'),
+});
+
+// The pools the block API exposes: the three spendable types plus the creator
+// payout pools. `red` (disabled) and `club` (legacy) are deliberately excluded.
+export const blockBuzzAccountTypes = [
+  'yellow',
+  'blue',
+  'green',
+  'creatorProgramBank',
+  'creatorProgramBankGreen',
+  'cashPending',
+  'cashSettled',
+] as const satisfies readonly BuzzAccountType[];
+
+const transactionTypeNames = Object.keys(TransactionType).filter((key) =>
+  Number.isNaN(Number(key))
+) as [keyof typeof TransactionType, ...(keyof typeof TransactionType)[]];
+
+// tRPC input contracts for the block-token-authed buzz self-read MUTATIONS
+// (host-mediated page-block bridges — blocks.router `getMyBuzz{Transactions,
+// Accounts}` / `getMyDailyCompensation`). Each carries the page's block token;
+// the account/user is SELF-BOUND server-side off `claims.sub` (never these
+// inputs). `type` takes the TransactionType NAME ("Tip"), not the numeric value.
+// Dates use `z.coerce.date` so an ISO string OR a Date from the host bridge both
+// parse; `limit` is a real number (mutation body, not a query string).
+export type GetMyBuzzTransactionsInput = z.infer<typeof getMyBuzzTransactionsInput>;
+export const getMyBuzzTransactionsInput = z.object({
+  blockToken: z.string().min(1),
+  accountType: z.enum(blockBuzzAccountTypes).default('yellow'),
+  type: z.enum(transactionTypeNames).optional(),
+  cursor: z.coerce.date().optional(),
+  start: z.coerce.date().optional(),
+  end: z.coerce.date().optional(),
+  limit: z.number().int().min(1).max(200).default(50),
+});
+
+export type GetMyBuzzAccountsInput = z.infer<typeof getMyBuzzAccountsInput>;
+export const getMyBuzzAccountsInput = z.object({
+  blockToken: z.string().min(1),
+});
+
+export type GetMyDailyCompensationInput = z.infer<typeof getMyDailyCompensationInput>;
+export const getMyDailyCompensationInput = z.object({
+  blockToken: z.string().min(1),
+  date: z.coerce.date(),
+  source: z.enum(compensationSources).default('compensation'),
+  accountType: z.enum(blockBuzzAccountTypes).optional(),
+});
+
+export type ClaimWatchedAdRewardInput = z.infer<typeof claimWatchedAdRewardSchema>;
+export const claimWatchedAdRewardSchema = z.object({ key: z.string() });
+
+export type GetTransactionsReportSchema = z.infer<typeof getTransactionsReportSchema>;
+export const getTransactionsReportSchema = z.object({
+  accountType: z.enum(buzzSpendTypes).default('yellow'),
+  window: z.enum(['hour', 'day', 'week', 'month']).default('hour'),
+});
+
+export type GetTransactionsReportResultSchema = z.infer<typeof getTransactionsReportResultSchema>;
+export const getTransactionsReportResultSchema = z.array(
+  z.object({
+    date: buzzServiceDate.transform((val) => formatDate(val, 'YYYY-MM-DDTHH:mm:ss', true)),
+    start: buzzServiceDate.transform((val) => formatDate(val, 'YYYY-MM-DDTHH:mm:ss', true)),
+    end: buzzServiceDate.transform((val) => formatDate(val, 'YYYY-MM-DDTHH:mm:ss', true)),
+    accounts: z.array(
+      z.object({
+        accountType: buzzAccountTypeFromApiValueSchema,
+        spent: z.number(),
+        gained: z.number(),
+      })
+    ),
+  })
+);
+
+export type GetBuzzMovementsBetweenAccounts = z.infer<typeof getBuzzMovementsBetweenAccounts>;
+export const getBuzzMovementsBetweenAccounts = z.object({
+  accountId: z.number().min(0),
+  accountType: z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes).optional()),
+  counterPartyAccountId: z.number().min(0),
+  counterPartyAccountType: z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes).optional()),
+});
+
+export type GetBuzzMovementsBetweenAccountsResponse = z.infer<
+  typeof getBuzzMovementsBetweenAccountsResponse
+>;
+export const getBuzzMovementsBetweenAccountsResponse = z.object({
+  // This is the user id
+  accountType: z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes).optional()),
+  accountId: z.number(),
+  counterPartyAccountType: z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes).optional()),
+  counterPartyAccountId: z.number(),
+  inwardsBalance: z.number(),
+  outwardsBalance: z.number(),
+  totalBalance: z.number(),
+});
+
+// Multi-account transaction schemas
+export type CreateMultiAccountBuzzTransactionInput = z.infer<
+  typeof createMultiAccountBuzzTransactionInput
+>;
+export const createMultiAccountBuzzTransactionInput = z.object({
+  fromAccountTypes: z.array(z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes))).min(1),
+  fromAccountId: z.number().min(1),
+  toAccountType: z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes)).optional(),
+  toAccountId: z.number().min(0),
+  type: z.nativeEnum(TransactionType).optional(),
+  amount: z.number().min(1),
+  details: z.object({}).passthrough().optional(),
+  externalTransactionIdPrefix: z.string(),
+  description: z.string().trim().max(100).nonempty().nullish(),
+});
+
+// export type CreateMultiAccountBuzzTransactionResponse = z.infer<
+//   typeof createMultiAccountBuzzTransactionResponse
+// >;
+export const createMultiAccountBuzzTransactionResponse = z.object({
+  transactionIds: z.array(
+    z.object({
+      transactionId: z.string(),
+      accountType: buzzAccountTypeFromApiValueSchema,
+      amount: z.number(),
+      // The wire type (`CreateMultiTransactionResponse`) declares this REQUIRED,
+      // and omitting it here made zod strip it — so a leg the ledger reported as
+      // a duplicate of an already-occupied external id arrived indistinguishable
+      // from one that moved money, with a plausible `transactionCount` and
+      // `totalAmount` behind it. Optional rather than required because whether
+      // the service sends it on every response is unverified from here, and a
+      // required field would fail the parse for every caller of this endpoint if
+      // it does not; `undefined` therefore means "not reported", never "false".
+      duplicate: z.boolean().optional(),
+    })
+  ),
+  totalAmount: z.number(),
+  transactionCount: z.number(),
+});
+
+export type RefundMultiAccountTransactionInput = z.infer<typeof refundMultiAccountTransactionInput>;
+export const refundMultiAccountTransactionInput = z.object({
+  externalTransactionIdPrefix: z.string(),
+  description: z.string().optional(),
+  details: z.object({}).passthrough().optional(),
+});
+
+// export type RefundMultiAccountTransactionResponse = z.infer<
+//   typeof refundMultiAccountTransactionResponse
+// >;
+export const refundMultiAccountTransactionResponse = z.object({
+  refundedTransactions: z.array(
+    z.object({
+      originalTransactionId: z.string(),
+      refundTransactionId: z.string(),
+      accountType: buzzAccountTypeFromApiValueSchema,
+      amount: z.number(),
+      originalExternalTransactionId: z.string(),
+    })
+  ),
+  totalRefunded: z.number(),
+  externalTransactionIdPrefix: z.string(),
+});
+
+export type PreviewMultiAccountTransactionInput = z.infer<
+  typeof previewMultiAccountTransactionInput
+>;
+export const previewMultiAccountTransactionInput = z.object({
+  fromAccountId: z.number().min(1),
+  fromAccountTypes: z.array(z.preprocess(preprocessAccountType, z.enum(buzzAccountTypes))).min(1),
+  amount: z.number().min(1),
+});
+
+// export type PreviewMultiAccountTransactionResponse = z.infer<
+//   typeof previewMultiAccountTransactionResponse
+// >;
+export const previewMultiAccountTransactionResponse = z.object({
+  isPossible: z.boolean(),
+  totalAvailableBalance: z.number(),
+  requestedAmount: z.number(),
+  accountCharges: z.array(
+    z.object({
+      accountType: buzzAccountTypeFromApiValueSchema,
+      availableBalance: z.number(),
+      chargeAmount: z.number(),
+      remainingBalance: z.number(),
+    })
+  ),
+  remainingAmount: z.number(),
+  message: z.string(),
+});

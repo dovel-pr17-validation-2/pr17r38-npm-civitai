@@ -1,0 +1,695 @@
+import * as z from 'zod';
+import { imageSelectProfileFilterSchema } from '~/components/ImageGeneration/GenerationForm/resource-select.types';
+import { SearchIndexEntityTypes } from '~/components/Search/parsers/base';
+import { constants } from '~/server/common/constants';
+import {
+  baseQuerySchema,
+  infiniteQuerySchema,
+  keysetCursorSchema,
+  paginationSchema,
+  periodModeSchema,
+} from '~/server/schema/base.schema';
+import { allBrowsingLevelsFlag } from '~/shared/constants/browsingLevel.constants';
+import { hubLimits, hubSourceExclusionSchema } from '~/server/schema/user-hub.schema';
+import {
+  ImageGenerationProcess,
+  MediaType,
+  MetricTimeframe,
+  ReportStatus,
+  ReviewReactions,
+} from '~/shared/utils/prisma/enums';
+import { zc } from '~/utils/schema-helpers';
+import { ImageSort, NsfwLevel, ViolationType } from './../common/enums';
+import { usernameSchema } from '~/shared/zod/username.schema';
+import { stripBlockProvenanceMetadata } from '~/shared/utils/block-provenance-metadata';
+import { jumpToMonthSchema } from '~/shared/utils/jump-to-month';
+
+const stringToNumber = z.coerce.number().optional();
+
+const undefinedString = z
+  .preprocess((value) => (value ? value : undefined), z.string().optional())
+  .optional();
+
+export type ImageEntityType = (typeof imageEntities)[number];
+const imageEntities = ['Bounty', 'BountyEntry', 'User', 'Post', 'Article'] as const;
+const imageEntitiesSchema = z.enum(imageEntities);
+// export type ImageEntityType = (typeof ImageEntityType)[keyof typeof ImageEntityType];
+
+export type ComfyMetaSchema = z.infer<typeof comfyMetaSchema>;
+export const comfyMetaSchema = z
+  .object({
+    prompt: z.looseObject({}),
+    workflow: z.looseObject({
+      nodes: z.looseObject({}).array().optional(),
+    }),
+  })
+  .partial();
+
+// TODO do we need mediaUrl in here to confirm?
+export const externalMetaSchema = z.object({
+  /**
+   * Name and/or homepage for your service
+   */
+  source: z
+    .object({
+      /**
+       * Name of your service
+       */
+      name: z.string().optional(),
+      /**
+       * Your service's home URL
+       */
+      homepage: z.url().optional(),
+    })
+    .optional(),
+  /**
+   * Key-value object for custom parameters specific to your service.
+   * Limited to 10 props
+   */
+  details: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+  // details: z.record(z.string(), z.coerce.string()).optional(),
+  /**
+   * Link back to the URL used to create the media
+   */
+  createUrl: z.url().optional(),
+  /**
+   * URL to link back to the source of the media
+   */
+  referenceUrl: z.url().optional(),
+});
+export type ExternalMetaSchema = z.infer<typeof externalMetaSchema>;
+
+export const baseImageMetaSchema = z.object({
+  prompt: z.string().optional(),
+  negativePrompt: z.string().optional(),
+  cfgScale: z.coerce.number().optional(),
+  steps: z.coerce.number().optional(),
+  sampler: z.string().optional(),
+  seed: z.coerce.number().optional(),
+  clipSkip: z.coerce.number().optional(),
+});
+
+export const imageMetadataResourceSchema = z.object({
+  type: z.string(),
+  name: z.string().optional(),
+  weight: z.number().optional(),
+  hash: z.string().optional(),
+  unmatched: z.boolean().optional(),
+});
+
+export type UnmatchedResource = z.infer<typeof unmatchedResourceSchema>;
+export const unmatchedResourceSchema = z.object({
+  type: z.string().optional(),
+  name: z.string(),
+  hash: z.string(),
+});
+
+export const additionalResourceSchema = z.object({
+  name: z.string().optional(),
+  type: z.string().optional(),
+  strength: z.number().optional(),
+  strengthClip: z.number().optional(),
+  air: z.string().optional(),
+});
+
+export type CivitaiResource = z.infer<typeof civitaiResourceSchema>;
+export const civitaiResourceSchema = z.object({
+  type: z.string().optional(),
+  weight: z.number().optional(),
+  modelVersionId: z.number(),
+});
+
+export const imageGenerationSchema = z.object({
+  baseModel: z.string().optional(),
+  prompt: undefinedString,
+  negativePrompt: undefinedString,
+  cfgScale: stringToNumber,
+  steps: stringToNumber,
+  sampler: undefinedString,
+  seed: stringToNumber,
+  hashes: z.record(z.string(), z.string()).optional(),
+  unmatchedResources: z.array(unmatchedResourceSchema).optional(),
+  clipSkip: z.coerce.number().optional(),
+  'Clip skip': z.coerce.number().optional(),
+  comfy: z.union([z.string().optional(), comfyMetaSchema.optional()]).optional(), // stored as stringified JSON
+  external: externalMetaSchema.optional(),
+  effects: z.record(z.string(), z.any()).optional(),
+  engine: z.string().optional(),
+  version: z.string().optional(),
+  process: z.string().optional(),
+  type: z.string().optional(),
+  workflow: z.string().optional(),
+  resources: imageMetadataResourceSchema.array().optional(),
+  additionalResources: additionalResourceSchema.array().optional(),
+  civitaiResources: civitaiResourceSchema.array().optional(),
+  extra: z
+    .object({
+      remixOfId: z.number().optional(),
+      /**
+       * Signed at submit, baked into the output file by the orchestrator, read
+       * back here. Declared so the parser keeps it; the upload path verifies it
+       * and then drops it in favour of `sourceImageIds`.
+       */
+      provenance: z.string().optional(),
+      /**
+       * Images this one was actually generated from. Server-written only — a
+       * client-supplied value is discarded on the way in. Absent means unknown,
+       * never "not a remix".
+       */
+      sourceImageIds: z.number().array().optional(),
+    })
+    .optional()
+    .catch(undefined),
+});
+
+export const imageMetaSchema = z.looseObject({ ...imageGenerationSchema.shape });
+export const imageMetaOutput = imageGenerationSchema
+  .extend({
+    comfy: z
+      .preprocess((value) => {
+        if (typeof value !== 'string') return value;
+        try {
+          let rVal = value.replace('"workflow": undefined', '"workflow": {}');
+          rVal = rVal.replace('[NaN]', '[]');
+          return JSON.parse(rVal);
+        } catch {
+          return {};
+        }
+      }, comfyMetaSchema.optional())
+      .optional(),
+    controlNets: z.string().array().optional(),
+    software: z.coerce.string().optional(),
+    civitaiResources: civitaiResourceSchema.array().optional(),
+    process: z.string().optional(),
+    type: z.string().optional(),
+  })
+  .passthrough();
+
+export type FaceDetectionInput = z.infer<typeof faceDetectionSchema>;
+export const faceDetectionSchema = z.object({
+  age: z.number(),
+  emotions: z.array(z.object({ emotion: z.string(), score: z.number() })),
+  gender: z.enum(['male', 'female', 'unknown']),
+  genderConfidence: z.number().optional().default(0),
+  live: z.number(),
+  real: z.number(),
+});
+
+export type ImageAnalysisInput = z.infer<typeof imageAnalysisSchema>;
+export const imageAnalysisSchema = z.object({
+  drawing: z.number(),
+  hentai: z.number(),
+  neutral: z.number(),
+  porn: z.number(),
+  sexy: z.number(),
+  faces: z.array(faceDetectionSchema).optional(),
+});
+
+// #region [Image Resource]
+export type ImageResourceUpsertInput = z.infer<typeof imageResourceUpsertSchema>;
+export const imageResourceUpsertSchema = z.object({
+  id: z.number().optional(),
+  modelVersionId: z.number().optional(),
+  name: z.string().optional(),
+  detected: z.boolean().optional(),
+});
+export const isImageResource = (
+  entity: ImageResourceUpsertInput
+): entity is Omit<ImageResourceUpsertInput, 'id'> & { id: number } => !!entity.id;
+export const isNotImageResource = (
+  entity: ImageResourceUpsertInput
+): entity is Omit<ImageResourceUpsertInput, 'id'> & { id: undefined } => !entity.id;
+// #endregion
+
+export type ImageSchema = z.infer<typeof imageSchema>;
+export const imageSchema = z.object({
+  id: z.number().optional(),
+  name: z.string().nullish(),
+  url: z.string().uuid('One of the files did not upload properly, please try again'),
+  meta: z
+    .preprocess((value) => {
+      if (!value || typeof value !== 'object' || !Object.keys(value).length) {
+        return null;
+      }
+      return value;
+    }, imageMetaSchema.nullish())
+    .nullish(),
+  hash: z.string().nullish(),
+  height: z.number().nullish(),
+  width: z.number().nullish(),
+  mimeType: z.string().optional(),
+  sizeKB: z.number().optional(),
+  postId: z.number().nullish(),
+  modelVersionId: z.number().nullish(),
+  type: z.enum(MediaType).default(MediaType.image),
+  metadata: z
+    .record(z.string(), z.any())
+    .transform((metadata) => stripBlockProvenanceMetadata(metadata))
+    .optional(),
+  externalDetailsUrl: z.url().optional(),
+  toolIds: z.number().array().optional(),
+  techniqueIds: z.number().array().optional(),
+  index: z.number().optional(),
+});
+
+/**
+ * The image fields a client may send. `id`, `postId` and `index` are server-owned `Image`
+ * columns: server code decides an image's row id, the post it belongs to and its position
+ * there, and assigns them explicitly at the write. Route inputs use this (or
+ * `imageReferenceInputSchema`); `imageSchema` is for server-internal callers.
+ */
+export const imageInputSchema = imageSchema.omit({ id: true, postId: true, index: true });
+export type ImageInput = z.infer<typeof imageInputSchema>;
+
+/**
+ * `imageInputSchema` plus an optional `id` naming an EXISTING row, for routes that let a
+ * client keep or link an image it already has (a cover it is re-saving, a bounty image it is
+ * keeping). The route decides whether the caller may use that row; the id is never written
+ * as a new row's primary key.
+ */
+export const imageReferenceInputSchema = imageInputSchema.extend({
+  id: z.number().int().positive().optional(),
+});
+export type ImageReferenceInput = z.infer<typeof imageReferenceInputSchema>;
+
+/** A client-proposed position within a post. */
+export const imagePositionSchema = z.number().int().min(0);
+
+export const comfylessImageSchema = imageReferenceInputSchema.extend({
+  meta: imageGenerationSchema.omit({ comfy: true }).nullish(),
+});
+
+export type ImageMetaProps = z.infer<typeof imageMetaSchema> & Record<string, unknown>;
+
+export const imageUpdateSchema = z.object({
+  id: z.number(),
+  name: z.string().optional(),
+  url: z
+    .string()
+    .url()
+    .or(z.string().uuid('One of the files did not upload properly, please try again').optional())
+    .optional(),
+  needsReview: z.string().nullish(),
+});
+export type ImageUpdateSchema = z.infer<typeof imageUpdateSchema>;
+
+export const imageModerationSchema = z.object({
+  ids: z.number().array(),
+  reviewAction: z.enum(['unblock', 'block']),
+  violationType: z.enum(ViolationType).optional(),
+  violationDetails: z.string().optional(),
+});
+export type ImageModerationSchema = z.infer<typeof imageModerationSchema>;
+export type ImageModerationUnblockSchema = {
+  ids: number[];
+  moderatorId?: number;
+  removeMinorFlag?: boolean;
+};
+export type ImageModerationBlockSchema = {
+  ids?: number[];
+  userId?: number;
+  include?: Array<'user-notification' | 'phash-block'>;
+  moderatorId?: number;
+};
+
+export type GetModelVersionImagesSchema = z.infer<typeof getModelVersionImageSchema>;
+export const getModelVersionImageSchema = z.object({
+  modelVersionId: z.number(),
+});
+
+export type GetReviewImagesSchema = z.infer<typeof getReviewImagesSchema>;
+export const getReviewImagesSchema = z.object({
+  reviewId: z.number(),
+});
+
+export type UpdateImageInput = z.infer<typeof updateImageSchema>;
+export const updateImageSchema = z.object({
+  id: z.number(),
+  meta: z
+    .preprocess((value) => {
+      if (typeof value !== 'object') return null;
+      if (value && !Object.keys(value).length) return null;
+      return value;
+    }, imageMetaSchema.nullish())
+    .nullish(),
+  hideMeta: z.boolean().optional(),
+  resources: z.array(imageResourceUpsertSchema).optional(),
+});
+
+export type IngestImageInput = z.infer<typeof ingestImageSchema>;
+export const ingestImageSchema = z.object({
+  id: z.number(),
+  url: z.string(),
+  type: z.enum(MediaType).optional(),
+  height: z.coerce.number().nullish(),
+  width: z.coerce.number().nullish(),
+  prompt: z.string().nullish(),
+});
+
+const imageInclude = z.enum([
+  'tags',
+  'count',
+  'cosmetics',
+  'report',
+  'meta',
+  'tagIds',
+  'profilePictures',
+  'metaSelect',
+]);
+export type ImageInclude = z.infer<typeof imageInclude>;
+export type GetInfiniteImagesInput = z.input<typeof getInfiniteImagesSchema>;
+export type GetInfiniteImagesOutput = z.output<typeof getInfiniteImagesSchema>;
+
+// TODO try using ".strict()", fix "authed" as unrecognized key
+
+// Params the search index physically can't serve — these must use the DB
+// (getAllImages). The decision is server-side: there is no client `useIndex`
+// flag, so a client can't force the expensive un-indexed path on a broad query.
+// Correctness-critical filters (wrong results if the index ignored them):
+// - postId/postIds: specific post lookups (~2ms covered-index in PG; also create
+//   unique cache keys in the index that hurt cache hit rate)
+// - collectionId: requires relational joins through CollectionItem
+// - reactions: per-user reaction data isn't indexed (needs ImageReaction subquery)
+// - imageId: not a search-index filter
+// - ids: the index feed builder never applies it, so an ids batch would return the global feed
+// - bare modelId: the index keys on modelVersionId / postedToId, not modelId, so
+//   a modelId-only query would silently return the global feed (matches the
+//   /api/v1/images legacy-method logic)
+// Ordering-only:
+// - prioritizedUserIds: DB-level user prioritization (TODO in getAllImagesIndex).
+//   Only forces the DB when scoped to a model (its sole legit use — the model
+//   showcase carousel, which always pairs it with modelVersionId). Sent alone it
+//   degrades to index ordering rather than acting as a broad-feed DB escape hatch.
+// Freshness, not correctness:
+// - publishedOnly paired with userId: the "pick something of mine to submit"
+//   modals (remix gallery, challenge, add-to-collection). The index can serve
+//   this query, but not in time: measured on prod 2026-08-27, an image is
+//   missing from metrics_images_v1 for 10-30 minutes after it is published,
+//   while it is Scanned and carries an nsfwLevel within the first minute. So
+//   someone posts an image, opens the picker to submit it, and the one image
+//   they came to submit is the one that isn't there. No browse feed sends
+//   publishedOnly — it exists only because those mutations refuse an
+//   unpublished image — so this routes the three pickers and nothing else.
+//   Paired with userId for the same reason prioritizedUserIds is paired with a
+//   model: alone it would be a broad-feed DB escape hatch anyone could type
+//   into a URL. Both halves ARE URL params, so pairing narrows the hatch rather
+//   than closing it — getInfiniteImagesHandler additionally withdraws
+//   `publishedOnly` unless the userId is the caller's own, which is what closes
+//   it. Do not read the pairing here as the whole guard.
+//
+//   Three accepted differences, none of them silent once you have read this.
+//   The DB path is NARROWER than the index for own content in three places, and
+//   in each the submit mutations refuse the row anyway (remix-gallery.service
+//   re-checks publishedAt, ingestion and needsReview), so nothing submittable is
+//   lost: own unscanned (`nsfwLevel = 0`), own `acceptableMinor`, and own
+//   `needsReview`. The first is the one to know about — between publish and the
+//   level landing, the picker shows nothing where the index showed the row. That
+//   window is under a minute (over 99% of images are Scanned and levelled inside
+//   one), against the 10-30 minutes this change removes.
+//   And `getAllImages` orders `Newest` by `i."id" DESC`, i.e. by UPLOAD, while the
+//   index orders by `sortAt` = GREATEST(publishedAt, scannedAt, createdAt). For
+//   the case this exists for — post, then submit — they agree. For "publish a
+//   months-old draft, then submit it" they do not, and the draft lands at its
+//   upload rank rather than first.
+//
+//   Cost, measured on the prod replica 2026-08-27: 0.83-1.03 ms at a wide
+//   browsing level, 14-82 ms at browsingLevel=1, where the backward index walk
+//   discards thousands of rows before 51 survive. Plan is an index scan backward
+//   on image_userid_id_idx in every case.
+//
+// A hub can only be served from the index, so this list is also the set `hubId`
+// cannot be combined with. Both the dispatcher and that rejection read it here so
+// the two cannot drift.
+export function requiresImageDbPath(input: {
+  postId?: number | null;
+  postIds?: number[] | null;
+  collectionId?: number | null;
+  reactions?: unknown[] | null;
+  imageId?: number | null;
+  ids?: number[] | null;
+  modelId?: number | null;
+  modelVersionId?: number | null;
+  prioritizedUserIds?: number[] | null;
+  publishedOnly?: boolean | null;
+  userId?: number | null;
+  hidden?: boolean | null;
+}) {
+  return (
+    !!input.hidden ||
+    !!input.postId ||
+    !!input.postIds?.length ||
+    !!input.collectionId ||
+    !!input.reactions?.length ||
+    !!input.imageId ||
+    !!input.ids?.length ||
+    (!!input.modelId && !input.modelVersionId) ||
+    (!!input.prioritizedUserIds?.length && (!!input.modelId || !!input.modelVersionId)) ||
+    (!!input.publishedOnly && !!input.userId)
+  );
+}
+
+// faux-extends imagesQueryParamSchema output type
+export const getInfiniteImagesSchema = baseQuerySchema
+  .extend({
+    // - from imagesQueryParamSchema
+    baseModels: z.string().array().optional(),
+    collectionId: z.number().optional(),
+    collectionTagId: z.number().optional(),
+    hideAutoResources: z.boolean().optional(),
+    hideManualResources: z.boolean().optional(),
+    followed: z.boolean().optional(),
+    fromPlatform: z.coerce.boolean().optional(),
+    hidden: z.boolean().optional(),
+    jumpTo: jumpToMonthSchema.optional(),
+    limit: z.number().min(0).max(200).default(constants.galleryFilterDefaults.limit),
+    modelId: z.number().optional(),
+    // The viewer's level before a model gallery's cap narrows `browsingLevel`. A
+    // sponsored post is served at this and the cap frozen when its host accepted.
+    preCapBrowsingLevel: z.number().int().min(0).optional(),
+    modelVersionId: z.number().optional(),
+    // Filter the gallery to posts linked to a single Model3D
+    // (Post.model3dId). Resolved server-side into a postIds prefilter so the
+    // existing image fetch path is reused unchanged.
+    model3dId: z.number().optional(),
+    notPublished: z.coerce.boolean().optional(),
+    period: z.enum(MetricTimeframe).default(constants.galleryFilterDefaults.period),
+    periodMode: periodModeSchema,
+    postId: z.number().optional(),
+    prioritizedUserIds: z.array(z.number()).optional(),
+    reactions: z.array(z.enum(ReviewReactions)).optional(),
+    // section: z.enum(imageSections),
+    scheduled: z.coerce.boolean().optional(),
+    sort: z.enum(ImageSort).default(constants.galleryFilterDefaults.sort),
+    tags: z.array(z.number()).optional(),
+    techniques: z.number().array().optional(),
+    tools: z.number().array().optional(),
+    types: z.array(z.enum(MediaType)).optional(),
+    userId: z.number().optional(),
+    username: usernameSchema.optional(),
+    // Serve a user-composed hub. The source ids are resolved server-side from
+    // this id — the client never sends them. An arbitrary client-supplied OR
+    // group would be an unbounded-cost query anyone could post.
+    hubId: z.number().optional(),
+    // Sources the VIEWER switched off for this session, on a hub they do not own.
+    // Read only as a subtraction from what `hubId` resolves to, so a forged entry
+    // narrows the forger's own feed and can widen nobody's.
+    hubExcludedSources: z.array(hubSourceExclusionSchema).max(hubLimits.sourcesPerHub).optional(),
+    // Restrict the feed to creators currently on the "new & upcoming" board. The
+    // board id is resolved server-side from this flag plus the request domain —
+    // the client never supplies a user list.
+    newCreators: z.boolean().optional(),
+    // Hide daily-challenge entries. The server resolves this to the challenge
+    // tag id and unions it into `excludedTagIds` — the client never sends tag ids.
+    hideChallenges: z.boolean().optional(),
+    // view: z.enum(['categories', 'feed']),
+    withMeta: z.boolean().default(false),
+    requiringMeta: z.boolean().optional(),
+
+    // - additional
+    cursor: keysetCursorSchema.optional(),
+    excludedTagIds: z.array(z.number()).optional(),
+    excludedUserIds: z.array(z.number()).optional(),
+    // excludedImageIds: z.array(z.number()).optional(),
+    generation: z.enum(ImageGenerationProcess).array().optional(),
+    // Raw SQL serves ids queries, so keep it bounded; sticker-book sends up to 200.
+    ids: z.array(z.number()).max(200).optional(),
+    imageId: z.number().optional(),
+    include: z.array(imageInclude).default((): ImageInclude[] => ['cosmetics']),
+    includeBaseModel: z.boolean().optional(),
+    pending: z.boolean().optional(),
+    publishedOnly: z.boolean().optional(),
+    postIds: z.number().array().optional(),
+    reviewId: z.number().optional(),
+    skip: z.number().optional(),
+    withTags: z.boolean().optional(),
+    remixOfId: z.number().optional(),
+    remixesOnly: z.boolean().optional(),
+    nonRemixesOnly: z.boolean().optional(),
+    disablePoi: z.boolean().optional(),
+    disableMinor: z.boolean().optional(),
+    // Mod only:
+    poiOnly: z.boolean().optional(),
+    minorOnly: z.boolean().optional(),
+    // Mod only: restrict a collection feed to entries still under review (CollectionItem.status = REVIEW).
+    pendingReviewOnly: z.boolean().optional(),
+    // Client-only on green: opt-in PG-13 on public feeds. Passes through the
+    // schema so the type lines up with client filter state; the server does
+    // not read it (browsing level is the authoritative cap).
+    includePG13: z.boolean().optional(),
+  })
+  .superRefine((value, ctx) => {
+    // A hub is only expressible on the index. Combined with an input that forces
+    // the DB path the request has no correct answer, so refuse it rather than
+    // serve one of the two filters and label it as the other.
+    if (value.hubId && requiresImageDbPath(value))
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['hubId'],
+        message: 'A hub feed cannot be combined with this filter',
+      });
+  })
+  .transform((value) => {
+    if (value.withTags) {
+      if (!value.include) value.include = [];
+      if (!value.include.includes('tags')) value.include.push('tags');
+    }
+    if (value.withMeta) {
+      if (!value.include) value.include = [];
+      if (!value.include.includes('meta')) value.include.push('meta');
+    }
+    return value;
+  });
+
+export type GetImageInput = z.infer<typeof getImageSchema>;
+export const getImageSchema = z.object({
+  id: z.number(),
+  // excludedTagIds: z.array(z.number()).optional(),
+  // excludedUserIds: z.array(z.number()).optional(),
+});
+
+export type RemoveImageResourceSchema = z.infer<typeof removeImageResourceSchema>;
+export const removeImageResourceSchema = z.object({
+  imageId: z.number(),
+  modelVersionId: z.number(),
+});
+
+/**
+ * Ceiling on the `entities` list `getEntitiesCoverImage` will accept.
+ *
+ * Sized off what the callers can actually produce, with room to spare. The two UI
+ * callers are a profile showcase and the notification panel; neither has a fixed
+ * ceiling of its own that this could narrow:
+ *
+ * - `addEntityToShowcase` truncates the showcase it writes to
+ *   `constants.profile.showcaseItemsLimit` (32). That is the only write path that
+ *   truncates — `userProfile.update` takes `showcaseItems` unbounded and the service
+ *   stores it as given, so a stored showcase is not guaranteed to be at or under 32.
+ * - The notification panel dedupes image ids out of a 30-per-page infinite list, so
+ *   500 is ~16 pages deep, and in practice more, since only notifications naming an
+ *   image contribute an id.
+ *
+ * Each caller clamps its own list to this before querying, so exceeding it is a caller
+ * bug rather than something a session can walk into — which matters because a refused
+ * query has no error branch in any of them.
+ *
+ * An empty array is deliberately still accepted: `getEntityCoverImage` returns [] for
+ * it, and this is a token-reachable read where that is a valid no-op.
+ */
+export const MAX_ENTITIES_COVER_IMAGE = 500;
+
+export type GetEntitiesCoverImage = z.infer<typeof getEntitiesCoverImage>;
+export const getEntitiesCoverImage = z.object({
+  entities: z
+    .array(
+      z.object({
+        entityType: z.union([z.enum(SearchIndexEntityTypes), z.enum(['ModelVersion', 'Post'])]),
+        entityId: z.number(),
+      })
+    )
+    .max(MAX_ENTITIES_COVER_IMAGE),
+});
+
+export type ScanJobsOutput = z.output<typeof scanJobsSchema>;
+export const scanJobsSchema = z.looseObject({
+  scans: z.record(z.string(), z.number()).default({}),
+  retryCount: z.number().optional(),
+});
+// .catchall(z.string());
+
+export type UpdateImageNsfwLevelOutput = z.output<typeof updateImageNsfwLevelSchema>;
+export const updateImageNsfwLevelSchema = z.object({
+  id: z.number(),
+  nsfwLevel: z.enum(NsfwLevel),
+  status: z.enum(ReportStatus).optional(),
+  reason: z.string().optional(),
+});
+
+export type ReportCsamImagesInput = z.infer<typeof reportCsamImagesSchema>;
+export const reportCsamImagesSchema = z.object({
+  imageIds: z.array(z.number()).min(1),
+});
+
+// #region [image tools]
+const baseImageToolSchema = z.object({
+  imageId: z.number(),
+  toolId: z.number(),
+});
+export type AddOrRemoveImageToolsOutput = z.output<typeof addOrRemoveImageToolsSchema>;
+export const addOrRemoveImageToolsSchema = z.object({ data: baseImageToolSchema.array() });
+
+export type UpdateImageToolsOutput = z.output<typeof updateImageToolsSchema>;
+export const updateImageToolsSchema = z.object({
+  data: baseImageToolSchema.extend({ notes: z.string().nullish() }).array(),
+});
+// #endregion
+
+// #region [image tools]
+const baseImageTechniqueSchema = z.object({
+  imageId: z.number(),
+  techniqueId: z.number(),
+});
+export type AddOrRemoveImageTechniquesOutput = z.output<typeof addOrRemoveImageTechniquesSchema>;
+export const addOrRemoveImageTechniquesSchema = z.object({
+  data: baseImageTechniqueSchema.array(),
+});
+
+export type UpdateImageTechniqueOutput = z.output<typeof updateImageTechniqueSchema>;
+export const updateImageTechniqueSchema = z.object({
+  data: baseImageTechniqueSchema.extend({ notes: z.string().nullish() }).array(),
+});
+// #endregion
+
+export type SetVideoThumbnailInput = z.infer<typeof setVideoThumbnailSchema>;
+export const setVideoThumbnailSchema = z.object({
+  imageId: z.number(),
+  frame: z.number().nullable(),
+  customThumbnail: imageInputSchema.nullish(),
+  postId: z.number().optional(),
+});
+
+export type UpdateImageAcceptableMinorInput = z.infer<typeof updateImageAcceptableMinorSchema>;
+export const updateImageAcceptableMinorSchema = z.object({
+  id: z.number(),
+  collectionId: z.number(),
+  acceptableMinor: z.boolean(),
+});
+
+export type SetTosViolationSchema = z.infer<typeof setTosViolationSchema>;
+export const setTosViolationSchema = z.object({
+  id: z.number(),
+  violationType: z.enum(ViolationType).optional(),
+  violationDetails: z.string().optional(),
+});
+
+export type ToggleImageFlagInput = z.infer<typeof toggleImageFlagSchema>;
+export const toggleImageFlagSchema = z.object({
+  id: z.number(),
+  flag: z.enum(['minor', 'poi']),
+});
+
+export type GetMyImagesInput = z.infer<typeof getMyImagesInput>;
+export const getMyImagesInput = infiniteQuerySchema.merge(imageSelectProfileFilterSchema).extend({
+  publishedOnly: z.boolean().optional(),
+  /** With publishedOnly: also the caller's unpublished media from the crucible entry modal. */
+  includeEntryDrafts: z.boolean().optional(),
+});

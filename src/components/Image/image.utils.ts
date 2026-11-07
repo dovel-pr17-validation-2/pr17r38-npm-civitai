@@ -1,0 +1,306 @@
+import { resolveFeedSort } from '~/components/Filters/sort-availability';
+import { useSortAvailability } from '~/components/Filters/useSortAvailability';
+import { withPlaceholderData } from '~/hooks/trpcHelpers';
+import { closeModal, openConfirmModal } from '@mantine/modals';
+import { hideNotification, showNotification } from '@mantine/notifications';
+import { isEqual } from 'lodash-es';
+import { useMemo, useState } from 'react';
+import { useBrowsingLevelDebounced } from '~/components/BrowsingLevel/BrowsingLevelProvider';
+import { useApplyHiddenPreferences } from '~/components/HiddenPreferences/useApplyHiddenPreferences';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useZodRouteParams } from '~/hooks/useZodRouteParams';
+import { useBrowsingSettingsAddons } from '~/providers/BrowsingSettingsAddonsProvider';
+import type { FilterKeys } from '~/providers/FiltersProvider';
+import { useFiltersContext } from '~/providers/FiltersProvider';
+import type { GetInfiniteImagesInput } from '~/server/schema/image.schema';
+import { MediaType } from '~/shared/utils/prisma/enums';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
+import { removeEmpty } from '~/utils/object-helpers';
+import { trpc } from '~/utils/trpc';
+import { isDefined } from '~/utils/type-guards';
+import { isViewer, isViewerUsername } from '~/utils/is-viewer';
+import { imagesQueryParamSchema } from '~/components/Image/image-query-params';
+
+export {
+  imagesQueryParamSchema,
+  parseImageQueryParams,
+  hasImageDetailQueryFilters,
+} from '~/components/Image/image-query-params';
+export type { ImageSections, ImagesQueryParamSchema } from '~/components/Image/image-query-params';
+
+// Dev helper: simulate a transient search failure on the client so the retry UI
+// can be tested without touching the backend. Enable via browser console:
+//   localStorage.debugSearchRetry = '3000'    // base delay in ms
+//   localStorage.debugSearchRetryAfter = '1'  // trigger after N successful pages
+// To disable: localStorage.removeItem('debugSearchRetry')
+//
+// When active, callers MUST block further fetches — otherwise real requests
+// keep succeeding, more images load, and the retry counter resets every cycle.
+function useDebugSearchRetry(pagesLoaded: number) {
+  if (typeof window === 'undefined') return { delayMs: 0, active: false };
+  const raw = window.localStorage.getItem('debugSearchRetry');
+  if (!raw) return { delayMs: 0, active: false };
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return { delayMs: 0, active: false };
+  const triggerAfter = Number(window.localStorage.getItem('debugSearchRetryAfter') ?? '1');
+  if (pagesLoaded < triggerAfter) return { delayMs: 0, active: false };
+  return { delayMs: parsed, active: true };
+}
+
+/**
+ * The pair that routes an own-content submit picker off the search index.
+ *
+ * 🔴 These two are not two independent preferences. Together they are the signal
+ * `requiresImageDbPath` reads to serve the picker from the database instead of
+ * Meilisearch, and `getInfiniteImagesHandler` additionally requires the `userId`
+ * to be the caller's own. Measured on prod 2026-08-27: an image is absent from
+ * `metrics_images_v1` for 10-30 minutes after publish, so without this the one
+ * image someone opened the picker to submit is the one that is missing.
+ *
+ * It lives here, spread into all three pickers, because it used to be written out
+ * three times. Two of those copies had no test: deleting `publishedOnly` from an
+ * inline ten-key filter block sent that picker silently back to the index — the
+ * grid still rendered, still returned rows, and only the newest image was gone.
+ * One chokepoint means one assertion covers all three.
+ */
+export const ownContentPickerFilters = (userId: number | undefined) =>
+  ({ userId, publishedOnly: true } as const);
+
+export const useImageQueryParams = () => useZodRouteParams(imagesQueryParamSchema);
+
+// The media-type scope a feed falls back to when its filters are cleared.
+// `/images` shows images, `/videos` shows videos; model-image feeds stay
+// unscoped (all media types). Returning `undefined` here would let `removeEmpty`
+// drop `types` from the payload, so the feed would serve every media type.
+export const getDefaultMediaTypes = (
+  filterType: FilterKeys<'images' | 'videos' | 'modelImages'>
+): MediaType[] | undefined => {
+  if (filterType === 'images') return [MediaType.image];
+  if (filterType === 'videos') return [MediaType.video];
+  return undefined;
+};
+
+// could have userImages and userVideo
+export const useImageFilters = (type: FilterKeys<'images' | 'videos' | 'modelImages'>) => {
+  const storeFilters = useFiltersContext((state) => state[type]);
+  const { query } = useImageQueryParams(); // router params are the overrides
+  const availability = useSortAvailability();
+
+  const filters = removeEmpty({ ...storeFilters, ...query });
+  // A sort the menu withholds is still a sort the query runs on, whether it came
+  // from the store, a link or the schema default.
+  return { ...filters, sort: resolveFeedSort({ type, value: filters.sort }, availability) };
+};
+
+export const useDumbImageFilters = (defaultFilters?: Partial<GetInfiniteImagesInput>) => {
+  const [filters, setFilters] = useState<Partial<GetInfiniteImagesInput>>(defaultFilters ?? {});
+  const filtersUpdated = !isEqual(filters, defaultFilters);
+
+  return {
+    filters: { ...filters },
+    setFilters,
+    filtersUpdated,
+  };
+};
+
+export function isViewingOwnImages(
+  currentUser: { id: number; username?: string | null } | null | undefined,
+  filters: { username?: string; userId?: number }
+) {
+  return isViewerUsername(currentUser, filters.username) || isViewer(currentUser, filters.userId);
+}
+
+export const useQueryImages = (
+  filters?: GetInfiniteImagesInput,
+  options?: { keepPreviousData?: boolean; enabled?: boolean; applyHiddenPreferences?: boolean }
+) => {
+  const currentUser = useCurrentUser();
+  const { applyHiddenPreferences = true, ...queryOptions } = options ?? {};
+  filters ??= {};
+  const browsingSettingsAddons = useBrowsingSettingsAddons();
+  // Only the domains that cap browsing (green) get `browsingLevel` backfilled by
+  // `applyDomainFeature`; on red/blue an absent level reaches the query as NULL and
+  // `(nsfwLevel & NULL)` drops every row. Default from context so a caller that omits
+  // it can't silently return zero images — inside a forced provider (minor models)
+  // this is the forced level, which is what those queries should be asking for.
+  const contextBrowsingLevel = useBrowsingLevelDebounced();
+
+  const isOwnImages = isViewingOwnImages(currentUser, filters);
+  const excludedTagIds = [
+    ...(filters.excludedTagIds ?? []),
+    ...(isOwnImages ? [] : browsingSettingsAddons.settings.excludedTagIds ?? []),
+  ].filter(isDefined);
+
+  const { data, isLoading, ...rest } = trpc.image.getInfinite.useInfiniteQuery(
+    {
+      ...filters,
+      browsingLevel: filters.browsingLevel ?? contextBrowsingLevel,
+      excludedTagIds,
+      // OR-merge with the addon so either source can flag the filter.
+      // Mods always have addon = false (BrowsingSettingsAddonsProvider), so
+      // the chip controls them. Non-mods don't see the chip; the addon
+      // value flows through untouched.
+      disablePoi: !!filters.disablePoi || browsingSettingsAddons.settings.disablePoi,
+      disableMinor: !!filters.disableMinor || browsingSettingsAddons.settings.disableMinor,
+    },
+    {
+      getNextPageParam: (lastPage) => lastPage.nextCursor,
+      // abortOnUnmount: true forces tRPC to forward React Query's AbortSignal
+      // to the underlying fetch. Without it, queryClient.cancelQueries is a
+      // no-op on the actual HTTP request — needed here so the slow-fetch
+      // timeout can truly abort a hung request instead of waiting for it to
+      // resolve naturally.
+      trpc: { context: { skipBatch: true }, abortOnUnmount: true },
+      // Disable React Query's silent auto-retry so our retry banner drives
+      // every attempt. Otherwise the user sees nothing for the first failure,
+      // then the banner appears belatedly.
+      retry: 0,
+      ...withPlaceholderData(queryOptions),
+    }
+  );
+
+  // Deduplicate items to prevent duplicates from offset pagination drift
+  const flatData = useMemo(() => {
+    const allItems = data?.pages.flatMap((x) => (!!x ? x.items : [])) ?? [];
+
+    // Track IDs within this render to filter duplicates that appear across pages
+    const seenIds = new Set<number>();
+    const dedupedItems: typeof allItems = [];
+    for (const item of allItems) {
+      if (!seenIds.has(item.id)) {
+        seenIds.add(item.id);
+        dedupedItems.push(item);
+      }
+    }
+
+    return dedupedItems;
+  }, [data]);
+  const { items, loadingPreferences, hiddenCount } = useApplyHiddenPreferences({
+    type: 'images',
+    data: flatData,
+    showHidden: !!filters.hidden,
+    disabled: !applyHiddenPreferences,
+    isRefetching: rest.isRefetching,
+  });
+
+  // Debug-mode override so the retry UI can be exercised without a real
+  // backend failure. The parent combines this with React Query's isError to
+  // decide when to show the banner.
+  const { delayMs: debugDelayMs, active: debugRetryActive } = useDebugSearchRetry(
+    data?.pages.length ?? 0
+  );
+
+  return {
+    data,
+    flatData,
+    images: items,
+    removedImages: hiddenCount,
+    fetchedImages: flatData?.length,
+    isLoading: isLoading || loadingPreferences,
+    debugRetryActive,
+    debugDelayMs,
+    ...rest,
+  };
+};
+
+export const useQueryModelVersionImages = (
+  modelVersionId: number,
+  options?: { keepPreviousData?: boolean; enabled?: boolean }
+) => {
+  const { data, isLoading, ...rest } = trpc.image.getImagesForModelVersion.useQuery(
+    {
+      id: modelVersionId,
+    },
+    options
+  );
+
+  const images = data?.[modelVersionId]?.images;
+
+  const { items, loadingPreferences, hiddenCount } = useApplyHiddenPreferences({
+    type: 'images',
+    data: images,
+    isRefetching: rest.isRefetching,
+  });
+
+  return {
+    data,
+    flatData: images,
+    images: items,
+    removedImages: hiddenCount,
+    fetchedImages: images?.length,
+    isLoading: isLoading || loadingPreferences,
+    ...rest,
+  };
+};
+
+const CSAM_NOTIFICATION_ID = 'sending-report';
+
+export function useReportCsamImages(
+  options?: Parameters<typeof trpc.image.reportCsamImages.useMutation>[0]
+) {
+  const { onMutate, onSuccess, onError, onSettled, ...rest } = options ?? {};
+  const { mutateAsync, ...reportCsamImage } = trpc.image.reportCsamImages.useMutation({
+    async onMutate(...args) {
+      showNotification({
+        id: CSAM_NOTIFICATION_ID,
+        loading: true,
+        withCloseButton: false,
+        autoClose: false,
+        message: 'Sending report...',
+      });
+      await onMutate?.(...args);
+    },
+    async onSuccess(...args) {
+      showSuccessNotification({
+        title: 'Image reported',
+        message: 'Your request has been received',
+      });
+      closeModal('confirm-csam');
+      await onSuccess?.(...args);
+    },
+    async onError(error, ...args) {
+      showErrorNotification({
+        error: new Error(error.message),
+        title: 'Unable to send report',
+        reason: error.message ?? 'An unexpected error occurred, please try again',
+      });
+      await onError?.(error, ...args);
+    },
+    async onSettled(...args) {
+      hideNotification(CSAM_NOTIFICATION_ID);
+      await onSettled?.(...args);
+    },
+    ...rest,
+  });
+
+  const mutate = (args: Parameters<typeof reportCsamImage.mutate>[0]) => {
+    openConfirmModal({
+      modalId: 'confirm-csam',
+      title: 'Report CSAM',
+      children: `Are you sure you want to report this as CSAM?`,
+      centered: true,
+      labels: { confirm: 'Yes', cancel: 'Cancel' },
+      confirmProps: { color: 'red', loading: reportCsamImage.isPending },
+      closeOnConfirm: false,
+      onConfirm: () => reportCsamImage.mutate(args),
+    });
+  };
+
+  return { ...reportCsamImage, mutate };
+}
+
+export const useImageContestCollectionDetails = (
+  filters: { id: number },
+  options?: { enabled: boolean }
+) => {
+  const { data, ...rest } = trpc.image.getContestCollectionDetails.useQuery(
+    { ...filters },
+    { ...options }
+  );
+
+  return {
+    collectionItems: data?.collectionItems ?? [],
+    post: data?.post ?? null,
+    ...rest,
+  };
+};

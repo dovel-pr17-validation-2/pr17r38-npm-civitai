@@ -1,0 +1,92 @@
+import { Box, Center, Group, Loader, Stack } from '@mantine/core';
+import { useRouter } from 'next/router';
+
+import { NotFound } from '~/components/AppLayout/NotFound';
+import { CollectionsInfinite } from '~/components/Collections/Infinite/CollectionsInfinite';
+import { useCollectionQueryParams } from '~/components/Collections/collection.utils';
+import { SortFilter } from '~/components/Filters';
+import { MasonryContainer } from '~/components/MasonryColumns/MasonryContainer';
+import { MasonryProvider } from '~/components/MasonryColumns/MasonryProvider';
+import { constants } from '~/server/common/constants';
+import type { CollectionSort } from '~/server/common/enums';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+import { trpc } from '~/utils/trpc';
+import React from 'react';
+import { UserProfileLayout } from '~/components/Profile/ProfileLayout2';
+import { Page } from '~/components/AppLayout/Page';
+import { getUserBannedAtByUsername } from '~/server/services/user-banned-at.service';
+
+export const getServerSideProps = createServerSideProps({
+  useSSG: true,
+  resolver: async ({ ctx, features, ssg }) => {
+    const username = ctx.query.username as string;
+    if (!features?.profileCollections)
+      return {
+        redirect: { destination: `/user/${username}`, permanent: false },
+      };
+
+    const user = await getUserBannedAtByUsername(username);
+    if (user?.bannedAt)
+      return {
+        redirect: { destination: `/user/${username}`, permanent: true },
+      };
+
+    await Promise.all([
+      ssg?.userProfile.get.prefetch({ username }),
+      ssg?.userProfile.overview.prefetch({ username }),
+    ]);
+  },
+});
+
+function UserCollectionsPage() {
+  const router = useRouter();
+  const { set, ...queryFilters } = useCollectionQueryParams();
+  const sort = queryFilters.sort ?? constants.collectionFilterDefaults.sort;
+
+  const username = (router.query.username as string) ?? '';
+  const { data: user, isLoading } = trpc.userProfile.get.useQuery(
+    { username },
+    { enabled: username !== constants.system.user.username }
+  );
+
+  // currently not showing any content if the username is undefined
+  if (!username || (!user && !isLoading)) return <NotFound />;
+
+  if (isLoading) {
+    return (
+      <Box mt="md">
+        <Center>
+          <Loader />
+        </Center>
+      </Box>
+    );
+  }
+
+  // After the loading guard above, an absent user means not-found (also narrows the type).
+  if (!user) return <NotFound />;
+
+  return (
+    <Box mt="md">
+      <MasonryProvider
+        columnWidth={constants.cardSizes.model}
+        maxColumnCount={7}
+        maxSingleColumnWidth={450}
+      >
+        <MasonryContainer p={0}>
+          <Stack gap="xs">
+            <Group gap={8} justify="flex-end">
+              <SortFilter
+                type="collections"
+                value={sort}
+                onChange={(x) => set({ sort: x as CollectionSort })}
+              />
+            </Group>
+            <CollectionsInfinite filters={{ ...queryFilters, sort, userId: user.id }} />
+          </Stack>
+        </MasonryContainer>
+      </MasonryProvider>
+    </Box>
+  );
+}
+
+export default Page(UserCollectionsPage, { getLayout: UserProfileLayout });

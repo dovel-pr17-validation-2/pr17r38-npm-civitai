@@ -1,0 +1,393 @@
+import {
+  Alert,
+  Button,
+  Group,
+  Select,
+  Stack,
+  Text,
+  Textarea,
+  TextInput,
+  Title,
+} from '@mantine/core';
+import { IconAlertTriangle, IconDeviceFloppy, IconInfoCircle } from '@tabler/icons-react';
+import Link from 'next/link';
+import { useState } from 'react';
+import { BlockScopeSelector } from '~/components/Apps/BlockScopeSelector';
+import { buildScopeJustifications } from '~/components/Apps/blockScopeSelection';
+import {
+  ALLOWED_CONTENT_RATINGS,
+  MANIFEST_TAGLINE_MAX_LENGTH,
+  MAX_REPOSITORY_URL_LENGTH,
+  REPOSITORY_HOST_ALLOWLIST,
+  validateRepositoryUrl,
+} from '~/server/services/block-manifest-validator.service';
+import {
+  MARKETPLACE_CATEGORIES,
+  MARKETPLACE_CATEGORY_LABELS,
+  isMarketplaceCategory,
+} from '~/server/services/blocks/marketplace-categories.constants';
+import { offsiteContentRatingLabel } from '~/shared/constants/browsingLevel.constants';
+import { MY_APPS_HREF } from '~/shared/constants/apps-build.constants';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
+import { trpc } from '~/utils/trpc';
+import {
+  AppDeveloperTermsCheckbox,
+  useAppDeveloperTermsAccepted,
+} from '~/components/Apps/AppDeveloperTerms/AppDeveloperTermsCheckbox';
+
+/**
+ * App management (Phase 1) — web form to edit an app's manifest. On save it
+ * calls `blocks.updateManifest`, which does a BACKGROUND commit to the app's
+ * Forgejo repo and re-enters the no-trust pending-review flow (the change does
+ * NOT go live until a moderator approves it via /apps/review).
+ *
+ * blockId is IMMUTABLE (shown read-only). iframe.src is platform-owned and not
+ * editable here (the server stamps it). The SERVER re-validates every field with
+ * BlockManifestValidator — this form's hints are advisory only.
+ */
+
+const SEMVER_RE = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
+
+type StoredManifest = Record<string, unknown> & {
+  blockId?: string;
+  version?: string;
+  name?: string;
+  description?: string;
+  tagline?: string;
+  repository?: string;
+  category?: string;
+  contentRating?: string;
+  scopes?: string[];
+  scopeJustifications?: Record<string, string>;
+  targets?: Array<{ slotId?: string }>;
+};
+
+/** Max length of a single per-scope justification (mirrors the server validator). */
+const SCOPE_JUSTIFICATION_MAX_LENGTH = 500;
+
+export function ManifestEditForm({
+  appBlockId,
+  slug,
+  currentVersion,
+  manifest,
+}: {
+  appBlockId: string;
+  slug: string;
+  currentVersion: string;
+  manifest: StoredManifest;
+}) {
+  const utils = trpc.useUtils();
+
+  const [name, setName] = useState<string>(manifest.name ?? '');
+  const [description, setDescription] = useState<string>(manifest.description ?? '');
+  // One-line store pitch + marketplace category. Both are MANIFEST-GOVERNED for
+  // an onsite listing (the /apps/[appBlockId]/edit Listing tab is media-only), so
+  // this form is the ONLY place an author sets them. Empty tagline / null
+  // category = "not set" and is sent as an explicit `null` so the server CLEARS
+  // the manifest key (see the nullable patch fields in blocks.router).
+  const [tagline, setTagline] = useState<string>(manifest.tagline ?? '');
+  // Public source-repository link — manifest-governed on exactly the same terms as
+  // tagline/category, so the same empty-string → explicit-`null` clearing applies.
+  const [repository, setRepository] = useState<string>(manifest.repository ?? '');
+  const [category, setCategory] = useState<string | null>(
+    isMarketplaceCategory(manifest.category) ? manifest.category : null
+  );
+  const [contentRating, setContentRating] = useState<string>(manifest.contentRating ?? 'g');
+  const [version, setVersion] = useState<string>(bumpPatch(currentVersion));
+  // Declared scopes, seeded from the stored manifest. Driven by the
+  // BlockScopeSelector checklist; a legacy/unknown scope in the stored set is
+  // preserved (shown selected + removable) rather than dropped.
+  const [scopes, setScopes] = useState<string[]>((manifest.scopes ?? []).filter(Boolean));
+  // Per-scope justification the dev supplies for the moderator (scope-id →
+  // rationale). Kept as a superset map keyed by scope; only justifications for
+  // currently-SELECTED scopes are submitted (see handleSave). Deselecting a scope
+  // therefore hides its input and drops its justification from the payload, but
+  // preserves any typed text if the scope is re-selected before saving.
+  const [justifications, setJustifications] = useState<Record<string, string>>(
+    manifest.scopeJustifications && typeof manifest.scopeJustifications === 'object'
+      ? { ...manifest.scopeJustifications }
+      : {}
+  );
+
+  const versionValid = SEMVER_RE.test(version);
+  const versionHigher = compareSemver(version, currentVersion) > 0;
+
+  const termsAccepted = useAppDeveloperTermsAccepted();
+  const mutation = trpc.blocks.updateManifest.useMutation({
+    onSuccess: async (res) => {
+      showSuccessNotification({
+        title: 'Manifest update submitted for review',
+        message: `v${res.version} is now pending moderator review. It will not go live until approved.`,
+      });
+      await utils.blocks.getMyAppManifest.invalidate({ appBlockId });
+    },
+    onError: (err) => {
+      showErrorNotification({
+        title: 'Could not submit manifest update',
+        error: new Error(err.message),
+      });
+    },
+  });
+
+  function handleSave() {
+    // Only submit justifications for currently-selected scopes, trimmed and
+    // non-empty (the server rejects a justification for an undeclared scope, so
+    // filtering here also avoids a needless validation error).
+    const scopeJustifications = buildScopeJustifications(scopes, justifications);
+    // Decide whether to SEND the map. Send an explicit (possibly EMPTY) object
+    // whenever there is something to write OR something to clear — i.e. the
+    // stored manifest already had justifications. If we sent `undefined` for the
+    // cleared case, superjson may drop the key in transit, so the server's
+    // `{...stored, ...patch}` merge would RETAIN the old justifications and keep
+    // showing stale rationale to the mod. `{}` overwrites/clears them (the
+    // validator treats a defined-but-empty map as a valid "no justifications"
+    // state). Only omit the field entirely when there were none before AND none
+    // now, keeping never-used manifests backward-compatible.
+    const storedHadJustifications =
+      !!manifest.scopeJustifications &&
+      typeof manifest.scopeJustifications === 'object' &&
+      Object.keys(manifest.scopeJustifications).length > 0;
+    const shouldSend = Object.keys(scopeJustifications).length > 0 || storedHadJustifications;
+    mutation.mutate({
+      appBlockId,
+      patch: {
+        version,
+        name: name.trim() || undefined,
+        description: description.trim() || undefined,
+        // Explicit `null` = clear the manifest key (an `undefined` may be dropped
+        // in transit and the server merge would then retain the stored value).
+        tagline: tagline.trim() || null,
+        // Explicit `null` = clear the manifest key, for the same reason as `tagline`:
+        // the server merges `{...stored, ...patch}`, so an `undefined` (which superjson
+        // may drop in transit) would silently RETAIN the old repository link — an author
+        // clearing the field would see it come back.
+        repository: repository.trim() || null,
+        category: category ?? null,
+        contentRating,
+        scopes,
+        scopeJustifications: shouldSend ? scopeJustifications : undefined,
+        // Target slots are a DEFERRED feature — the editor no longer edits them.
+        // OMIT `targets` from the patch entirely: the server merges
+        // `{...stored, ...patch}`, so leaving the key out preserves
+        // `stored.targets` verbatim — no round-trip, no clobber. Re-sending the
+        // stored targets would instead re-validate them against the strict
+        // `updateManifest` targets schema, so a pre-existing malformed/oversized
+        // stored target would fail the whole save (the old textarea path never
+        // touched targets either).
+      },
+    });
+  }
+
+  // Advisory client gate only — the server re-validates every field with
+  // BlockManifestValidator (which is what actually enforces the tagline cap).
+  const taglineTooLong = tagline.trim().length > MANIFEST_TAGLINE_MAX_LENGTH;
+  // Advisory too — the SAME `validateRepositoryUrl` the server runs, so the inline
+  // message is character-for-character what a save would return rather than a
+  // second, drifting approximation of the rule.
+  const repositoryError =
+    repository.trim().length > 0
+      ? (() => {
+          const res = validateRepositoryUrl(repository);
+          return res.ok ? undefined : res.error;
+        })()
+      : undefined;
+  const canSave =
+    versionValid &&
+    versionHigher &&
+    !mutation.isPending &&
+    name.trim().length > 0 &&
+    !taglineTooLong &&
+    !repositoryError &&
+    termsAccepted;
+
+  return (
+    <Stack gap="md">
+      <Title order={3}>Edit manifest</Title>
+
+      <Alert icon={<IconInfoCircle size={16} />} color="blue" variant="light">
+        Saving commits the new manifest to your app&apos;s repository and opens a moderator review.
+        The change does <strong>not</strong> go live until a moderator approves it. blockId (
+        <code>{slug}</code>) cannot be changed.
+      </Alert>
+
+      <TextInput label="Block ID (immutable)" value={slug} readOnly disabled />
+
+      <TextInput
+        label="Name"
+        required
+        value={name}
+        onChange={(e) => setName(e.currentTarget.value)}
+        error={name.trim().length === 0 ? 'Name is required' : undefined}
+      />
+
+      <TextInput
+        label="Tagline"
+        description={`A one-line pitch shown under your app's name in the Apps store. Optional — leave it empty for no tagline. Max ${MANIFEST_TAGLINE_MAX_LENGTH} characters.`}
+        value={tagline}
+        onChange={(e) => setTagline(e.currentTarget.value)}
+        error={
+          taglineTooLong
+            ? `Tagline must be at most ${MANIFEST_TAGLINE_MAX_LENGTH} characters`
+            : undefined
+        }
+      />
+
+      <Textarea
+        label="Description"
+        autosize
+        minRows={2}
+        maxRows={6}
+        value={description}
+        onChange={(e) => setDescription(e.currentTarget.value)}
+      />
+
+      <TextInput
+        label="Source repository"
+        description={`Public link to your app's source code, shown on its Apps store page. Optional — leave it empty for no link. ${REPOSITORY_HOST_ALLOWLIST.join(
+          ', '
+        )} only, linking to the repository itself (e.g. https://github.com/your-org/your-app). Max ${MAX_REPOSITORY_URL_LENGTH} characters.`}
+        placeholder="https://github.com/your-org/your-app"
+        value={repository}
+        onChange={(e) => setRepository(e.currentTarget.value)}
+        error={repositoryError}
+        data-testid="apps-manifest-source-repo"
+      />
+
+      <Select
+        label="Category"
+        description="Where your app is filed in the Apps store. Optional — a moderator can categorise it for you. A category a moderator has already set is not overwritten."
+        placeholder="No category"
+        clearable
+        data={[...MARKETPLACE_CATEGORIES].map((c) => ({
+          value: c,
+          label: MARKETPLACE_CATEGORY_LABELS[c],
+        }))}
+        value={category}
+        onChange={setCategory}
+      />
+
+      <Select
+        label="Content rating"
+        // `ALLOWED_CONTENT_RATINGS` is the manifest validator's own copy of the same
+        // five values; the LABEL still comes from the one display map (was `label: r`).
+        data={[...ALLOWED_CONTENT_RATINGS].map((r) => ({
+          value: r,
+          label: offsiteContentRatingLabel(r),
+        }))}
+        value={contentRating}
+        onChange={(v) => setContentRating(v ?? 'g')}
+      />
+
+      <TextInput
+        label="New version"
+        description={`Must be greater than the current version (${currentVersion}).`}
+        required
+        value={version}
+        onChange={(e) => setVersion(e.currentTarget.value)}
+        error={
+          !versionValid
+            ? 'Must be a semantic version (e.g. 1.2.3)'
+            : !versionHigher
+            ? `Must be greater than ${currentVersion}`
+            : undefined
+        }
+      />
+
+      <Stack gap={4}>
+        <Text size="sm" fw={500}>
+          Scopes
+        </Text>
+        <Text size="xs" c="dimmed">
+          The permissions your app requests. Must be a subset of your app&apos;s granted scopes —
+          the server enforces this. Sensitive scopes are flagged.
+        </Text>
+        <BlockScopeSelector value={scopes} onChange={setScopes} />
+      </Stack>
+
+      {scopes.length > 0 && (
+        <Stack gap={4}>
+          <Text size="sm" fw={500}>
+            Permission justifications
+          </Text>
+          <Text size="xs" c="dimmed">
+            Optional. Explain why your app needs each requested permission — a moderator sees this
+            during review. (These are shown as-is and are not automatically verified.)
+          </Text>
+          <Stack gap="xs" mt={4}>
+            {scopes.map((scope) => (
+              <Textarea
+                key={scope}
+                label={scope}
+                placeholder={`Why does this app need "${scope}"?`}
+                autosize
+                minRows={1}
+                maxRows={4}
+                maxLength={SCOPE_JUSTIFICATION_MAX_LENGTH}
+                value={justifications[scope] ?? ''}
+                onChange={(e) =>
+                  setJustifications((prev) => ({ ...prev, [scope]: e.currentTarget.value }))
+                }
+                styles={{ label: { fontFamily: 'ui-monospace, monospace', fontWeight: 400 } }}
+              />
+            ))}
+          </Stack>
+        </Stack>
+      )}
+
+      {mutation.error && (
+        <Alert icon={<IconAlertTriangle size={16} />} color="red" variant="light">
+          {mutation.error.message}
+        </Alert>
+      )}
+
+      <AppDeveloperTermsCheckbox />
+
+      <Group justify="flex-end">
+        <Button component={Link} href={`/apps/${appBlockId}`} variant="default">
+          Cancel
+        </Button>
+        <Button
+          leftSection={<IconDeviceFloppy size={16} />}
+          onClick={handleSave}
+          loading={mutation.isPending}
+          disabled={!canSave}
+        >
+          Save &amp; submit for review
+        </Button>
+      </Group>
+
+      {mutation.data && (
+        <Alert color="green" variant="light">
+          Submitted as review request <code>{mutation.data.publishRequestId}</code>. Track it on{' '}
+          <Link href={MY_APPS_HREF}>My builds</Link>.
+        </Alert>
+      )}
+    </Stack>
+  );
+}
+
+/** Bump the patch component of a semver string for a sensible default new version. */
+function bumpPatch(v: string): string {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v);
+  if (!m) return v;
+  return `${m[1]}.${m[2]}.${Number(m[3]) + 1}`;
+}
+
+/** Mirror of the server's compareSemver (advisory client-side gate only). */
+function compareSemver(a: string, b: string): number {
+  const split = (v: string) => {
+    const [core, pre = null] = v.split('-', 2);
+    const nums = core.split('.').map((n) => parseInt(n, 10) || 0);
+    while (nums.length < 3) nums.push(0);
+    return { nums, pre };
+  };
+  const A = split(a);
+  const B = split(b);
+  for (let i = 0; i < 3; i++) {
+    if (A.nums[i] !== B.nums[i]) return A.nums[i] < B.nums[i] ? -1 : 1;
+  }
+  if (A.pre === null && B.pre === null) return 0;
+  if (A.pre === null) return 1;
+  if (B.pre === null) return -1;
+  return A.pre < B.pre ? -1 : A.pre > B.pre ? 1 : 0;
+}

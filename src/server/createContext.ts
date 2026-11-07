@@ -1,0 +1,142 @@
+import type { NextApiRequest, NextApiResponse } from 'next';
+import { getServerAuthSession } from '~/server/auth/get-server-auth-session';
+import { Tracker } from './clickhouse/client';
+import { resolveClientIpOrNull } from '~/server/utils/client-ip';
+import { isProd } from '~/env/other';
+import { getFeatureFlagsLazy } from '~/server/services/feature-flags.service';
+import { getRequestDomainColor } from '~/server/utils/server-domain';
+import { isAllowedOriginRequest } from '~/server/utils/origin-helpers';
+import { getRequestCredential } from '~/server/auth/request-credential';
+import { trpcViewer } from '~/server/auth/api-auth-session';
+
+type CacheSettings = {
+  browserTTL?: number;
+  edgeTTL?: number;
+  staleWhileRevalidate?: number;
+  tags?: string[];
+  canCache?: boolean;
+  skip: boolean;
+};
+
+export const createContext = async ({
+  req,
+  res,
+}: {
+  req: NextApiRequest;
+  res: NextApiResponse;
+}) => {
+  const session = await getServerAuthSession({ req, res });
+  // ATTRIBUTION surface. `ctx.ip` labels a caller for tracking, audit trails and
+  // actor hashing; it is not an input to an allow/deny decision, so it takes the
+  // derivation that always yields a label rather than the fail-closed one that
+  // collapses non-edge callers onto a shared hop. See the "CHOOSING BETWEEN THE
+  // TWO PREDICATES" section in `~/server/utils/client-ip`.
+  //
+  // The `''` sentinel is PRESERVED deliberately. `ctx.ip` is read in 23 places,
+  // and two of them treat a falsy address as meaningfully different from a
+  // non-address string: `base.reward.ts` folds `''` to `undefined` before it
+  // reaches a buzz-transaction idempotency key, and the captcha verifier
+  // forwards the value to an external API as a remote address. Only WHICH
+  // address is derived changes here — the unresolvable case is byte-identical.
+  const ip = resolveClientIpOrNull(req) ?? '';
+  // Bearer/API-key auth carries no cookies, so CSRF does not apply.
+  const isBearerAuth = (req as any).context?.apiKeyId != null;
+  const acceptableOrigin = !isProd || isBearerAuth || isAllowedOriginRequest(req);
+  // Pass the already-resolved session so high-volume tracking routes
+  // (e.g. track.addView ~100/s on api-primary) skip the Tracker's own
+  // getServerAuthSession call. Matters for ANONYMOUS requests: a null session
+  // isn't memoized by req.context.session, so the lazy path re-decrypted the
+  // JWE on every track() call (authenticated requests already cache-hit).
+  // The full session, banned or not: a banned account's activity is still attributed to it.
+  const track = new Tracker(req, res, session);
+  // Keyed on the full session: a banned session still reaches its own appeal state, which a shared
+  // cache must never keep.
+  const cache: CacheSettings | null = {
+    browserTTL: session?.user ? 0 : 60,
+    edgeTTL: session?.user ? 0 : 60,
+    staleWhileRevalidate: session?.user ? 0 : 30,
+    canCache: true,
+    skip: false,
+  };
+  const domain = getRequestDomainColor(req) ?? 'blue';
+
+  // Abort downstream work (Meili, DB calls that plumb signal) when the client
+  // disconnects — e.g. when the image feed's slow-fetch timeout cancels a hung
+  // request. Saves pod CPU on requests whose response will never be read.
+  //
+  // Listen on `res` (per-request) rather than `req.socket` (long-lived,
+  // reused across keep-alive requests). `res.close` fires once when the
+  // underlying connection terminates OR after `res.end()` completes, covering
+  // both abnormal client disconnect and normal completion. Because `res` is
+  // per-request and not reused, the listener is reclaimed by GC when `res`
+  // becomes unreferenced — no manual detach needed, and no accumulation on
+  // the keep-alive socket.
+  const abortController = new AbortController();
+  const onDisconnect = () => {
+    if (!res.writableEnded && !abortController.signal.aborted) abortController.abort();
+  };
+  res.once('close', onDisconnect);
+
+  // apiKeyId / subject are only present when auth came from a Bearer token.
+  // Modeled as optional (undefined when absent) so DeepNonNullable<Context> in
+  // controller signatures can collapse them to required fields when the caller
+  // already knows the request is token-auth'd.
+  const { tokenScope, apiKeyId, apiKeyType, subject } = getRequestCredential(req);
+
+  // Tag content-creation tracking with how the request was authenticated (web vs.
+  // personal API key vs. OAuth app) so moderators can trace agent/API activity.
+  track.setProvenance({ subject, apiKeyId });
+
+  return {
+    ...trpcViewer(session?.user),
+    acceptableOrigin,
+    // The full session's flags: the site appeal form's procedures are flag-gated, and a banned
+    // account must still reach them.
+    features: getFeatureFlagsLazy({ user: session?.user, req }),
+    track,
+    ip,
+    cache,
+    res,
+    req,
+    domain,
+    signal: abortController.signal,
+    tokenScope,
+    apiKeyId,
+    apiKeyType,
+    subject,
+  };
+};
+
+export const publicApiContext = async (req: NextApiRequest, res: NextApiResponse) => {
+  return {
+    user: undefined,
+    acceptableOrigin: true,
+    features: getFeatureFlagsLazy({ req }),
+    track: new Tracker(req, res),
+    // ATTRIBUTION surface — see the note on `ip` in `createContext` above.
+    ip: resolveClientIpOrNull(req) ?? '',
+    cache: {
+      browserCacheTTL: 3 * 60,
+      edgeCacheTTL: 3 * 60,
+      staleWhileRevalidate: 60,
+      canCache: true,
+      skip: false,
+    },
+    res,
+    req,
+  };
+};
+
+export type Context = AsyncReturnType<typeof createContext>;
+
+/**
+ * Context shape for protected procedures, where `user` (and other base fields)
+ * are guaranteed non-null but `apiKeyId`/`apiKeyType`/`subject` legitimately remain
+ * nullable (session auth has no apiKeyId). Replaces `DeepNonNullable<Context>` for
+ * controllers, which would otherwise strip the nullability of these fields.
+ */
+export type ProtectedContext = Omit<
+  DeepNonNullable<Context>,
+  'apiKeyId' | 'apiKeyType' | 'subject' | 'bannedUser'
+> &
+  Pick<Context, 'apiKeyId' | 'apiKeyType' | 'subject' | 'bannedUser'>;

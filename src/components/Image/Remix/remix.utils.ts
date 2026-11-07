@@ -1,0 +1,193 @@
+import { recordGallerySourceRating } from '~/components/form-graph/generation/useFlux3MatureSource';
+import type { RemixKind } from '~/shared/constants/remix.constants';
+import { ImageIngestionStatus } from '~/shared/utils/prisma/enums';
+import {
+  getEngineRefusal,
+  getRemixEngine,
+  getRemixSourceUrl,
+  REMIX_FALLBACK_DIMENSIONS,
+  type RemixSourceImage,
+} from '~/shared/utils/remix-tier';
+import {
+  fetchGenerationData,
+  generationGraphPanel,
+  generationGraphStore,
+  withExternalFetch,
+} from '~/store/generation-graph.store';
+import { getImageDimensions } from '~/utils/image-utils';
+import { remixProvenanceStore, trackPromptMint } from '~/store/remix-provenance.store';
+import { trpcVanilla } from '~/utils/trpc';
+
+export {
+  getEngineRefusal,
+  getRemixEngine,
+  getRemixSourceUrl,
+  getRemixTier,
+  type RemixSourceImage,
+} from '~/shared/utils/remix-tier';
+
+/**
+ * Prompt reuse copies text and resource ids that are already on the page, so it
+ * carries none of the risk of handing the pixels to an engine. It stays
+ * available while a scan is pending — only a blocked image loses it.
+ */
+export function isReuseRefused(image: RemixSourceImage): boolean {
+  return image.ingestion === ImageIngestionStatus.Blocked || !!image.blockedFor;
+}
+
+/** Remix kinds that need only the image itself. */
+export function getRemixKinds(image: RemixSourceImage): RemixKind[] {
+  if (image.type === 'image') return ['edit', 'video'];
+  if (image.type === 'video') return ['video'];
+  return [];
+}
+
+/** One thing the Remix button can do for this viewer: a remix kind, or prompt reuse. */
+export type RemixOptionKey = RemixKind | 'reuse';
+
+/**
+ * The options the Remix menu actually offers this viewer, in menu order. This is
+ * the menu's own list — it renders from it — so the count it is judged by cannot
+ * drift from what is on screen. An engine refusal removes the kinds, a refused
+ * reuse removes that; nothing here names a media type, so a new kind added to
+ * `getRemixKinds` changes the count by itself.
+ */
+export function getRemixOptions(image: RemixSourceImage): RemixOptionKey[] {
+  const options: RemixOptionKey[] = getEngineRefusal(image) ? [] : [...getRemixKinds(image)];
+  if (canReusePrompt(image) && !isReuseRefused(image)) options.push('reuse');
+  return options;
+}
+
+/**
+ * The option a click on the Remix button should run without opening a menu, if
+ * there is exactly one. Undefined with several (pick one) or none. An image that
+ * carries a refusal keeps its menu even with one option left, because the menu is
+ * where the viewer is told why the others are missing.
+ */
+export function getSoleRemixOption(image: RemixSourceImage): RemixOptionKey | undefined {
+  if (getEngineRefusal(image)) return undefined;
+  const options = getRemixOptions(image);
+  return options.length === 1 ? options[0] : undefined;
+}
+
+/** Whether the original prompt-and-resource path has anything to offer. */
+export function canReusePrompt(image: RemixSourceImage): boolean {
+  return !!(image.hasPositivePrompt ?? image.hasMeta);
+}
+
+async function resolveDimensions(image: RemixSourceImage, sourceUrl: string) {
+  if (image.width && image.height) return { width: image.width, height: image.height };
+  return getImageDimensions(sourceUrl).catch(() => REMIX_FALLBACK_DIMENSIONS);
+}
+
+/**
+ * Open the generator on the configured engine with this image as the input.
+ *
+ * The panel is opened before the awaits so the click feels immediate; the
+ * `preserveEntryAction` flag keeps the no-input open from stamping 'direct'
+ * over the 'remix' that `setData` is about to write.
+ *
+ * `loading` is set for the same reason the store's own fetch path sets it —
+ * the panel is already on screen showing the previous session's form, and
+ * without it a Generate press during the fetch submits (and charges for) that
+ * stale form.
+ *
+ * The `openSequence` re-check is the store's concurrent-open guard, which the
+ * store applies to its own fetches and cannot apply to ours. Without it a
+ * slower engine fetch resolves last and overwrites whatever the user opened in
+ * the meantime — including the form they are already typing in.
+ */
+export async function startRemix({ kind, image }: { kind: RemixKind; image: RemixSourceImage }) {
+  const engine = getRemixEngine(kind, image);
+  generationGraphPanel.open(undefined, { preserveEntryAction: true });
+
+  const sourceUrl = getRemixSourceUrl(image);
+  const { result, superseded } = await withExternalFetch(() =>
+    Promise.all([
+      resolveDimensions(image, sourceUrl),
+      fetchGenerationData({ type: 'modelVersion', id: engine.modelVersionId }),
+      // Minted HERE, against the image the user actually clicked, because this is
+      // the last moment the link is knowable. The generation form re-uploads any
+      // source that is not already an orchestrator URL — resized and re-encoded —
+      // so `sourceUrl` is replaced before submit and the server's URL-derived
+      // provenance finds nothing. Measured: the engine this button picks kept its
+      // on-site URL 98 times out of 2,526.
+      //
+      // In the same `Promise.all` so it costs no extra wall-clock, and swallowed
+      // because provenance is an enrichment: a remix whose token fails to mint
+      // must still open the generator, exactly as an off-site remix does.
+      trpcVanilla.orchestrator.mintRemixProvenance
+        .mutate({ imageId: image.id })
+        .then((r) => r.provenance)
+        .catch(() => undefined),
+    ])
+  );
+
+  // A newer open owns the panel now — applying would overwrite whatever the
+  // user has opened since, including a form they are already typing in.
+  if (superseded) return;
+
+  const [{ width, height }, data, provenance] = result;
+
+  // Keyed by the URL we are about to seed, so `uploadOrchestratorImage` can move
+  // it onto the uploaded blob when the form rewrites this source. Stored before
+  // `setData` for the same reason the panel opens before the awaits: the form
+  // can start resolving the moment the data lands.
+  if (provenance) remixProvenanceStore.setToken(sourceUrl, provenance);
+  // The form can switch to an engine that gates on the source's rating, and an on-site url has
+  // no other way to be rated there.
+  recordGallerySourceRating(sourceUrl, image.nsfwLevel);
+
+  generationGraphStore.setData({
+    params: {
+      ...data.params,
+      workflow: engine.workflow,
+      ecosystem: engine.ecosystemKey,
+      images: [{ url: sourceUrl, width, height }],
+      // `data.params` describes the engine's model version, not this image, so
+      // nothing else here carries the source's shape. Workflows whose graph has
+      // no aspectRatio node ignore the key; the ones that have it snap to the
+      // nearest supported bucket rather than the 1:1 default.
+      aspectRatio: { value: `${width}:${height}`, width, height },
+    },
+    resources: data.resources,
+    runType: 'remix',
+  });
+}
+
+/**
+ * Counts reuse clicks so a slower mint cannot land after a newer one. There is
+ * one prompt token, and the mints resolve in whatever order the network gives
+ * them, so without this two quick clicks can leave the token naming the image
+ * the user clicked FIRST.
+ */
+let promptReuseSequence = 0;
+
+/**
+ * Open the generator seeded from this image's prompt and resources.
+ *
+ * The mint is what makes the link knowable at all: this path seeds no media, so
+ * by submit time nothing in the graph names the image the user started from.
+ * Swallowed and not awaited for the same reason as `startRemix`'s — provenance is
+ * an enrichment, and a reuse whose token fails to mint must still open the
+ * generator.
+ */
+export function startPromptReuse(image: RemixSourceImage) {
+  const sequence = ++promptReuseSequence;
+
+  const mint = trpcVanilla.orchestrator.mintPromptProvenance
+    .mutate({ imageId: image.id })
+    .then((r) => {
+      // A newer reuse click owns the form. Counted separately from the panel's
+      // own sequence, which every open bumps: a media-remix click supersedes the
+      // panel but leaves an in-flight prompt mint alone, and the id match is what
+      // refuses that token rather than this.
+      if (sequence !== promptReuseSequence) return;
+      if (r.provenance) remixProvenanceStore.setPromptToken(r.provenance, image.id);
+    })
+    .catch(() => undefined);
+  // A Generate click can come before the mint answers; the submit waits on this.
+  trackPromptMint(image.id, mint);
+
+  return generationGraphPanel.open({ type: image.type, id: image.id });
+}

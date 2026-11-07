@@ -1,0 +1,586 @@
+import { TRPCError } from '@trpc/server';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * App management (Phase 1) — `blocks.updateManifest` router coverage.
+ * Drives the REAL blocks router so the middleware chain (`protectedProcedure`
+ * → isAuthed, `enforceAppBlocksFlag`) + the owner / approved / immutability /
+ * validation gates decide the outcome. The Forgejo commit, the validator, and
+ * the pending-review recorder are mocked at the module boundary so this suite
+ * exercises the GATES + the server-derived commit, not the downstream services.
+ *
+ * GATING / SAFETY INVARIANTS pinned here (each FAILS if its gate is dropped):
+ *   - anon → UNAUTHORIZED; nothing committed.
+ *   - non-owner → FORBIDDEN; nothing committed.
+ *   - owner, app NOT approved → PRECONDITION_FAILED; nothing committed.
+ *   - invalid manifest (validator reject) → BAD_REQUEST; nothing committed.
+ *   - version not strictly greater → BAD_REQUEST; nothing committed.
+ *   - owner + valid → commitFiles called with the SERVER-derived slug + the
+ *     merged manifest (blockId forced to the slug), then recordPendingFromPush
+ *     records a PENDING review (no auto-approve / no deploy).
+ *   - immutable blockId: even if the merged manifest's stored blockId differs
+ *     from the slug, the committed manifest carries the SLUG.
+ */
+
+const { mockIsAppBlocksEnabled, mockCommitFiles, mockRecordPending, mockValidate, mockStamp } =
+  vi.hoisted(() => ({
+    mockIsAppBlocksEnabled: vi.fn(),
+    mockCommitFiles: vi.fn(),
+    mockRecordPending: vi.fn(),
+    mockValidate: vi.fn(),
+    mockStamp: vi.fn(),
+  }));
+
+vi.mock('~/server/services/app-blocks-flag', () => ({
+  isAppBlocksEnabled: mockIsAppBlocksEnabled,
+}));
+// env comes from the global ~/env/server mock in src/__tests__/setup.ts
+// (complete TEST_ENV_DEFAULTS incl. FORGEJO_PUBLIC_URL / APPS_DOMAIN / MEILI /
+// S3). Overriding it locally drops those defaults and crashes at import.
+vi.mock('~/server/services/blocks/forgejo.service', () => ({
+  FORGEJO_ORG: 'civitai-apps',
+  commitFiles: mockCommitFiles,
+  addCollaborator: vi.fn(),
+}));
+vi.mock('~/server/services/blocks/publish-request.service', () => ({
+  recordPendingFromPush: mockRecordPending,
+}));
+vi.mock('~/server/services/block-manifest-validator.service', () => ({
+  // The router now calls the async submission gate (validate + settings-pattern
+  // ReDoS check); point it at the same mock so mockValidate drives the outcome.
+  BlockManifestValidator: { validate: mockValidate, validateSubmission: mockValidate },
+}));
+vi.mock('~/server/services/blocks/manifest-normalize', () => ({
+  stampCanonicalIframeSrc: mockStamp,
+}));
+// publish-request.schema is a pure module (regexes + zod schemas) — use the
+// REAL one so the router's static imports (withdrawRequestSchema, etc.) resolve
+// and SEMVER_REGEX is the canonical pattern.
+
+// --- the rest of the router's static import graph (stubbed, as in getMyAppRepo) ---
+vi.mock('~/server/services/block-registry.service', () => ({
+  BlockRegistry: {
+    listForModel: vi.fn(),
+    listAvailable: vi.fn(),
+    getAppDetail: vi.fn(),
+    getFeaturedBlocks: vi.fn(),
+    installOnModel: vi.fn(),
+    updateSettings: vi.fn(),
+    toggleEnabled: vi.fn(),
+    uninstallFromModel: vi.fn(),
+    listUserSubscriptions: vi.fn(),
+    resolveBlockInstance: vi.fn(),
+  },
+}));
+vi.mock('~/server/middleware/block-scope.middleware', () => ({
+  verifyBlockToken: vi.fn(),
+  parseSubjectUserId: vi.fn(),
+}));
+vi.mock('~/server/orchestrator/get-orchestrator-token', () => ({ getOrchestratorToken: vi.fn() }));
+vi.mock('~/server/services/orchestrator/orchestration-new.service', () => ({
+  buildGenerationContext: vi.fn(),
+  createWorkflowStepsFromGraphInput: vi.fn(),
+}));
+vi.mock('~/server/services/orchestrator/workflows', () => ({
+  submitWorkflow: vi.fn(),
+  getWorkflow: vi.fn(),
+  cancelWorkflow: vi.fn(),
+}));
+vi.mock('~/server/services/orchestrator/promptAuditing', () => ({ auditPromptServer: vi.fn() }));
+vi.mock('~/server/services/user.service', () => ({ getUserById: vi.fn() }));
+vi.mock('~/server/rewards/active/dailyBoost.reward', () => ({
+  dailyBoostReward: { apply: vi.fn(), getUserRewardDetails: vi.fn() },
+}));
+vi.mock('~/server/services/buzz.service', () => ({
+  getUserBuzzAccounts: vi.fn(async () => ({ yellow: 0, blue: 0, green: 0 })),
+}));
+vi.mock('~/server/middleware.trpc', async () => {
+  const { middleware } = await import('~/server/trpc');
+  return { rateLimit: () => middleware(async ({ next }) => next()) };
+});
+
+import { blocksRouter } from '../blocks.router';
+import { dbRead } from '~/server/db/client';
+import { TokenScope } from '~/shared/constants/token-scope.constants';
+import { dbMock } from '~/__tests__/mocks/db.mock';
+import { loggingMock } from '~/__tests__/mocks/logging.mock';
+import { redisMock } from '~/__tests__/mocks/redis.mock';
+import type * as AppDeveloperTermsService from '~/server/services/blocks/app-developer-terms.service';
+// Publish paths here run as a developer who accepted the App Developer Terms; a test that needs the
+// refusal overrides the stub.
+vi.mock('~/server/services/blocks/app-developer-terms.service', async (importOriginal) => ({
+  ...(await importOriginal<typeof AppDeveloperTermsService>()),
+  hasAcceptedAppDeveloperTerms: vi.fn(async () => true),
+  assertAcceptedAppDeveloperTerms: vi.fn(async () => undefined),
+  assertAcceptedAppDeveloperTermsTrpc: vi.fn(async () => undefined),
+  assertOwnerAcceptedAppDeveloperTerms: vi.fn(async () => undefined),
+  assertListingOwnerAcceptedAppDeveloperTerms: vi.fn(async () => undefined),
+}));
+
+function fakeCtx(user: unknown) {
+  return {
+    acceptableOrigin: true,
+    user,
+    apiKeyId: null,
+    tokenScope: TokenScope.Full,
+    req: { headers: {} } as never,
+    res: { setHeader: () => undefined } as never,
+    cache: { edgeTTL: 0 },
+    features: { appBlocks: true } as never,
+    track: undefined,
+  };
+}
+
+const ownerUser = { id: 7, isModerator: false, tier: 'free', username: 'owner' };
+const otherUser = { id: 99, isModerator: false, tier: 'free', username: 'intruder' };
+
+const findUnique = dbRead.appBlock.findUnique as ReturnType<typeof vi.fn>;
+
+const approvedBlock = {
+  id: 'ab_1',
+  blockId: 'my-app',
+  status: 'approved',
+  version: '1.0.0',
+  manifest: { blockId: 'my-app', version: '1.0.0', name: 'My App', scopes: ['models:read:self'] },
+  app: { userId: ownerUser.id, allowedScopes: 1, allowedOrigins: ['https://my-app.civit.ai'] },
+};
+
+const validPatch = {
+  version: '1.0.1',
+  name: 'My App v2',
+  contentRating: 'g',
+  scopes: [] as string[],
+};
+
+beforeEach(() => {
+  mockIsAppBlocksEnabled.mockReset().mockResolvedValue(true);
+  mockCommitFiles.mockReset().mockResolvedValue({ sha: 'a'.repeat(40) });
+  mockRecordPending.mockReset().mockResolvedValue({ publishRequestId: 'pubreq_x' });
+  mockValidate.mockReset().mockReturnValue({ valid: true });
+  mockStamp.mockReset().mockImplementation((m: Record<string, unknown>) => m);
+  findUnique.mockReset();
+});
+
+describe('blocks.updateManifest — Phase 1 web manifest editor', () => {
+  it('anon: UNAUTHORIZED, nothing committed', async () => {
+    const caller = blocksRouter.createCaller(fakeCtx(undefined) as never);
+    await expect(
+      caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch })
+    ).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    expect(mockCommitFiles).not.toHaveBeenCalled();
+    expect(mockRecordPending).not.toHaveBeenCalled();
+  });
+
+  it('non-owner: FORBIDDEN, nothing committed', async () => {
+    findUnique.mockResolvedValue(approvedBlock);
+    const caller = blocksRouter.createCaller(fakeCtx(otherUser) as never);
+    await expect(
+      caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch })
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(mockCommitFiles).not.toHaveBeenCalled();
+  });
+
+  it('owner but block missing: NOT_FOUND', async () => {
+    findUnique.mockResolvedValue(null);
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await expect(
+      caller.updateManifest({ appBlockId: 'nope', patch: validPatch })
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('App Developer Terms not accepted: refused before anything is committed', async () => {
+    const terms = await import('~/server/services/blocks/app-developer-terms.service');
+    vi.mocked(terms.assertAcceptedAppDeveloperTermsTrpc).mockRejectedValueOnce(
+      new TRPCError({ code: 'FORBIDDEN', message: 'Accept the App Developer Terms' })
+    );
+    findUnique.mockResolvedValue(approvedBlock);
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await expect(
+      caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch })
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(mockCommitFiles).not.toHaveBeenCalled();
+  });
+
+  it("collaborator while the owner hasn't accepted the terms: refused before anything is committed", async () => {
+    const terms = await import('~/server/services/blocks/app-developer-terms.service');
+    vi.mocked(terms.assertOwnerAcceptedAppDeveloperTerms).mockRejectedValueOnce(
+      new TRPCError({ code: 'FORBIDDEN', message: 'The app owner must accept the terms' })
+    );
+    findUnique.mockResolvedValue(approvedBlock);
+    (dbRead.appListing.findUnique as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ id: 'l_1' });
+    (dbRead.appCollaborator.findFirst as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      userId: otherUser.id,
+    });
+    const caller = blocksRouter.createCaller(fakeCtx(otherUser) as never);
+    await expect(
+      caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch })
+    ).rejects.toMatchObject({ code: 'FORBIDDEN', message: 'The app owner must accept the terms' });
+    expect(terms.assertOwnerAcceptedAppDeveloperTerms).toHaveBeenCalledWith(ownerUser.id);
+    expect(mockCommitFiles).not.toHaveBeenCalled();
+  });
+
+  it('owner editing: the owner check is not called separately', async () => {
+    const terms = await import('~/server/services/blocks/app-developer-terms.service');
+    vi.mocked(terms.assertOwnerAcceptedAppDeveloperTerms).mockClear();
+    findUnique.mockResolvedValue(approvedBlock);
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch });
+    expect(terms.assertOwnerAcceptedAppDeveloperTerms).not.toHaveBeenCalled();
+    expect(mockCommitFiles).toHaveBeenCalledTimes(1);
+  });
+
+  it('owner, app NOT approved: PRECONDITION_FAILED, nothing committed', async () => {
+    findUnique.mockResolvedValue({ ...approvedBlock, status: 'pending' });
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await expect(
+      caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch })
+    ).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    expect(mockCommitFiles).not.toHaveBeenCalled();
+  });
+
+  it('version not strictly greater: BAD_REQUEST, nothing committed', async () => {
+    findUnique.mockResolvedValue(approvedBlock);
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await expect(
+      caller.updateManifest({ appBlockId: 'ab_1', patch: { ...validPatch, version: '1.0.0' } })
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(mockCommitFiles).not.toHaveBeenCalled();
+  });
+
+  it('invalid manifest (validator reject) → BAD_REQUEST, nothing committed', async () => {
+    findUnique.mockResolvedValue(approvedBlock);
+    mockValidate.mockReturnValue({
+      valid: false,
+      errors: ['scope "x" is not a known block scope'],
+    });
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await expect(
+      caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch })
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(mockCommitFiles).not.toHaveBeenCalled();
+    expect(mockRecordPending).not.toHaveBeenCalled();
+  });
+
+  it('over-scope manifest is rejected via the SERVER validator (scope-subset gate runs)', async () => {
+    findUnique.mockResolvedValue(approvedBlock);
+    mockValidate.mockReturnValue({
+      valid: false,
+      errors: ['requested scopes exceed OAuth client allowedScopes: models:write:self'],
+    });
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await expect(
+      caller.updateManifest({
+        appBlockId: 'ab_1',
+        patch: { ...validPatch, scopes: ['models:write:self'] },
+      })
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    // The validator was called with the app's OauthClient context (the
+    // allowedScopes bitmask + allowedOrigins), i.e. the subset check actually ran.
+    expect(mockValidate).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ allowedScopes: 1, allowedOrigins: ['https://my-app.civit.ai'] })
+    );
+    expect(mockCommitFiles).not.toHaveBeenCalled();
+  });
+
+  it('owner + valid: commits server-derived slug + merged manifest, records a PENDING review', async () => {
+    findUnique.mockResolvedValue(approvedBlock);
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    const res = await caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch });
+
+    expect(res.status).toBe('pending');
+    expect(res.slug).toBe('my-app');
+    expect(res.version).toBe('1.0.1');
+    expect(res.publishRequestId).toBe('pubreq_x');
+
+    // Committed to the canonical org + the SERVER-derived slug, only the manifest
+    // file, with the new version baked in.
+    expect(mockCommitFiles).toHaveBeenCalledTimes(1);
+    const commitArg = mockCommitFiles.mock.calls[0][0];
+    expect(commitArg.org).toBe('civitai-apps');
+    expect(commitArg.slug).toBe('my-app');
+    expect(commitArg.files).toHaveLength(1);
+    expect(commitArg.files[0].path).toBe('block.manifest.json');
+    const committed = JSON.parse(commitArg.files[0].content.toString('utf8'));
+    expect(committed.version).toBe('1.0.1');
+    expect(committed.name).toBe('My App v2');
+
+    // PENDING review recorded (no auto-approve / no deploy) with the commit sha.
+    expect(mockRecordPending).toHaveBeenCalledWith(
+      expect.objectContaining({
+        slug: 'my-app',
+        sha: 'a'.repeat(40),
+        appBlockId: 'ab_1',
+        version: '1.0.1',
+      })
+    );
+  });
+
+  it('banned owner: FORBIDDEN, nothing committed', async () => {
+    findUnique.mockResolvedValue(approvedBlock);
+    const caller = blocksRouter.createCaller(
+      fakeCtx({ ...ownerUser, bannedAt: new Date('2026-01-01') }) as never
+    );
+    await expect(
+      caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch })
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(mockCommitFiles).not.toHaveBeenCalled();
+    expect(mockRecordPending).not.toHaveBeenCalled();
+  });
+
+  it('SSRF: a client-supplied off-origin iframe.src is OVERWRITTEN to the canonical per-app subdomain in the committed bytes', async () => {
+    // iframe.src is platform-owned. Even if the client smuggles a hostile
+    // off-origin URL (an SSRF / origin-confusion vector) through the patch, the
+    // server unconditionally stamps the canonical `https://<slug>.<APPS_DOMAIN>/`
+    // before committing. Use the REAL stamper here (not the pass-through mock)
+    // so this asserts the actual normalization, on the bytes that get committed.
+    mockStamp.mockImplementation((m: Record<string, unknown>, slug: string, appsDomain: string) => {
+      const existing =
+        m.iframe && typeof m.iframe === 'object' && !Array.isArray(m.iframe)
+          ? (m.iframe as Record<string, unknown>)
+          : {};
+      m.iframe = { ...existing, src: `https://${slug}.${appsDomain}/` };
+      return m;
+    });
+    findUnique.mockResolvedValue({
+      ...approvedBlock,
+      // Stored manifest already carries a hostile src; the patch tries to set
+      // another one. Neither must survive the stamp.
+      manifest: { ...approvedBlock.manifest, iframe: { src: 'https://evil.example.com/steal' } },
+    });
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await caller.updateManifest({
+      appBlockId: 'ab_1',
+      // The input schema doesn't accept iframe.src, but a stored/leaked hostile
+      // value (above) must still be overwritten — assert on the committed bytes.
+      patch: validPatch,
+    });
+
+    const commitArg = mockCommitFiles.mock.calls[0][0];
+    const committed = JSON.parse(commitArg.files[0].content.toString('utf8'));
+    expect(committed.iframe.src).toBe('https://my-app.civit.ai/');
+    // The hostile origin is gone from the committed manifest.
+    expect(commitArg.files[0].content.toString('utf8')).not.toContain('evil.example.com');
+    // The validator also saw the canonical-stamped manifest (the security
+    // boundary runs AFTER the stamp).
+    const validated = mockValidate.mock.calls[0][0] as { iframe: { src: string } };
+    expect(validated.iframe.src).toBe('https://my-app.civit.ai/');
+  });
+
+  it('immutable blockId: the committed manifest carries the SLUG even if the stored manifest blockId drifted', async () => {
+    // Stored manifest has a stale/wrong blockId; the slug (block.blockId) is the
+    // source of truth and must win in the committed manifest.
+    findUnique.mockResolvedValue({
+      ...approvedBlock,
+      manifest: { ...approvedBlock.manifest, blockId: 'WRONG-old-slug' },
+    });
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch });
+
+    const commitArg = mockCommitFiles.mock.calls[0][0];
+    const committed = JSON.parse(commitArg.files[0].content.toString('utf8'));
+    expect(committed.blockId).toBe('my-app');
+    // And the validator saw the slug-forced manifest too.
+    const validated = mockValidate.mock.calls[0][0] as { blockId: string };
+    expect(validated.blockId).toBe('my-app');
+  });
+
+  it('server-owned trustTier: a client patch tier is OVERRIDDEN to the stored tier in the committed bytes AND the value the validator saw', async () => {
+    // trustTier is moderator-controlled, NOT publisher-declared. The stored row
+    // has trustTier=unverified; the client patch tries to self-declare the most
+    // privileged tier (`internal`, which grants allow-same-origin in the sandbox
+    // allowlist). The server must force the merged manifest's trustTier back to
+    // the STORED value BEFORE validating + committing — so the validator gates
+    // the sandbox against the real tier, and the pending row records the real
+    // tier. Mirrors how submitVersion/approveRequest re-stamp it.
+    findUnique.mockResolvedValue({
+      ...approvedBlock,
+      trustTier: 'unverified',
+      // Stored manifest also carries a (possibly drifted) tier — must not survive.
+      manifest: { ...approvedBlock.manifest, trustTier: 'verified' },
+    });
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await caller.updateManifest({
+      appBlockId: 'ab_1',
+      patch: { ...validPatch, trustTier: 'internal' },
+    });
+
+    const commitArg = mockCommitFiles.mock.calls[0][0];
+    const committed = JSON.parse(commitArg.files[0].content.toString('utf8'));
+    // The committed bytes carry the STORED tier, not the client-claimed one.
+    expect(committed.trustTier).toBe('unverified');
+    expect(commitArg.files[0].content.toString('utf8')).not.toContain('internal');
+    // And the validator (the sandbox-allowlist security boundary) saw the stored
+    // tier — never the self-declared `internal`.
+    const validated = mockValidate.mock.calls[0][0] as { trustTier: string };
+    expect(validated.trustTier).toBe('unverified');
+  });
+
+  // The MANIFEST-GOVERNED store fields. An onsite listing has no other author
+  // surface for these (the /apps/[appBlockId]/edit Listing tab is media-only),
+  // so the editor must be able to both SET and CLEAR them here.
+  describe('tagline + category (manifest-governed store fields)', () => {
+    it('accepts + commits a tagline and category', async () => {
+      findUnique.mockResolvedValue(approvedBlock);
+      const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+      await caller.updateManifest({
+        appBlockId: 'ab_1',
+        patch: { ...validPatch, tagline: 'A crisp one-liner', category: 'utility' },
+      });
+
+      const commitArg = mockCommitFiles.mock.calls[0][0];
+      const committed = JSON.parse(commitArg.files[0].content.toString('utf8'));
+      expect(committed.tagline).toBe('A crisp one-liner');
+      expect(committed.category).toBe('utility');
+      // The validator (the authoritative gate) saw them too.
+      const validated = mockValidate.mock.calls[0][0] as Record<string, unknown>;
+      expect(validated.tagline).toBe('A crisp one-liner');
+      expect(validated.category).toBe('utility');
+    });
+
+    it('an explicit null DELETES the key from the merged manifest (clear, not a null value)', async () => {
+      // The stored manifest already has both; the client clears them. `null` must
+      // REMOVE the key — the manifest fields are optional and the validator
+      // rejects a non-string value, so a literal null would fail validation and
+      // an `undefined` would be dropped by the {...stored, ...patch} merge (which
+      // would silently retain the stale value).
+      findUnique.mockResolvedValue({
+        ...approvedBlock,
+        manifest: { ...approvedBlock.manifest, tagline: 'Old pitch', category: 'games' },
+      });
+      const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+      await caller.updateManifest({
+        appBlockId: 'ab_1',
+        patch: { ...validPatch, tagline: null, category: null },
+      });
+
+      const validated = mockValidate.mock.calls[0][0] as Record<string, unknown>;
+      expect('tagline' in validated).toBe(false);
+      expect('category' in validated).toBe(false);
+      const commitArg = mockCommitFiles.mock.calls[0][0];
+      const committed = JSON.parse(commitArg.files[0].content.toString('utf8'));
+      expect('tagline' in committed).toBe(false);
+      expect('category' in committed).toBe(false);
+      // And the stale values are genuinely gone from the committed bytes.
+      expect(commitArg.files[0].content.toString('utf8')).not.toContain('Old pitch');
+    });
+
+    it('OMITTING them preserves the stored values (sparse patch, unchanged merge semantics)', async () => {
+      findUnique.mockResolvedValue({
+        ...approvedBlock,
+        manifest: { ...approvedBlock.manifest, tagline: 'Kept pitch', category: 'games' },
+      });
+      const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+      await caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch });
+
+      const validated = mockValidate.mock.calls[0][0] as Record<string, unknown>;
+      expect(validated.tagline).toBe('Kept pitch');
+      expect(validated.category).toBe('games');
+    });
+
+    it('a validator-rejected tagline is a BAD_REQUEST — nothing committed', async () => {
+      findUnique.mockResolvedValue(approvedBlock);
+      mockValidate.mockReturnValue({ valid: false, errors: ['tagline must be ≤140 chars'] });
+      const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+      await expect(
+        caller.updateManifest({
+          appBlockId: 'ab_1',
+          patch: { ...validPatch, tagline: 'a'.repeat(200) },
+        })
+      ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+      expect(mockCommitFiles).not.toHaveBeenCalled();
+    });
+  });
+
+  // The public SOURCE-REPOSITORY link is manifest-governed on exactly the same terms
+  // as tagline/category, so the same SET / CLEAR / OMIT contract has to hold for it.
+  // 🔴 These live in the BLOCKING node project deliberately: the browser tier is
+  // report-only, so the rule that an explicit `null` must DELETE the key cannot be
+  // gated there alone — a dropped `undefined` would silently retain a stale published
+  // repository link, which is the exact failure the null was introduced for.
+  describe('repository (the manifest-governed public source-repo link)', () => {
+    it('accepts + commits a repository link', async () => {
+      findUnique.mockResolvedValue(approvedBlock);
+      const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+      await caller.updateManifest({
+        appBlockId: 'ab_1',
+        patch: { ...validPatch, repository: 'https://github.com/civitai/my-app' },
+      });
+
+      const commitArg = mockCommitFiles.mock.calls[0][0];
+      const committed = JSON.parse(commitArg.files[0].content.toString('utf8'));
+      expect(committed.repository).toBe('https://github.com/civitai/my-app');
+      // The validator (the authoritative gate) saw it too — the router never decides
+      // whether a link is acceptable.
+      const validated = mockValidate.mock.calls[0][0] as Record<string, unknown>;
+      expect(validated.repository).toBe('https://github.com/civitai/my-app');
+    });
+
+    it('🔴 an explicit null DELETES the key (clear) — a null VALUE would fail validation', async () => {
+      findUnique.mockResolvedValue({
+        ...approvedBlock,
+        manifest: { ...approvedBlock.manifest, repository: 'https://github.com/old/repo' },
+      });
+      const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+      await caller.updateManifest({
+        appBlockId: 'ab_1',
+        patch: { ...validPatch, repository: null },
+      });
+
+      const validated = mockValidate.mock.calls[0][0] as Record<string, unknown>;
+      expect('repository' in validated).toBe(false);
+      const commitArg = mockCommitFiles.mock.calls[0][0];
+      const committed = JSON.parse(commitArg.files[0].content.toString('utf8'));
+      expect('repository' in committed).toBe(false);
+      // The stale link is genuinely gone from the committed bytes — not merely
+      // overwritten by a null the reader would have to interpret.
+      expect(commitArg.files[0].content.toString('utf8')).not.toContain('old/repo');
+    });
+
+    it('OMITTING it preserves the stored link (sparse patch — the merge is unchanged)', async () => {
+      findUnique.mockResolvedValue({
+        ...approvedBlock,
+        manifest: { ...approvedBlock.manifest, repository: 'https://github.com/kept/repo' },
+      });
+      const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+      await caller.updateManifest({ appBlockId: 'ab_1', patch: validPatch });
+
+      const validated = mockValidate.mock.calls[0][0] as Record<string, unknown>;
+      expect(validated.repository).toBe('https://github.com/kept/repo');
+    });
+
+    it('a validator-rejected repository is a BAD_REQUEST — nothing committed', async () => {
+      findUnique.mockResolvedValue(approvedBlock);
+      mockValidate.mockReturnValue({
+        valid: false,
+        errors: ['repository host "gist.github.com" is not an accepted source host'],
+      });
+      const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+      await expect(
+        caller.updateManifest({
+          appBlockId: 'ab_1',
+          patch: { ...validPatch, repository: 'https://gist.github.com/x/y' },
+        })
+      ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+      expect(mockCommitFiles).not.toHaveBeenCalled();
+      expect(mockRecordPending).not.toHaveBeenCalled();
+    });
+  });
+
+  it('server-owned trustTier: with no stored tier on the row it defaults to `unverified` (never the patched value)', async () => {
+    // approvedBlock has no trustTier field at all (null/undefined on the row) —
+    // the override must fall back to `unverified`, not honour the client patch.
+    findUnique.mockResolvedValue(approvedBlock);
+    const caller = blocksRouter.createCaller(fakeCtx(ownerUser) as never);
+    await caller.updateManifest({
+      appBlockId: 'ab_1',
+      patch: { ...validPatch, trustTier: 'internal' },
+    });
+
+    const validated = mockValidate.mock.calls[0][0] as { trustTier: string };
+    expect(validated.trustTier).toBe('unverified');
+    const commitArg = mockCommitFiles.mock.calls[0][0];
+    const committed = JSON.parse(commitArg.files[0].content.toString('utf8'));
+    expect(committed.trustTier).toBe('unverified');
+  });
+});

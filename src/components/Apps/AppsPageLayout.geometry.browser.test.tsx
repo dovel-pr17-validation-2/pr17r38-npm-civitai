@@ -1,0 +1,383 @@
+/**
+ * `/apps` chrome — RENDERED VERTICAL GEOMETRY. THE SINGLE HOME FOR IT.
+ *
+ * 🔴 THIS IS WHERE THE PAGE CHROME'S VERTICAL NUMBERS LIVE, AND THAT IS NOW A PROPERTY
+ * OF THE SUITE RATHER THAN A COINCIDENCE. The 32px band→body gap used to be asserted
+ * here TWICE and a third time in `AppsPageLayout.chromeAlignment.browser.test.tsx`, so
+ * one number had three homes and any vertical change to the chrome had to be re-fixed in
+ * all three — the shape where it ends up right in one place and wrong in the others. That
+ * third copy is gone (the deletion is recorded in that file's docstring, which is now
+ * horizontal-only). The rail's INTERNAL vertical geometry — the first group heading's
+ * row, which the collapse toggle shares — is a different subject and lives in
+ * `AppsRailHeaderRow.geometry.test.tsx`, in the tier that can see `sr-only`.
+ * `AppsPageLayout.railSurface.browser.test.tsx` also reads vertical numbers, about the
+ * painted panel's BLEED rather than about the chrome's heights; left there deliberately.
+ *
+ * ⚠️ TWO HONEST QUALIFICATIONS ON THAT CONSOLIDATION, BECAUSE "A CONSOLIDATION RATHER
+ * THAN A LOSS" IS STRONGER THAN WHAT WAS MEASURED. (a) The deleted copy ran inside
+ * `describe.each(VIEWPORTS)` and so measured the gap at 1440 / 2560 / 3440; every test in
+ * THIS file renders at 1440 only. The gap is `Stack gap="xl"`, a non-responsive token, so
+ * no viewport-dependent defect is reachable — but the viewport coverage genuinely
+ * narrowed and that is the trade. (b) 🔴 THE FILENAME LIES ABOUT THE TIER: this file ends
+ * `.browser.test.tsx`, so it is collected by the `component` project, NOT by the
+ * `geometry` one, despite "geometry" being in its name, and runs in CI as
+ * `Component tests`. Do not read the name as a tier.
+ *
+ * 🔴 READ THIS BEFORE TRUSTING IT AS A GATE: it is not one. This file is in the
+ * Vitest browser-mode `component` project (`Component tests` in CI), and no check in
+ * this repo blocks a merge. ⚠️ AND THE
+ * SENTENCE THAT FOLLOWED USED TO SAY "the enforceable half lives as source guards in the
+ * BLOCKING `unit` project", WHICH IS FALSE: verified 2026-10-03 against the GitHub API,
+ * `civitai/civitai` `main` carries `required_status_checks: null`, so no project in this
+ * repo can block a merge. The source guards in `__tests__/appsPageLayout.test.ts` and
+ * `__tests__/appsRailGeometry.test.ts` are still the STRUCTURAL half and still worth
+ * having; they are not enforcement. This file exists because those pin token names and
+ * only a real render can pin PIXELS — and the layout's own comments record that token
+ * math already overstated a visual difference once (a Title's line box eats part of the
+ * nominal gap).
+ *
+ * 🔴 REWRITTEN FOR THE LEFT RAIL, AND MOST OF WHAT IT USED TO MEASURE NO LONGER EXISTS.
+ * Every number in the retired table below was a property of the TAB ROW — its height, its
+ * block and inline padding, the `Tabs.List::before` hairline, the tab-bottom-to-title gap.
+ * There is no tab row. Rather than re-baseline those to whatever the rail happens to
+ * render (which would be deriving the expectation from the implementation), they are
+ * DELETED and replaced by the claims a rail actually has to hold. Recorded so the
+ * deletions read as decisions:
+ *
+ *   retired                       why
+ *   tab row height (29)           no tab row
+ *   tab padBlock [6,6]            no tab; a rail entry's padding is a Tailwind class
+ *   tab padInline [16,16]         same — and the `padding`-shorthand trap it guarded
+ *                                 against was specific to Mantine's `Tabs` styles API
+ *   marketplaceTabWidth 133.27    a measurement of one label in a horizontal strip
+ *   listRule width/colour         the rail draws NO rule (pinned as an ABSENCE in
+ *                                 `__tests__/appsPageLayout.test.ts`)
+ *   tabsRuleToTitle (16)          the two things measured are in different columns now
+ *
+ * What SURVIVES unchanged is the band→body 32px gap, the container's padding, and the
+ * claim that `/apps/*` starts flush under the global header — plus two claims the rail
+ * adds: the two columns start at the same y, and the rail is `sticky` at the subnav gap.
+ *
+ * 🔴 WHY THIS FILE LOADS `@mantine/core/styles.css` AND THE OTHERS MUST NOT.
+ * The shared component scaffold deliberately omits Mantine's stylesheet, so the
+ * sibling browser tests assert only inline styles / ARIA. But every number this file is
+ * about — `Stack`'s `gap` (a stylesheet rule consuming `--stack-gap`), the Container's
+ * padding — comes FROM that stylesheet. Without the import each of them computes to 0
+ * and every assertion below passes while measuring nothing. Vitest browser mode runs each
+ * test file in its own iframe, so the import does not leak into the sibling suites.
+ */
+import '@mantine/core/styles.css';
+import { describe, expect, test, vi } from 'vitest';
+import type { ReactElement } from 'react';
+import { page } from 'vitest/browser';
+// `test/` lives outside `src`, so the `~` alias doesn't reach it — relative import.
+import { renderWithProviders } from '../../../test/component-setup';
+import type * as TrpcMod from '~/utils/trpc';
+
+// 🔴 The viewer MUST be one the rail renders for. `AppsPageLayout` hides the rail
+// entirely below two qualifying sections, and the summary query is stubbed empty here, so
+// an anonymous / non-author viewer would render NO `<nav>` at all and `measure()` would
+// fail its lookup guard instead of measuring. The author capability (`appBlocksAuthor`)
+// yields Marketplace + Build — two sections, which clears the floor.
+vi.mock('~/providers/FeatureFlagsProvider', () => ({
+  useFeatureFlags: () => ({ appBlocks: true, appBlocksAuthor: true }),
+}));
+vi.mock('~/providers/IsClientProvider', () => ({ useIsClient: () => true }));
+vi.mock('~/hooks/useCurrentUser', () => ({
+  useCurrentUser: () => ({ id: 1, username: 'author', isModerator: false }),
+}));
+// Spread the REAL module and override only `trpc` (local-rules/no-wholesale-
+// module-mock) — see the sibling browser test for why.
+vi.mock('~/utils/trpc', async (importOriginal) => ({
+  ...(await importOriginal<typeof TrpcMod>()),
+  trpc: { blocks: { getNavSummary: { useQuery: () => ({ data: undefined }) } } },
+}));
+
+const { AppsPageLayout } = await import('./AppsPageLayout');
+const { SUBNAV_STICKY_GAP } = await import('~/hooks/useSubnavBottom');
+
+const pad = (el: Element, side: 'Top' | 'Bottom' | 'Left' | 'Right') =>
+  Math.round(parseFloat(getComputedStyle(el)[`padding${side}` as 'paddingTop']) * 100) / 100;
+
+const px2 = (n: number) => Math.round(n * 100) / 100;
+
+type Geometry = ReturnType<typeof measure>;
+
+/**
+ * Resolve an element this file's numbers are measured FROM, or fail with the reason.
+ *
+ * A bare `document.querySelector(...) as HTMLElement` hands `null` on to
+ * `getBoundingClientRect()` / `getComputedStyle()`, which throws an anonymous
+ * `TypeError` naming neither the selector nor the likely cause. Every lookup here can
+ * legitimately go missing when the rail's flag mocks stop admitting the viewer, so that
+ * is the diagnosis worth printing.
+ */
+function required(selector: string): HTMLElement {
+  const el = document.querySelector(selector) as HTMLElement | null;
+  expect(
+    el,
+    `\`${selector}\` is not in the document. The geometry here is measured off the ` +
+      '`/apps` rail, which renders only for a viewer with ≥2 qualifying sections AND at a ' +
+      'viewport ≥ APPS_RAIL_MIN_VIEWPORT — check the `useFeatureFlags` / `useCurrentUser` ' +
+      'mocks and the viewport above before re-baselining a number.'
+  ).not.toBeNull();
+  return el as HTMLElement;
+}
+
+function measure() {
+  const rail = required('[data-apps-chrome="rail"]');
+  const bodyColumn = required('[data-apps-chrome="body-column"]');
+  const band = required('[data-apps-chrome="band"]');
+  const container = required('.mantine-Container-root');
+  // The sticky element is the ASIDE ITSELF (a flex item), not a wrapper inside it —
+  // see the inline comment on the `<aside>`. Reading the inner div here is what the
+  // retired assertions did, and it is why they reported `position: sticky` on a rail
+  // that could not travel.
+  const sticky = rail;
+  const title = document.querySelector('h2') as HTMLElement | null;
+  const body = required('[data-testid="body"]');
+
+  const containerTop = container.getBoundingClientRect().top;
+  const bandRect = band.getBoundingClientRect();
+  const bodyTop = body.getBoundingClientRect().top;
+
+  return {
+    // Guard-the-guard: if the stylesheet failed to load, the Container loses its padding
+    // and every gap below reads 0. Asserted in each test before anything else.
+    styleSheetLoaded: pad(container, 'Left') > 0,
+    containerPadInline: [pad(container, 'Left'), pad(container, 'Right')] as const,
+    containerPadTop: pad(container, 'Top'),
+    containerPadBottom: pad(container, 'Bottom'),
+    /** The two columns' top edges, relative to the Container's content box top. */
+    railTop: px2(rail.getBoundingClientRect().top - containerTop),
+    bodyColumnTop: px2(bodyColumn.getBoundingClientRect().top - containerTop),
+    /** The rail's sticky wrapper — position and offset, as the browser resolves them. */
+    stickyPosition: getComputedStyle(sticky).position,
+    stickyTop: getComputedStyle(sticky).top,
+    bandToBody: px2(bodyTop - bandRect.bottom),
+    topToBody: px2(bodyTop - containerTop),
+    hasTitle: title != null,
+  };
+}
+
+async function renderAndMeasure(ui: ReactElement): Promise<Geometry> {
+  await page.viewport(1440, 900);
+  renderWithProviders(ui);
+  await expect.element(page.getByTestId('body')).toBeInTheDocument();
+  // Two frames so layout + the injected stylesheet have both settled.
+  await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+  return measure();
+}
+
+const body = (
+  <div data-testid="body" style={{ height: 200 }}>
+    body
+  </div>
+);
+
+/**
+ * A body tall enough that the page actually scrolls. The 200px `body` above cannot
+ * scroll at all, which is the second reason the retired sticky assertions could not
+ * observe stickiness: even had they read the right property, there was no travel.
+ */
+const tallBody = (
+  <div data-testid="body" style={{ height: 3000 }}>
+    body
+  </div>
+);
+
+/**
+ * Render, measure the rail's VIEWPORT-relative top, scroll, measure again.
+ *
+ * Viewport is 1440 — above `APPS_RAIL_MIN_VIEWPORT` (1300), so the rail is actually
+ * displayed. Measuring this below 1300 would read a `display: none` box and report a
+ * pinned rail because there is no rail.
+ */
+async function renderTallAndScroll(ui: ReactElement) {
+  await page.viewport(1440, 900);
+  renderWithProviders(ui);
+  await expect.element(page.getByTestId('body')).toBeInTheDocument();
+  await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+
+  const rail = required('[data-apps-chrome="rail"]');
+  const container = required('.mantine-Container-root');
+  // The sticky element is the ASIDE ITSELF (a flex item), not a wrapper inside it —
+  // see the inline comment on the `<aside>`. Reading the inner div here is what the
+  // retired assertions did, and it is why they reported `position: sticky` on a rail
+  // that could not travel.
+  const sticky = rail;
+  const stickyPosition = getComputedStyle(sticky).position;
+  const stickyTop = getComputedStyle(sticky).top;
+  const railViewportTopBefore = px2(rail.getBoundingClientRect().top);
+
+  const before = window.scrollY;
+  window.scrollTo(0, 600);
+  await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+  const scrolledBy = window.scrollY - before;
+  const railViewportTopAfter = px2(rail.getBoundingClientRect().top);
+  window.scrollTo(0, 0);
+
+  return {
+    styleSheetLoaded: pad(container, 'Left') > 0,
+    stickyPosition,
+    stickyTop,
+    railViewportTopBefore,
+    railViewportTopAfter,
+    scrolledBy,
+  };
+}
+
+describe('/apps chrome vertical geometry', () => {
+  test('the Container drops its TOP pad and keeps its BOTTOM one', async () => {
+    // REGRESSION coverage for the vertical-padding pass, unchanged by the rail: `/apps/*`
+    // starts flush under the global header (was 16px below it), and the bottom pad stays
+    // because this Container is the outermost element on every apps page — it is the only
+    // thing holding the last grid/table row off whatever follows.
+    const g = await renderAndMeasure(<AppsPageLayout>{body}</AppsPageLayout>);
+    expect(g.styleSheetLoaded).toBe(true);
+    expect(g.containerPadTop).toBe(0);
+    expect(g.containerPadBottom).toBe(16);
+    expect(g.containerPadInline).toEqual([16, 16]);
+  });
+
+  test('🔴 the BODY starts at the container top; the RAIL clamps to its sticky offset', async () => {
+    // ⚠️ AN EARLIER REVISION ASSERTED `railTop === 0` AND CLAIMED IT WAS THE CAUSE OF THE
+    // STICKY WORKING — "Both columns starting at 0 is what makes the sticky work". Both
+    // halves were wrong, and together they are why a completely inert rail passed this
+    // file for the whole review. `railTop === 0` held identically whether the rail pinned
+    // or scrolled away; the property that decides stickiness is which box is the sticky
+    // element's CONTAINING BLOCK, which no unscrolled measurement can see.
+    //
+    // The rail now clamps to `SUBNAV_STICKY_GAP` at rest, and that is the CORRECT value
+    // rather than a regression: a sticky element whose static position is ABOVE its `top`
+    // threshold is pushed down to it. This harness mounts no global subnav, so
+    // `useSubnavBottom` returns 0, `top` resolves to `0 + SUBNAV_STICKY_GAP`, and the
+    // Container sits flush at the viewport top — so the clamp fires immediately. On the
+    // real page the same 16px is the deliberate gap between the subnav's bottom edge and
+    // the rail, which is the entire reason `SUBNAV_STICKY_GAP` exists.
+    //
+    // The body column is NOT sticky, so it keeps starting at the container top. The pair
+    // is what makes the claim readable: same container, one offset by the sticky gap.
+    const g = await renderAndMeasure(<AppsPageLayout>{body}</AppsPageLayout>);
+    expect(g.styleSheetLoaded).toBe(true);
+    expect(g.railTop).toBe(SUBNAV_STICKY_GAP);
+    expect(g.bodyColumnTop).toBe(0);
+  });
+
+  test('🔴 the rail STAYS PINNED WHEN THE PAGE SCROLLS — the whole point of the rail', async () => {
+    /**
+     * 🔴 THIS TEST SCROLLS, AND THAT IS THE ENTIRE REASON IT EXISTS. The two assertions
+     * it replaces measured `position === 'sticky'`, `top === '16px'` and `railTop === 0`
+     * WITHOUT EVER SCROLLING — and all four of those hold on an arrangement where the
+     * rail is completely inert. Measured on the pre-fix markup: identical values, and a
+     * rail that left the viewport at scroll 600.
+     *
+     * The mechanism the unscrolled assertions cannot see: `position: sticky` is
+     * constrained to its CONTAINING BLOCK. The pre-fix markup put the sticky on a div
+     * INSIDE `<aside class=rail>`, and `.railRow { align-items: flex-start }` shrink-wraps
+     * that aside to its content height (~220px). Travel range is then
+     * `aside.height − sticky.height` ≈ 0, so the rail scrolls away with the page — worse
+     * than the tab strip it replaced, which at least could never be scrolled past.
+     *
+     * The fix follows `CollectionsLayout`, the precedent this component's docstring
+     * already cites: put `position: sticky` on the FLEX ITEM itself with
+     * `align-self: flex-start`. A sticky flex item's containing block is the flex
+     * CONTAINER — full height — so it travels the length of the row.
+     *
+     * RED/GREEN MATRIX, measured in THIS harness at 1440×900 with a 3000px body. The
+     * container starts flush at the viewport top here (no global subnav is mounted and
+     * `containerPadTop` is 0), so the rail's natural top is 0; scrolling 600 then either
+     * clamps it at the sticky offset or carries it off-screen:
+     *
+     *   pre-fix  : top  0 at scroll 0  →  −600 at scroll 600   (rail gone)
+     *   post-fix : top 16 at scroll 0  →   +16 at scroll 600   (pinned, does not move)
+     *
+     * The pre-fix `0` vs post-fix `16` at rest is the sticky offset clamping — see the
+     * alignment test above. The assertion that matters is the SECOND column: the pre-fix
+     * rail moves by the full scroll delta, the post-fix rail does not move at all.
+     */
+    const g = await renderTallAndScroll(<AppsPageLayout>{tallBody}</AppsPageLayout>);
+    expect(g.styleSheetLoaded).toBe(true);
+    // Guard-the-guard: if the page cannot scroll, every assertion below is vacuous.
+    expect(g.scrolledBy, 'the harness page did not actually scroll').toBeGreaterThan(500);
+    expect(g.stickyPosition).toBe('sticky');
+    expect(g.stickyTop).toBe(`${SUBNAV_STICKY_GAP}px`);
+    // At rest: clamped to the sticky offset (see the alignment test for why this is 16
+    // and not 0 in this harness).
+    expect(g.railViewportTopBefore).toBe(SUBNAV_STICKY_GAP);
+    // 🔴 THE LOAD-BEARING ASSERTION. Pinned ⇒ clamped at the sticky offset and still on
+    // screen. Inert ⇒ carried up by the full scroll delta, i.e. far negative.
+    expect(
+      g.railViewportTopAfter,
+      'the rail scrolled away with the page — `position: sticky` is inert because its ' +
+        'containing block is a shrink-wrapped box with no travel range'
+    ).toBe(SUBNAV_STICKY_GAP);
+  });
+
+  test('no-header page: the body starts at the top of the chrome, with no empty band above it', async () => {
+    const g = await renderAndMeasure(<AppsPageLayout>{body}</AppsPageLayout>);
+    expect(g.styleSheetLoaded).toBe(true);
+    expect(g.hasTitle).toBe(false);
+    // At ≥1300 a no-header page's band holds only the drawer trigger, which is `display: none`,
+    // so the band's wrapper is hidden too and takes the root stack's `xl` gap with it: the body
+    // starts level with the rail instead of one empty band lower (design review, recording 2582).
+    expect(g.topToBody).toBe(0);
+    expect(g.bandToBody).toBe(0);
+  });
+
+  test('hasHeader page: the 32px band→body gap survives unchanged', async () => {
+    const g = await renderAndMeasure(
+      <AppsPageLayout
+        title="Your installed apps"
+        subtitle="Manage them"
+        actions={<button>Act</button>}
+      >
+        {body}
+      </AppsPageLayout>
+    );
+    expect(g.styleSheetLoaded).toBe(true);
+    expect(g.hasTitle).toBe(true);
+
+    // 🔴 INVARIANT GUARD — identical before and after the rail, which is the point. With
+    // no rule under the header, this gap is what separates the band from the page. Its
+    // partner (the 16px gap INSIDE the band) no longer has two things to sit between on a
+    // desktop viewport — see the header note — so the `gap="md"` SOURCE pin in
+    // `__tests__/appsPageLayout.test.ts` is what still guards that half.
+    expect(g.bandToBody).toBe(32);
+    // …and the header band still starts flush at the top of the page.
+    expect(g.containerPadTop).toBe(0);
+  });
+
+  test('🔴 a MEASURED header page keeps the same 32px gap — the extra `maw` wrapper is free', async () => {
+    // 🔴 RELOCATED FROM `AppsPageLayout.chromeAlignment.browser.test.tsx`, WHICH IS WHY IT
+    // READS AS A NEAR-DUPLICATE OF THE TEST ABOVE AND IS NOT ONE. A `measure` wraps BOTH
+    // the header band's contents and the body in a `<Box maw=…>`, and that wrapper is an
+    // extra block in the vertical chain — the audit that introduced the header bound found
+    // the two could drift apart. The unmeasured arm above cannot see it, because on a
+    // full-container page the wrapper is not rendered at all (`bounded()` hands the node
+    // back untouched, deliberately).
+    //
+    // The HORIZONTAL half of the relocated test — that the header box is capped at the
+    // measure and shares the body's left edge — stays in the chrome-alignment file, which
+    // is where horizontal claims live.
+    const g = await renderAndMeasure(
+      <AppsPageLayout
+        measure={1068}
+        title="Submit an app"
+        subtitle="Choose how you want to list your app, on-platform or as an external link."
+      >
+        {body}
+      </AppsPageLayout>
+    );
+    expect(g.styleSheetLoaded).toBe(true);
+    expect(g.hasTitle).toBe(true);
+    // Guard-the-guard: the measure really was applied, or this is just the test above
+    // again under a different name.
+    const capped = (document.querySelector('h2') as HTMLElement).closest(
+      '[style*="max-width"]'
+    ) as HTMLElement | null;
+    expect(capped, 'the measure did not produce a capped header box').not.toBeNull();
+    expect(g.bandToBody).toBe(32);
+    expect(g.containerPadTop).toBe(0);
+  });
+});

@@ -1,0 +1,537 @@
+import { NsfwLevel } from '~/server/common/enums';
+import type { ColorDomain } from '~/shared/constants/domain.constants';
+import { Flags } from '~/shared/utils/flags';
+
+export function parseBitwiseBrowsingLevel(level: number): number[] {
+  return Flags.instanceToArray(level);
+}
+
+export function flagifyBrowsingLevel(levels: number[]) {
+  return Flags.arrayToInstance(levels);
+}
+
+export const orchestratorNsfwLevelMap: Record<string, NsfwLevel> = {
+  pg: NsfwLevel.PG,
+  pg13: NsfwLevel.PG13,
+  'pg-13': NsfwLevel.PG13,
+  r: NsfwLevel.R,
+  x: NsfwLevel.X,
+  xxx: NsfwLevel.XXX,
+};
+
+export type BrowsingLevels = typeof browsingLevels;
+export type BrowsingLevel = BrowsingLevels[number];
+export const browsingLevels = [
+  NsfwLevel.PG,
+  NsfwLevel.PG13,
+  NsfwLevel.R,
+  NsfwLevel.X,
+  NsfwLevel.XXX,
+] as const;
+
+export const browsingLevelLabels = {
+  0: '?',
+  [NsfwLevel.PG]: 'PG',
+  [NsfwLevel.PG13]: 'PG-13',
+  [NsfwLevel.R]: 'R',
+  [NsfwLevel.X]: 'X',
+  [NsfwLevel.XXX]: 'XXX',
+  [NsfwLevel.Blocked]: 'Blocked',
+} as const;
+
+export const browsingLevelDescriptions = {
+  [NsfwLevel.PG]: 'Safe for work. No naughty stuff',
+  [NsfwLevel.PG13]:
+    'Revealing clothing, small bulges, subtle nipple outline, posing/sexualized bare chested men, light gore, violence',
+  [NsfwLevel.R]:
+    'Adult themes and situations, partial nudity, bikinis, big bulges, sexual situations, graphic violence',
+  [NsfwLevel.X]: 'Graphic nudity, genitalia, adult objects, or settings',
+  [NsfwLevel.XXX]:
+    'Sexual Acts, masturbation, ejaculation, cum, vore, anal gape, extremely disturbing content',
+  [NsfwLevel.Blocked]: 'Violates our terms of service',
+} as const;
+
+// public browsing levels
+export const publicBrowsingLevelsArray: BrowsingLevel[] = [NsfwLevel.PG];
+export const publicBrowsingLevelsFlag = flagifyBrowsingLevel(publicBrowsingLevelsArray);
+
+export const sfwBrowsingLevelsArray: BrowsingLevel[] = [NsfwLevel.PG, NsfwLevel.PG13];
+export const sfwBrowsingLevelsFlag = flagifyBrowsingLevel(sfwBrowsingLevelsArray);
+
+// nsfw browsing levels
+export const nsfwBrowsingLevelsArray: NsfwLevel[] = [
+  NsfwLevel.R,
+  NsfwLevel.X,
+  NsfwLevel.XXX,
+  NsfwLevel.Blocked,
+];
+
+// Order matters: highest-severity bit first. `getHighestBrowsingLevelBit`
+// returns the most severe single-bit value contained in a composite, which
+// is what `getBrowsingLevelLabel` uses to label aggregate levels (e.g.
+// comic projects bit_or all chapter levels — a composite of PG | R = 5
+// has no direct entry in `browsingLevelLabels`).
+const browsingLevelBitsBySeverity: NsfwLevel[] = [
+  NsfwLevel.Blocked,
+  NsfwLevel.XXX,
+  NsfwLevel.X,
+  NsfwLevel.R,
+  NsfwLevel.PG13,
+  NsfwLevel.PG,
+];
+
+export function getHighestBrowsingLevelBit(value: number): NsfwLevel | 0 {
+  for (const bit of browsingLevelBitsBySeverity) {
+    if ((value & bit) !== 0) return bit;
+  }
+  return 0;
+}
+
+export function getBrowsingLevelLabel(value: number) {
+  // Fast path: single-bit values (or 0) hit the table directly.
+  const direct = browsingLevelLabels[value as keyof typeof browsingLevelLabels];
+  if (direct) return direct;
+  // Composite (e.g. comic projects): label by the most severe bit
+  // present, otherwise fall back to '?' for truly unrated.
+  const highest = getHighestBrowsingLevelBit(value);
+  return highest ? browsingLevelLabels[highest] : '?';
+}
+
+// ---------------------------------------------------------------------------
+// Off-site App-Listing content-rating ↔ NsfwLevel mapping (App Blocks W13).
+//
+// Client-SAFE (this module is imported by browser components), so both the review
+// modal (derive a rating from an approved listing's asset levels) AND the server
+// (approve stamp + the asset attach ceiling) share ONE implementation — a
+// divergent inverse would let mature assets publish under a too-low rating.
+// ---------------------------------------------------------------------------
+
+/**
+ * The off-site content-rating ladder, ASCENDING by maturity ceiling. Kept in sync
+ * with `OFFSITE_CONTENT_RATINGS` in `offsite-listing.schema` (a plain literal list
+ * here avoids a shared→server-schema import; a unit test asserts they match). A
+ * value typed as {@link OffsiteRatingValue} is structurally assignable to that
+ * schema's `OffsiteContentRating` (same string literals).
+ */
+export const OFFSITE_CONTENT_RATING_LADDER = ['g', 'pg', 'pg13', 'r', 'x'] as const;
+export type OffsiteRatingValue = (typeof OFFSITE_CONTENT_RATING_LADDER)[number];
+
+/**
+ * Off-site content rating → its USER-FACING label. The counterpart of
+ * `MARKETPLACE_CATEGORY_LABELS`, and the single source of truth for how a stored
+ * rating is spelled to a human.
+ *
+ * 🔴 THE WORDS ARE NOT DERIVED FROM THE ENUM, AND MUST NOT BE. Three surfaces had
+ * each invented their own transformation of the same five values — the store
+ * detail rail and the moderator queue rendered the raw key (`pg13`), the off-site
+ * submit form uppercased it (`PG13`), and title-casing it would give `Pg13`. All
+ * three are spellings this site uses NOWHERE else.
+ *
+ * The chosen words are `browsingLevelLabels` — the maturity vocabulary Civitai
+ * ALREADY shows users on models, images and posts. Four of the five rungs
+ * (`pg`/`pg13`/`r`/`x`) map onto an `NsfwLevel` with an existing label, so they
+ * reuse it verbatim (`PG`, `PG-13`, `R`, `X`) and one app cannot read "PG-13" on
+ * a model page and "pg13" in the store. `g` is the one rung the browsing ladder
+ * has no bit for — it shares `pg`'s PG ceiling but is a distinct stored value a
+ * moderator can pick — so it takes the natural next rung of the same
+ * film-classification ladder the other four already are: `G`.
+ *
+ * Spelled out LITERALLY here rather than read out of `browsingLevelLabels`, so
+ * this map answers "what does the store say?" on its own — and a unit test pins
+ * the four overlapping rungs to `browsingLevelLabels` as a RELATIONSHIP, so
+ * rewording either vocabulary alone goes red instead of silently diverging.
+ *
+ * ⚠️ `PG-13` carries a HYPHEN. That is the site's existing spelling and it is the
+ * whole point: no mechanical transformation of the string `pg13` produces it.
+ */
+export const OFFSITE_CONTENT_RATING_LABELS: Record<OffsiteRatingValue, string> = {
+  g: 'G',
+  pg: 'PG',
+  pg13: 'PG-13',
+  r: 'R',
+  x: 'X',
+};
+
+/** Type guard — is the given value one of the known off-site content ratings. */
+export function isOffsiteContentRating(value: unknown): value is OffsiteRatingValue {
+  return (
+    typeof value === 'string' &&
+    (OFFSITE_CONTENT_RATING_LADDER as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Stored content-rating value → its display label, with a RAW FALLBACK.
+ *
+ * `AppListing.contentRating` is a nullable free-text column (`string | null`), not
+ * the closed union — the backfill service explicitly guards against "a poison row
+ * (an out-of-domain contentRating)" — so a renderer can be handed a value outside
+ * the ladder. Mirrors `marketplaceCategoryLabel`: map it if known, otherwise show
+ * the raw string. Never blank, never a throw; a details row is decoration and must
+ * not be able to blank the page it decorates.
+ */
+export function offsiteContentRatingLabel(rating: string): string {
+  return isOffsiteContentRating(rating) ? OFFSITE_CONTENT_RATING_LABELS[rating] : rating;
+}
+
+/**
+ * Stored content-rating value → the Mantine colour of its rating pill.
+ *
+ * NOT A NEW PALETTE: each rating resolves to its maturity ceiling
+ * ({@link nsfwLevelFromContentRating}) and takes that level's colour from
+ * {@link nsfwLevelColors}, the map the site already colours browsing levels with — so a PG-13
+ * app pill and a PG-13 badge elsewhere are the same yellow. `g` shares `pg`'s PG ceiling and
+ * therefore its colour. An out-of-ladder value is `gray`, never the fail-closed PG green that
+ * `nsfwLevelFromContentRating` would give it: a colour that reads "safe" must not be inferred
+ * from a value nobody recognises.
+ */
+export function offsiteContentRatingColor(rating: string): string {
+  if (!isOffsiteContentRating(rating)) return 'gray';
+  return nsfwLevelColors[nsfwLevelFromContentRating(rating)] ?? 'gray';
+}
+
+/**
+ * Map an off-site content rating (`g|pg|pg13|r|x` — nullable) to the MAXIMUM
+ * `NsfwLevel` bit its published assets may carry. Reuses the canonical
+ * `orchestratorNsfwLevelMap` (which lacks the SFW `g` rating → PG). A null/unknown
+ * rating FAILS CLOSED to PG (SFW) — never widen on ambiguity. (Canonical home; the
+ * app-listing-assets service re-exports this.)
+ */
+export function nsfwLevelFromContentRating(rating: string | null | undefined): NsfwLevel {
+  if (!rating || rating === 'g') return NsfwLevel.PG;
+  return orchestratorNsfwLevelMap[rating] ?? NsfwLevel.PG;
+}
+
+/**
+ * Inverse of {@link nsfwLevelFromContentRating} for a SINGLE detected level: the
+ * MINIMAL off-site rating whose ceiling covers `level`. Fail-CLOSED: a level above
+ * the `x` ceiling (X/XXX/Blocked) returns the TOP rating (`x`), NEVER a lower one —
+ * so a scanner's high reading can never be under-rated. Level 0 (no maturity
+ * signal) → `g`.
+ */
+export function contentRatingFromNsfwLevel(level: number): OffsiteRatingValue {
+  const bit = getHighestBrowsingLevelBit(level);
+  for (const rating of OFFSITE_CONTENT_RATING_LADDER) {
+    if (bit <= nsfwLevelFromContentRating(rating)) return rating;
+  }
+  // Fail closed: a bit above every ladder ceiling (X/XXX/Blocked) → the top rating.
+  return OFFSITE_CONTENT_RATING_LADDER[OFFSITE_CONTENT_RATING_LADDER.length - 1];
+}
+
+/**
+ * Derive the minimal off-site content rating that covers the MAX `nsfwLevel` across
+ * a listing's assets (icon + cover + screenshots). Empty / all-null → `g`. Used as
+ * the review modal's default + the approve-time derived floor. Fail-CLOSED via
+ * {@link contentRatingFromNsfwLevel} (never under-rates).
+ */
+export function deriveContentRatingFromAssets(
+  assets: { nsfwLevel?: number | null }[]
+): OffsiteRatingValue {
+  let maxBit = 0;
+  for (const a of assets) {
+    const bit = getHighestBrowsingLevelBit(a.nsfwLevel ?? 0);
+    if (bit > maxBit) maxBit = bit;
+  }
+  return contentRatingFromNsfwLevel(maxBit);
+}
+export const nsfwBrowsingLevelsFlag = flagifyBrowsingLevel(nsfwBrowsingLevelsArray);
+
+// all browsing levels
+export const allBrowsingLevelsFlag = flagifyBrowsingLevel([...browsingLevels]);
+
+/** R, X and XXX; unlike nsfwBrowsingLevelsFlag, without Blocked. */
+export const matureBrowsingLevelsFlag = allBrowsingLevelsFlag & ~sfwBrowsingLevelsFlag;
+
+/** A model flagged unsuitable for mature content is held to PG/PG-13 wherever it is shown or used. */
+export const modelBrowsingLevelLimit = (model: { minor: boolean; sfwOnly: boolean }) =>
+  model.minor || model.sfwOnly ? sfwBrowsingLevelsFlag : allBrowsingLevelsFlag;
+
+export const exceedsModelBrowsingLevelLimit = (
+  nsfwLevel: number,
+  model: { minor: boolean; sfwOnly: boolean }
+) => (nsfwLevel & ~modelBrowsingLevelLimit(model)) !== 0;
+
+/**
+ * App Blocks maturity policy — the SINGLE SOURCE OF TRUTH mapping a color
+ * domain to the maximum browsing-level flag content rendered/generated inside a
+ * block on that domain may carry.
+ *
+ * PRODUCT DECISION (App-Blocks-scoped): BOTH `green` AND `blue` clamp to SFW
+ * (PG + PG-13); only `red` permits mature output. This DELIBERATELY differs
+ * from the site-wide `canViewNsfw` feature flag, which today is TRUE on `blue`
+ * (the main site treats blue as a mature domain). Blocks lead the platform
+ * here: until the site-wide blue→SFW flip lands as a separate platform change,
+ * the App-Blocks generation/catalog belts enforce blue=SFW on their own. Change
+ * the policy in ONE place — this function — and the token-mint claim, the
+ * generation clamp, the prompt-audit, and the BLOCK_INIT signal all follow.
+ *
+ * Returned value is a bitwise browsing-level flag (see `NsfwLevel`):
+ *   - green → SFW  (PG + PG-13)              `sfwBrowsingLevelsFlag`
+ *   - blue  → SFW  (PG + PG-13) [product]    `sfwBrowsingLevelsFlag`
+ *   - red   → all levels (no clamp)          `allBrowsingLevelsFlag`
+ *
+ * Unknown / undefined domain → FAIL CLOSED to SFW (the most restrictive
+ * non-empty ceiling). Callers must never widen on ambiguity.
+ */
+export function domainBrowsingCeiling(color: ColorDomain | undefined | null): number {
+  switch (color) {
+    case 'red':
+      return allBrowsingLevelsFlag;
+    case 'green':
+    case 'blue':
+      return sfwBrowsingLevelsFlag;
+    default:
+      // Fail closed: an unknown/missing domain gets the most restrictive ceiling.
+      return sfwBrowsingLevelsFlag;
+  }
+}
+
+/**
+ * Derive whether mature (NSFW) generation output is permitted for a given
+ * browsing-level ceiling. Mirrors the orchestrator's `allowMatureContent`
+ * semantics (orchestrator.router.ts): `false` hard-blocks mature output,
+ * `undefined` leaves it to the caller/orchestrator default (red domain).
+ *
+ * A ceiling that contains NO nsfw bits (SFW domains) → `false` (block mature).
+ * A ceiling that contains any nsfw bit (red) → `undefined` (no clamp).
+ */
+export function allowMatureContentForCeiling(maxBrowsingLevel: number): boolean | undefined {
+  return Flags.intersects(maxBrowsingLevel, nsfwBrowsingLevelsFlag) ? undefined : false;
+}
+
+/**
+ * The EFFECTIVE browsing-level ceiling for one viewer on one color domain: the
+ * bitwise intersection of what the DOMAIN permits and what the VIEWER's own
+ * NSFW setting permits.
+ *
+ * 🔴 THE TWO INPUTS ROUTINELY DISAGREE, AND EITHER ONE CAN BE THE WIDER.
+ *   - On `blue`, `domainBrowsingCeiling` returns SFW (an App-Blocks-scoped
+ *     product decision — see its docstring) while `getServerBrowsingLevel`
+ *     returns the viewer's saved preference, which may carry R/X/XXX. The
+ *     VIEWER is wider; the domain must win.
+ *   - On `red`, the domain ceiling is every level while a viewer who never
+ *     enabled NSFW sits at PG. The DOMAIN is wider; the viewer must win.
+ * Taking either input alone is wrong in one of those two directions, which is
+ * why this returns the intersection and not a "max" or a preference order.
+ *
+ * FAIL CLOSED on both axes, and note they fail closed to DIFFERENT values:
+ *   - An absent / non-finite DOMAIN ceiling collapses to `sfwBrowsingLevelsFlag`
+ *     — the same most-restrictive-non-empty fallback `domainBrowsingCeiling`
+ *     uses for an unknown domain.
+ *   - An absent / non-finite / negative VIEWER level collapses to
+ *     `publicBrowsingLevelsFlag` (PG), matching what `getServerBrowsingLevel`
+ *     returns for an anonymous viewer. "We could not establish who is looking"
+ *     and "nobody is looking" must resolve to the same, narrowest answer.
+ * A negative viewer level is rejected rather than masked because a two's
+ * complement value has every high bit set: `-1 & ceiling === ceiling` would
+ * silently resolve to the FULL domain ceiling, i.e. junk input would read as
+ * the widest possible viewer, which is the one outcome this function exists to
+ * make impossible.
+ *
+ * The result is always a subset of the domain ceiling, so a consumer handed
+ * this value can never act on more than the domain allows.
+ */
+export function effectiveBrowsingCeiling(
+  domainCeiling: number | null | undefined,
+  viewerBrowsingLevel: number | null | undefined
+): number {
+  const ceiling =
+    typeof domainCeiling === 'number' && Number.isFinite(domainCeiling)
+      ? domainCeiling
+      : sfwBrowsingLevelsFlag;
+  const viewer =
+    typeof viewerBrowsingLevel === 'number' &&
+    Number.isFinite(viewerBrowsingLevel) &&
+    viewerBrowsingLevel >= 0
+      ? viewerBrowsingLevel
+      : publicBrowsingLevelsFlag;
+  return Flags.intersection(ceiling, viewer);
+}
+
+// helpers
+export function onlySelectableLevels(level: number) {
+  if (Flags.hasFlag(level, NsfwLevel.Blocked)) level = Flags.removeFlag(level, NsfwLevel.Blocked);
+  return level;
+}
+
+export function getIsPublicBrowsingLevel(level: number) {
+  const levels = parseBitwiseBrowsingLevel(level);
+  return levels.every((level) => publicBrowsingLevelsArray.includes(level));
+}
+
+/** does not include any nsfw level flags */
+export function getIsSafeBrowsingLevel(level: number) {
+  return level !== 0 && !Flags.intersects(level, nsfwBrowsingLevelsFlag);
+}
+
+/** includes a level suitable for public browsing */
+export function hasPublicBrowsingLevel(level: number) {
+  return Flags.hasFlag(level, publicBrowsingLevelsFlag);
+}
+
+/** every bit is a public level; an unrated 0 is not */
+export function isPublicOnlyBrowsingLevel(level: number) {
+  return level !== 0 && Flags.hasFlag(publicBrowsingLevelsFlag, level);
+}
+
+export function hasSafeBrowsingLevel(level: number) {
+  return Flags.intersects(level, sfwBrowsingLevelsFlag);
+}
+
+const explicitBrowsingLevelFlags = flagifyBrowsingLevel([
+  NsfwLevel.X,
+  NsfwLevel.XXX,
+  NsfwLevel.Blocked,
+]);
+export function getHasExplicitBrowsingLevel(level: number) {
+  return level !== 0 && Flags.intersects(level, explicitBrowsingLevelFlags);
+}
+
+export const browsingLevelOr = (array: (number | undefined)[]) => {
+  for (const item of array) {
+    if (!!item) return item;
+  }
+  return publicBrowsingLevelsFlag;
+};
+
+export enum NsfwLevelDeprecated {
+  None = 'None',
+  Soft = 'Soft',
+  Mature = 'Mature',
+  X = 'X',
+  Blocked = 'Blocked',
+}
+export const nsfwLevelMapDeprecated = {
+  None: NsfwLevel.PG,
+  Soft: flagifyBrowsingLevel([NsfwLevel.PG, NsfwLevel.PG13]),
+  Mature: flagifyBrowsingLevel([NsfwLevel.PG, NsfwLevel.PG13, NsfwLevel.R]),
+  X: flagifyBrowsingLevel([NsfwLevel.PG, NsfwLevel.PG13, NsfwLevel.R, NsfwLevel.X, NsfwLevel.XXX]),
+  Blocked: NsfwLevel.Blocked,
+};
+const nsfwLevelReverseMapDeprecated = {
+  [NsfwLevel.PG]: NsfwLevelDeprecated.None,
+  [NsfwLevel.PG13]: NsfwLevelDeprecated.Soft,
+  [NsfwLevel.R]: NsfwLevelDeprecated.Mature,
+  [NsfwLevel.X]: NsfwLevelDeprecated.X,
+  [NsfwLevel.XXX]: NsfwLevelDeprecated.X,
+  [NsfwLevel.Blocked]: NsfwLevelDeprecated.Blocked,
+};
+
+export const getNsfwLevelDeprecatedReverseMapping = (level: number) => {
+  return nsfwLevelReverseMapDeprecated[level as NsfwLevel] ?? NsfwLevelDeprecated.None;
+};
+
+export const nsfwLevelColors: Record<number, string> = {
+  [NsfwLevel.PG]: 'green',
+  [NsfwLevel.PG13]: 'yellow',
+  [NsfwLevel.R]: 'orange',
+  [NsfwLevel.X]: 'red',
+  [NsfwLevel.XXX]: 'grape',
+};
+
+export const votableTagColors = {
+  [0]: { dark: { color: 'gray', shade: 5 }, light: { color: 'gray', shade: 3 } },
+  [NsfwLevel.PG]: { dark: { color: 'gray', shade: 5 }, light: { color: 'gray', shade: 3 } },
+  [NsfwLevel.PG13]: { dark: { color: 'yellow', shade: 5 }, light: { color: 'yellow', shade: 3 } },
+  [NsfwLevel.R]: { dark: { color: 'red', shade: 9 }, light: { color: 'red', shade: 6 } },
+  [NsfwLevel.X]: { dark: { color: 'red', shade: 9 }, light: { color: 'red', shade: 6 } },
+  [NsfwLevel.XXX]: { dark: { color: 'red', shade: 9 }, light: { color: 'red', shade: 6 } },
+  [NsfwLevel.Blocked]: { dark: { color: 'red', shade: 9 }, light: { color: 'red', shade: 6 } },
+} as const;
+
+export const toggleableBrowsingCategories = [
+  {
+    title: 'Hide anime',
+    relatedTags: [
+      { id: 4, name: 'anime' },
+      { id: 413, name: 'manga' },
+      // { id: 5218, name: 'hentai' },
+    ],
+  },
+  {
+    title: 'Hide furry',
+    relatedTags: [
+      { id: 5139, name: 'anthro' },
+      { id: 5140, name: 'furry' },
+    ],
+  },
+  {
+    title: 'Hide gore',
+    relatedTags: [
+      { id: 1282, name: 'gore' },
+      { id: 789, name: 'body horror' },
+    ],
+  },
+  {
+    title: 'Hide political',
+    relatedTags: [{ id: 2470, name: 'political' }],
+  },
+];
+
+export const browsingModeDefaults = {
+  showNsfw: false,
+  blurNsfw: true,
+  browsingLevel: publicBrowsingLevelsFlag,
+};
+
+export const browsingLevelReasons = {
+  [NsfwLevel.Blocked]: ['Violates terms of service'],
+  [NsfwLevel.XXX]: [
+    'Sexual intercourse or penetration',
+    'Visible handjob',
+    'Visible oral sex (fellatio)',
+    'Visible oral sex (cunnilingus / analingus)',
+    'Hidden / implied masturbation or handjob',
+    'Explicit breast/genital interaction',
+    'Visible masturbation',
+    'Visible ejaculation or bodily fluids',
+    'BDSM or bondage content',
+    'Tentacle-related sexual content',
+    'Extreme close-ups of stretched orifices',
+    'Vore',
+    'Inflation with insertion',
+  ],
+  [NsfwLevel.X]: [
+    'Exposed genitalia',
+    'Visible genitals through clothing gaps',
+    'Extreme upskirt or crotch focus',
+    'Explicit genital focus, even if partially covered',
+    'Visible erection',
+  ],
+  [NsfwLevel.R]: [
+    'Visible uncovered female nipples or areolas',
+    'Full exposed buttocks',
+    'Adult toys or paraphernalia',
+    'Suggestive lingerie without outer clothing',
+    'Prominent genital outline through clothing',
+    'See-through wet clothing revealing anatomy',
+    'Sexually suggestive poses with clothing',
+    'Standard bikini / two-piece swimwear',
+    'Micro or thong swimwear baring anatomy',
+    'Breasts spilling out of clothing / extreme cleavage',
+    'Inflation without insertion',
+  ],
+  [NsfwLevel.PG13]: [
+    'Excessive cleavage display',
+    'Exaggerated sexual body proportions',
+    'Sexualized topless / bare-chested male',
+    'Revealing or minimal clothing coverage',
+    'One-piece swimwear, trunks, or undergarments',
+    'Excessively tight clothing',
+    'Visible subtle bulges',
+    'Visible nipple outlines',
+    'Kink clothing (suggestive latex, bondage harness without nudity)',
+    'Foot fetish framing',
+    'Sexualized pregnancy',
+    'Significant non-gore blood',
+    'Profanity or explicit text in image',
+  ],
+  [NsfwLevel.PG]: [
+    'Fully clothed content',
+    'Fully clothed with midriff exposed',
+    'Non-sexualized topless / bare-chested male',
+    'Above-shoulder portraits',
+    'Safe for work content',
+    'All-ages appropriate content',
+  ],
+};

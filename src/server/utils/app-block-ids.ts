@@ -1,0 +1,181 @@
+import { randomBytes } from 'crypto';
+
+// Crockford base32 alphabet (no I, L, O, U)
+const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+const TIME_LEN = 10;
+const RANDOM_LEN = 16;
+
+function encodeTime(time: number, length: number): string {
+  let out = '';
+  for (let i = length - 1; i >= 0; i--) {
+    const mod = time % 32;
+    out = ALPHABET[mod] + out;
+    time = (time - mod) / 32;
+  }
+  return out;
+}
+
+// 32-character Crockford base32 alphabet over 8-bit bytes. 256 / 32 = 8
+// exactly, so `byte % 32` is uniform without rejection sampling. If
+// ALPHABET length ever changes to a value that doesn't divide 256 evenly,
+// switch to rejection sampling against the largest multiple of N below 256.
+function freshRandom(): number[] {
+  const bytes = randomBytes(RANDOM_LEN);
+  const out: number[] = new Array(RANDOM_LEN);
+  for (let i = 0; i < RANDOM_LEN; i++) out[i] = bytes[i] % 32;
+  return out;
+}
+
+function encodeRandom(digits: number[]): string {
+  let out = '';
+  for (const d of digits) out += ALPHABET[d];
+  return out;
+}
+
+// Same-millisecond monotonicity: when the time prefix matches the previous
+// call, increment the random suffix by 1 instead of regenerating it. This
+// matches the `ulid` package's spec.monotonic() behavior — without it, two
+// IDs minted in the same millisecond can sort in arbitrary order. Carrying
+// across the high bit overflow throws (vanishingly rare with 80-bit space).
+let lastTime = -1;
+let lastRandom: number[] = freshRandom();
+
+function nextRandom(time: number): number[] {
+  if (time !== lastTime) {
+    lastTime = time;
+    lastRandom = freshRandom();
+    return lastRandom;
+  }
+  // Increment lastRandom in place, base-32, from the least-significant digit up.
+  const next = lastRandom.slice();
+  for (let i = RANDOM_LEN - 1; i >= 0; i--) {
+    if (next[i] < 31) {
+      next[i] += 1;
+      lastRandom = next;
+      return next;
+    }
+    next[i] = 0;
+  }
+  // Overflow — extremely unlikely given 80 bits per millisecond. Fail loud
+  // so we'd notice rather than silently regress sortability.
+  throw new Error('app-block-ids: random suffix overflow within a single millisecond');
+}
+
+/**
+ * Returns a ULID-format identifier (26-char Crockford base32, 48-bit timestamp + 80-bit randomness).
+ * Within a single millisecond IDs are strictly monotonic — newer ids sort
+ * later even at sub-ms cadence. Sufficient for our id needs without taking
+ * the `ulid` npm dependency.
+ */
+export function newUlid(): string {
+  const time = Date.now();
+  return encodeTime(time, TIME_LEN) + encodeRandom(nextRandom(time));
+}
+
+// Built from the constants `newUlid` encodes with, so the two cannot disagree about the shape.
+const ULID_SHAPE = new RegExp(`^[${ALPHABET}]{${TIME_LEN + RANDOM_LEN}}$`);
+
+/** True for any string `newUlid` could return. Case-sensitive: the generator emits upper case only. */
+export function isUlidShaped(value: string): boolean {
+  return ULID_SHAPE.test(value);
+}
+
+export function newAppBlockId(): string {
+  return `ab_${newUlid()}`;
+}
+
+export function newModelBlockInstallId(): string {
+  return `mbi_${newUlid()}`;
+}
+
+export function newBlockInstanceId(): string {
+  return `bki_${newUlid()}`;
+}
+
+export function newBlockUserSubscriptionId(): string {
+  return `bus_${newUlid()}`;
+}
+
+export function newBlockBuzzAttributionId(): string {
+  return `bba_${newUlid()}`;
+}
+
+export function newBlockSpendAttributionId(): string {
+  return `bsa_${newUlid()}`;
+}
+
+export function newBlockSubscriptionAttributionId(): string {
+  return `bsu_${newUlid()}`;
+}
+
+/**
+ * App Blocks per-generation AUTHOR FEE accrual (slice 2).
+ *
+ * Distinct prefix from `bsa_` (spend attribution) on purpose: the two tables
+ * describe the same generation and an id pasted into the wrong lookup should
+ * miss loudly rather than resolve to an unrelated row.
+ */
+export function newBlockAuthorFeeAccrualId(): string {
+  return `bafa_${newUlid()}`;
+}
+
+/**
+ * App Blocks DIGITAL GOODS. Two prefixes, not one, because the purchase (money)
+ * and the entitlement (what the viewer owns) are separate rows with separate
+ * lifetimes — a refund keeps the purchase and revokes the entitlement — and an
+ * id pasted into the wrong lookup should miss loudly.
+ */
+export function newBlockGoodPurchaseId(): string {
+  return `bgp_${newUlid()}`;
+}
+
+export function newBlockGoodEntitlementId(): string {
+  return `bge_${newUlid()}`;
+}
+
+export function newAppUserScopeGrantId(): string {
+  return `augr_${newUlid()}`;
+}
+
+// App Store Listings (W13).
+export function newAppListingId(): string {
+  return `apl_${newUlid()}`;
+}
+
+export function newAppListingScreenshotId(): string {
+  return `apls_${newUlid()}`;
+}
+
+export function newAppListingPublishRequestId(): string {
+  return `alpr_${newUlid()}`;
+}
+
+// App Store Listings (W13) — P3b off-site moderation (report / delist / claim).
+export function newAppListingReportId(): string {
+  return `alrp_${newUlid()}`;
+}
+
+export function newAppListingModerationEventId(): string {
+  return `alme_${newUlid()}`;
+}
+
+// App Store sub-listings. The shape is pinned by `APP_SUB_LISTING_ID_RE`.
+export function newAppSubListingId(): string {
+  return `asl_${newUlid()}`;
+}
+
+// App Blocks — agentic mod code-review report (P0). Dark/additive.
+export function newAppReviewAgentReportId(): string {
+  return `arar_${newUlid()}`;
+}
+
+// App Listing Collaborators — the append-only ownership audit trail + the
+// in-flight ownership transfer. (`AppCollaborator` itself has a COMPOSITE key
+// `(appBlockId, userId)` and needs no generated id.)
+export function newAppOwnershipEventId(): string {
+  return `aoe_${newUlid()}`;
+}
+
+export function newAppOwnershipTransferId(): string {
+  return `aot_${newUlid()}`;
+}

@@ -1,0 +1,1263 @@
+import {
+  Button,
+  Card,
+  Divider,
+  getPrimaryShade,
+  Group,
+  Loader,
+  Progress,
+  Select,
+  Stack,
+  Text,
+  TextInput,
+  ThemeIcon,
+  useComputedColorScheme,
+  useMantineTheme,
+  Badge,
+  Switch,
+} from '@mantine/core';
+import { Popover, Tooltip } from '~/components/MantineOverlays';
+import { Dropzone, type FileRejection } from '@mantine/dropzone';
+import { openConfirmModal } from '@mantine/modals';
+import {
+  IconAlertTriangle,
+  IconBan,
+  IconBulb,
+  IconCircleCheck,
+  IconCloudUpload,
+  IconLink,
+  IconPencil,
+  IconPlus,
+  IconRefresh,
+  IconTrash,
+  IconX,
+  IconFile3d,
+  IconLayersLinked,
+} from '@tabler/icons-react';
+import { isEqual, startCase } from 'lodash-es';
+import { useEffect, useState } from 'react';
+
+import { UploadNotice } from '~/components/UploadNotice/UploadNotice';
+import { AddFromImportsButton } from '~/components/Moderation/HuggingFaceImport/AddFromImportsButton';
+import type { FileFromContextProps } from '~/components/Resource/FilesProvider';
+import { useFilesContext } from '~/components/Resource/FilesProvider';
+import type { ModelFileType, ZipModelFileType } from '~/server/common/constants';
+import { componentFileTypes, constants, zipModelFileTypes } from '~/server/common/constants';
+import { baseModelHasFileSize } from '~/shared/constants/basemodel.constants';
+import { useIsOverflown } from '~/hooks/useIsOverflown';
+import { useModelFileOptions } from '~/hooks/useModelFileOptions';
+import { useS3UploadStore } from '~/store/s3-upload.store';
+import { removeDuplicates } from '~/utils/array-helpers';
+import { showErrorNotification } from '~/utils/notifications';
+import { formatBytes, formatKBytes, formatSeconds } from '~/utils/number-helpers';
+import { getFileExtension } from '~/utils/string-helpers';
+import { sanitizeOverrideName } from '~/utils/model-file-naming';
+import { trpc } from '~/utils/trpc';
+import { getModelFileTypeOptions, UNQUANTIZED_QUANT_TYPE } from '~/utils/file-display-helpers';
+import classes from './Files.module.scss';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { isAndroidDevice } from '~/utils/device-helpers';
+import type { LinkedComponent } from '~/server/schema/model-file.schema';
+import { openResourceSelectModal } from '~/components/Dialog/triggers/resource-select';
+import type { GenerationResource } from '~/shared/types/generation.types';
+import { ModelType, ModelUsageControl } from '~/shared/utils/prisma/enums';
+import { componentTypeConfig, getFileIconConfig } from '~/utils/file-display-icons';
+
+// Small inline dropzone for adding files within a section
+function InlineDropzone({
+  label,
+  description,
+  onDrop,
+  accept,
+  maxFiles,
+  onReject,
+}: {
+  label: string;
+  description?: string;
+  onDrop: (files: File[]) => void;
+  accept?: Record<string, string[]>;
+  maxFiles?: number;
+  onReject?: (rejectedFiles: FileRejection[]) => void;
+}) {
+  return (
+    <Dropzone
+      onDrop={onDrop}
+      accept={accept}
+      maxFiles={maxFiles}
+      onReject={onReject}
+      useFsAccessApi={!isAndroidDevice()}
+      className={classes.dropzone}
+      p="md"
+    >
+      <Stack gap={4} align="center" style={{ pointerEvents: 'none' }}>
+        <Group justify="center" gap="xs">
+          <IconPlus size={14} style={{ color: 'var(--mantine-color-dimmed)' }} />
+          <Text size="sm" c="dimmed">
+            {label}
+          </Text>
+        </Group>
+        {description && (
+          <Text size="xs" c="dimmed">
+            {description}
+          </Text>
+        )}
+      </Stack>
+    </Dropzone>
+  );
+}
+
+function modelTypeToComponentType(modelType: ModelType): ModelFileComponentType {
+  switch (modelType) {
+    case ModelType.VAE:
+      return 'VAE';
+    case ModelType.TextEncoder:
+      return 'TextEncoder';
+    case ModelType.UNet:
+      return 'UNet';
+    case ModelType.CLIPVision:
+      return 'CLIPVision';
+    case ModelType.CLIP:
+      return 'CLIP';
+    case ModelType.VisionLanguage:
+      return 'VisionLanguage';
+    case ModelType.Controlnet:
+      return 'ControlNet';
+    case ModelType.Upscaler:
+      return 'Upscaler';
+    case ModelType.Workflows:
+    case ModelType.ComfyWorkflows:
+      return 'Workflow';
+    case ModelType.Other:
+    default:
+      return 'Other';
+  }
+}
+
+export function Files() {
+  const {
+    files,
+    linkedComponents,
+    onDrop,
+    dropzoneConfig,
+    sequentialUploads,
+    setSequentialUploads,
+    baseModel,
+    modelVersionId,
+    addLinkedComponent,
+    removeLinkedComponent,
+  } = useFilesContext();
+
+  const { primary, additional } = dropzoneConfig;
+  const totalMaxFiles = primary.maxFiles + additional.maxFiles;
+  const primaryTypes = primary.fileTypes;
+  const additionalFileTypes = additional.fileTypes;
+
+  const modelFiles = files.filter((f) => primaryTypes.includes(f.type as ModelFileType));
+  const additionalFiles = files.filter((f) => !primaryTypes.includes(f.type as ModelFileType));
+
+  const handleInlineDrop = (
+    droppedFiles: File[],
+    sectionFiles: FileFromContextProps[],
+    sectionMaxFiles: number,
+    defaultType?: ModelFileType,
+    skipInference?: boolean
+  ) => {
+    if (sectionFiles.length + droppedFiles.length > sectionMaxFiles) {
+      showErrorNotification({
+        title: 'Too many files',
+        error: new Error(`Maximum ${sectionMaxFiles} files allowed in this section.`),
+      });
+      return;
+    }
+    if (files.length + droppedFiles.length > totalMaxFiles) {
+      showErrorNotification({
+        title: 'Too many files',
+        error: new Error(`Maximum ${totalMaxFiles} total files allowed per version.`),
+      });
+      return;
+    }
+    onDrop(droppedFiles, defaultType, skipInference);
+  };
+
+  // iOS resolves `accept` entries to UTIs with no extension fallback, so a bare
+  // `.safetensors` greys out every file in the picker; octet-stream maps to `public.data`.
+  const primaryAccept = { 'application/octet-stream': primary.extensions };
+  const additionalAccept = { 'application/octet-stream': additional.extensions };
+  const makeRejectHandler =
+    (section: 'primary' | 'additional') => (rejectedFiles: FileRejection[]) => {
+      const sectionConfig = section === 'primary' ? primary : additional;
+      const otherConfig = section === 'primary' ? additional : primary;
+      const otherLabel = section === 'primary' ? 'Additional Components' : 'Model Files';
+
+      const otherErrors = removeDuplicates(
+        rejectedFiles.flatMap((file) => file.errors),
+        'code'
+      )
+        .filter((error) => error.code !== 'file-invalid-type')
+        .map((error) => error.message)
+        .join('\n');
+
+      const misplaced = [
+        ...new Set(
+          rejectedFiles
+            .map((f) => `.${getFileExtension(f.file.name).toLowerCase()}`)
+            .filter(
+              (ext) =>
+                !sectionConfig.extensions.includes(ext) && otherConfig.extensions.includes(ext)
+            )
+        ),
+      ];
+
+      const hint = misplaced.length
+        ? `\n\nTry the "${otherLabel}" section below for: ${misplaced.join(', ')}.`
+        : '';
+
+      const prefix = otherErrors ? `${otherErrors}\n\n` : '';
+
+      showErrorNotification({
+        title: 'File not accepted',
+        error: new Error(
+          `${prefix}This section accepts: ${sectionConfig.extensions.join(', ')}.${hint}`
+        ),
+      });
+    };
+  const handleRejectPrimary = makeRejectHandler('primary');
+  const handleRejectAdditional = makeRejectHandler('additional');
+
+  // `application/octet-stream` is what makes the picker usable on iOS, but it also matches
+  // any file the OS reports as octet-stream, whatever its extension. react-dropzone's
+  // attr-accept is the only other client-side type check and the upload API only screens
+  // against a denylist, so re-check the extension here before anything reaches onDrop.
+  const withExtensionGuard =
+    (section: 'primary' | 'additional', handle: (files: File[]) => void) =>
+    (droppedFiles: File[]) => {
+      const { extensions } = section === 'primary' ? primary : additional;
+      const accepted = droppedFiles.filter((file) =>
+        extensions.includes(`.${getFileExtension(file.name).toLowerCase()}`)
+      );
+      const rejected = droppedFiles.filter((file) => !accepted.includes(file));
+
+      if (rejected.length)
+        makeRejectHandler(section)(
+          rejected.map((file) => ({
+            file,
+            errors: [
+              { code: 'file-invalid-type', message: `${file.name} has an unsupported type` },
+            ],
+          }))
+        );
+      if (accepted.length) handle(accepted);
+    };
+
+  const handleLinkResource = (resource: GenerationResource) => {
+    const componentType = modelTypeToComponentType(resource.model.type);
+
+    // Error notification is handled by the mutation's onError callback in FilesProvider
+    addLinkedComponent({
+      componentType,
+      modelId: resource.model.id,
+      modelName: resource.model.name,
+      versionId: resource.id,
+      versionName: resource.name,
+      isRequired: true,
+    }).catch(() => null);
+  };
+
+  const handleOpenResourceSelect = () => {
+    // Compute compatible base models from the version's base model
+    const resourceTypes = [
+      ModelType.VAE,
+      ModelType.TextEncoder,
+      ModelType.UNet,
+      ModelType.CLIPVision,
+      ModelType.CLIP,
+      ModelType.VisionLanguage,
+      ModelType.Controlnet,
+      ModelType.Upscaler,
+      ModelType.Poses,
+    ] as const;
+
+    const resources = resourceTypes.map((type) => {
+      if (!baseModel) return { type };
+      return { type, baseModels: [baseModel] };
+    });
+
+    openResourceSelectModal({
+      title: 'Link Component',
+      onSelect: handleLinkResource,
+      options: {
+        resources,
+        excludeIds: linkedComponents.map((c) => c.versionId),
+      },
+      selectSource: 'modelVersion',
+    });
+  };
+
+  const hasAdditionalContent = additionalFiles.length > 0 || linkedComponents.length > 0;
+
+  return (
+    <Stack>
+      {/* Model Files Section - always visible */}
+      <Card
+        withBorder
+        style={{
+          borderColor: 'rgba(34, 139, 230, 0.2)',
+          backgroundColor: 'rgba(34, 139, 230, 0.03)',
+        }}
+      >
+        <Card.Section
+          withBorder
+          inheritPadding
+          py="md"
+          style={{ borderColor: 'rgba(34, 139, 230, 0.2)' }}
+        >
+          <Group gap="xs" justify="space-between" wrap="nowrap">
+            <Group gap="xs">
+              <IconFile3d size={20} style={{ color: 'var(--mantine-color-blue-4)' }} />
+              <Text fw={600} c="white">
+                Model Files
+              </Text>
+            </Group>
+            {modelVersionId && <AddFromImportsButton modelVersionId={modelVersionId} />}
+          </Group>
+          <Text size="sm" c="dimmed" mt={4}>
+            The main model files users will download. We&apos;ll show the best match based on their
+            preferences.
+          </Text>
+          {primary.maxFiles > 1 && (
+            <Switch
+              mt="sm"
+              size="xs"
+              label="Upload files one at a time"
+              description="Each file finishes and is saved before the next one starts. Slower, but if an upload fails the files already finished are kept."
+              checked={sequentialUploads}
+              onChange={(e) => setSequentialUploads(e.currentTarget.checked)}
+            />
+          )}
+        </Card.Section>
+        <Stack gap="sm" pt="md">
+          {modelFiles.length > 0 ? (
+            <>
+              {modelFiles.map((file) => (
+                <FileCard
+                  key={file.uuid}
+                  data={file}
+                  index={files.indexOf(file)}
+                  fileTypes={primaryTypes}
+                  showRename
+                />
+              ))}
+              <InlineDropzone
+                label="Add another model file variant"
+                onDrop={withExtensionGuard('primary', (dropped) =>
+                  handleInlineDrop(
+                    dropped,
+                    modelFiles,
+                    primary.maxFiles,
+                    primaryTypes.length === 1 ? primaryTypes[0] : undefined
+                  )
+                )}
+                accept={primaryAccept}
+                maxFiles={primary.maxFiles}
+                onReject={handleRejectPrimary}
+              />
+            </>
+          ) : (
+            <Dropzone
+              accept={primaryAccept}
+              onDrop={withExtensionGuard('primary', (droppedFiles) => {
+                if (modelFiles.length + droppedFiles.length > primary.maxFiles) return;
+                if (files.length + droppedFiles.length > totalMaxFiles) return;
+                const defaultType = primaryTypes.length === 1 ? primaryTypes[0] : undefined;
+                onDrop(droppedFiles, defaultType);
+              })}
+              maxFiles={primary.maxFiles}
+              onReject={handleRejectPrimary}
+              className={classes.dropzone}
+              useFsAccessApi={!isAndroidDevice()}
+            >
+              <Stack gap="xs" align="center" py="lg" style={{ pointerEvents: 'none' }}>
+                <ThemeIcon size={48} radius="xl" variant="light" color="blue">
+                  <IconCloudUpload size={22} />
+                </ThemeIcon>
+                <Text size="sm" fw={500}>
+                  Drop model files here or click to browse
+                </Text>
+                <Text size="xs" c="dimmed">
+                  {`Supports ${primary.extensions.join(', ')} files`}
+                </Text>
+              </Stack>
+            </Dropzone>
+          )}
+        </Stack>
+      </Card>
+
+      {/* Additional Components Section - merged required + optional */}
+      <Card withBorder>
+        <Card.Section
+          withBorder
+          inheritPadding
+          py="md"
+          style={{ borderColor: 'var(--mantine-color-dark-4)' }}
+        >
+          <Group gap="xs" justify="space-between" wrap="nowrap">
+            <Group gap="xs">
+              <IconLayersLinked size={20} style={{ color: 'var(--mantine-color-dimmed)' }} />
+              <Text fw={600} c="white">
+                Additional Components
+              </Text>
+            </Group>
+            {modelVersionId && (
+              <AddFromImportsButton
+                modelVersionId={modelVersionId}
+                types={additionalFileTypes}
+                label="Add components from imports"
+                title="Add components from Hugging Face imports"
+              />
+            )}
+          </Group>
+          <Text size="sm" c="dimmed" mt={4}>
+            Components and files that accompany this model. Mark each as required or optional.
+          </Text>
+        </Card.Section>
+        <Stack gap="sm" pt="md">
+          {!hasAdditionalContent && (
+            <Stack gap="xs" align="center" py="md">
+              <IconLayersLinked
+                size={32}
+                style={{ color: 'var(--mantine-color-dimmed)', opacity: 0.25 }}
+              />
+              <Text size="sm" c="dimmed">
+                No additional components yet
+              </Text>
+              <Text size="xs" c="dimmed" ta="center" maw={400}>
+                Upload component files like VAE, Text Encoder, or UNet, or link to existing models
+                on Civitai.
+              </Text>
+            </Stack>
+          )}
+          {additionalFiles.map((file) => (
+            <FileCard
+              key={file.uuid}
+              data={file}
+              index={files.indexOf(file)}
+              showRequiredToggle
+              fileTypes={additionalFileTypes}
+            />
+          ))}
+          {linkedComponents.map((component) => (
+            <LinkedComponentCard
+              key={component.versionId}
+              component={component}
+              onRemove={() => removeLinkedComponent(component.versionId)}
+              onToggleRequired={(isRequired) => {
+                addLinkedComponent({ ...component, isRequired });
+              }}
+            />
+          ))}
+          <InlineDropzone
+            label="Upload a component file"
+            description={`Supports ${additional.extensions.join(', ')} files`}
+            onDrop={withExtensionGuard('additional', (dropped) =>
+              handleInlineDrop(
+                dropped,
+                additionalFiles,
+                additional.maxFiles,
+                additionalFileTypes.length === 1 ? additionalFileTypes[0] : undefined,
+                true
+              )
+            )}
+            accept={additionalAccept}
+            maxFiles={additional.maxFiles}
+            onReject={handleRejectAdditional}
+          />
+          <Text size="xs" c="dimmed" ta="center">
+            or
+          </Text>
+          <Button
+            variant="default"
+            fullWidth
+            leftSection={<IconLink size={16} />}
+            onClick={handleOpenResourceSelect}
+          >
+            Link to Existing Model on Civitai
+          </Button>
+        </Stack>
+      </Card>
+
+      {/* Tips Card */}
+      <Card
+        withBorder
+        style={{
+          borderColor: 'rgba(144, 97, 249, 0.2)',
+          backgroundColor: 'rgba(144, 97, 249, 0.03)',
+        }}
+      >
+        <Group align="flex-start" gap="sm" wrap="nowrap">
+          <IconBulb size={24} style={{ color: 'var(--mantine-color-violet-4)', flexShrink: 0 }} />
+          <Stack gap={4}>
+            <Text fw={500} c="white">
+              Tips for better organization
+            </Text>
+            <Text size="sm" c="dimmed" component="div">
+              <ul style={{ margin: 0, paddingLeft: 16 }}>
+                <li>
+                  Add <strong>multiple precision variants</strong> (fp16, fp8) for both model files
+                  and components
+                </li>
+                <li>Users&apos; preferences will auto-select the best match for their setup</li>
+                <li>Link to existing models when the component already exists on Civitai</li>
+                <li>
+                  Only create a new <strong>version</strong> when you&apos;ve actually
+                  trained/updated the model
+                </li>
+              </ul>
+            </Text>
+          </Stack>
+        </Group>
+      </Card>
+      <UploadNotice />
+    </Stack>
+  );
+}
+
+// Compact horizontal card for linked components
+function LinkedComponentCard({
+  component,
+  onRemove,
+  onToggleRequired,
+}: {
+  component: LinkedComponent;
+  onRemove: () => void;
+  onToggleRequired: (isRequired: boolean) => void;
+}) {
+  const config = componentTypeConfig[component.componentType] ?? componentTypeConfig.Other;
+  const Icon = config.icon;
+
+  return (
+    <Card
+      withBorder
+      p="sm"
+      style={{
+        borderColor: 'rgba(64, 192, 87, 0.2)',
+        backgroundColor: 'rgba(64, 192, 87, 0.05)',
+      }}
+    >
+      <Group gap="md" wrap="nowrap">
+        <ThemeIcon size={40} radius="sm" color={config.color} variant="light">
+          <Icon size={20} />
+        </ThemeIcon>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <Text size="sm" fw={500} c="white" truncate>
+            {component.modelName}
+          </Text>
+          <Group gap={4}>
+            <IconLink size={12} style={{ color: 'var(--mantine-color-green-4)' }} />
+            <Text size="xs" c="green.4" truncate>
+              Linked: {component.versionName} &rarr; {component.fileName}
+            </Text>
+          </Group>
+          <Switch
+            size="xs"
+            label="Required"
+            checked={component.isRequired ?? true}
+            onChange={(e) => onToggleRequired(e.currentTarget.checked)}
+            mt={4}
+          />
+        </div>
+        <Group gap="xs" wrap="nowrap">
+          <div>
+            <Text
+              size="xs"
+              fw={500}
+              c="dimmed"
+              tt="uppercase"
+              style={{ letterSpacing: 0.5, fontSize: 11 }}
+              mb={2}
+            >
+              Type
+            </Text>
+            <Select
+              allowDeselect={false}
+              size="xs"
+              w={110}
+              data={constants.modelFileComponentTypes.map((t) => ({
+                label: componentTypeConfig[t]?.name ?? t,
+                value: t,
+              }))}
+              value={component.componentType}
+              disabled
+            />
+          </div>
+          <LegacyActionIcon color="red" onClick={onRemove} style={{ marginTop: 18 }}>
+            <IconTrash size={16} />
+          </LegacyActionIcon>
+        </Group>
+      </Group>
+    </Card>
+  );
+}
+
+/**
+ * Whether a file still needs required metadata before it's publishable — mirrors
+ * the client validation refinements: a type for everything, quant type for GGUF,
+ * precision for Checkpoint model weights. Drives the "Needs info" badge so
+ * auto-uploaded files that couldn't be auto-detected get flagged instead of
+ * silently persisting incomplete.
+ */
+function isMissingRequiredInfo(file: FileFromContextProps): boolean {
+  if (!file.type) return true;
+  const isGguf = file.name.toLowerCase().endsWith('.gguf');
+  const isCheckpointModel = file.type === 'Model' && file.modelType === 'Checkpoint';
+  if (isGguf) return !file.quantType;
+  if (isCheckpointModel) return !file.fp;
+  return false;
+}
+
+// Compact horizontal file card
+function FileCard({
+  data: versionFile,
+  index,
+  showRequiredToggle,
+  showRename,
+  fileTypes: fileTypesProp,
+}: {
+  data: FileFromContextProps;
+  index: number;
+  showRequiredToggle?: boolean;
+  showRename?: boolean;
+  fileTypes?: ModelFileType[];
+}) {
+  const { removeFile, updateFile, dropzoneConfig, modelId, errors } = useFilesContext();
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameValue, setRenameValue] = useState('');
+  const allFileTypes = [
+    ...dropzoneConfig.primary.fileTypes,
+    ...dropzoneConfig.additional.fileTypes,
+  ];
+  const fileTypes = fileTypesProp ?? allFileTypes;
+  const queryUtils = trpc.useUtils();
+  const failedUpload = versionFile.status === 'error' || versionFile.status === 'aborted';
+
+  const trackedFiles = useS3UploadStore((state) => state.items);
+  const trackedFile = trackedFiles.find((x) => x.meta?.uuid === versionFile.uuid);
+
+  const deleteFileMutation = trpc.modelFile.delete.useMutation({
+    async onSuccess() {
+      await queryUtils.modelVersion.getById.invalidate({
+        id: versionFile.versionId,
+        withFiles: true,
+      });
+      await queryUtils.modelVersion.getByIdForEdit.invalidate({
+        id: versionFile.versionId,
+        withFiles: true,
+      });
+      if (modelId) await queryUtils.model.getById.invalidate({ id: modelId });
+      removeFile(versionFile.uuid);
+    },
+    onError(error) {
+      showErrorNotification({ title: 'Could not delete file', error: new Error(error.message) });
+    },
+  });
+
+  const handleRemoveFile = async (uuid?: string) => {
+    if (versionFile.id) await deleteFileMutation.mutateAsync({ id: versionFile.id });
+    else if (uuid) removeFile(uuid);
+  };
+
+  const renameFileMutation = trpc.modelFile.update.useMutation({
+    async onSuccess(_, variables) {
+      updateFile(versionFile.uuid, { overrideName: variables.overrideName ?? null });
+      await queryUtils.modelVersion.getByIdForEdit.invalidate({
+        id: versionFile.versionId,
+        withFiles: true,
+      });
+      setRenameOpen(false);
+    },
+    onError() {
+      showErrorNotification({ error: new Error('Could not rename file, please try again') });
+    },
+  });
+
+  // Persisted on change rather than through the file's inline Save: the page-level
+  // "Save Changes" button only starts uploads, so a deferred flag silently gets lost.
+  const requiredMutation = trpc.modelFile.update.useMutation({
+    onError(_error, variables) {
+      updateFile(versionFile.uuid, { isRequired: !variables.metadata?.isRequired });
+      showErrorNotification({
+        error: new Error('Could not update the required flag, please try again'),
+      });
+    },
+  });
+
+  const handleToggleRequired = (isRequired: boolean) => {
+    updateFile(versionFile.uuid, { isRequired });
+    if (versionFile.id) requiredMutation.mutate({ id: versionFile.id, metadata: { isRequired } });
+  };
+
+  const handleRenameOpen = () => {
+    setRenameValue(versionFile.overrideName ?? versionFile.name);
+    setRenameOpen(true);
+  };
+
+  const handleRenameSave = () => {
+    if (!versionFile.id) return;
+    const next = sanitizeOverrideName(renameValue, versionFile.name);
+    renameFileMutation.mutate({ id: versionFile.id, overrideName: next });
+  };
+
+  const displayName = versionFile.overrideName ?? versionFile.name;
+  const { ref: nameRef, overflown: nameOverflown } = useIsOverflown<HTMLParagraphElement>([
+    displayName,
+  ]);
+  const iconConfig = getFileIconConfig(versionFile.name, {
+    format: versionFile.format,
+  });
+  const FileIcon = iconConfig.icon;
+  const fileSizeStr = versionFile.sizeKB ? formatKBytes(versionFile.sizeKB) : undefined;
+  const extension = getFileExtension(versionFile.name);
+  const formatLabel = versionFile.format ?? (extension ? extension.toUpperCase() : undefined);
+
+  // Check if this file has validation errors
+  const fileError = errors?.[index] as Record<string, { _errors?: string[] }> | undefined;
+  const hasValidationError =
+    fileError && Object.entries(fileError).some(([k, v]) => k !== '_errors' && v?._errors?.length);
+
+  return (
+    <Card
+      style={{
+        opacity: deleteFileMutation.isPending ? 0.2 : undefined,
+        borderColor: hasValidationError ? 'var(--mantine-color-red-6)' : undefined,
+      }}
+      withBorder
+      p="sm"
+    >
+      <Group gap="md">
+        <Group gap="md" wrap="nowrap" style={{ flex: '1 1 220px', minWidth: 0 }}>
+          <ThemeIcon size={40} radius="sm" color={iconConfig.color} variant="light">
+            <FileIcon size={20} />
+          </ThemeIcon>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <Tooltip
+              label={displayName}
+              disabled={!nameOverflown}
+              openDelay={300}
+              withinPortal
+              multiline
+              maw={420}
+              style={{ overflowWrap: 'anywhere' }}
+            >
+              <Text ref={nameRef} size="sm" fw={500} c={failedUpload ? 'red' : 'white'} truncate>
+                {displayName}
+              </Text>
+            </Tooltip>
+            <Group gap={6} wrap="nowrap">
+              <Text size="xs" c="dimmed">
+                {[fileSizeStr, formatLabel].filter(Boolean).join(' \u2022 ')}
+              </Text>
+              {isMissingRequiredInfo(versionFile) && (
+                <Badge color="yellow" variant="light" size="xs">
+                  Needs info
+                </Badge>
+              )}
+            </Group>
+            {versionFile.isCheckingOfficial && (
+              <Group gap={6} wrap="nowrap" mt={4}>
+                <Loader size="xs" />
+                <Text size="xs" c="dimmed">
+                  Checking for an existing copy on Civitai&hellip;
+                </Text>
+              </Group>
+            )}
+            {showRequiredToggle && !versionFile.isUploading && !versionFile.isCheckingOfficial && (
+              <Switch
+                size="xs"
+                label="Required"
+                checked={versionFile.isRequired ?? false}
+                onChange={(e) => handleToggleRequired(e.currentTarget.checked)}
+                mt={4}
+              />
+            )}
+          </div>
+        </Group>
+        {/* Selects render during upload too, so the user can set type/precision/
+            size/quant while the bytes upload — the save reads the latest via
+            filesRef. */}
+        <Group gap="xs" align="flex-end">
+          <FileEditForm file={versionFile} fileTypes={fileTypes} index={index} />
+          {!versionFile.isUploading && showRename && versionFile.id && !trackedFile && (
+            <Popover
+              opened={renameOpen}
+              onClose={() => setRenameOpen(false)}
+              width={300}
+              position="top-end"
+              withArrow
+              withinPortal
+            >
+              <Popover.Target>
+                <LegacyActionIcon onClick={handleRenameOpen} title="Rename download file">
+                  <IconPencil size={16} />
+                </LegacyActionIcon>
+              </Popover.Target>
+              <Popover.Dropdown>
+                <Stack gap="xs">
+                  <TextInput
+                    label="Download filename"
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.currentTarget.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleRenameSave()}
+                    size="xs"
+                    autoFocus
+                  />
+                  <Group justify="flex-end" gap="xs">
+                    <Button size="xs" variant="default" onClick={() => setRenameOpen(false)}>
+                      Cancel
+                    </Button>
+                    <Button
+                      size="xs"
+                      onClick={handleRenameSave}
+                      loading={renameFileMutation.isPending}
+                    >
+                      Save
+                    </Button>
+                  </Group>
+                </Stack>
+              </Popover.Dropdown>
+            </Popover>
+          )}
+          {!trackedFile && (
+            <LegacyActionIcon
+              color="red"
+              onClick={() => handleRemoveFile(versionFile.uuid)}
+              loading={deleteFileMutation.isPending}
+            >
+              <IconTrash size={16} />
+            </LegacyActionIcon>
+          )}
+        </Group>
+      </Group>
+      {trackedFile && (
+        <Card.Section>
+          <TrackedFile uuid={versionFile.uuid} />
+        </Card.Section>
+      )}
+    </Card>
+  );
+}
+
+function TrackedFile({ uuid: versionFileUuid }: { uuid: string }) {
+  const items = useS3UploadStore((state) => state.items);
+  const trackedFile = items.find((x) => x.meta?.uuid === versionFileUuid);
+
+  if (!trackedFile) return null;
+
+  return (
+    <>
+      <Divider />
+      <Group gap="xs" py="md" px="sm" style={{ width: '100%' }}>
+        <TrackedFileStatus trackedFile={trackedFile} versionFileUuid={versionFileUuid} />
+      </Group>
+    </>
+  );
+}
+
+function TrackedFileStatus({
+  trackedFile,
+  versionFileUuid,
+}: {
+  trackedFile: TrackedFile;
+  versionFileUuid: string;
+}) {
+  const theme = useMantineTheme();
+  const colorScheme = useComputedColorScheme('dark');
+  const clear = useS3UploadStore((state) => state.clear);
+  const abort = useS3UploadStore((state) => state.abort);
+  const { retry, removeFile, updateFile } = useFilesContext();
+
+  const { uuid, status, progress, timeRemaining, speed } = trackedFile;
+
+  const handleRemoveFile = async () => {
+    try {
+      await clear((x) => x.uuid === trackedFile.uuid);
+      removeFile(versionFileUuid);
+    } catch (e) {
+      showErrorNotification({
+        title: 'There was an error while removing the file',
+        error: e as Error,
+      });
+    }
+  };
+
+  switch (status) {
+    case 'uploading':
+      return (
+        <Group justify="space-between" wrap="nowrap" gap="xs" style={{ width: '100%' }}>
+          <IconCloudUpload color={theme.colors.blue[getPrimaryShade(theme, colorScheme)]} />
+          <Stack gap={4} w="100%" style={{ flex: '1 !important' }}>
+            <Group gap={4}>
+              <Progress.Root size="xl" radius="xs" style={{ flex: 1 }}>
+                <Progress.Section
+                  value={progress}
+                  color={progress < 100 ? 'blue' : 'green'}
+                  striped
+                  animated
+                  style={{
+                    backgroundColor: theme.colors.blue[colorScheme === 'dark' ? 4 : 6],
+                  }}
+                >
+                  <Progress.Label>{`${Math.floor(progress)}%`}</Progress.Label>
+                </Progress.Section>
+              </Progress.Root>
+              <Tooltip label="Cancel upload" position="left">
+                <LegacyActionIcon
+                  color="red"
+                  onClick={() => {
+                    abort(uuid);
+                    updateFile(versionFileUuid, { status: 'aborted' });
+                  }}
+                >
+                  <IconX />
+                </LegacyActionIcon>
+              </Tooltip>
+            </Group>
+            <Group justify="space-between" wrap="nowrap">
+              <Text c="dimmed" size="xs">{`${formatBytes(speed)}/s`}</Text>
+              <Text c="dimmed" size="xs">{`${formatSeconds(timeRemaining)} remaining`}</Text>
+            </Group>
+          </Stack>
+        </Group>
+      );
+    case 'aborted':
+      return (
+        <Group justify="space-between" wrap="nowrap" gap="xs" style={{ width: '100%' }}>
+          <Group gap="xs">
+            <IconBan color="red" />
+            <Text size="sm">Aborted upload</Text>
+          </Group>
+          <Tooltip label="Remove file" position="left">
+            <LegacyActionIcon color="red" onClick={handleRemoveFile}>
+              <IconTrash />
+            </LegacyActionIcon>
+          </Tooltip>
+        </Group>
+      );
+    case 'error':
+      return (
+        <Group justify="space-between" wrap="nowrap" gap="xs" style={{ width: '100%' }}>
+          <Group gap="xs" wrap="nowrap">
+            <IconAlertTriangle color="red" style={{ flexShrink: 0 }} />
+            <Text size="sm" c="red">
+              Upload failed and couldn&apos;t recover automatically. Retry, or remove the file.
+            </Text>
+          </Group>
+          <Group gap={4} wrap="nowrap">
+            <Tooltip label="Retry upload" position="left">
+              <LegacyActionIcon color="blue" onClick={() => retry(versionFileUuid)}>
+                <IconRefresh />
+              </LegacyActionIcon>
+            </Tooltip>
+            <Tooltip label="Remove file" position="left">
+              <LegacyActionIcon color="red" onClick={handleRemoveFile}>
+                <IconTrash />
+              </LegacyActionIcon>
+            </Tooltip>
+          </Group>
+        </Group>
+      );
+    case 'success':
+      return (
+        <>
+          <IconCircleCheck color="green" />
+          <Text size="sm">Upload completed</Text>
+        </>
+      );
+    case 'pending':
+      return (
+        <Group justify="space-between" wrap="nowrap" gap="xs" style={{ width: '100%' }}>
+          <Group gap="xs">
+            <IconCloudUpload />
+            <Text size="sm">Pending upload</Text>
+          </Group>
+          <Tooltip label="Remove file" position="left">
+            <LegacyActionIcon color="red" onClick={handleRemoveFile}>
+              <IconTrash />
+            </LegacyActionIcon>
+          </Tooltip>
+        </Group>
+      );
+    default:
+      return null;
+  }
+}
+
+// Compact inline label for selects
+function SelectLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <Text
+      size="xs"
+      fw={500}
+      c="dimmed"
+      tt="uppercase"
+      style={{ letterSpacing: 0.5, fontSize: 11 }}
+      mb={2}
+    >
+      {children}
+    </Text>
+  );
+}
+
+// Inline compact edit form with small selects
+function FileEditForm({
+  file: versionFile,
+  index,
+  fileTypes,
+}: {
+  file: FileFromContextProps;
+  index: number;
+  fileTypes: ModelFileType[];
+}) {
+  const [initialFile, setInitialFile] = useState({ ...versionFile });
+  const { errors, updateFile, validationCheck, baseModel } = useFilesContext();
+  const error = errors?.[index];
+  const { precisions, quantTypes } = useModelFileOptions();
+  const showSize = baseModelHasFileSize(baseModel);
+
+  const { mutate, isPending: isLoading } = trpc.modelFile.update.useMutation({
+    onSuccess: () => {
+      setInitialFile(versionFile);
+    },
+  });
+
+  // When the file gets persisted (auto-start assigns an id on upload completion),
+  // rebase the dirty-comparison baseline so Save/Reset don't show spuriously for
+  // a file the user never manually edited.
+  useEffect(() => {
+    if (versionFile.id) setInitialFile({ ...versionFile });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [versionFile.id]);
+
+  const handleSave = () => {
+    const valid = validationCheck(versionFile.uuid);
+    if (valid && versionFile.id) {
+      mutate({
+        id: versionFile.id,
+        type: versionFile.type ?? undefined,
+        metadata: {
+          fp: versionFile.fp ?? undefined,
+          size: versionFile.size ?? undefined,
+          format: versionFile.format ?? undefined,
+          quantType: versionFile.quantType ?? undefined,
+          isRequired: versionFile.isRequired ?? undefined,
+        },
+      });
+    }
+  };
+
+  const handleReset = () => {
+    updateFile(versionFile.uuid, {
+      type: initialFile.type,
+      size: initialFile.size,
+      fp: initialFile.fp,
+      quantType: initialFile.quantType,
+    });
+  };
+
+  // isRequired is excluded because its toggle persists on change — comparing it
+  // would leave Save/Reset showing for a value that's already saved.
+  const canManualSave =
+    !!versionFile.id &&
+    !isEqual(
+      { ...versionFile, overrideName: undefined, isRequired: undefined },
+      { ...initialFile, overrideName: undefined, isRequired: undefined }
+    );
+
+  const isCheckpoint = versionFile.type === 'Model' && versionFile.modelType === 'Checkpoint';
+  const isComponentFileByType =
+    versionFile.type &&
+    componentFileTypes.includes(versionFile.type as (typeof componentFileTypes)[number]);
+  const isComponentFile = !!isComponentFileByType;
+  const isGguf = versionFile.name.endsWith('.gguf');
+  const isZip = versionFile.name.endsWith('.zip');
+
+  // Show precision/quant/format for model checkpoint files AND component files
+  const showMetadataSelects = isCheckpoint || isComponentFile;
+
+  return (
+    <Group gap="xs" align="flex-end">
+      <div>
+        <SelectLabel>Type</SelectLabel>
+        <Select
+          allowDeselect={false}
+          size="xs"
+          w={160}
+          placeholder="Type"
+          error={error?.type?._errors[0]}
+          data={getModelFileTypeOptions(versionFile.name, {
+            // A saved file can't become training data; only an upload can (assertFileTypeChangeAllowed).
+            types:
+              versionFile.id && initialFile.type !== 'Training Data'
+                ? fileTypes.filter((type) => type !== 'Training Data')
+                : fileTypes,
+            currentType: versionFile.type,
+            modelType: versionFile.modelType,
+          })}
+          value={versionFile.type ?? null}
+          onChange={(value) => {
+            const newType = value as ModelFileType | null;
+            // Preserve precision/size when relabeling the file type — re-picking
+            // them every time is tedious and they're usually still correct.
+            updateFile(versionFile.uuid, { type: newType });
+          }}
+        />
+      </div>
+
+      {showMetadataSelects && (
+        <>
+          {isZip && (
+            <div>
+              <SelectLabel>Format</SelectLabel>
+              <Select
+                allowDeselect={false}
+                size="xs"
+                w={90}
+                placeholder="Format"
+                error={error?.format?._errors[0]}
+                data={zipModelFileTypes.map((x) => ({ label: x, value: x }))}
+                value={versionFile.format ?? null}
+                onChange={(value) => {
+                  updateFile(versionFile.uuid, { format: value as ZipModelFileType | null });
+                }}
+              />
+            </div>
+          )}
+
+          {isGguf && (
+            <div>
+              <SelectLabel>Quant</SelectLabel>
+              <Select
+                allowDeselect={false}
+                size="xs"
+                w={110}
+                placeholder="Quant"
+                searchable
+                error={error?.quantType?._errors[0]}
+                data={quantTypes}
+                value={versionFile.quantType ?? null}
+                onChange={(value) => {
+                  updateFile(versionFile.uuid, {
+                    quantType: value as ModelFileQuantType | null,
+                    // Precision is only editable while unquantized; don't strand a hidden value.
+                    ...(value !== UNQUANTIZED_QUANT_TYPE && { fp: null }),
+                  });
+                }}
+              />
+            </div>
+          )}
+
+          {(!isGguf || versionFile.quantType === UNQUANTIZED_QUANT_TYPE) && (
+            <div>
+              <SelectLabel>Precision</SelectLabel>
+              <Select
+                allowDeselect={false}
+                size="xs"
+                w={85}
+                placeholder="fp16"
+                error={error?.fp?._errors[0]}
+                data={precisions}
+                value={versionFile.fp ?? null}
+                onChange={(value) => {
+                  updateFile(versionFile.uuid, { fp: value as ModelFileFp | null });
+                }}
+              />
+            </div>
+          )}
+
+          {isCheckpoint && showSize && (
+            <div>
+              <SelectLabel>Size</SelectLabel>
+              <Select
+                allowDeselect={false}
+                size="xs"
+                w={80}
+                placeholder="Size"
+                data={constants.modelFileSizes.map((size) => ({
+                  label: startCase(size),
+                  value: size,
+                }))}
+                value={versionFile.size ?? null}
+                onChange={(value) => {
+                  updateFile(versionFile.uuid, { size: value as 'full' | 'pruned' | null });
+                }}
+              />
+            </div>
+          )}
+        </>
+      )}
+
+      {canManualSave && (
+        <>
+          <Button
+            size="xs"
+            variant="default"
+            onClick={handleReset}
+            disabled={isLoading}
+            style={{ marginBottom: 0 }}
+          >
+            Reset
+          </Button>
+          <Button
+            size="xs"
+            loading={isLoading}
+            variant="filled"
+            onClick={handleSave}
+            style={{ marginBottom: 0 }}
+          >
+            Save
+          </Button>
+        </>
+      )}
+    </Group>
+  );
+}
+
+export function UploadStepActions({ onBackClick, onNextClick }: ActionProps) {
+  const { files, usageControl } = useFilesContext();
+  const isExternalGeneration = usageControl === ModelUsageControl.ExternalGeneration;
+
+  // Files upload automatically on drop, so "Next" just navigates forward. We
+  // intentionally let the user proceed to the post step WITHOUT files so they can
+  // prep the post before (or while) uploading — the version can't actually be
+  // published until files exist, which is enforced at publish time in the post
+  // step. Warn here so it isn't a surprise.
+  const handleNext = () => {
+    const hasUploadingOrUploaded = files.some((file) => file.isUploading || !!file.id);
+
+    if (!isExternalGeneration && !hasUploadingOrUploaded) {
+      return openConfirmModal({
+        title: (
+          <Group gap="xs">
+            <IconAlertTriangle color="gold" />
+            <Text size="lg">No files uploaded</Text>
+          </Group>
+        ),
+        children:
+          "You haven't uploaded any files yet. You can continue and set up your post now, but you won't be able to publish this version until at least one file has uploaded.",
+        labels: { cancel: 'Cancel', confirm: 'Continue' },
+        onConfirm: onNextClick,
+      });
+    }
+
+    onNextClick();
+  };
+
+  return (
+    <Group mt="xl" justify="flex-end">
+      <Button variant="default" onClick={onBackClick}>
+        Back
+      </Button>
+      <Button onClick={handleNext}>Next</Button>
+    </Group>
+  );
+}
+
+type ActionProps = { onBackClick: () => void; onNextClick: () => void };

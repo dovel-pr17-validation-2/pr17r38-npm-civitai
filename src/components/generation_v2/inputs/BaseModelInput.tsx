@@ -1,0 +1,836 @@
+/**
+ * BaseModelInput
+ *
+ * A form input component for selecting the base model group for generation.
+ * When the base model changes, it notifies the ResourceDataProvider to
+ * re-evaluate resource compatibility.
+ */
+
+import { Badge, Group, Stack, Text, TextInput, UnstyledButton } from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import { useDisclosure, useLocalStorage } from '@mantine/hooks';
+import { trackRecentEcosystem, useRecentEcosystemsStore } from '~/store/recent-ecosystems.store';
+import {
+  IconArrowRight,
+  IconCheck,
+  IconChevronDown,
+  IconSearch,
+  IconStack2,
+  IconX,
+} from '@tabler/icons-react';
+import clsx from 'clsx';
+import React, { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import { PopoverOrSheet } from '~/components/generation_v2/PopoverOrSheet';
+import {
+  ecosystemByKey,
+  ecosystemById,
+  ecosystemFamilies,
+  getEcosystemGroup,
+  getEcosystemDisplayItems,
+  type EcosystemDisplayItem,
+} from '~/shared/constants/basemodel.constants';
+import { getWorkflowsForEcosystem } from '~/shared/generation/config/workflows';
+import type { GateItemState } from '~/shared/generation/gates';
+import { useEcosystemGroupPreferencesStore } from '~/store/ecosystem-group-preferences.store';
+import { ExperimentalFlask } from '~/components/generation_v2/Experimental';
+import { SfwOnlyBadge } from '~/components/SfwOnlyBadge/SfwOnlyBadge';
+import { PartnerDisclosureIcons } from '~/components/generation_v2/PartnerDisclosureIcons';
+import { PARTNER_SERVICE_ECOSYSTEMS } from '~/shared/constants/partner-ecosystems.constants';
+
+// Badge + default tooltip per shown-but-disabled state. A rule's `message`
+// (when present) overrides only the tooltip copy, layered on the same badge.
+const GATE_BADGE: Record<
+  GateItemState['state'],
+  { label: string; color: string; tooltip: string }
+> = {
+  memberOnly: { label: 'Members only', color: 'yellow', tooltip: 'Members-only generation' },
+  disabled: { label: 'Disabled', color: 'gray', tooltip: 'Temporarily unavailable' },
+};
+
+function getItemEcosystemIds(item: EcosystemDisplayItem): number[] {
+  if (item.type === 'group') return item.ecosystemIds ?? [];
+  const eco = ecosystemByKey.get(item.key);
+  return eco ? [eco.id] : [];
+}
+
+// =============================================================================
+// Types
+// =============================================================================
+
+export interface BaseModelInputProps {
+  value?: string;
+  onChange?: (value: string) => void;
+  /** Label displayed before the value */
+  label?: string;
+  /** Compatible ecosystems for the selected workflow (ecosystem keys) */
+  compatibleEcosystems?: string[];
+  /** Ecosystem keys to exclude from the list entirely (gated/hidden upstream). */
+  excludeEcosystems?: string[];
+  /**
+   * Ecosystem keys shown but disabled (not selectable), each with its own
+   * state (`disabled`/`memberOnly`) + optional message — resolved by the
+   * ecosystem node from the unified gate sources (self-hosted toggle + rules).
+   * Rendered greyed with a per-state badge, unlike `excludeEcosystems` which
+   * removes them entirely.
+   */
+  ecosystemStates?: GateItemState[];
+  /** Whether the input is disabled */
+  disabled?: boolean;
+  /** Check if an ecosystem is compatible with the current workflow */
+  isCompatible?: (ecosystemKey: string) => boolean;
+  /** Get the target workflow label for an incompatible ecosystem */
+  getTargetWorkflow?: (ecosystemKey: string) => string;
+  /** Current output type - only ecosystems supporting this type will be shown */
+  outputType?: 'image' | 'video' | 'audio' | 'model3d';
+}
+
+type FamilyGroup = {
+  familyId: number | null;
+  familyName: string | null;
+  items: EcosystemDisplayItem[]; // Changed from EcosystemItem
+};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+const TAB_PREFERENCE_KEY = 'generation-basemodel-tab';
+
+type TabValue = 'compatible' | 'recent' | 'all';
+
+// =============================================================================
+// Trigger Button
+// =============================================================================
+
+/** The model card's header strip; `min-h-11` is the phone tap height, kept on every layout. */
+interface TriggerButtonProps {
+  label: string;
+  ecosystemKey?: string;
+  disabled?: boolean;
+  onClick: () => void;
+}
+
+const TriggerButton = forwardRef<HTMLButtonElement, TriggerButtonProps>(
+  ({ label, ecosystemKey, disabled, onClick }, ref) => (
+    <UnstyledButton
+      ref={ref}
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={`Ecosystem: ${label}. Change ecosystem`}
+      data-tap-target
+      className={clsx(
+        'flex min-h-11 w-full min-w-0 items-center gap-2 bg-gray-1 px-2 text-left text-[13px] dark:bg-dark-5',
+        disabled && 'cursor-not-allowed opacity-50'
+      )}
+    >
+      <IconStack2 size={16} className="shrink-0 text-gray-6 dark:text-dark-2" />
+      <span className="min-w-0 flex-1 truncate">
+        <span className="text-gray-6 dark:text-dark-2">Ecosystem</span>{' '}
+        <span className="font-semibold">{label}</span>
+      </span>
+      <PartnerDisclosureIcons
+        partnerService={!!ecosystemKey && PARTNER_SERVICE_ECOSYSTEMS.has(ecosystemKey)}
+      />
+      <span className="flex shrink-0 items-center gap-1 font-semibold text-blue-6 dark:text-blue-4">
+        Change
+        <IconChevronDown size={14} stroke={2.5} />
+      </span>
+    </UnstyledButton>
+  )
+);
+
+TriggerButton.displayName = 'TriggerButton';
+
+// =============================================================================
+// List Content (the same on every surface)
+// =============================================================================
+
+export interface BaseModelListContentProps {
+  value?: string;
+  recentItems: EcosystemDisplayItem[];
+  groupedByFamily: FamilyGroup[];
+  /** All items grouped by family (no outputType filter) for search */
+  allGroupedByFamily: FamilyGroup[];
+  /** Get the target workflow label for an incompatible ecosystem */
+  getTargetWorkflow?: (ecosystemKey: string) => string;
+  onSelect: (key: string) => void;
+  /** Ecosystem key → its shown-but-disabled state (badge/tooltip per state). */
+  disabledStateMap?: Map<string, GateItemState>;
+  /** Whether there are any incompatible items */
+  hasIncompatibleItems?: boolean;
+  /** Current tab */
+  activeTab: TabValue;
+  /** Tab change handler */
+  onTabChange: (tab: TabValue) => void;
+  /** Whether the recent tab should be available */
+  showRecentTab: boolean;
+  /** Whether to auto-focus the search input */
+  autoFocusSearch?: boolean;
+  /** Callback when search value changes (for parent to clear on close) */
+  searchValue?: string;
+  onSearchChange?: (value: string) => void;
+}
+
+export function BaseModelListContent({
+  value,
+  recentItems,
+  groupedByFamily,
+  allGroupedByFamily,
+  getTargetWorkflow,
+  onSelect,
+  disabledStateMap,
+  hasIncompatibleItems,
+  activeTab,
+  onTabChange,
+  showRecentTab,
+  autoFocusSearch,
+  searchValue = '',
+  onSearchChange,
+}: BaseModelListContentProps) {
+  const searchRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const isSearching = searchValue.length > 0;
+  const [activeIndex, setActiveIndex] = useState(-1);
+
+  // Auto-focus search input when requested
+  useEffect(() => {
+    if (autoFocusSearch) {
+      // Small delay to ensure the input is mounted
+      const timer = setTimeout(() => searchRef.current?.focus(), 50);
+      return () => clearTimeout(timer);
+    }
+  }, [autoFocusSearch]);
+
+  // Auto-focus search input on any keypress while the picker is open
+  useEffect(() => {
+    if (autoFocusSearch) return; // focused by the effect above
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!searchRef.current || document.activeElement === searchRef.current) return;
+      // Only capture printable single characters (allow shift for uppercase)
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        searchRef.current.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [autoFocusSearch]);
+
+  // Filter grouped items based on active tab and search query
+  const filteredGroups = useMemo(() => {
+    const filterBySearch = (items: EcosystemDisplayItem[]) => {
+      if (!isSearching) return items;
+      const query = searchValue.toLowerCase();
+      return items.filter(
+        (item) => item.name.toLowerCase().includes(query) || item.key.toLowerCase().includes(query)
+      );
+    };
+
+    // When searching, show all items (including other output types) regardless of tab
+    if (isSearching) {
+      return allGroupedByFamily
+        .map((group) => ({
+          ...group,
+          items: filterBySearch(group.items),
+        }))
+        .filter((group) => group.items.length > 0);
+    }
+
+    if (activeTab === 'all') return groupedByFamily;
+
+    if (activeTab === 'recent') {
+      // For recent tab, show only the recent items (flat list, no grouping)
+      return [];
+    }
+
+    // Compatible tab: filter to compatible items only
+    return groupedByFamily
+      .map((group) => ({
+        ...group,
+        items: group.items.filter((item) => item.compatible),
+      }))
+      .filter((group) => group.items.length > 0);
+  }, [groupedByFamily, activeTab, isSearching, searchValue]);
+
+  // Build available tabs
+  const tabs: { value: TabValue; label: string }[] = useMemo(() => {
+    const result: { value: TabValue; label: string }[] = [
+      { value: 'compatible', label: 'Workflow Compatible' },
+    ];
+    if (showRecentTab) {
+      result.push({ value: 'recent', label: 'Recent' });
+    }
+    if (hasIncompatibleItems) {
+      result.push({ value: 'all', label: 'All' });
+    }
+    return result;
+  }, [showRecentTab, hasIncompatibleItems]);
+
+  // Filter recent items by search
+  const filteredRecentItems = useMemo(() => {
+    if (!isSearching) return recentItems;
+    const query = searchValue.toLowerCase();
+    return recentItems.filter(
+      (item) => item.name.toLowerCase().includes(query) || item.key.toLowerCase().includes(query)
+    );
+  }, [recentItems, isSearching, searchValue]);
+
+  // Flat ordered list of visible items for keyboard navigation
+  const flatItems = useMemo(() => {
+    if (activeTab === 'recent' && !isSearching) return filteredRecentItems;
+    return filteredGroups.flatMap((g) => g.items);
+  }, [activeTab, isSearching, filteredRecentItems, filteredGroups]);
+
+  // Reset keyboard focus when content changes
+  useEffect(() => {
+    setActiveIndex(-1);
+  }, [searchValue, activeTab]);
+
+  // Scroll active item into view
+  useEffect(() => {
+    if (activeIndex < 0 || !listRef.current) return;
+    const el = listRef.current.querySelector('[data-keyboard-active="true"]');
+    el?.scrollIntoView({ block: 'nearest' });
+  }, [activeIndex]);
+
+  const activeItemKey = activeIndex >= 0 ? flatItems[activeIndex]?.key : undefined;
+
+  const handleSearchKeyDown: React.KeyboardEventHandler<HTMLInputElement> = (e) => {
+    if (flatItems.length === 0) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setActiveIndex((prev) => Math.min(prev + 1, flatItems.length - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setActiveIndex((prev) => Math.max(prev - 1, -1));
+    } else if (e.key === 'Enter' && activeIndex >= 0) {
+      e.preventDefault();
+      const item = flatItems[activeIndex];
+      if (item && !disabledStateMap?.has(item.key)) onSelect(item.key);
+    }
+  };
+
+  // Check if search has no results
+  const hasNoResults =
+    isSearching && filteredGroups.length === 0 && filteredRecentItems.length === 0;
+
+  // Shared per-item renderer for the recent + grouped lists. Handles the
+  // selected / keyboard-active / incompatible states plus the self-hosted
+  // "disabled" state (greyed, non-selectable, badge + tooltip).
+  const renderItem = (item: EcosystemDisplayItem) => {
+    const isSelected = value === item.key;
+    const isActive = item.key === activeItemKey;
+    // Group items carry a group id as `key`; selection resolves to the group's
+    // default ecosystem (see `handleSelect`). The disabled set holds ecosystem
+    // keys, so resolve group → default ecosystem key before checking — mirrors
+    // the `applyExcludeFilter` resolution used for gated items.
+    const disabledCheckKey =
+      item.type === 'group' && item.defaultEcosystemId
+        ? ecosystemById.get(item.defaultEcosystemId)?.key ?? item.key
+        : item.key;
+    const gateState = disabledStateMap?.get(disabledCheckKey);
+    // `disabled` stays selectable — the form explains it and blocks generation.
+    const isDisabled = gateState?.state === 'memberOnly';
+    const badge = gateState ? GATE_BADGE[gateState.state] : undefined;
+    const button = (
+      <UnstyledButton
+        key={item.key}
+        data-keyboard-active={isActive ? 'true' : undefined}
+        onClick={() => {
+          if (isDisabled) return;
+          onSelect(item.key);
+        }}
+        className={clsx(
+          'flex w-full items-center justify-between rounded px-3 py-2 transition-colors',
+          isDisabled
+            ? 'cursor-not-allowed opacity-50'
+            : isSelected
+            ? 'bg-blue-0 dark:bg-blue-9/20'
+            : isActive
+            ? 'bg-gray-1 dark:bg-dark-4'
+            : 'hover:bg-gray-1 dark:hover:bg-dark-4',
+          !isDisabled && !item.compatible && 'opacity-60'
+        )}
+      >
+        <div className="flex flex-1 items-center gap-1.5">
+          <Text size="sm" fw={isSelected ? 600 : 400}>
+            {item.name}
+          </Text>
+          <ExperimentalFlask target={{ kind: 'ecosystem', key: disabledCheckKey }} size={16} />
+          <PartnerDisclosureIcons partnerService={PARTNER_SERVICE_ECOSYSTEMS.has(item.key)} />
+          <SfwOnlyBadge ecosystemIds={getItemEcosystemIds(item)} />
+        </div>
+        {badge ? (
+          <Badge size="xs" color={badge.color} variant="light">
+            {badge.label}
+          </Badge>
+        ) : (
+          <>
+            {isSelected && <IconCheck size={16} className="text-blue-6" />}
+            {!item.compatible && !isSelected && (
+              <IconArrowRight size={14} className="text-gray-5" />
+            )}
+          </>
+        )}
+      </UnstyledButton>
+    );
+
+    if (gateState && badge) {
+      return (
+        <Tooltip
+          key={item.key}
+          label={gateState.message ?? badge.tooltip}
+          position="right"
+          withArrow
+          openDelay={300}
+        >
+          {button}
+        </Tooltip>
+      );
+    }
+
+    if (!item.compatible && getTargetWorkflow) {
+      return (
+        <Tooltip
+          key={item.key}
+          label={`Will switch to ${getTargetWorkflow(item.key)}`}
+          position="right"
+          withArrow
+          openDelay={300}
+        >
+          {button}
+        </Tooltip>
+      );
+    }
+
+    return button;
+  };
+
+  return (
+    <Stack gap="md">
+      {/* Search input */}
+      <TextInput
+        ref={searchRef}
+        value={searchValue}
+        onChange={(e) => onSearchChange?.(e.currentTarget.value)}
+        onKeyDown={handleSearchKeyDown}
+        placeholder="Search ecosystems..."
+        size="sm"
+        leftSection={<IconSearch size={14} />}
+        rightSection={
+          isSearching ? (
+            <UnstyledButton onClick={() => onSearchChange?.('')} className="flex items-center">
+              <IconX size={14} className="text-gray-5" />
+            </UnstyledButton>
+          ) : null
+        }
+      />
+
+      {/* Tab header - hidden while searching */}
+      {tabs.length > 1 && !isSearching && (
+        <Group gap="xs">
+          {tabs.map((tab) => (
+            <UnstyledButton
+              key={tab.value}
+              onClick={() => onTabChange(tab.value)}
+              className={clsx(
+                'rounded-md px-3 py-1.5 text-sm font-medium transition-colors',
+                activeTab === tab.value
+                  ? 'bg-blue-1 text-blue-7 dark:bg-blue-9/30 dark:text-blue-4'
+                  : 'text-gray-6 hover:bg-gray-1 dark:text-gray-4 dark:hover:bg-dark-4'
+              )}
+            >
+              {tab.label}
+            </UnstyledButton>
+          ))}
+        </Group>
+      )}
+
+      {/* No results message */}
+      {hasNoResults && (
+        <Text size="sm" c="dimmed" ta="center" py="md">
+          No ecosystems match &ldquo;{searchValue}&rdquo;
+        </Text>
+      )}
+
+      {/* Scrollable item list */}
+      <div ref={listRef}>
+        {/* Recent tab content - hidden while searching since grouped results cover all items */}
+        {activeTab === 'recent' && !isSearching && filteredRecentItems.length > 0 && (
+          <Stack gap={0}>{filteredRecentItems.map(renderItem)}</Stack>
+        )}
+
+        {/* Grouped models (for compatible and all tabs) */}
+        {filteredGroups.map((familyGroup) => (
+          <div key={familyGroup.familyId ?? 'standalone'} className="mb-4 last:mb-0">
+            <Text size="xs" c="dimmed" fw={600} tt="uppercase" className="mb-2">
+              {familyGroup.familyName ?? 'Other'}
+            </Text>
+            <Stack gap={0}>{familyGroup.items.map(renderItem)}</Stack>
+          </div>
+        ))}
+      </div>
+    </Stack>
+  );
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+function groupItemsByFamily(items: EcosystemDisplayItem[]): FamilyGroup[] {
+  const familyMap = new Map<number | null, EcosystemDisplayItem[]>();
+
+  for (const item of items) {
+    const familyId = item.familyId ?? null;
+    const existing = familyMap.get(familyId) ?? [];
+    familyMap.set(familyId, [...existing, item]);
+  }
+
+  const result: FamilyGroup[] = [];
+
+  const families = [...familyMap.entries()]
+    .filter(([familyId]) => familyId !== null)
+    .sort(([a], [b]) => {
+      const nameA = ecosystemFamilies.find((f) => f.id === a)?.name ?? '';
+      const nameB = ecosystemFamilies.find((f) => f.id === b)?.name ?? '';
+      return nameA.localeCompare(nameB);
+    });
+
+  for (const [familyId, familyItems] of families) {
+    const family = ecosystemFamilies.find((f) => f.id === familyId);
+    result.push({
+      familyId,
+      familyName: family?.name ?? null,
+      items: familyItems,
+    });
+  }
+
+  const standalone = familyMap.get(null) ?? [];
+  if (standalone.length) {
+    result.push({
+      familyId: null,
+      familyName: null,
+      items: standalone,
+    });
+  }
+
+  return result;
+}
+
+// =============================================================================
+// Component
+// =============================================================================
+
+/**
+ * Everything `BaseModelListContent` needs to render: the display items, their
+ * family grouping, recents, tab state and the group→ecosystem resolution that
+ * happens on select.
+ */
+function useBaseModelPickerState({
+  value,
+  onChange,
+  compatibleEcosystems,
+  excludeEcosystems,
+  ecosystemStates,
+  isCompatible,
+  outputType,
+  onSelected,
+}: Omit<BaseModelInputProps, 'disabled' | 'label' | 'getTargetWorkflow'> & {
+  /** Fired after a selection commits — the trigger uses it to close and reset. */
+  onSelected?: () => void;
+}) {
+  const excludeSet = useMemo(
+    () => (excludeEcosystems?.length ? new Set(excludeEcosystems) : null),
+    [excludeEcosystems]
+  );
+  const disabledStateMap = useMemo(
+    () => (ecosystemStates?.length ? new Map(ecosystemStates.map((e) => [e.key, e])) : undefined),
+    [ecosystemStates]
+  );
+  const recentEcosystems = useRecentEcosystemsStore((state) => state.recent);
+  const [storedTab, setStoredTab] = useLocalStorage<TabValue>({
+    key: TAB_PREFERENCE_KEY,
+    defaultValue: 'compatible',
+  });
+
+  // Get/set last used ecosystem for groups
+  const getLastUsedEcosystem = useEcosystemGroupPreferencesStore(
+    (state) => state.getLastUsedEcosystem
+  );
+  const setLastUsedEcosystem = useEcosystemGroupPreferencesStore(
+    (state) => state.setLastUsedEcosystem
+  );
+
+  // Filter out excluded ecosystems (e.g. gated by feature flag).
+  // For groups, drop the entire group if its default ecosystem is excluded.
+  const applyExcludeFilter = useCallback(
+    (list: EcosystemDisplayItem[]): EcosystemDisplayItem[] => {
+      if (!excludeSet) return list;
+      return list.filter((item) => {
+        if (item.type === 'ecosystem') return !excludeSet.has(item.key);
+        const defaultEco = item.defaultEcosystemId
+          ? ecosystemById.get(item.defaultEcosystemId)
+          : undefined;
+        return defaultEco ? !excludeSet.has(defaultEco.key) : true;
+      });
+    },
+    [excludeSet]
+  );
+
+  // Get display items: groups and standalone ecosystems
+  const items = useMemo((): EcosystemDisplayItem[] => {
+    return applyExcludeFilter(
+      getEcosystemDisplayItems({
+        compatibleEcosystems,
+        isCompatible,
+        outputType,
+      })
+    );
+  }, [compatibleEcosystems, isCompatible, outputType, applyExcludeFilter]);
+
+  // Get ALL items (no outputType filter) for search across all ecosystems.
+  // Filters out ecosystems/groups that don't have any dedicated workflows.
+  const allItems = useMemo((): EcosystemDisplayItem[] => {
+    const all = applyExcludeFilter(
+      getEcosystemDisplayItems({
+        compatibleEcosystems,
+        isCompatible,
+      })
+    );
+
+    return all.filter((item) => {
+      if (item.type === 'group' && item.ecosystemIds) {
+        // Group: at least one ecosystem in the group must have a dedicated workflow
+        return item.ecosystemIds.some((id) =>
+          getWorkflowsForEcosystem(id).some((w) => w.ecosystemIds.includes(id))
+        );
+      }
+
+      // Standalone ecosystem: must have a dedicated workflow
+      const eco = ecosystemByKey.get(item.key);
+      if (!eco) return false;
+      return getWorkflowsForEcosystem(eco.id).some((w) => w.ecosystemIds.includes(eco.id));
+    });
+  }, [compatibleEcosystems, isCompatible, applyExcludeFilter]);
+
+  // Check if there are any incompatible items (to show the toggle)
+  const hasIncompatibleItems = useMemo(() => {
+    return items.some((item) => !item.compatible);
+  }, [items]);
+
+  // Track when value changes - update last used ecosystem for groups
+  useEffect(() => {
+    if (!value) return;
+
+    const eco = ecosystemByKey.get(value);
+    if (!eco) return;
+
+    const group = getEcosystemGroup(eco.id);
+    if (group) {
+      // This ecosystem is part of a group - track it
+      setLastUsedEcosystem(group.id, value);
+    }
+  }, [value, setLastUsedEcosystem]);
+
+  // Get readable name for current value
+  const readableName = useMemo(() => {
+    if (!value) return 'Select';
+
+    const eco = ecosystemByKey.get(value);
+    if (!eco) return value;
+
+    // Check if this ecosystem is in a group
+    const group = getEcosystemGroup(eco.id);
+    return group ? group.displayName : eco.displayName;
+  }, [value]);
+
+  // Group items by family
+  const groupedByFamily = useMemo(() => groupItemsByFamily(items), [items]);
+
+  // Group all items by family (for search across all ecosystems)
+  const allGroupedByFamily = useMemo(() => groupItemsByFamily(allItems), [allItems]);
+
+  const handleSelect = (key: string) => {
+    // Search results may come from allItems (cross-output-type), so check both
+    const item = items.find((i) => i.key === key) ?? allItems.find((i) => i.key === key);
+
+    if (item?.type === 'group') {
+      // Resolve group to an actual ecosystem:
+      // 1. Last used (if still in group AND compatible with current workflow)
+      // 2. Default ecosystem from group config
+      // 3. First compatible ecosystem in the group
+      const ids = item.ecosystemIds ?? [];
+      const lastUsed = getLastUsedEcosystem(item.key);
+      if (lastUsed) {
+        const lastUsedEco = ecosystemByKey.get(lastUsed);
+        if (
+          lastUsedEco &&
+          ids.includes(lastUsedEco.id) &&
+          (!isCompatible || isCompatible(lastUsed))
+        ) {
+          onChange?.(lastUsed);
+          trackRecentEcosystem(key);
+          onSelected?.();
+          return;
+        }
+      }
+
+      // Try default ecosystem
+      const defaultEco = ecosystemById.get(item.defaultEcosystemId!);
+      if (defaultEco && (!isCompatible || isCompatible(defaultEco.key))) {
+        onChange?.(defaultEco.key);
+      } else {
+        // Default not compatible — find first compatible ecosystem in the group
+        const compatibleEco = ids
+          .map((id) => ecosystemById.get(id))
+          .find((eco) => eco && isCompatible?.(eco.key));
+        onChange?.(compatibleEco?.key ?? defaultEco?.key ?? key);
+      }
+    } else {
+      onChange?.(key);
+    }
+
+    trackRecentEcosystem(key);
+    onSelected?.();
+  };
+
+  // Get recent items - resolve recent keys to current display items
+  const recentItems = useMemo(() => {
+    return recentEcosystems
+      .map((key) => items.find((item) => item.key === key))
+      .filter((item): item is EcosystemDisplayItem => item !== undefined);
+  }, [recentEcosystems, items]);
+
+  // Show recent tab only if there are recent items that don't match the current selection
+  const showRecentTab = useMemo(() => {
+    return recentItems.some((item) => item.key !== value);
+  }, [recentItems, value]);
+
+  // Compute active tab - default to 'compatible' if stored tab isn't available
+  const activeTab = useMemo((): TabValue => {
+    if (storedTab === 'recent' && !showRecentTab) return 'compatible';
+    if (storedTab === 'all' && !hasIncompatibleItems) return 'compatible';
+    return storedTab;
+  }, [storedTab, showRecentTab, hasIncompatibleItems]);
+
+  const handleTabChange = useCallback(
+    (tab: TabValue) => {
+      setStoredTab(tab);
+    },
+    [setStoredTab]
+  );
+
+  return {
+    readableName,
+    recentItems,
+    groupedByFamily,
+    allGroupedByFamily,
+    disabledStateMap,
+    hasIncompatibleItems,
+    activeTab,
+    handleTabChange,
+    handleSelect,
+    showRecentTab,
+  };
+}
+
+export function BaseModelInput({
+  value,
+  onChange,
+  compatibleEcosystems,
+  excludeEcosystems,
+  ecosystemStates,
+  disabled,
+  isCompatible,
+  getTargetWorkflow,
+  outputType,
+}: BaseModelInputProps) {
+  const [popoverOpened, { close: closePopover, open: openPopover }] = useDisclosure(false);
+  const [searchValue, setSearchValue] = useState('');
+
+  const {
+    readableName,
+    recentItems,
+    groupedByFamily,
+    allGroupedByFamily,
+    disabledStateMap,
+    hasIncompatibleItems,
+    activeTab,
+    handleTabChange,
+    handleSelect,
+    showRecentTab,
+  } = useBaseModelPickerState({
+    value,
+    onChange,
+    compatibleEcosystems,
+    excludeEcosystems,
+    ecosystemStates,
+    isCompatible,
+    outputType,
+    onSelected: () => {
+      closePopover();
+      setSearchValue('');
+    },
+  });
+
+  const close = () => {
+    closePopover();
+    setSearchValue('');
+  };
+
+  // Click to open and close: hover-to-open was unreliable, because the popover's portal sits past an
+  // offset gap and leaving the trigger closed it before the cursor arrived.
+  return (
+    <PopoverOrSheet
+      opened={popoverOpened}
+      onClose={close}
+      title="Select Base Model"
+      narrow="fullscreen"
+      tall
+      // Under the strip's Change, at its right end.
+      popoverProps={{ position: 'bottom-end', shadow: 'xl' }}
+      // A step lighter than the generator's cards, so it stands off the form it opens over.
+      dropdownProps={{
+        p: 'sm',
+        className: 'max-h-[70vh] min-w-[280px] overflow-y-auto bg-white dark:bg-dark-5',
+      }}
+      target={
+        <TriggerButton
+          label={readableName}
+          ecosystemKey={value}
+          disabled={disabled}
+          onClick={() => {
+            if (disabled) return;
+            if (popoverOpened) close();
+            else openPopover();
+          }}
+        />
+      }
+    >
+      {(surface) => (
+        <div className={clsx(surface === 'fullscreen' && 'pt-4')}>
+          <BaseModelListContent
+            value={value}
+            recentItems={recentItems}
+            groupedByFamily={groupedByFamily}
+            allGroupedByFamily={allGroupedByFamily}
+            getTargetWorkflow={getTargetWorkflow}
+            onSelect={handleSelect}
+            disabledStateMap={disabledStateMap}
+            hasIncompatibleItems={hasIncompatibleItems}
+            activeTab={activeTab}
+            onTabChange={handleTabChange}
+            showRecentTab={showRecentTab}
+            // The full-screen picker opens to type in; in a sheet the keyboard would cover the list.
+            autoFocusSearch={surface === 'fullscreen'}
+            searchValue={searchValue}
+            onSearchChange={setSearchValue}
+          />
+        </div>
+      )}
+    </PopoverOrSheet>
+  );
+}

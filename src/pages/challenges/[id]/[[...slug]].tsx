@@ -1,0 +1,1979 @@
+import { OwnerRatingControls } from '~/components/RatingReview/OwnerRatingControls';
+import { challengeEndedMessage } from '~/components/Challenge/challenge-messages';
+import {
+  Accordion,
+  ActionIcon,
+  Badge,
+  Button,
+  Container,
+  Divider,
+  Drawer,
+  Group,
+  Indicator,
+  Loader,
+  type MantineSize,
+  ScrollArea,
+  Spoiler,
+  Stack,
+  Text,
+  Progress,
+  ThemeIcon,
+  Title,
+  useMantineTheme,
+  useComputedColorScheme,
+} from '@mantine/core';
+import { Menu, Popover, Tooltip } from '~/components/MantineOverlays';
+import { closeAllModals, openConfirmModal } from '@mantine/modals';
+import type { InferGetServerSidePropsType } from 'next';
+import type { MouseEvent } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import * as z from 'zod';
+
+import { BuzzTransactionButton } from '~/components/Buzz/BuzzTransactionButton';
+import { ToggleLockComments } from '~/components/CommentsV3/ToggleLockComments';
+import { Page } from '~/components/AppLayout/Page';
+import { NotFound } from '~/components/AppLayout/NotFound';
+import { Gated } from '~/components/Gated/Gated';
+import { PageLoader } from '~/components/PageLoader/PageLoader';
+import { RenderHtml } from '~/components/RenderHtml/RenderHtml';
+import { CreatorCardSimple } from '~/components/CreatorCard/CreatorCardSimple';
+import { ChallengeNotifyToggle } from '~/components/Challenge/ChallengeNotifyToggle';
+import { UserAvatar } from '~/components/UserAvatar/UserAvatar';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { CONTEST_BANNED_MESSAGE } from '~/shared/constants/contest-ban.constants';
+import { useIsContestBanned } from '~/hooks/useIsContestBanned';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+import { formatDate } from '~/utils/date-helpers';
+import { removeEmpty } from '~/utils/object-helpers';
+import { CurrencyBadge } from '~/components/Currency/CurrencyBadge';
+import { CurrencyIcon } from '~/components/Currency/CurrencyIcon';
+import {
+  ChallengeReviewCostType,
+  Currency,
+  ChallengeSource,
+  ChallengeStatus,
+  PrizeMode,
+  PoolTrigger,
+} from '~/shared/utils/prisma/enums';
+import { openReportModal } from '~/components/Dialog/triggers/report';
+import { ReportEntity } from '~/shared/utils/report-helpers';
+import { ShareButton } from '~/components/ShareButton/ShareButton';
+import {
+  IconBrush,
+  IconBulb,
+  IconCheck,
+  IconClockHour4,
+  IconDotsVertical,
+  IconFilter,
+  IconFlag,
+  IconGavel,
+  IconGift,
+  IconPencil,
+  IconPhoto,
+  IconRefresh,
+  IconShare3,
+  IconSparkles,
+  IconLock,
+  IconTrash,
+  IconTrendingUp,
+  IconTrophy,
+  IconX,
+} from '@tabler/icons-react';
+import { useRouter } from 'next/router';
+import { abbreviateNumber } from '~/utils/number-helpers';
+import {
+  getChallengeDisplayUser,
+  useDeleteUserChallenge,
+  useIsChallengeOwner,
+  useQueryChallenge,
+} from '~/components/Challenge/challenge.utils';
+import { WinnerPodiumCard } from '~/components/Challenge/WinnerPodiumCard';
+import {
+  DescriptionTable,
+  type Props as DescriptionTableProps,
+} from '~/components/DescriptionTable/DescriptionTable';
+import { buildPassthroughQuery } from '~/utils/query-string-helpers';
+import { getCanonicalSlugDestination } from '~/utils/canonical-slug';
+import { slugit } from '~/utils/string-helpers';
+import { LoginRedirect } from '~/components/LoginRedirect/LoginRedirect';
+import { DaysFromNow } from '~/components/Dates/DaysFromNow';
+import { IconBadge } from '~/components/IconBadge/IconBadge';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
+import { ContainerGrid2 } from '~/components/ContainerGrid/ContainerGrid';
+import { EdgeMedia2 } from '~/components/EdgeMedia/EdgeMedia';
+import { ImageGuard2 } from '~/components/ImageGuard/ImageGuard2';
+import { MediaHash } from '~/components/ImageHash/ImageHash';
+import { EligibleModelsList } from '~/components/EligibleModels/EligibleModelsList';
+import { NoContent } from '~/components/NoContent/NoContent';
+import {
+  SpotlightDivider,
+  SpotlightGlow,
+  SpotlightSurface,
+} from '~/components/SpotlightCard/SpotlightBorderCard';
+import type { ChallengeDetail } from '~/server/schema/challenge.schema';
+import { generationGraphPanel } from '~/store/generation-graph.store';
+import { generationFormStore } from '~/store/generation-form.store';
+import { trpc } from '~/utils/trpc';
+import ConfirmDialog from '~/components/Dialog/Common/ConfirmDialog';
+import { dialogStore } from '~/components/Dialog/dialogStore';
+import { showSuccessNotification, showErrorNotification } from '~/utils/notifications';
+import { ChallengeSubmitModal } from '~/components/Challenge/ChallengeSubmitModal';
+import {
+  parseBitwiseBrowsingLevel,
+  browsingLevelLabels,
+  nsfwLevelColors,
+} from '~/shared/constants/browsingLevel.constants';
+import ImagesInfinite from '~/components/Image/Infinite/ImagesInfinite';
+import { MasonryProvider } from '~/components/MasonryColumns/MasonryProvider';
+import { MasonryContainer } from '~/components/MasonryColumns/MasonryContainer';
+import { constants as appConstants } from '~/server/common/constants';
+import { ImageSort } from '~/server/common/enums';
+import { CustomMarkdown } from '~/components/Markdown/CustomMarkdown';
+import { ChallengeDiscussion } from '~/components/Challenge/ChallengeDiscussion';
+import { FilterButton } from '~/components/Buttons/FilterButton';
+import { FilterChip } from '~/components/Filters/FilterChip';
+import { IsClient } from '~/components/IsClient/IsClient';
+import { useIsMobile } from '~/hooks/useIsMobile';
+import { useDomainColor } from '~/hooks/useDomainColor';
+import {
+  getBorder,
+  getBackground,
+  getShadow,
+  PREVIEW_STATES,
+  SECTION_GLOWS,
+} from '~/components/Challenge/DynamicPrizeCard/constants';
+import { ProgressLegendDot } from '~/components/Challenge/DynamicPrizeCard/ProgressLegendDot';
+import { distributePrizes } from '~/server/games/daily-challenge/challenge-pool';
+
+function useInjectKeyframes() {
+  useEffect(() => {
+    const id = 'challenge-spotlight-keyframes';
+    if (document.getElementById(id)) return;
+    const style = document.createElement('style');
+    style.id = id;
+    style.textContent = `@keyframes sweep-fill-pulse {
+  0% { background-position: 100% 0; opacity: 1; }
+  35% { background-position: 0% 0; opacity: 1; }
+  55% { opacity: 0.6; }
+  70% { opacity: 1; }
+  85% { opacity: 0.6; }
+  100% { background-position: 0% 0; opacity: 1; }
+}
+@keyframes prize-shimmer {
+  0% { background-position: -200% center; }
+  100% { background-position: 200% center; }
+}
+@keyframes prize-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.85; transform: scale(1.02); }
+}`;
+    document.head.appendChild(style);
+    return () => {
+      style.remove();
+    };
+  }, []);
+}
+
+/** Open the generation panel for a challenge's model versions. */
+function openChallengeGenerator(modelVersionIds: number[]) {
+  if (modelVersionIds.length) {
+    generationGraphPanel.open({ type: 'modelVersions', ids: modelVersionIds.slice(0, 1) });
+  } else {
+    generationGraphPanel.open();
+  }
+  generationFormStore.setType('image');
+}
+
+const querySchema = z.object({
+  id: z.coerce.number(),
+  slug: z.array(z.string()).optional(),
+});
+
+export const getServerSideProps = createServerSideProps({
+  useSSG: true,
+  resolver: async ({ ctx, ssg, features }) => {
+    if (!features?.challengePlatform) return { notFound: true };
+
+    const result = querySchema.safeParse(ctx.query);
+    if (!result.success) return { notFound: true };
+
+    let gating: { contentNsfwLevel: number; nsfw?: boolean } | undefined;
+
+    if (ssg) {
+      // Fetch challenge to check slug and prefetch for client hydration
+      const challenge = await ssg.challenge.getById.fetch({ id: result.data.id }).catch(() => null);
+
+      if (challenge)
+        gating = {
+          contentNsfwLevel: challenge.allowedNsfwLevel | (challenge.coverImage?.nsfwLevel ?? 0),
+          nsfw: challenge.source === ChallengeSource.User && challenge.buzzType === 'yellow',
+        };
+
+      if (challenge) {
+        const destination = getCanonicalSlugDestination({
+          basePath: '/challenges',
+          id: result.data.id,
+          title: challenge.title,
+          currentSlug: result.data.slug?.join('/'),
+          queryString: buildPassthroughQuery(ctx.query),
+        });
+        if (destination) return { redirect: { destination, permanent: false } };
+      }
+    }
+
+    return { props: removeEmpty(result.data), gating };
+  },
+});
+
+// The hero, prize and judge panels above the target section keep resolving after the challenge
+// query does, so a single scroll lands short. Re-pin on a short interval to the first of `ids`
+// present in the DOM (winners → entries fallback, since a completed challenge that never picked
+// winners has no podium), and stop the moment the reader takes over. Returns an abort fn so the
+// caller can cancel on unmount; the AbortController's signal also tears down all three listeners
+// in one shot on any exit path.
+function scrollToHash(ids: string[]) {
+  const deadline = Date.now() + 1500;
+  const controller = new AbortController();
+  const { signal } = controller;
+  const events = ['wheel', 'touchmove', 'keydown'] as const;
+  events.forEach((e) =>
+    window.addEventListener(e, () => controller.abort(), { passive: true, signal })
+  );
+
+  const pin = () => {
+    if (signal.aborted) return;
+    const target = ids.map((id) => document.getElementById(id)).find(Boolean);
+    target?.scrollIntoView();
+    if (Date.now() < deadline) setTimeout(pin, 250);
+    else controller.abort();
+  };
+  requestAnimationFrame(pin);
+  return () => controller.abort();
+}
+
+// Deep-link anchors → ordered scroll targets (first present wins).
+const DEEP_LINK_TARGETS: Record<string, string[]> = {
+  entries: ['entries'],
+  winners: ['winners', 'entries'],
+};
+
+function ChallengeDetailsPage({ id }: InferGetServerSidePropsType<typeof getServerSideProps>) {
+  const { data: challenge, isLoading } = useQueryChallenge(id);
+  const currentUser = useCurrentUser();
+  const isContestBanned = useIsContestBanned();
+  const features = useFeatureFlags();
+  const router = useRouter();
+  const queryUtils = trpc.useUtils();
+  const { deleteChallenge: deleteOwnChallenge, deleting: deletingOwn } = useDeleteUserChallenge();
+  const deletingOwnRef = useRef(false);
+  const deepLinkHandledFor = useRef<number>();
+  const isOwner = useIsChallengeOwner(challenge);
+
+  const handleMutationError = (error: { message: string }) => {
+    showErrorNotification({ error: new Error(error.message) });
+  };
+
+  const endAndPickWinnersMutation = trpc.challenge.endAndPickWinners.useMutation({
+    onSuccess: (data) => {
+      queryUtils.challenge.getById.invalidate({ id });
+      showSuccessNotification({ message: challengeEndedMessage(data) });
+    },
+    onError: handleMutationError,
+  });
+
+  const voidChallengeMutation = trpc.challenge.voidChallenge.useMutation({
+    onSuccess: () => {
+      queryUtils.challenge.getById.invalidate({ id });
+      showSuccessNotification({ message: 'Challenge cancelled' });
+    },
+    onError: handleMutationError,
+  });
+
+  const rescanMutation = trpc.challenge.rescan.useMutation({
+    onSuccess: () => {
+      showSuccessNotification({
+        message: 'Rescan queued. The verdict will apply once the scan completes.',
+      });
+    },
+    onError: handleMutationError,
+  });
+
+  const rejudgeMutation = trpc.challenge.rejudge.useMutation({
+    onSuccess: ({ entries }) => {
+      showSuccessNotification({
+        message: entries
+          ? `${entries} entries queued for judging again.`
+          : 'No judged entries to re-judge.',
+      });
+    },
+    onError: handleMutationError,
+  });
+
+  const deleteMutation = trpc.challenge.delete.useMutation({
+    onSuccess: () => {
+      showSuccessNotification({ message: 'Challenge deleted' });
+      router.push('/challenges');
+    },
+    onError: handleMutationError,
+  });
+
+  const handleEndAndPickWinners = () => {
+    if (!challenge) return;
+    dialogStore.trigger({
+      component: ConfirmDialog,
+      props: {
+        title: 'End & Pick Winners',
+        message: (
+          <Stack gap="xs">
+            <Text>
+              Are you sure you want to end <strong>&ldquo;{challenge.title}&rdquo;</strong> and pick
+              winners now?
+            </Text>
+            <Text size="sm" c="dimmed">
+              This will close the collection, run the winner selection process, and award prizes.
+            </Text>
+          </Stack>
+        ),
+        labels: { cancel: 'Cancel', confirm: 'End & Pick Winners' },
+        onConfirm: () => endAndPickWinnersMutation.mutateAsync({ id }),
+      },
+    });
+  };
+
+  const handleVoidChallenge = () => {
+    if (!challenge) return;
+    dialogStore.trigger({
+      component: ConfirmDialog,
+      props: {
+        title: 'Void Challenge',
+        message: (
+          <Stack gap="xs">
+            <Text>
+              Are you sure you want to void <strong>&ldquo;{challenge.title}&rdquo;</strong>?
+            </Text>
+            <Text size="sm" c="dimmed">
+              This will cancel the challenge without picking winners. Users will keep their entry
+              prizes (if any were awarded).
+            </Text>
+          </Stack>
+        ),
+        labels: { cancel: 'Cancel', confirm: 'Void Challenge' },
+        confirmProps: { color: 'red' },
+        onConfirm: () => voidChallengeMutation.mutateAsync({ id }),
+      },
+    });
+  };
+
+  const handleRescan = () => {
+    if (!challenge) return;
+    // Only a live green user challenge is cancelled outright on an NSFW verdict
+    // (computeNsfwEscalation); everything else just has its rating raised in place.
+    const warnOnNsfw =
+      challenge.status === ChallengeStatus.Active &&
+      challenge.source === ChallengeSource.User &&
+      challenge.buzzType === 'green';
+    dialogStore.trigger({
+      component: ConfirmDialog,
+      props: {
+        title: 'Rescan Content',
+        message: (
+          <Stack gap="xs">
+            <Text>
+              Re-run the content scan for <strong>&ldquo;{challenge.title}&rdquo;</strong>?
+            </Text>
+            <Text size="sm" c="dimmed">
+              Resubmits the challenge text and re-queues the cover image, ignoring the previous
+              verdict. The challenge stays visible while the scan runs.
+            </Text>
+            {warnOnNsfw && (
+              <Text size="sm" c="yellow.6">
+                This challenge is live. If the rescan comes back NSFW, it will be cancelled and
+                hidden — entrants are refunded their prize-pool contribution and notified, and the
+                creator&apos;s escrowed prize is returned.
+              </Text>
+            )}
+          </Stack>
+        ),
+        labels: { cancel: 'Cancel', confirm: 'Rescan' },
+        onConfirm: () => rescanMutation.mutateAsync({ id }),
+      },
+    });
+  };
+
+  const handleRejudge = () => {
+    if (!challenge) return;
+    dialogStore.trigger({
+      component: ConfirmDialog,
+      props: {
+        title: 'Re-judge Entries',
+        message: (
+          <Stack gap="xs">
+            <Text>
+              Have the judge review every judged entry in{' '}
+              <strong>&ldquo;{challenge.title}&rdquo;</strong> again?
+            </Text>
+            <Text size="sm" c="dimmed">
+              Deletes the judge&apos;s comments, reactions and scores on those entries and resets
+              the rankings. The review job then judges each entry again over its next runs (about
+              one judge call per entry, plus ranking comparisons), and entrants get new comments. An
+              entry whose review keeps failing is dropped after 3 attempts.
+            </Text>
+          </Stack>
+        ),
+        labels: { cancel: 'Cancel', confirm: 'Re-judge' },
+        confirmProps: { color: 'red' },
+        onConfirm: () => rejudgeMutation.mutateAsync({ id }),
+      },
+    });
+  };
+
+  const handleDelete = () => {
+    dialogStore.trigger({
+      component: ConfirmDialog,
+      props: {
+        title: 'Delete Challenge',
+        message: <Text>Are you sure you want to delete this challenge?</Text>,
+        labels: { cancel: 'Cancel', confirm: 'Delete' },
+        confirmProps: { color: 'red' },
+        onConfirm: () => deleteMutation.mutateAsync({ id }),
+      },
+    });
+  };
+
+  // Deep links from the "Your Challenges" cards: `#entries`/`#winners` scroll to that section,
+  // `?submit=1` opens the submit modal. All wait on `challenge` — the target section mounts with
+  // the query, long after the browser would have tried its own hash scroll (and it scrolls an
+  // inner `.scroll-area` container, not the window). `submit` is stripped before the modal opens
+  // so a refresh or back-nav doesn't re-trigger it.
+  useEffect(() => {
+    // Scoped to the loaded challenge id, not a one-shot bool: Next reuses this component across
+    // detail→detail navigations, so a boolean guard would swallow a deep link on the second one.
+    if (!challenge || deepLinkHandledFor.current === challenge.id) return;
+    deepLinkHandledFor.current = challenge.id;
+
+    const wantsSubmit = !!router.query.submit;
+    if (wantsSubmit) {
+      const { submit, ...query } = router.query;
+      router.replace({ pathname: router.pathname, query }, undefined, { shallow: true });
+    }
+
+    const targets = DEEP_LINK_TARGETS[router.asPath.split('#')[1]];
+    const abortScroll = targets ? scrollToHash(targets) : undefined;
+
+    const canSubmit =
+      challenge.status === ChallengeStatus.Active &&
+      !!challenge.collectionId &&
+      !currentUser?.muted &&
+      !isContestBanned;
+    if (wantsSubmit && canSubmit && challenge.collectionId)
+      dialogStore.trigger({
+        component: ChallengeSubmitModal,
+        props: { challengeId: challenge.id, collectionId: challenge.collectionId },
+      });
+
+    return abortScroll;
+  }, [challenge, router, currentUser?.muted, isContestBanned]);
+
+  if (isLoading) return <PageLoader />;
+  if (!challenge) return <NotFound />;
+
+  const isActive = challenge.status === ChallengeStatus.Active;
+  const isCompleted = challenge.status === ChallengeStatus.Completed;
+  const isScheduled = challenge.status === ChallengeStatus.Scheduled;
+  // Only User-source challenges carry user-authored text worth reporting
+  const canReport = !!currentUser && challenge.source === ChallengeSource.User;
+
+  const isCancelled = challenge.status === ChallengeStatus.Cancelled;
+  const canManageOwn =
+    features.userChallenges && isOwner && !currentUser?.isModerator && isScheduled;
+  // Delete stays available after a moderator voids the challenge (Cancelled) so the owner can clear
+  // a dead challenge off their list; edit remains Scheduled-only (canManageOwn).
+  const canDeleteOwn =
+    features.userChallenges && isOwner && !currentUser?.isModerator && (isScheduled || isCancelled);
+
+  const handleOwnerDelete = () => {
+    openConfirmModal({
+      title: 'Delete challenge',
+      // A Cancelled challenge was already refunded by the void, so don't promise another refund.
+      children: isCancelled
+        ? 'Delete this cancelled challenge? This cannot be undone.'
+        : 'Delete this challenge? Your escrowed prize Buzz will be refunded. This cannot be undone.',
+      centered: true,
+      closeOnConfirm: false,
+      labels: { cancel: 'No, keep it', confirm: 'Delete challenge' },
+      confirmProps: { color: 'red' },
+      onConfirm: async () => {
+        if (deletingOwnRef.current) return;
+        deletingOwnRef.current = true;
+        try {
+          await deleteOwnChallenge(challenge.id);
+          closeAllModals();
+          await router.push('/challenges');
+        } catch {
+          // notification surfaced by the mutation
+        } finally {
+          deletingOwnRef.current = false;
+        }
+      },
+    });
+  };
+
+  return (
+    <Gated
+      // Gate on the challenge's allowed rating combined with the cover image's real level. On the
+      // green site the server already omits a cover above the site's ceiling.
+      contentNsfwLevel={challenge.allowedNsfwLevel | (challenge.coverImage?.nsfwLevel ?? 0)}
+      // Yellow user challenges live on civitai.red regardless of rating — the server returns
+      // them on green so this renders the redirect card instead of a 404 (inert on red).
+      // Owner/mods keep detail access on green for SFW yellow challenges, mirroring the
+      // server-side preview exemption; NSFW ones still redirect via contentNsfwLevel.
+      nsfw={
+        challenge.source === ChallengeSource.User &&
+        challenge.buzzType === 'yellow' &&
+        !isOwner &&
+        !currentUser?.isModerator
+      }
+      bypassRating={isOwner || (currentUser?.isModerator ?? false)}
+      meta={{
+        title: `${challenge.title} | Civitai Challenges`,
+        description:
+          challenge.description || `Participate in the ${challenge.title} challenge on Civitai`,
+        canonical: `/challenges/${challenge.id}/${slugit(challenge.title)}`,
+        ogEndpoint: `/api/og?type=challenge&id=${challenge.id}`,
+      }}
+    >
+      <Container size="xl" mb={{ base: 'md', sm: 32 }}>
+        <Stack gap="xs" mb="xl">
+          {/* Row 1: Title + context menu */}
+          <Group justify="space-between" align="flex-start" wrap="nowrap">
+            <Title fw="bold" lineClamp={2} order={1} fz={{ base: 'h2', sm: 'h1' }}>
+              {challenge.title}
+            </Title>
+            <Group gap={4} wrap="nowrap" className="shrink-0">
+              <ChallengeNotifyToggle challenge={{ id: challenge.id, status: challenge.status }} />
+              <ShareButton url={router.asPath} title={challenge.title}>
+                <ActionIcon variant="light" size="lg" color="gray">
+                  <IconShare3 size={20} />
+                </ActionIcon>
+              </ShareButton>
+              {(currentUser?.isModerator || canReport || canDeleteOwn) && (
+                <Menu position="bottom-end" withArrow>
+                  <Menu.Target>
+                    <ActionIcon variant="light" size="lg">
+                      <IconDotsVertical size={20} />
+                    </ActionIcon>
+                  </Menu.Target>
+                  <Menu.Dropdown>
+                    {currentUser?.isModerator && (
+                      <>
+                        <Menu.Label>Actions</Menu.Label>
+                        <Menu.Item
+                          leftSection={<IconPencil size={14} stroke={1.5} />}
+                          component={Link}
+                          // User challenges use the user form (entry fee / judging categories);
+                          // the moderator form's prize model doesn't apply to them.
+                          href={
+                            challenge.source === ChallengeSource.User
+                              ? `/challenges/${challenge.id}/edit`
+                              : `/moderator/challenges/${challenge.id}/edit`
+                          }
+                        >
+                          Edit Challenge
+                        </Menu.Item>
+                        <ToggleLockComments entityId={challenge.id} entityType="challenge">
+                          {({ toggle, locked, isLoading }) => (
+                            <Menu.Item
+                              leftSection={
+                                isLoading ? (
+                                  <Loader size={14} />
+                                ) : (
+                                  <IconLock size={14} stroke={1.5} />
+                                )
+                              }
+                              onClick={toggle}
+                              disabled={isLoading}
+                              closeMenuOnClick={false}
+                            >
+                              {locked ? 'Unlock' : 'Lock'} Comments
+                            </Menu.Item>
+                          )}
+                        </ToggleLockComments>
+                        <Menu.Item
+                          leftSection={
+                            rescanMutation.isPending ? (
+                              <Loader size={14} />
+                            ) : (
+                              <IconRefresh size={14} stroke={1.5} />
+                            )
+                          }
+                          onClick={handleRescan}
+                          disabled={rescanMutation.isPending}
+                        >
+                          Rescan Content
+                        </Menu.Item>
+
+                        {isActive && (
+                          <>
+                            <Menu.Divider />
+                            <Menu.Label>Quick Actions</Menu.Label>
+                            <Menu.Item
+                              leftSection={<IconTrophy size={14} />}
+                              onClick={handleEndAndPickWinners}
+                            >
+                              End & Pick Winners
+                            </Menu.Item>
+                            <Menu.Item
+                              leftSection={
+                                rejudgeMutation.isPending ? (
+                                  <Loader size={14} />
+                                ) : (
+                                  <IconGavel size={14} />
+                                )
+                              }
+                              onClick={handleRejudge}
+                              disabled={rejudgeMutation.isPending}
+                            >
+                              Re-judge Entries
+                            </Menu.Item>
+                            <Menu.Item
+                              leftSection={<IconX size={14} />}
+                              color="red"
+                              onClick={handleVoidChallenge}
+                            >
+                              Void Challenge
+                            </Menu.Item>
+                          </>
+                        )}
+
+                        {isScheduled && (
+                          <>
+                            <Menu.Divider />
+                            <Menu.Label>Quick Actions</Menu.Label>
+                            <Menu.Item
+                              leftSection={<IconX size={14} />}
+                              color="red"
+                              onClick={handleVoidChallenge}
+                            >
+                              Cancel Challenge
+                            </Menu.Item>
+                          </>
+                        )}
+
+                        <Menu.Divider />
+                        <Menu.Item
+                          leftSection={<IconTrash size={14} />}
+                          color="red"
+                          onClick={handleDelete}
+                        >
+                          Delete
+                        </Menu.Item>
+                      </>
+                    )}
+                    {canDeleteOwn && (
+                      <>
+                        <Menu.Label>Actions</Menu.Label>
+                        {canManageOwn && (
+                          <Menu.Item
+                            leftSection={<IconPencil size={14} stroke={1.5} />}
+                            component={Link}
+                            href={`/challenges/${challenge.id}/edit`}
+                          >
+                            Edit Challenge
+                          </Menu.Item>
+                        )}
+                        <Menu.Item
+                          leftSection={<IconTrash size={14} />}
+                          color="red"
+                          disabled={deletingOwn}
+                          onClick={handleOwnerDelete}
+                        >
+                          Delete
+                        </Menu.Item>
+                        {canReport && <Menu.Divider />}
+                      </>
+                    )}
+                    {canReport && (
+                      <>
+                        {currentUser?.isModerator && <Menu.Divider />}
+                        <Menu.Item
+                          leftSection={<IconFlag size={14} stroke={1.5} />}
+                          onClick={() =>
+                            openReportModal({
+                              entityType: ReportEntity.Challenge,
+                              entityId: challenge.id,
+                            })
+                          }
+                        >
+                          Report
+                        </Menu.Item>
+                      </>
+                    )}
+                  </Menu.Dropdown>
+                </Menu>
+              )}
+            </Group>
+          </Group>
+
+          {/* Row 2: Theme + Status + Stats (inline with dividers) */}
+          <Group gap={8} wrap="wrap">
+            {/* Status badge */}
+            {isCompleted ? (
+              <IconBadge
+                size="lg"
+                radius="sm"
+                color="yellow.7"
+                icon={<IconTrophy size={16} fill="currentColor" />}
+              >
+                Completed
+              </IconBadge>
+            ) : isActive ? (
+              <IconBadge size="lg" radius="sm" color="green" icon={<IconSparkles size={16} />}>
+                Live
+              </IconBadge>
+            ) : isScheduled ? (
+              <Badge size="lg" radius="sm" color="blue">
+                Upcoming
+              </Badge>
+            ) : isCancelled ? (
+              <IconBadge size="lg" radius="sm" color="red" icon={<IconX size={16} />}>
+                Cancelled
+              </IconBadge>
+            ) : null}
+
+            {/* Countdown (active, and only while there is time left to count). A moderator can end
+                a challenge early, which puts endsAt in the past while the status is still Active
+                until the completion job takes it — and `fromNow(withoutSuffix)` renders a past
+                date as a bare magnitude, so the badge would read "2 minutes" as though that much
+                time remained. */}
+            {isActive && new Date(challenge.endsAt).getTime() > Date.now() && (
+              <IconBadge size="lg" radius="sm" icon={<IconClockHour4 size={18} />} color="gray">
+                <DaysFromNow date={challenge.endsAt} withoutSuffix />
+              </IconBadge>
+            )}
+
+            {/* Entry count */}
+            <IconBadge size="lg" radius="sm" icon={<IconPhoto size={18} />} color="gray">
+              {abbreviateNumber(challenge.entryCount)}{' '}
+              {challenge.entryCount === 1 ? 'entry' : 'entries'}
+            </IconBadge>
+
+            {challenge.theme && (
+              <>
+                <Divider orientation="vertical" />
+                <IconBadge
+                  size="lg"
+                  radius="sm"
+                  icon={<IconBulb size={18} />}
+                  color="violet"
+                  variant="light"
+                >
+                  {challenge.theme}
+                </IconBadge>
+              </>
+            )}
+          </Group>
+          <OwnerRatingControls entityType="Challenge" entityId={challenge.id} isOwner={isOwner} />
+        </Stack>
+
+        <ContainerGrid2 gutter={{ base: 16, md: 32, lg: 64 }}>
+          <ContainerGrid2.Col span={{ base: 12, md: 8 }}>
+            <Stack gap="md">
+              {/* w-full is load-bearing: `mx-auto` cancels the parent Stack's cross-axis stretch,
+                  so without a definite width the box is fit-content — and the blurred branch's only
+                  content is MediaHash's absolutely-positioned canvas, collapsing the cover to 0x0. */}
+              {challenge.coverImage && (
+                <div className="relative mx-auto w-full max-w-2xl overflow-hidden rounded-lg">
+                  <ImageGuard2 image={challenge.coverImage}>
+                    {(safe) => (
+                      <>
+                        <ImageGuard2.BlurToggle className="absolute left-2 top-2 z-10" />
+                        {safe ? (
+                          <EdgeMedia2
+                            src={challenge.coverImage!.url}
+                            type={challenge.coverImage!.type}
+                            width={800}
+                            className="aspect-[4/3] w-full object-cover"
+                          />
+                        ) : (
+                          <div className="relative aspect-[4/3] w-full overflow-hidden">
+                            <MediaHash {...challenge.coverImage} />
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </ImageGuard2>
+                </div>
+              )}
+
+              {/* About */}
+              <article>
+                <Stack gap={4}>
+                  {challenge.description ? (
+                    <RenderHtml html={challenge.description} withMentions />
+                  ) : (
+                    <Text c="dimmed">No description provided.</Text>
+                  )}
+                </Stack>
+              </article>
+
+              {/* Mobile CTA - shown after description on mobile only */}
+              <MobileCTAInline challenge={challenge} />
+            </Stack>
+          </ContainerGrid2.Col>
+          <ContainerGrid2.Col span={{ base: 12, md: 4 }}>
+            <ChallengeSidebar challenge={challenge} />
+          </ContainerGrid2.Col>
+        </ContainerGrid2>
+      </Container>
+
+      {/* Winners Section (for completed challenges) */}
+      {isCompleted && challenge.winners.length > 0 && <ChallengeWinners challenge={challenge} />}
+
+      {/* Discussion Section */}
+      <Container size="xl" id="comments" py={32}>
+        <ChallengeDiscussion
+          challengeId={challenge.id}
+          userId={getChallengeDisplayUser(challenge).id}
+        />
+      </Container>
+
+      {/* Entries Section */}
+      <ChallengeEntries challenge={challenge} />
+    </Gated>
+  );
+}
+
+function ChallengeSidebar({ challenge }: { challenge: ChallengeDetail }) {
+  useInjectKeyframes();
+  const colorScheme = useComputedColorScheme('dark');
+  const cs = colorScheme; // shorthand for style helpers
+  const currentUser = useCurrentUser();
+  const isActive = challenge.status === ChallengeStatus.Active;
+  const isDynamicPool = challenge.prizeMode === PrizeMode.Dynamic && challenge.buzzPerAction > 0;
+  const isOwner = useIsChallengeOwner(challenge);
+
+  const handleOpenSubmitModal = () => {
+    if (!challenge.collectionId) return;
+    dialogStore.trigger({
+      component: ChallengeSubmitModal,
+      props: { challengeId: challenge.id, collectionId: challenge.collectionId },
+    });
+  };
+
+  // Get user's entry count for this challenge
+  const { data: userEntryData } = trpc.challenge.getUserEntryCount.useQuery(
+    { challengeId: challenge.id },
+    { enabled: !!currentUser && isActive }
+  );
+  const userEntryCount = userEntryData?.count ?? 0;
+
+  // Get user's entries for paid review stats
+  const { data: userEntryData2 } = trpc.challenge.getUserUnjudgedEntries.useQuery(
+    { challengeId: challenge.id },
+    { enabled: !!currentUser && isActive && userEntryCount > 0 }
+  );
+  const userEntries = userEntryData2?.entries;
+  const hasFlatRatePurchase = userEntryData2?.hasFlatRatePurchase ?? false;
+  // TODO: REMOVE — preview state toggle for mods (-1 = live/real data)
+  const [previewState, setPreviewState] = useState<-1 | 0 | 1 | 2>(-1);
+  const isPreview = previewState !== -1;
+  // Real review data from API
+  const realReviewedCount = userEntries?.filter((e) => e.reviewStatus !== 'pending').length ?? 0;
+  const realUnreviewedCount = userEntries?.filter((e) => e.reviewStatus === 'pending').length ?? 0;
+  // Mock overrides when previewing
+  const previewData = isPreview ? PREVIEW_STATES[previewState as 0 | 1 | 2] : null;
+  const reviewedCount = previewData?.reviewedCount ?? realReviewedCount;
+  const unreviewedCount = previewData?.unreviewedCount ?? realUnreviewedCount;
+  const totalEntries = previewData?.totalEntries ?? userEntryCount;
+  const effectiveUserEntryCount = previewData?.userEntryCount ?? userEntryCount;
+  const effectiveHasFlatRatePurchase = previewData?.hasFlatRatePurchase ?? hasFlatRatePurchase;
+  const hasUserEntries = effectiveUserEntryCount > 0;
+  // END preview state
+  const totalPrizes = challenge.prizePool;
+  const isFlatRate = challenge.reviewCostType === ChallengeReviewCostType.Flat;
+  const guaranteeCost = isFlatRate ? challenge.reviewCost : unreviewedCount * challenge.reviewCost;
+  const hasPaidReview =
+    challenge.reviewCostType !== ChallengeReviewCostType.None && challenge.reviewCost > 0;
+  const [buyHover, setBuyHover] = useState(false);
+  const remainingSlots = challenge.maxEntriesPerUser - effectiveUserEntryCount;
+  const reviewedPct = (reviewedCount / challenge.maxEntriesPerUser) * 100;
+  const unreviewedPct = (unreviewedCount / challenge.maxEntriesPerUser) * 100;
+  const submittedPct = (userEntryCount / challenge.maxEntriesPerUser) * 100;
+
+  const queryUtils = trpc.useUtils();
+  const requestReviewMutation = trpc.challenge.requestReview.useMutation({
+    onSuccess: () => {
+      showSuccessNotification({ message: 'All entries queued for guaranteed review!' });
+      queryUtils.challenge.getUserUnjudgedEntries.invalidate({ challengeId: challenge.id });
+    },
+    onError: (error) => {
+      showErrorNotification({ error: new Error(error.message) });
+    },
+  });
+
+  const challengeDetails: DescriptionTableProps['items'] = [
+    {
+      label: 'Starts',
+      value: <Text size="sm">{formatDate(challenge.startsAt, 'MMM DD, YYYY hh:mm A', false)}</Text>,
+    },
+    {
+      label: 'Ends',
+      value: <Text size="sm">{formatDate(challenge.endsAt, 'MMM DD, YYYY hh:mm A', false)}</Text>,
+    },
+    {
+      label: 'Max Entries',
+      value: <Text size="sm">{challenge.maxEntriesPerUser} per user</Text>,
+    },
+    {
+      label: 'AI Reviews',
+      value: (
+        <Text size="sm">
+          {challenge.entryFee > 0
+            ? 'Every entry is judged'
+            : 'Only 6–12 entries selected at random every 10 min'}
+        </Text>
+      ),
+    },
+    ...(challenge.entryPrize && challenge.entryPrizeRequirement > 0
+      ? [
+          {
+            label: 'Participation Prize Requirement',
+            value: <Text size="sm">Min {challenge.entryPrizeRequirement} entries to qualify</Text>,
+          },
+        ]
+      : []),
+    ...(challenge.allowedNsfwLevel > 0
+      ? [
+          {
+            label: 'Allowed Ratings',
+            value: (
+              <Group gap={4}>
+                {parseBitwiseBrowsingLevel(challenge.allowedNsfwLevel).map((level) => (
+                  <Badge key={level} size="sm" color={nsfwLevelColors[level]} variant="filled">
+                    {browsingLevelLabels[level as keyof typeof browsingLevelLabels]}
+                  </Badge>
+                ))}
+              </Group>
+            ),
+          },
+        ]
+      : []),
+  ];
+
+  // Prize breakdown. Dynamic-pool (user) challenges don't materialize `prizes` until they end
+  // (distributePrizes runs at winner-pick), so before then show the projected split derived from
+  // the current pool + distribution. Completed challenges render their real `prizes`.
+  const isProjectedPrizes =
+    isDynamicPool && !challenge.prizes.length && !!challenge.prizeDistribution?.length;
+  const prizeBreakdown = isProjectedPrizes
+    ? distributePrizes(challenge.prizePool, challenge.prizeDistribution ?? [])
+    : challenge.prizes;
+  const prizeItems: DescriptionTableProps['items'] = prizeBreakdown.map((prize, index) => ({
+    label: (
+      <Group gap={4}>
+        <ThemeIcon
+          size="sm"
+          color={index === 0 ? 'yellow' : index === 1 ? 'gray.4' : 'orange.7'}
+          variant="light"
+        >
+          <IconTrophy size={14} />
+        </ThemeIcon>
+        <Text size="sm" c="dimmed">
+          {getPlaceLabel(index + 1)}
+        </Text>
+      </Group>
+    ),
+    value: (
+      <CurrencyBadge
+        size="sm"
+        currency={Currency.BUZZ}
+        type={challenge.buzzType}
+        unitAmount={prize.buzz}
+      />
+    ),
+  }));
+
+  if (challenge.entryPrize) {
+    prizeItems.push({
+      label: (
+        <Group gap={4}>
+          <ThemeIcon size="sm" color="blue" variant="light">
+            <IconGift size={14} />
+          </ThemeIcon>
+          <Text size="sm" c="dimmed">
+            Participation
+          </Text>
+        </Group>
+      ),
+      value: (
+        <CurrencyBadge
+          size="sm"
+          currency={Currency.BUZZ}
+          type="blue"
+          unitAmount={challenge.entryPrize.buzz}
+        />
+      ),
+    });
+  }
+
+  // Shared props for DescriptionTable inside accordion panels (no outer borders)
+  const accordionTableProps = {
+    withBorder: true,
+    paperProps: {
+      style: { borderLeft: 0, borderRight: 0, borderBottom: 0 },
+      radius: 0,
+    },
+  } as const;
+
+  return (
+    <Stack gap="md">
+      {/* Combined Dynamic Prize Pool + Entries Card */}
+      {isDynamicPool && (
+        <SpotlightSurface className="overflow-hidden rounded-md">
+          <SpotlightGlow color="rgba(255,255,255,0.04)" />
+          {/* TODO: REMOVE — preview state toggle (mod only) */}
+          {currentUser?.isModerator && (
+            <Group
+              justify="space-between"
+              px="xs"
+              py={4}
+              style={{
+                background: 'rgba(128,128,128,0.1)',
+                border: '1px dashed rgba(128,128,128,0.3)',
+                borderRadius: 'var(--mantine-radius-sm) var(--mantine-radius-sm) 0 0',
+              }}
+            >
+              <Text size="xs" fw={500}>
+                Preview:
+              </Text>
+              <Group gap={4}>
+                {(
+                  [
+                    { key: -1, label: 'Live', color: 'green' },
+                    { key: 0, label: 'No entries', color: 'blue' },
+                    { key: 1, label: 'Has entries', color: 'blue' },
+                    { key: 2, label: 'Paid', color: 'blue' },
+                  ] as const
+                ).map(({ key, label, color }) => (
+                  <Badge
+                    key={key}
+                    size="xs"
+                    variant={previewState === key ? 'filled' : 'light'}
+                    color={previewState === key ? color : 'gray'}
+                    style={{ cursor: 'pointer' }}
+                    onClick={() => setPreviewState(key as -1 | 0 | 1 | 2)}
+                  >
+                    {label}
+                  </Badge>
+                ))}
+              </Group>
+            </Group>
+          )}
+          {/* END preview toggle */}
+
+          {/* ── Green top: Growing Prize Pool ── */}
+          <div
+            style={{
+              borderTop: getBorder(cs, 'teal'),
+              borderLeft: getBorder(cs, 'teal'),
+              borderRight: getBorder(cs, 'teal'),
+              background: getBackground(cs, 'teal'),
+              borderRadius: 'var(--mantine-radius-md) var(--mantine-radius-md) 0 0',
+            }}
+          >
+            <Stack gap="sm" align="center" p="md">
+              <Group gap={6} justify="center">
+                <ThemeIcon variant="light" color="teal" size="sm" radius="xl">
+                  <IconTrendingUp size={14} />
+                </ThemeIcon>
+                <Text size="sm" fw={700} tt="uppercase" lts={0.5}>
+                  Growing Prize Pool
+                </Text>
+              </Group>
+
+              <Group gap={6} justify="center" align="baseline">
+                <CurrencyIcon currency="BUZZ" type={challenge.buzzType} size={28} />
+                <Text
+                  fw={900}
+                  style={{
+                    fontSize: '2rem',
+                    lineHeight: 1.1,
+                    background:
+                      cs === 'dark'
+                        ? 'linear-gradient(135deg, #6ee7b7 0%, #34d399 30%, #10b981 60%, #34d399 100%)'
+                        : 'linear-gradient(135deg, #059669 0%, #10b981 30%, #34d399 60%, #10b981 100%)',
+                    backgroundSize: '200% auto',
+                    WebkitBackgroundClip: 'text',
+                    WebkitTextFillColor: 'transparent',
+                    animation: 'prize-shimmer 4s linear infinite',
+                  }}
+                >
+                  {challenge.prizePool.toLocaleString()}
+                </Text>
+              </Group>
+
+              <Badge
+                size="lg"
+                variant="light"
+                color="teal"
+                leftSection={<IconTrendingUp size={14} />}
+                style={{ animation: 'prize-pulse 3s ease-in-out infinite' }}
+              >
+                +{challenge.buzzPerAction} Buzz per{' '}
+                {challenge.poolTrigger === PoolTrigger.User ? 'participant' : 'entry'}
+              </Badge>
+
+              {challenge.maxPrizePool && challenge.maxPrizePool > 0 && (
+                <Stack gap={4} w="100%">
+                  <Progress
+                    value={Math.min((challenge.prizePool / challenge.maxPrizePool) * 100, 100)}
+                    color="teal"
+                    size="sm"
+                    radius="xl"
+                  />
+                  <Text size="xs" c="dimmed" ta="center">
+                    {Math.round((challenge.prizePool / challenge.maxPrizePool) * 100)}% to{' '}
+                    {challenge.maxPrizePool.toLocaleString()} max
+                  </Text>
+                </Stack>
+              )}
+
+              <Text size="sm" ta="center">
+                Every {challenge.poolTrigger === PoolTrigger.User ? 'new participant' : 'entry'}{' '}
+                adds{' '}
+                <Text span fw={700} c="teal.5">
+                  {challenge.buzzPerAction.toLocaleString()} Buzz
+                </Text>{' '}
+                to the prize pool. Enter now to make the prize bigger for everyone!
+              </Text>
+            </Stack>
+          </div>
+
+          {/* ── Your Entries section ── */}
+          <div
+            style={{
+              position: 'relative',
+              borderTop: getBorder(cs, 'teal'),
+              borderLeft: getBorder(cs, hasUserEntries ? 'yellow' : 'gray'),
+              borderRight: getBorder(cs, hasUserEntries ? 'yellow' : 'gray'),
+              background: hasUserEntries
+                ? getBackground(cs, 'yellow')
+                : getBackground(cs, 'neutral'),
+              boxShadow: getShadow(cs, 'large'),
+            }}
+          >
+            <SpotlightDivider overlay color={SECTION_GLOWS.teal} size={200} />
+            <Stack gap="sm" p="md">
+              <Group justify="space-between" align="center">
+                <Text size="sm" fw={700}>
+                  Your Entries
+                </Text>
+                <Badge size="sm" variant="light" color={reviewedCount > 0 ? 'yellow' : 'gray'}>
+                  {reviewedCount}/{totalEntries} reviewed
+                </Badge>
+              </Group>
+
+              <Progress.Root size="lg" radius="xl" style={{ boxShadow: getShadow(cs, 'small') }}>
+                {reviewedCount > 0 && <Progress.Section value={reviewedPct} color="green" />}
+                {unreviewedCount > 0 && (
+                  <Progress.Section
+                    value={unreviewedPct}
+                    color={buyHover ? undefined : 'orange'}
+                    style={
+                      buyHover
+                        ? {
+                            background:
+                              'linear-gradient(to right, var(--mantine-color-green-6) 50%, var(--mantine-color-orange-6) 50%)',
+                            backgroundSize: '200% 100%',
+                            animation: 'sweep-fill-pulse 2s ease-in-out infinite',
+                          }
+                        : undefined
+                    }
+                  />
+                )}
+              </Progress.Root>
+              <Group gap={8}>
+                {reviewedCount > 0 && (
+                  <ProgressLegendDot color="green" count={reviewedCount} label="reviewed" />
+                )}
+                {unreviewedCount > 0 && (
+                  <ProgressLegendDot
+                    color="orange"
+                    count={unreviewedCount}
+                    label={buyHover ? 'could be reviewed' : 'pending'}
+                    dynamicColor={buyHover ? 'var(--mantine-color-green-6)' : undefined}
+                  />
+                )}
+                {remainingSlots > 0 && (
+                  <ProgressLegendDot color="gray" count={remainingSlots} label="remaining" />
+                )}
+              </Group>
+
+              {/* All entries reviewed — congrats message */}
+              {hasUserEntries && unreviewedCount === 0 && reviewedCount > 0 && (
+                <Group gap={6} justify="center" py={4}>
+                  <ThemeIcon variant="light" color="yellow" size="sm" radius="xl">
+                    <IconCheck size={12} />
+                  </ThemeIcon>
+                  <Text size="xs" c="yellow.5" fw={500}>
+                    All entries guaranteed a review — you{'\u2019'}re in it to win it!
+                  </Text>
+                </Group>
+              )}
+
+              {/* Review text + button when user has unreviewed entries */}
+              {hasUserEntries &&
+                unreviewedCount > 0 &&
+                !effectiveHasFlatRatePurchase &&
+                hasPaidReview && (
+                  <>
+                    <Text size="xs">
+                      Only reviewed entries compete for the prize pool. Don&apos;t leave it to
+                      chance. Guarantee all your entries get reviewed!
+                    </Text>
+
+                    <Stack gap={4}>
+                      {!isFlatRate && (
+                        <Text size="xs" c="dimmed" ta="center">
+                          {challenge.reviewCost} Buzz per entry {'\u00b7'} {unreviewedCount}{' '}
+                          {unreviewedCount === 1 ? 'entry' : 'entries'}
+                        </Text>
+                      )}
+                      <div
+                        onMouseEnter={() => setBuyHover(true)}
+                        onMouseLeave={() => setBuyHover(false)}
+                      >
+                        <BuzzTransactionButton
+                          buzzAmount={guaranteeCost}
+                          onPerformTransaction={() => {
+                            if (isFlatRate) {
+                              requestReviewMutation.mutate({ challengeId: challenge.id });
+                            } else {
+                              const imageIds = (userEntries ?? [])
+                                .filter((e) => e.reviewStatus === 'pending')
+                                .map((e) => e.imageId);
+                              requestReviewMutation.mutate({
+                                challengeId: challenge.id,
+                                imageIds,
+                              });
+                            }
+                          }}
+                          loading={requestReviewMutation.isPending}
+                          label={
+                            isFlatRate
+                              ? 'Review All My Entries'
+                              : `Guarantee ${
+                                  unreviewedCount === 1
+                                    ? '1 Review'
+                                    : `All ${unreviewedCount} Reviews`
+                                }`
+                          }
+                          showPurchaseModal
+                          color="yellow.6"
+                          fullWidth
+                        />
+                      </div>
+                    </Stack>
+                  </>
+                )}
+            </Stack>
+          </div>
+
+          {/* ── Gray bottom: Generate + Submit ── */}
+          {isActive && !currentUser?.muted && (
+            <div
+              style={{
+                position: 'relative',
+                borderTop: getBorder(cs, hasUserEntries ? 'yellow' : 'gray'),
+                borderLeft: getBorder(cs, 'gray'),
+                borderRight: getBorder(cs, 'gray'),
+                borderBottom: getBorder(cs, 'gray'),
+                background: getBackground(cs, 'neutral'),
+                borderRadius: '0 0 var(--mantine-radius-md) var(--mantine-radius-md)',
+                padding: 'var(--mantine-spacing-md)',
+                boxShadow: getShadow(cs, 'large'),
+              }}
+            >
+              <SpotlightDivider
+                overlay
+                color={SECTION_GLOWS[hasUserEntries ? 'yellow' : 'gray']}
+                size={200}
+              />
+              <Group gap={8} wrap="nowrap">
+                <Button
+                  onClick={() => openChallengeGenerator(challenge.modelVersionIds)}
+                  leftSection={<IconBrush size={16} />}
+                  variant="filled"
+                  color="blue"
+                  fullWidth
+                >
+                  Generate
+                </Button>
+                {challenge.collectionId && (
+                  <SubmitEntryButton
+                    isOwner={isOwner}
+                    onClick={handleOpenSubmitModal}
+                    label="Submit"
+                    fullWidth
+                  />
+                )}
+              </Group>
+            </div>
+          )}
+        </SpotlightSurface>
+      )}
+
+      {/* Action buttons - shown when NOT dynamic pool; hidden on mobile */}
+      {!isDynamicPool && (
+        <Group gap={8} wrap="nowrap" visibleFrom="md">
+          {isActive && !currentUser?.muted ? (
+            <>
+              <Button
+                onClick={() => openChallengeGenerator(challenge.modelVersionIds)}
+                leftSection={<IconBrush size={16} />}
+                variant="filled"
+                color="blue"
+                fullWidth
+              >
+                Generate
+              </Button>
+              {challenge.collectionId && (
+                <SubmitEntryButton
+                  isOwner={isOwner}
+                  onClick={handleOpenSubmitModal}
+                  label="Submit"
+                  fullWidth
+                />
+              )}
+            </>
+          ) : challenge.status === ChallengeStatus.Completed ? (
+            <Group
+              gap="xs"
+              justify="center"
+              py="xs"
+              px="md"
+              style={{
+                flex: 1,
+                borderRadius: 'var(--mantine-radius-sm)',
+                background:
+                  colorScheme === 'dark'
+                    ? 'linear-gradient(135deg, rgba(250,176,5,0.12) 0%, rgba(250,176,5,0.04) 100%)'
+                    : 'linear-gradient(135deg, rgba(250,176,5,0.15) 0%, rgba(250,176,5,0.05) 100%)',
+                border: `1px solid ${
+                  colorScheme === 'dark' ? 'rgba(250,176,5,0.25)' : 'rgba(250,176,5,0.35)'
+                }`,
+              }}
+            >
+              <ThemeIcon variant="transparent" color="yellow.5" size="sm">
+                <IconTrophy size={18} fill="currentColor" />
+              </ThemeIcon>
+              <Text size="sm" fw={600} c="yellow.5" tt="uppercase" lts={1}>
+                Challenge Completed
+              </Text>
+            </Group>
+          ) : null}
+        </Group>
+      )}
+
+      <Accordion
+        variant="separated"
+        multiple
+        defaultValue={['details', 'models', 'prizes', 'judging']}
+        styles={(theme) => ({
+          content: { padding: 0 },
+          item: {
+            overflow: 'hidden',
+            borderColor: colorScheme === 'dark' ? theme.colors.dark[4] : theme.colors.gray[3],
+            boxShadow: theme.shadows.sm,
+          },
+          control: {
+            padding: theme.spacing.sm,
+          },
+        })}
+      >
+        <Accordion.Item value="details">
+          <Accordion.Control>
+            <Group justify="space-between">Overview</Group>
+          </Accordion.Control>
+          <Accordion.Panel>
+            <DescriptionTable items={challengeDetails} labelWidth="40%" {...accordionTableProps} />
+          </Accordion.Panel>
+        </Accordion.Item>
+
+        <Accordion.Item value="prizes">
+          <Accordion.Control>
+            <Group justify="space-between">Prizes</Group>
+          </Accordion.Control>
+          <Accordion.Panel>
+            <ScrollArea.Autosize mah={300}>
+              {isProjectedPrizes && (
+                <Text size="xs" c="dimmed" px="xs" pb={4}>
+                  Projected from the current pool — grows as entries are submitted.
+                </Text>
+              )}
+              <DescriptionTable items={prizeItems} labelWidth="50%" {...accordionTableProps} />
+            </ScrollArea.Autosize>
+          </Accordion.Panel>
+        </Accordion.Item>
+
+        {!!challenge.judgingCategories?.length && (
+          <Accordion.Item value="judging">
+            <Accordion.Control>
+              <Group justify="space-between">Judging</Group>
+            </Accordion.Control>
+            <Accordion.Panel>
+              <Text size="xs" c="dimmed" px="xs" pb={4}>
+                Only entries the judge scores can place. The highest scores make a shortlist, and a
+                final review of that shortlist decides the places, so a higher score doesn&apos;t
+                guarantee a place.
+              </Text>
+              <div className="flex flex-col bg-gray-0 dark:bg-[#1f2023]">
+                {challenge.judgingCategories.map((category) => (
+                  <div
+                    key={category.key}
+                    className="flex flex-col gap-1 border-b border-gray-3 px-4 py-2.5 last:border-b-0 dark:border-dark-4"
+                  >
+                    <Group justify="space-between" gap="xs" wrap="nowrap">
+                      <Text size="sm">{category.label}</Text>
+                      <Text size="sm" fw={500}>
+                        {category.weight}%
+                      </Text>
+                    </Group>
+                    <Text size="xs" c="dimmed">
+                      {category.criteria}
+                    </Text>
+                  </div>
+                ))}
+              </div>
+            </Accordion.Panel>
+          </Accordion.Item>
+        )}
+
+        {challenge.models.length > 0 && (
+          <Accordion.Item value="models">
+            <Accordion.Control>
+              <Group justify="space-between">Eligible Models</Group>
+            </Accordion.Control>
+            <Accordion.Panel>
+              <EligibleModelsList
+                models={challenge.models}
+                onGenerate={
+                  isActive
+                    ? (m) => {
+                        generationGraphPanel.open({ type: 'modelVersion', id: m.versionId });
+                        generationFormStore.setType('image');
+                      }
+                    : undefined
+                }
+              />
+            </Accordion.Panel>
+          </Accordion.Item>
+        )}
+      </Accordion>
+
+      <CreatorCardSimple
+        user={(() => {
+          const author = getChallengeDisplayUser(challenge);
+          return {
+            ...author,
+            // Convert null to undefined for CreatorCardSimple compatibility
+            cosmetics: author.cosmetics ?? undefined,
+            profilePicture: author.profilePicture ?? undefined,
+          };
+        })()}
+        statDisplayOverwrite={[]}
+      />
+    </Stack>
+  );
+}
+
+function ChallengeWinners({ challenge }: { challenge: ChallengeDetail }) {
+  const colorScheme = useComputedColorScheme('dark');
+  const isDark = colorScheme === 'dark';
+
+  const judgeInfo = useMemo(
+    () =>
+      challenge.judge
+        ? {
+            userId: challenge.judge.userId,
+            username: challenge.judge.name,
+            profilePicture: challenge.judge.profilePicture,
+          }
+        : undefined,
+    [challenge.judge]
+  );
+
+  // Reorder winners for podium display: [2nd, 1st, 3rd]
+  const podiumOrder = [
+    challenge.winners.find((w) => w.place === 2),
+    challenge.winners.find((w) => w.place === 1),
+    challenge.winners.find((w) => w.place === 3),
+  ].filter(Boolean) as ChallengeDetail['winners'];
+
+  return (
+    <div
+      id="winners"
+      className="relative overflow-hidden py-12"
+      style={{
+        background: isDark
+          ? 'linear-gradient(180deg, rgba(250, 176, 5, 0.15) 0%, rgba(250, 176, 5, 0.05) 100%)'
+          : 'linear-gradient(180deg, rgba(250, 176, 5, 0.2) 0%, rgba(250, 176, 5, 0.05) 100%)',
+      }}
+    >
+      {/* Decorative elements */}
+      <div className="pointer-events-none absolute inset-0 overflow-hidden">
+        <div className="absolute -left-20 -top-20 size-40 rounded-full bg-yellow-500/10 blur-3xl" />
+        <div className="absolute -right-20 top-1/2 size-60 rounded-full bg-orange-500/10 blur-3xl" />
+      </div>
+
+      <Container size="xl" className="relative">
+        <Stack gap="xl">
+          {/* Header */}
+          <div className="text-center">
+            <Group justify="center" gap="sm" mb="xs">
+              <IconTrophy size={32} className="text-yellow-500" />
+              <Title order={2}>Challenge Winners</Title>
+              <IconTrophy size={32} className="text-yellow-500" />
+            </Group>
+          </div>
+
+          {/* Podium Layout - Desktop: 2nd | 1st (elevated) | 3rd */}
+          <div className="hidden md:block">
+            <div className="flex items-end justify-center gap-4">
+              {podiumOrder.map((winner, index) => (
+                <WinnerPodiumCard
+                  key={winner.place}
+                  winner={winner}
+                  isFirst={index === 1}
+                  className={index === 1 ? 'z-10' : ''}
+                  judgeInfo={judgeInfo}
+                  judgingCategories={challenge.judgingCategories}
+                  buzzType={challenge.buzzType}
+                />
+              ))}
+            </div>
+          </div>
+
+          {/* Mobile Layout - Stacked with 1st on top */}
+          <div className="md:hidden">
+            <Stack gap="md">
+              {challenge.winners
+                .sort((a, b) => a.place - b.place)
+                .map((winner) => (
+                  <WinnerPodiumCard
+                    key={winner.place}
+                    winner={winner}
+                    isFirst={winner.place === 1}
+                    isMobile
+                    judgeInfo={judgeInfo}
+                    judgingCategories={challenge.judgingCategories}
+                    buzzType={challenge.buzzType}
+                  />
+                ))}
+            </Stack>
+          </div>
+
+          {/* Judge's Commentary Section */}
+          {(challenge.completionSummary?.judgingProcess ||
+            challenge.completionSummary?.outcome) && (
+            <div
+              className={`mt-4 rounded-xl border p-6 ${
+                isDark ? 'border-white/10 bg-white/5' : 'border-gray-200 bg-white/80'
+              }`}
+            >
+              {challenge.judge && (
+                <Group gap="sm" mb="md">
+                  <UserAvatar
+                    user={{
+                      id: challenge.judge.userId,
+                      profilePicture: challenge.judge.profilePicture ?? undefined,
+                      cosmetics: challenge.judge.cosmetics ?? undefined,
+                    }}
+                    size="md"
+                  />
+                  <div>
+                    <Text fw={600} size="sm">
+                      {challenge.judge.name}&apos;s Commentary
+                    </Text>
+                  </div>
+                </Group>
+              )}
+              {!challenge.judge && (
+                <Text fw={600} size="sm" mb="md">
+                  Judging Commentary
+                </Text>
+              )}
+
+              <Stack gap="md">
+                {challenge.completionSummary?.judgingProcess && (
+                  <div>
+                    <Text size="xs" fw={600} c="dimmed" mb={4}>
+                      Judging Process
+                    </Text>
+                    <Spoiler maxHeight={120} showLabel="Show more" hideLabel="Show less">
+                      <div className="text-sm">
+                        <CustomMarkdown>
+                          {challenge.completionSummary.judgingProcess}
+                        </CustomMarkdown>
+                      </div>
+                    </Spoiler>
+                  </div>
+                )}
+
+                {challenge.completionSummary?.outcome && (
+                  <div>
+                    <Text size="xs" fw={600} c="dimmed" mb={4}>
+                      Final Verdict
+                    </Text>
+                    <Spoiler maxHeight={80} showLabel="Show more" hideLabel="Show less">
+                      <div className="text-sm">
+                        <CustomMarkdown>{challenge.completionSummary.outcome}</CustomMarkdown>
+                      </div>
+                    </Spoiler>
+                  </div>
+                )}
+              </Stack>
+            </div>
+          )}
+        </Stack>
+      </Container>
+    </div>
+  );
+}
+
+// WinnerPodiumCard and placeConfig are now shared — imported from ~/components/Challenge/WinnerPodiumCard
+
+function ChallengeEntries({ challenge }: { challenge: ChallengeDetail }) {
+  const theme = useMantineTheme();
+  const colorScheme = useComputedColorScheme('dark');
+  const currentUser = useCurrentUser();
+  const mobile = useIsMobile();
+  const isModerator = currentUser?.isModerator ?? false;
+  const domainColor = useDomainColor();
+  // On green (SFW) the domain caps entries to PG. Logged-in users can opt into
+  // PG-13, mirroring the images feed filter. Anonymous users are hard-capped by
+  // the domain rule, so the toggle would be a no-op for them.
+  const showPG13Toggle = domainColor === 'green' && !!currentUser;
+
+  const router = useRouter();
+
+  const [judgeReviewedOnly, setJudgeReviewedOnly] = useState(false);
+  // Seeded from `?mine=1` so the Your Challenges "View entry" CTA lands on the user's own entries.
+  const [myEntriesOnly, setMyEntriesOnly] = useState(() => !!router.query.mine);
+  const [pendingReviewOnly, setPendingReviewOnly] = useState(false);
+  const [includePG13, setIncludePG13] = useState(false);
+  const [opened, setOpened] = useState(false);
+  const isActive = challenge.status === ChallengeStatus.Active;
+  const hasCollection = !!challenge.collectionId;
+  const displaySubmitAction = isActive && hasCollection && !currentUser?.muted;
+  const isOwner = useIsChallengeOwner(challenge);
+
+  const filterCount =
+    (judgeReviewedOnly ? 1 : 0) +
+    (myEntriesOnly ? 1 : 0) +
+    (isModerator && pendingReviewOnly ? 1 : 0) +
+    (showPG13Toggle && includePG13 ? 1 : 0);
+
+  const judgeInfo = useMemo(
+    () =>
+      challenge.judge
+        ? {
+            userId: challenge.judge.userId,
+            username: challenge.judge.name,
+            profilePicture: challenge.judge.profilePicture,
+          }
+        : undefined,
+    [challenge.judge]
+  );
+
+  const handleOpenSubmitModal = () => {
+    if (challenge.collectionId) {
+      dialogStore.trigger({
+        component: ChallengeSubmitModal,
+        props: { challengeId: challenge.id, collectionId: challenge.collectionId },
+      });
+    }
+  };
+
+  const hasAnyFilter = !!challenge.judgedTagId || !!currentUser;
+
+  const filterTarget = hasAnyFilter ? (
+    <Indicator
+      offset={4}
+      label={filterCount ? filterCount : undefined}
+      size={14}
+      zIndex={10}
+      disabled={!filterCount}
+      inline
+    >
+      <FilterButton icon={IconFilter} onClick={() => setOpened((o) => !o)} active={opened}>
+        Filters
+      </FilterButton>
+    </Indicator>
+  ) : null;
+
+  const filterDropdown = (
+    <Stack gap={8} p="md">
+      <Stack gap={0}>
+        <Divider label="Modifiers" className="text-sm font-bold" mb={4} />
+        <Group gap={8} mb={4}>
+          {showPG13Toggle && (
+            <FilterChip checked={includePG13} onChange={() => setIncludePG13((v) => !v)}>
+              <span>Include PG-13</span>
+            </FilterChip>
+          )}
+          <FilterChip checked={judgeReviewedOnly} onChange={() => setJudgeReviewedOnly((v) => !v)}>
+            <span>Judge Reviewed</span>
+          </FilterChip>
+          <FilterChip checked={myEntriesOnly} onChange={() => setMyEntriesOnly((v) => !v)}>
+            <span>My Entries</span>
+          </FilterChip>
+          {isModerator && (
+            <FilterChip
+              checked={pendingReviewOnly}
+              onChange={() => setPendingReviewOnly((v) => !v)}
+            >
+              <span>Pending Review</span>
+            </FilterChip>
+          )}
+        </Group>
+      </Stack>
+
+      {filterCount > 0 && (
+        <Button
+          color="gray"
+          variant={colorScheme === 'dark' ? 'filled' : 'light'}
+          onClick={() => {
+            setJudgeReviewedOnly(false);
+            setMyEntriesOnly(false);
+            setPendingReviewOnly(false);
+            setIncludePG13(false);
+          }}
+          fullWidth
+        >
+          Clear all filters
+        </Button>
+      )}
+    </Stack>
+  );
+
+  const filterMenu = hasAnyFilter ? (
+    <IsClient>
+      {mobile ? (
+        <>
+          {filterTarget}
+          <Drawer
+            opened={opened}
+            onClose={() => setOpened(false)}
+            size="90%"
+            position="bottom"
+            styles={{
+              content: {
+                height: 'auto',
+                maxHeight: 'calc(100dvh - var(--header-height))',
+              },
+              body: { padding: 0, overflowY: 'auto' },
+              header: { padding: '4px 8px' },
+              close: { height: 32, width: 32, '& > svg': { width: 24, height: 24 } },
+            }}
+          >
+            {filterDropdown}
+          </Drawer>
+        </>
+      ) : (
+        <Popover
+          zIndex={200}
+          position="bottom-end"
+          shadow="md"
+          onClose={() => setOpened(false)}
+          middlewares={{ flip: true, shift: true }}
+          withinPortal
+          withArrow
+        >
+          <Popover.Target>{filterTarget}</Popover.Target>
+          <Popover.Dropdown maw={468} p={0} w="100%">
+            <ScrollArea.Autosize mah="calc(90vh - var(--header-height) - 56px)" type="hover">
+              {filterDropdown}
+            </ScrollArea.Autosize>
+          </Popover.Dropdown>
+        </Popover>
+      )}
+    </IsClient>
+  ) : null;
+
+  return (
+    <Container
+      fluid
+      id="entries"
+      my="md"
+      style={{
+        background: colorScheme === 'dark' ? theme.colors.dark[6] : theme.colors.gray[1],
+      }}
+    >
+      <MasonryProvider columnWidth={appConstants.cardSizes.image} maxSingleColumnWidth={450}>
+        <MasonryContainer>
+          <Stack gap="md" py={32}>
+            <Group wrap="wrap" justify="space-between">
+              <Group wrap="wrap">
+                <Title order={2}>Entries</Title>
+                <Text c="dimmed" size="sm">
+                  {challenge.entryCount.toLocaleString()} total{' '}
+                  {challenge.entryCount === 1 ? 'entry' : 'entries'}
+                </Text>
+              </Group>
+              <Group gap="xs">
+                {filterMenu}
+                {displaySubmitAction && (
+                  <>
+                    <Button
+                      size="sm"
+                      variant="filled"
+                      onClick={() => openChallengeGenerator(challenge.modelVersionIds)}
+                      leftSection={<IconBrush size={16} />}
+                    >
+                      Generate Entries
+                    </Button>
+                    <SubmitEntryButton
+                      isOwner={isOwner}
+                      onClick={handleOpenSubmitModal}
+                      label="Submit Entries"
+                      size="sm"
+                    />
+                  </>
+                )}
+              </Group>
+            </Group>
+
+            {challenge.entryCount === 0 || !hasCollection ? (
+              <NoContent
+                message={
+                  isActive
+                    ? 'No entries yet. Be the first to submit!'
+                    : 'No entries for this challenge.'
+                }
+              />
+            ) : (
+              <ImagesInfinite
+                filters={{
+                  collectionId: challenge.collectionId ?? undefined,
+                  collectionTagId: judgeReviewedOnly
+                    ? challenge.judgedTagId ?? undefined
+                    : undefined,
+                  userId: myEntriesOnly ? currentUser?.id : undefined,
+                  pendingReviewOnly: isModerator && pendingReviewOnly ? true : undefined,
+                  includePG13: showPG13Toggle && includePG13 ? true : undefined,
+                  period: 'AllTime',
+                  sort: ImageSort.Random,
+                }}
+                disableStoreFilters
+                judgeInfo={judgeInfo}
+                judgingCategories={challenge.judgingCategories}
+                hideHatTurf
+              />
+            )}
+          </Stack>
+        </MasonryContainer>
+      </MasonryProvider>
+    </Container>
+  );
+}
+
+function MobileCTAInline({ challenge }: { challenge: ChallengeDetail }) {
+  const currentUser = useCurrentUser();
+  const isActive = challenge.status === ChallengeStatus.Active;
+  const isOwner = useIsChallengeOwner(challenge);
+
+  const isDynamicPool = challenge.prizeMode === PrizeMode.Dynamic && challenge.buzzPerAction > 0;
+
+  const handleOpenSubmitModal = () => {
+    if (!challenge.collectionId) return;
+    dialogStore.trigger({
+      component: ChallengeSubmitModal,
+      props: { challengeId: challenge.id, collectionId: challenge.collectionId },
+    });
+  };
+
+  if (!isActive || currentUser?.muted || isDynamicPool) return null;
+
+  return (
+    <Stack gap="xs" hiddenFrom="md" mt="md">
+      <Button
+        onClick={() => openChallengeGenerator(challenge.modelVersionIds)}
+        leftSection={<IconBrush size={16} />}
+        variant="filled"
+        color="blue"
+        fullWidth
+      >
+        Generate Entries
+      </Button>
+      {challenge.collectionId && (
+        <SubmitEntryButton
+          isOwner={isOwner}
+          onClick={handleOpenSubmitModal}
+          label="Submit Entries"
+          fullWidth
+        />
+      )}
+    </Stack>
+  );
+}
+
+function SubmitEntryButton({
+  isOwner,
+  onClick,
+  label,
+  size,
+  fullWidth,
+}: {
+  isOwner: boolean;
+  onClick: () => void;
+  label: string;
+  size?: MantineSize;
+  fullWidth?: boolean;
+}) {
+  const isContestBanned = useIsContestBanned();
+  const blocked = isOwner || isContestBanned;
+  const button = (
+    <Button
+      // `data-disabled` instead of `disabled` so the tooltip still receives hover events.
+      data-disabled={blocked || undefined}
+      aria-disabled={blocked || undefined}
+      onClick={blocked ? (e: MouseEvent) => e.preventDefault() : onClick}
+      leftSection={<IconPhoto size={16} />}
+      variant="light"
+      color="blue"
+      size={size}
+      fullWidth={fullWidth}
+    >
+      {label}
+    </Button>
+  );
+
+  if (blocked)
+    return (
+      <Tooltip
+        label={isOwner ? "You can't submit entries to your own challenge" : CONTEST_BANNED_MESSAGE}
+        withArrow
+      >
+        {button}
+      </Tooltip>
+    );
+
+  return <LoginRedirect reason="submit-challenge">{button}</LoginRedirect>;
+}
+
+function getPlaceLabel(place: number): string {
+  switch (place) {
+    case 1:
+      return '1st Place';
+    case 2:
+      return '2nd Place';
+    case 3:
+      return '3rd Place';
+    default:
+      return `${place}th Place`;
+  }
+}
+
+export default Page(ChallengeDetailsPage);

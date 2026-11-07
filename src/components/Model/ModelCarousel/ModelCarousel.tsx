@@ -1,0 +1,271 @@
+import { useCallback } from 'react';
+import { Card, Center, Indicator, Loader, Stack } from '@mantine/core';
+import { IconBrush, IconInfoCircle } from '@tabler/icons-react';
+import { BrowsingLevelProvider } from '~/components/BrowsingLevel/BrowsingLevelProvider';
+import { HiddenPreferencesProvider } from '~/components/HiddenPreferences/HiddenPreferencesProvider';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import {
+  publicBrowsingLevelsFlag,
+  sfwBrowsingLevelsFlag,
+} from '~/shared/constants/browsingLevel.constants';
+import HoverActionButton from '~/components/Cards/components/HoverActionButton';
+import { RoutedDialogLink } from '~/components/Dialog/RoutedDialogLink';
+import { ImageContextMenu } from '~/components/Image/ContextMenu/ImageContextMenu';
+import {
+  ExplainHiddenImages,
+  useExplainHiddenImages,
+} from '~/components/Image/ExplainHiddenImages/ExplainHiddenImages';
+import { useQueryImages } from '~/components/Image/image.utils';
+import { ImageMetaPopover2 } from '~/components/Image/Meta/ImageMetaPopover';
+import { ImageGuard2 } from '~/components/ImageGuard/ImageGuard2';
+import { ImagePreview } from '~/components/ImagePreview/ImagePreview';
+import { Reactions } from '~/components/Reaction/Reactions';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { useTourContext } from '~/components/Tours/ToursProvider';
+import { ImageSort } from '~/server/common/enums';
+import { RemixMenu, isRemixMenuVisible } from '~/components/Image/Remix/RemixMenu';
+import { tourClickThroughZIndex } from '~/shared/constants/app-layout.constants';
+import { BrowsingSettingsAddonsProvider } from '~/providers/BrowsingSettingsAddonsProvider';
+import { Embla } from '~/components/EmblaCarousel/EmblaCarousel';
+import { useContainerSmallerThan } from '~/components/ContainerProvider/useContainerSmallerThan';
+import classes from './ModelCarousel.module.css';
+import { EventDecorationOverlay } from '~/components/Cosmetics/EventDecoration/EventDecorationOverlay';
+import {
+  getEventDecorationClearLeftCss,
+  HAT_PLAIN_CARD_NUDGE,
+} from '~/components/Cosmetics/EventDecoration/event-decoration-placement';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import clsx from 'clsx';
+import { ImpressionSentinel } from '~/components/TrackView/ImpressionSentinel';
+
+export function ModelCarousel(props: Props) {
+  const currentUser = useCurrentUser();
+  const forceMinorLevel = props.minor && !currentUser?.isModerator;
+  const minorBrowsingLevel = currentUser ? sfwBrowsingLevelsFlag : publicBrowsingLevelsFlag;
+
+  return (
+    <BrowsingLevelProvider forcedBrowsingLevel={forceMinorLevel ? minorBrowsingLevel : undefined}>
+      <BrowsingSettingsAddonsProvider>
+        {forceMinorLevel ? (
+          <HiddenPreferencesProvider>
+            <ModelCarouselContent {...props} />
+          </HiddenPreferencesProvider>
+        ) : (
+          <ModelCarouselContent {...props} />
+        )}
+      </BrowsingSettingsAddonsProvider>
+    </BrowsingLevelProvider>
+  );
+}
+
+function ModelCarouselContent({ modelId, modelVersionId, modelUserId, limit = 10 }: Props) {
+  const features = useFeatureFlags();
+  const { running, helpers } = useTourContext();
+  // Both model-page tours spend two steps here — one on the button, one on the
+  // options it opens — so the open and the choice each move on by one.
+  const advanceTour = useCallback(() => {
+    if (running) helpers?.next();
+  }, [running, helpers]);
+  const { images, flatData, isLoading } = useQueryImages({
+    modelVersionId: modelVersionId,
+    prioritizedUserIds: [modelUserId],
+    period: 'AllTime',
+    sort: ImageSort.MostReactions,
+    limit,
+    pending: true,
+    include: [],
+    withMeta: false,
+  });
+
+  const hiddenExplained = useExplainHiddenImages(flatData);
+  const mobile = useContainerSmallerThan('md');
+
+  if (isLoading)
+    return (
+      <div className="flex items-center justify-center" style={{ minHeight: mobile ? 300 : 600 }}>
+        <Loader size="md" />
+      </div>
+    );
+
+  const totalItems = images.length + (hiddenExplained.hasHidden ? 1 : 0);
+  const slidesToShow = mobile ? 1 : 2;
+  const hasMultipleSlides = totalItems > slidesToShow;
+
+  return (
+    <Embla
+      key={modelVersionId}
+      align={hasMultipleSlides ? 'start' : 'center'}
+      slidesToScroll={1}
+      withControls={hasMultipleSlides ? true : false}
+      controlSize={mobile ? 32 : 56}
+      hatLayer
+      className="[--event-decoration-allowance-top:36px] [--event-decoration-allowance:16px] md:[--event-decoration-allowance:36px]"
+      loop
+      // initialHeight={mobile ? 300 : 600}
+    >
+      <Embla.Viewport>
+        <Embla.Container
+          className={clsx('-ml-3 flex @md:-ml-6', !hasMultipleSlides && 'justify-center')}
+        >
+          {images.map((image, index) => {
+            const fromCommunity = image.user.id !== modelUserId;
+            return (
+              <Embla.Slide
+                key={image.id}
+                index={index}
+                className="flex flex-[0_0_100%] items-center justify-center pl-3 @md:flex-[0_0_50%] @md:pl-6"
+              >
+                {({ inView }) => (
+                  <div
+                    className="relative w-full"
+                    style={
+                      {
+                        aspectRatio: `${image.width ?? 1} / ${image.height ?? 1}`,
+                        ...(image.eventDecoration && {
+                          '--event-decoration-clear-left': getEventDecorationClearLeftCss(
+                            image.eventDecoration.data,
+                            'corner',
+                            HAT_PLAIN_CARD_NUDGE
+                          ),
+                        }),
+                      } as React.CSSProperties
+                    }
+                  >
+                    <ImpressionSentinel
+                      impressions={[{ entityType: 'Image', entityId: image.id }]}
+                    />
+                    {image.eventDecoration && (
+                      <EventDecorationOverlay
+                        decoration={image.eventDecoration.data}
+                        placement="corner"
+                        wornOn={{ entityType: 'Image', entityId: image.id }}
+                      />
+                    )}
+                    {inView && (
+                      <ImageGuard2 image={image} connectType="model" connectId={modelId}>
+                        {(safe) => (
+                          <>
+                            <ImageGuard2.BlurToggle className="absolute left-[max(0.5rem,var(--event-decoration-clear-left,0px))] top-2 z-10" />
+                            <Stack
+                              gap="xs"
+                              align="flex-end"
+                              className="absolute right-2 top-2 z-10"
+                            >
+                              <ImageContextMenu image={image} />
+                              {features.imageGeneration && isRemixMenuVisible(image) && (
+                                <RemixMenu
+                                  image={image}
+                                  source="remix:model-carousel"
+                                  sourceModelVersionId={modelVersionId}
+                                  onAction={advanceTour}
+                                  onOpen={advanceTour}
+                                  tourTarget="model:remix-menu"
+                                  // Both model-page tours spend a step on this
+                                  // button and the next on the options it
+                                  // opens, over the layers Joyride draws.
+                                  zIndex={running ? tourClickThroughZIndex : undefined}
+                                >
+                                  <HoverActionButton
+                                    label="Remix"
+                                    size={30}
+                                    color="white"
+                                    variant="filled"
+                                    data-activity="remix:model-carousel"
+                                    data-tour="model:remix"
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                    }}
+                                  >
+                                    <IconBrush stroke={2.5} size={16} />
+                                  </HoverActionButton>
+                                </RemixMenu>
+                              )}
+                            </Stack>
+                            <RoutedDialogLink
+                              name="imageDetail"
+                              state={{ imageId: image.id, images }}
+                            >
+                              <Indicator
+                                label="From Community"
+                                radius="sm"
+                                position="top-center"
+                                size={24}
+                                disabled={!fromCommunity}
+                                withBorder
+                              >
+                                <ImagePreview
+                                  image={image}
+                                  edgeImageProps={{
+                                    width: 800,
+                                    hiDpi: features.hiDpiPreviews,
+                                    sourceWidth: image.width,
+                                  }}
+                                  aspectRatio={(image.width ?? 1) / (image.height ?? 1)}
+                                  // radius="md"
+                                  style={{ width: '100%' }}
+                                  nsfw={!safe}
+                                />
+                              </Indicator>
+                            </RoutedDialogLink>
+                            <Reactions
+                              entityId={image.id}
+                              entityType="image"
+                              reactions={image.reactions}
+                              metricsUnknown={image.stats?.statsUnknown}
+                              metrics={{
+                                likeCount: image.stats?.likeCountAllTime,
+                                dislikeCount: image.stats?.dislikeCountAllTime,
+                                heartCount: image.stats?.heartCountAllTime,
+                                laughCount: image.stats?.laughCountAllTime,
+                                cryCount: image.stats?.cryCountAllTime,
+                              }}
+                              readonly={!safe}
+                              className={classes.reactions}
+                              targetUserId={image.user.id}
+                              disableBuzzTip={image.poi}
+                            />
+                            {image.hasMeta && (
+                              <div className="absolute bottom-0.5 right-0.5 z-10">
+                                <ImageMetaPopover2 imageId={image.id} type={image.type}>
+                                  <LegacyActionIcon component="div" variant="transparent" size="lg">
+                                    <IconInfoCircle
+                                      color="white"
+                                      filter="drop-shadow(1px 1px 2px rgb(0 0 0 / 50%)) drop-shadow(0px 5px 15px rgb(0 0 0 / 60%))"
+                                      opacity={0.8}
+                                      strokeWidth={2.5}
+                                      size={26}
+                                    />
+                                  </LegacyActionIcon>
+                                </ImageMetaPopover2>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </ImageGuard2>
+                    )}
+                  </div>
+                )}
+              </Embla.Slide>
+            );
+          })}
+          {hiddenExplained.hasHidden && (
+            <Embla.Slide className="flex-[0_0_100%] pl-3 @md:flex-[0_0_50%] @md:pl-6">
+              <Card withBorder component={Center} mih={450} h="100%" w="100%">
+                <ExplainHiddenImages {...hiddenExplained} />
+              </Card>
+            </Embla.Slide>
+          )}
+        </Embla.Container>
+      </Embla.Viewport>
+    </Embla>
+  );
+}
+
+type Props = {
+  modelVersionId: number;
+  modelId: number;
+  modelUserId: number;
+  limit?: number;
+  minor?: boolean;
+};

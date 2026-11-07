@@ -1,0 +1,356 @@
+import type { ActionIconProps } from '@mantine/core';
+import { ActionIcon, Loader } from '@mantine/core';
+import { Menu } from '~/components/MantineOverlays';
+import { openConfirmModal } from '@mantine/modals';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
+import {
+  IconBan,
+  IconDotsVertical,
+  IconFlag,
+  IconLink,
+  IconPencil,
+  IconRadar2,
+  IconTrash,
+} from '@tabler/icons-react';
+import { useRouter } from 'next/router';
+import dynamic from 'next/dynamic';
+
+import { openArticleShareDraftModal } from '~/components/Article/ArticleShareDraftModal';
+import { LoginRedirect } from '~/components/LoginRedirect/LoginRedirect';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { ReportEntity } from '~/shared/utils/report-helpers';
+import type { ArticleGetAllRecord } from '~/server/services/article.service';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
+import { trpc } from '~/utils/trpc';
+import { AddToCollectionMenuItem } from '~/components/MenuItems/AddToCollectionMenuItem';
+import { ArticleStatus, CollectionType, CosmeticEntity } from '~/shared/utils/prisma/enums';
+import React from 'react';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { ToggleLockComments } from '~/components/CommentsV3/ToggleLockComments';
+import { IconLock, IconRosetteDiscountCheck } from '@tabler/icons-react';
+import { ToggleSearchableMenuItem } from '../MenuItems/ToggleSearchableMenuItem';
+import { AddArtFrameMenuItem } from '~/components/Decorations/AddArtFrameMenuItem';
+import { AddEventDecorationMenuItem } from '~/components/Decorations/AddEventDecorationMenuItem';
+import { useRescanArticle } from '~/hooks/useRescanArticle';
+import type { ArticleGetById } from '~/types/router';
+import { openAddToCollectionModal } from '~/components/Dialog/triggers/add-to-collection';
+import { openReportModal } from '~/components/Dialog/triggers/report';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { createDialogTrigger } from '~/components/Dialog/dialogStore';
+import { moderatorArticleLookupPath } from '~/shared/constants/moderator-app';
+import { ModeratorLookupMenuItem } from '~/components/Moderation/ModeratorLookupMenuItem';
+
+const ArticleUnpublishModal = dynamic(() => import('~/components/Modals/ArticleUnpublishModal'), {
+  ssr: false,
+});
+const openArticleUnpublishModal = createDialogTrigger(ArticleUnpublishModal);
+
+export function ArticleContextMenu({ article, ...props }: Props) {
+  const queryUtils = trpc.useUtils();
+  const router = useRouter();
+  const currentUser = useCurrentUser();
+  const isModerator = currentUser?.isModerator ?? false;
+  const isOwner = currentUser?.id === article.user?.id;
+
+  const atDetailsPage = router.pathname === '/articles/[id]/[[...slug]]';
+  const showUnpublish = atDetailsPage && article.status === ArticleStatus.Published;
+  const features = useFeatureFlags();
+
+  const { rescan: handleRescanArticle, isLoading: isRescanning } = useRescanArticle();
+
+  const deleteArticleMutation = trpc.article.delete.useMutation();
+  const handleDeleteArticle = () => {
+    openConfirmModal({
+      title: 'Delete article',
+      children:
+        'Are you sure you want to delete this article? This action is destructive and cannot be reverted.',
+      labels: { cancel: "No, don't delete it", confirm: 'Delete article' },
+      confirmProps: { color: 'red' },
+      onConfirm: () =>
+        deleteArticleMutation.mutate(
+          { id: article.id },
+          {
+            async onSuccess() {
+              showSuccessNotification({
+                title: 'Article deleted',
+                message: 'Successfully deleted article',
+              });
+
+              if (atDetailsPage) await router.push('/articles');
+              await queryUtils.article.getInfinite.invalidate();
+            },
+            onError(error) {
+              showErrorNotification({
+                title: 'Failed to delete article',
+                error: new Error(error.message),
+              });
+            },
+          }
+        ),
+    });
+  };
+
+  // Moderator-only, mirroring the model menu's Mark Official. The server is the authority
+  // (`article.setOfficial` is a `moderatorProcedure`); this only draws the control.
+  const setOfficialMutation = trpc.article.setOfficial.useMutation({
+    async onSuccess(result) {
+      showSuccessNotification({
+        title: result.isOfficial ? 'Marked official' : 'Unmarked official',
+        message: result.isOfficial
+          ? 'This article now shows the Civitai Official badge'
+          : 'The Civitai Official badge has been removed',
+      });
+
+      queryUtils.article.getById.setData({ id: article.id }, (old) =>
+        old ? { ...old, isOfficial: result.isOfficial } : old
+      );
+      await queryUtils.article.getInfinite.invalidate();
+    },
+    onError(error) {
+      showErrorNotification({
+        title: 'Failed to update official status',
+        error: new Error(error.message),
+      });
+    },
+  });
+
+  const unpublishArticleMutation = trpc.article.unpublish.useMutation();
+  const handleUnpublishArticle = () => {
+    unpublishArticleMutation.mutate(
+      { id: article.id },
+      {
+        async onSuccess(result) {
+          showSuccessNotification({
+            title: 'Article unpublished',
+            message: 'Successfully unpublished article',
+          });
+
+          queryUtils.article.getById.setData({ id: article.id }, (old) => {
+            if (!old) return old;
+            return { ...old, ...result, metadata: result.metadata ?? old.metadata };
+          });
+
+          await queryUtils.article.getInfinite.invalidate();
+          await queryUtils.article.getMyDraftArticles.invalidate();
+        },
+        onError(error) {
+          showErrorNotification({
+            title: 'Failed to unpublish article',
+            error: new Error(error.message),
+          });
+        },
+      }
+    );
+  };
+
+  return (
+    <Menu position="left-start" withArrow offset={-5} withinPortal>
+      <Menu.Target>
+        <LegacyActionIcon
+          {...props}
+          color="gray.2"
+          variant="transparent"
+          p={0}
+          onClick={(e: React.MouseEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+        >
+          <IconDotsVertical size={24} />
+        </LegacyActionIcon>
+      </Menu.Target>
+      <Menu.Dropdown>
+        {features.collections && (
+          <AddToCollectionMenuItem
+            key="add-to-collection"
+            onClick={() =>
+              openAddToCollectionModal({
+                props: {
+                  articleId: article.id,
+                  type: CollectionType.Article,
+                },
+              })
+            }
+          />
+        )}
+        <ToggleSearchableMenuItem
+          entityType="Article"
+          entityId={article.id}
+          key="toggle-searchable-menu-item"
+        />
+        {currentUser && (isOwner || isModerator) && (
+          <>
+            {isOwner && article.coverImage && !atDetailsPage && (
+              <AddArtFrameMenuItem
+                entityType={CosmeticEntity.Article}
+                entityId={article.id}
+                image={article.coverImage}
+                currentCosmetic={article.cosmetic}
+              />
+            )}
+            {/* On the article's own page too: otherwise its cover image is the nearest thing to hat. */}
+            {isOwner && article.coverImage && (
+              <AddEventDecorationMenuItem
+                entityType={CosmeticEntity.Article}
+                entityId={article.id}
+                image={article.coverImage}
+                currentCosmetic={article.eventDecoration}
+                findWornHat={atDetailsPage}
+              />
+            )}
+            <Menu.Item
+              color="red"
+              leftSection={<IconTrash size={14} stroke={1.5} />}
+              onClick={(e: React.MouseEvent) => {
+                e.preventDefault();
+                e.stopPropagation();
+                handleDeleteArticle();
+              }}
+              disabled={deleteArticleMutation.isPending}
+            >
+              Delete
+            </Menu.Item>
+            {showUnpublish && (
+              <>
+                {!isModerator && (
+                  <Menu.Item
+                    color="yellow"
+                    leftSection={
+                      unpublishArticleMutation.isPending ? (
+                        <Loader size={14} />
+                      ) : (
+                        <IconBan size={14} stroke={1.5} />
+                      )
+                    }
+                    onClick={(e: React.MouseEvent) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      handleUnpublishArticle();
+                    }}
+                    disabled={unpublishArticleMutation.isPending}
+                    closeMenuOnClick={false}
+                  >
+                    Unpublish
+                  </Menu.Item>
+                )}
+                {isModerator && (
+                  <Menu.Item
+                    color="yellow"
+                    leftSection={<IconBan size={14} stroke={1.5} />}
+                    onClick={(e: React.MouseEvent) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      openArticleUnpublishModal({ props: { articleId: article.id } });
+                    }}
+                  >
+                    Unpublish as Violation
+                  </Menu.Item>
+                )}
+              </>
+            )}
+            <Menu.Item
+              component={Link}
+              href={`/articles/${article.id}/edit`}
+              leftSection={<IconPencil size={14} stroke={1.5} />}
+            >
+              Edit
+            </Menu.Item>
+            {(article.status === ArticleStatus.Draft ||
+              article.status === ArticleStatus.Unpublished) && (
+              <Menu.Item
+                leftSection={<IconLink size={14} stroke={1.5} />}
+                onClick={(e: React.MouseEvent) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  openArticleShareDraftModal(article.id, { canCreate: isOwner });
+                }}
+              >
+                {isOwner ? 'Share draft' : 'Draft share links'}
+              </Menu.Item>
+            )}
+            {atDetailsPage && features.articleImageScanning && (
+              <Menu.Item
+                leftSection={
+                  isRescanning ? <Loader size={14} /> : <IconRadar2 size={14} stroke={1.5} />
+                }
+                onClick={(e: React.MouseEvent) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handleRescanArticle(article.id);
+                }}
+                disabled={isRescanning}
+                closeMenuOnClick={false}
+              >
+                Rescan
+              </Menu.Item>
+            )}
+            {isModerator && (
+              <Menu.Item
+                color="blue"
+                leftSection={
+                  setOfficialMutation.isPending ? (
+                    <Loader size={14} />
+                  ) : (
+                    <IconRosetteDiscountCheck size={14} stroke={1.5} />
+                  )
+                }
+                disabled={setOfficialMutation.isPending}
+                onClick={(e: React.MouseEvent) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setOfficialMutation.mutate({ id: article.id, isOfficial: !article.isOfficial });
+                }}
+              >
+                {article.isOfficial ? 'Unmark Official' : 'Mark Official'}
+              </Menu.Item>
+            )}
+            {isModerator && (
+              <ToggleLockComments entityId={article.id} entityType="article">
+                {({ toggle, locked, isLoading }) => {
+                  return (
+                    <Menu.Item
+                      leftSection={
+                        isLoading ? <Loader size={14} /> : <IconLock size={14} stroke={1.5} />
+                      }
+                      onClick={toggle}
+                      disabled={isLoading}
+                      closeMenuOnClick={false}
+                    >
+                      {locked ? 'Unlock' : 'Lock'} Comments
+                    </Menu.Item>
+                  );
+                }}
+              </ToggleLockComments>
+            )}
+          </>
+        )}
+        {(!isOwner || isModerator) && (
+          <LoginRedirect reason="report-article">
+            <Menu.Item
+              leftSection={<IconFlag size={14} stroke={1.5} />}
+              onClick={(e: React.MouseEvent) => {
+                e.preventDefault();
+                e.stopPropagation();
+                openReportModal({ entityType: ReportEntity.Article, entityId: article.id });
+              }}
+            >
+              Report article
+            </Menu.Item>
+          </LoginRedirect>
+        )}
+        {isModerator && (
+          <>
+            <Menu.Label>Moderator</Menu.Label>
+            <ModeratorLookupMenuItem path={moderatorArticleLookupPath(article.id)}>
+              Lookup Article
+            </ModeratorLookupMenuItem>
+          </>
+        )}
+      </Menu.Dropdown>
+    </Menu>
+  );
+}
+
+type Props = Omit<ActionIconProps, 'variant' | 'onClick'> & {
+  article: Omit<ArticleGetAllRecord, 'stats'>;
+};

@@ -1,0 +1,399 @@
+import { Alert, Anchor, Button, Group, Stack, Text, Title } from '@mantine/core';
+import {
+  Availability,
+  ModelUploadType,
+  ModelUsageControl,
+  TrainingStatus,
+} from '~/shared/utils/prisma/enums';
+import { IconArrowLeft } from '@tabler/icons-react';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
+import type { NextRouter } from 'next/router';
+import { useRouter } from 'next/router';
+import React from 'react';
+import { NotFound } from '~/components/AppLayout/NotFound';
+import { PageLoader } from '~/components/PageLoader/PageLoader';
+
+import { Files, UploadStepActions } from '~/components/Resource/Files';
+import { FilesProvider } from '~/components/Resource/FilesProvider';
+import { ModelVersionUpsertForm } from '~/components/Resource/Forms/ModelVersionUpsertForm';
+import { PostUpsertForm2 } from '~/components/Resource/Forms/PostUpsertForm2';
+import TrainingSelectFile from '~/components/Resource/Forms/TrainingSelectFile';
+import { useWizardAutoResume } from '~/components/Resource/Wizard/useWizardAutoResume';
+import { useS3UploadStore } from '~/store/s3-upload.store';
+import type { ModelById, ModelVersionById } from '~/types/router';
+import { trpc } from '~/utils/trpc';
+import { isNumber } from '~/utils/type-guards';
+import { showErrorNotification } from '~/utils/notifications';
+import { getModelUrl } from '~/utils/string-helpers';
+import { ReadOnlyAlert } from '~/components/ReadOnlyAlert/ReadOnlyAlert';
+import { WizardStepper } from '~/components/Stepper/WizardStepper';
+import { useWizardStepSave } from './useWizardStepSave';
+
+const MAX_STEPS = 3;
+
+const CreateSteps = ({
+  step,
+  versionId,
+  modelData,
+  modelVersion,
+  previousBaseModel,
+  goBack,
+  goNext,
+  router,
+  postId,
+  skipFiles,
+}: {
+  step: number;
+  versionId?: string | string[];
+  modelData?: ModelVersionById['model'];
+  modelVersion?: ModelVersionById;
+  previousBaseModel?: string | null;
+  goBack: () => void;
+  goNext: () => void;
+  router: NextRouter;
+  postId: number | undefined;
+  skipFiles: boolean;
+}) => {
+  const { getStatus: getUploadStatus } = useS3UploadStore();
+  const { uploading, error, aborted } = getUploadStatus(
+    (file) => file.meta?.versionId === modelVersion?.id
+  );
+  const editing = !!modelVersion?.id;
+
+  // URL step → stepper-rendered index. When skipFiles=true the Files step (URL step 2)
+  // is omitted, so URL step 3 (post) collapses to rendered index 1.
+  const activeIndex = skipFiles && step >= 2 ? Math.max(0, step - 2) : step - 1;
+
+  const navigateToStep = (urlStep: number) =>
+    router
+      .replace(`/models/${modelData?.id}/model-versions/${versionId}/wizard?step=${urlStep}`)
+      .then();
+  const { formId, handleStepSelect, withSavedNav, clearPendingStep } =
+    useWizardStepSave(navigateToStep);
+
+  return (
+    <WizardStepper
+      active={activeIndex}
+      onStepClick={(idx) => {
+        const urlStep = skipFiles && idx >= 1 ? idx + 2 : idx + 1;
+        handleStepSelect(urlStep, step);
+      }}
+      classNames={{ steps: 'container max-w-sm' }}
+    >
+      <WizardStepper.Step label={editing ? 'Edit version' : 'Add version'}>
+        <div className="container flex max-w-sm flex-col gap-3">
+          <Title order={3}>{editing ? 'Edit version' : 'Add version'}</Title>
+          <ModelVersionUpsertForm
+            id={formId}
+            model={modelData}
+            version={modelVersion}
+            previousBaseModel={previousBaseModel}
+            onSubmit={withSavedNav((result) => {
+              const skipFiles = result?.usageControl === ModelUsageControl.ExternalGeneration;
+              const nextStep = skipFiles ? 3 : 2;
+              router
+                .replace(
+                  `/models/${result?.modelId}/model-versions/${result?.id}/wizard?step=${nextStep}`,
+                  undefined,
+                  editing ? { shallow: true } : undefined
+                )
+                .then();
+            })}
+          >
+            {({ loading, canSave }) => (
+              <Group mt="xl" justify="flex-end">
+                <Button
+                  type="submit"
+                  loading={loading}
+                  disabled={!canSave}
+                  onClick={clearPendingStep}
+                >
+                  Next
+                </Button>
+              </Group>
+            )}
+          </ModelVersionUpsertForm>
+        </div>
+      </WizardStepper.Step>
+      {!skipFiles && (
+        <WizardStepper.Step
+          label="Upload files"
+          loading={uploading > 0}
+          color={error + aborted > 0 ? 'red' : undefined}
+        >
+          <div className="container flex max-w-sm flex-col gap-3">
+            <Title order={3}>Upload files</Title>
+            <Files />
+            <UploadStepActions onBackClick={goBack} onNextClick={goNext} />
+          </div>
+        </WizardStepper.Step>
+      )}
+      <WizardStepper.Step label={postId ? 'Edit post' : 'Create a post'}>
+        {modelVersion && modelData && (
+          <PostUpsertForm2
+            postId={postId}
+            modelVersionId={modelVersion.id}
+            modelId={modelData.id}
+          />
+        )}
+      </WizardStepper.Step>
+    </WizardStepper>
+  );
+};
+
+const TrainSteps = ({
+  step,
+  modelData,
+  modelVersion,
+  goBack,
+  goNext,
+  router,
+  postId,
+}: {
+  step: number;
+  modelData: ModelVersionById['model'];
+  modelVersion: ModelVersionById;
+  goBack: () => void;
+  goNext: () => void;
+  router: NextRouter;
+  postId: number | undefined;
+}) => {
+  const isPrivateModel = modelData?.availability === Availability.Private;
+  const publishPrivateModelVersionMutation =
+    trpc.modelVersion.publishPrivateModelVersion.useMutation();
+  const utils = trpc.useUtils();
+
+  const onPublish = async () => {
+    try {
+      await publishPrivateModelVersionMutation.mutateAsync({ id: modelVersion.id });
+
+      utils.modelVersion.getById.invalidate({ id: modelVersion.id });
+      utils.modelVersion.getByIdForEdit.invalidate({ id: modelVersion.id });
+      utils.model.getById.invalidate({ id: modelData.id });
+
+      router.replace(
+        getModelUrl({
+          modelId: modelData.id,
+          modelName: modelData.name,
+          modelVersionId: modelVersion.id,
+        })
+      );
+    } catch (error) {
+      showErrorNotification({
+        title: 'Failed to publish private model',
+        error: new Error((error as Error).message),
+      });
+    }
+  };
+
+  const navigateToStep = (urlStep: number) =>
+    router
+      .replace(`/models/${modelData?.id}/model-versions/${modelVersion.id}/wizard?step=${urlStep}`)
+      .then();
+  const { formId, handleStepSelect, withSavedNav, clearPendingStep } =
+    useWizardStepSave(navigateToStep);
+
+  return (
+    <WizardStepper
+      active={step - 1}
+      onStepClick={(idx) => handleStepSelect(idx + 1, step)}
+      classNames={{ steps: 'container max-w-sm' }}
+    >
+      {/* Step 1: Select File */}
+      <WizardStepper.Step
+        label="Select Model File"
+        loading={
+          modelVersion.trainingStatus === TrainingStatus.Pending ||
+          modelVersion.trainingStatus === TrainingStatus.Submitted ||
+          modelVersion.trainingStatus === TrainingStatus.Paused ||
+          modelVersion.trainingStatus === TrainingStatus.Processing
+        }
+        color={
+          modelVersion.trainingStatus === TrainingStatus.Failed ||
+          modelVersion.trainingStatus === TrainingStatus.Denied ||
+          modelVersion.trainingStatus === TrainingStatus.Expired
+            ? 'red'
+            : undefined
+        }
+      >
+        <div className="container flex max-w-sm flex-col gap-3">
+          <Title order={3}>Select Model File</Title>
+          <Title mb="sm" order={5}>
+            Choose a model file from the results of your training run.
+            <br />
+            Sample images are provided for reference.
+          </Title>
+          <TrainingSelectFile model={modelData} modelVersion={modelVersion} onNextClick={goNext} />
+        </div>
+      </WizardStepper.Step>
+
+      {/* Step 2: Version Info */}
+      <WizardStepper.Step label="Edit version">
+        <div className="container flex max-w-sm flex-col gap-3">
+          <Title order={3}>Edit version</Title>
+          <ModelVersionUpsertForm
+            id={formId}
+            model={modelData}
+            version={modelVersion}
+            onSubmit={withSavedNav(isPrivateModel ? onPublish : () => goNext())}
+          >
+            {({ loading, canSave }) => (
+              <Stack gap="xs" mt="xl">
+                {isPrivateModel && (
+                  <Alert color="yellow" title="Private model version">
+                    This model version will be marked as private because of the model&rsquo;s
+                    privacy. A post will be automatically created based off of the selected epoch.
+                  </Alert>
+                )}
+                <Group justify="flex-end">
+                  <Button variant="default" onClick={goBack}>
+                    Back
+                  </Button>
+                  <Button
+                    type="submit"
+                    loading={loading || publishPrivateModelVersionMutation.isPending}
+                    disabled={!canSave}
+                    onClick={clearPendingStep}
+                  >
+                    {isPrivateModel ? 'Complete' : 'Next'}
+                  </Button>
+                </Group>
+              </Stack>
+            )}
+          </ModelVersionUpsertForm>
+        </div>
+      </WizardStepper.Step>
+
+      {/* Step 3: Post Info - Not required for private models. */}
+      {(!isPrivateModel || step === 3) && (
+        <WizardStepper.Step label={postId ? 'Edit post' : 'Create a post'}>
+          {modelVersion && modelData && (
+            <PostUpsertForm2
+              postId={postId}
+              modelVersionId={modelVersion.id}
+              modelId={modelData.id}
+            />
+          )}
+        </WizardStepper.Step>
+      )}
+    </WizardStepper>
+  );
+};
+
+export function ModelVersionWizard({ data, previousBaseModel }: Props) {
+  const router = useRouter();
+
+  const { id, versionId } = router.query;
+  const isNew = router.pathname.includes('/create');
+  const parsedStep = router.query.step ? Number(router.query.step) : 1;
+  const step = isNumber(parsedStep) ? parsedStep : 1;
+
+  const {
+    data: modelVersion,
+    isInitialLoading,
+    isError,
+  } = trpc.modelVersion.getByIdForEdit.useQuery(
+    { id: Number(versionId), withFiles: true },
+    { enabled: !!versionId }
+  );
+
+  const modelData = modelVersion?.model ?? data;
+  const isPrivateModel = modelData?.availability === Availability.Private;
+  const totalSteps = isPrivateModel ? 2 : MAX_STEPS; // @luis: This whole thing requires a refactor, but anyway.
+
+  const goNext = () => {
+    if (step < totalSteps)
+      router
+        .replace(`/models/${id}/model-versions/${versionId}/wizard?step=${step + 1}`, undefined, {
+          shallow: !isNew,
+        })
+        .then();
+  };
+
+  const goBack = () => {
+    if (step > 1)
+      router
+        .replace(`/models/${id}/model-versions/${versionId}/wizard?step=${step - 1}`, undefined, {
+          shallow: !isNew,
+        })
+        .then();
+  };
+
+  const hasFiles = modelVersion && !!modelVersion.files?.length;
+  const skipFiles = modelVersion?.usageControl === ModelUsageControl.ExternalGeneration;
+
+  // Filter to posts belonging to the owner of the model
+  const postId = modelVersion?.posts?.filter((post) => post.userId === modelData?.user.id)?.[0]?.id;
+  const isTraining = modelVersion?.uploadType === ModelUploadType.Trained;
+
+  useWizardAutoResume({
+    ready: !isNew && !isTraining && !!modelVersion,
+    resolveStep: () => (!hasFiles && !skipFiles ? 2 : 3),
+    onResume: (targetStep) => {
+      router
+        .replace(`/models/${id}/model-versions/${versionId}/wizard?step=${targetStep}`, undefined, {
+          shallow: true,
+        })
+        .then();
+    },
+  });
+
+  return (
+    <FilesProvider model={modelData} version={modelVersion}>
+      <ReadOnlyAlert
+        message={
+          "Civitai is currently in read-only mode and you won't be able to edit your model version. Please try again later."
+        }
+      />
+      <div className="container max-w-sm pb-4">
+        <Link
+          legacyBehavior
+          href={
+            modelData?.id ? getModelUrl({ modelId: modelData.id, modelName: modelData.name }) : '#'
+          }
+          passHref
+        >
+          <Anchor size="xs">
+            <Group gap={4} wrap="nowrap">
+              <IconArrowLeft size={12} />
+              <Text inherit>Back to {modelData?.name} page</Text>
+            </Group>
+          </Anchor>
+        </Link>
+      </div>
+      {isInitialLoading ? (
+        <PageLoader text="Loading model..." />
+      ) : isError || !modelData ? (
+        <NotFound />
+      ) : isTraining ? (
+        <TrainSteps
+          step={step}
+          modelData={modelData}
+          modelVersion={modelVersion}
+          goBack={goBack}
+          goNext={goNext}
+          router={router}
+          postId={postId}
+        />
+      ) : (
+        <CreateSteps
+          step={step}
+          versionId={versionId}
+          modelData={modelData}
+          modelVersion={modelVersion}
+          previousBaseModel={previousBaseModel}
+          goBack={goBack}
+          goNext={goNext}
+          router={router}
+          postId={postId}
+          skipFiles={skipFiles}
+        />
+      )}
+    </FilesProvider>
+  );
+}
+
+type Props = {
+  data?: ModelById;
+  previousBaseModel?: string | null;
+};

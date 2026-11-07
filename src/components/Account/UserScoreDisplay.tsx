@@ -1,0 +1,348 @@
+import { ColorSwatch, Divider, Group, Paper, Progress, Stack, Text } from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import { IconAward, IconFlag, IconInfoCircle, IconShieldCheck } from '@tabler/icons-react';
+import type { ReactNode } from 'react';
+import {
+  creatorScorePenalty,
+  creatorScoreSources,
+  creatorScoreStaffAwarded,
+} from '~/components/Account/creator-score-copy';
+import { abbreviateNumber } from '~/utils/number-helpers';
+
+type Scores = {
+  total?: number;
+  models?: number;
+  images?: number;
+  articles?: number;
+  users?: number;
+  reportsActioned?: number;
+  reportsAgainst?: number;
+  staffAwarded?: number;
+};
+
+export const scoreCategories = [
+  { key: 'models' as const, color: 'blue' },
+  { key: 'images' as const, color: 'teal' },
+  { key: 'articles' as const, color: 'orange' },
+  { key: 'users' as const, color: 'grape' },
+].map((category) => ({
+  ...category,
+  label: creatorScoreSources[category.key].label,
+  tooltip: creatorScoreSources[category.key].earnedBy,
+}));
+
+const reportCategories = [
+  {
+    key: 'reportsAgainst' as const,
+    label: 'Against',
+    color: 'red',
+    icon: IconFlag,
+    tooltip:
+      'Points deducted for images this user posted that were removed for Terms of Service violations',
+    ownerLabel: 'Removed content',
+    ownerTooltip: creatorScorePenalty,
+  },
+  {
+    key: 'reportsActioned' as const,
+    label: 'Actioned',
+    color: 'green',
+    icon: IconShieldCheck,
+    tooltip: 'Points earned for reports this user filed that moderators actioned',
+    ownerLabel: creatorScoreSources.reportsActioned.label,
+    ownerTooltip: creatorScoreSources.reportsActioned.earnedBy,
+  },
+];
+
+export function UserScoreDisplay({
+  scores,
+  showReports = false,
+  owner = false,
+  flat = false,
+  abbreviate = true,
+}: {
+  scores: Scores | null | undefined;
+  showReports?: boolean;
+  /** The creator looking at their own score: the reports block speaks to them, not about them. */
+  owner?: boolean;
+  /** Drop the panel chrome when the caller already provides it. */
+  flat?: boolean;
+  abbreviate?: boolean;
+}) {
+  if (!scores) {
+    return (
+      <Paper withBorder={!flat} p={flat ? 0 : 'md'} radius="md">
+        <Text size="sm" c="dimmed" ta="center">
+          Score not yet available
+        </Text>
+      </Paper>
+    );
+  }
+
+  // Only positive contributions compose the bar; each segment is that category's
+  // share of the combined positive score pool, so the sections fill to 100%.
+  const categoryValues = scoreCategories.map(({ key }) => Math.max(scores[key] ?? 0, 0));
+  const categoryPool = categoryValues.reduce((sum, value) => sum + value, 0);
+
+  // `total` can be negative: reportsAgainst is stored as points (violations × a
+  // negative multiplier) and can outweigh the positive categories. That value is
+  // what pulls the score below zero, so it's the thing the user needs to see.
+  const total = scores.total ?? 0;
+  const reportsAgainstScore = scores.reportsAgainst ?? 0;
+  const reportsActionedScore = scores.reportsActioned ?? 0;
+  const staffAwardedScore = scores.staffAwarded ?? 0;
+
+  return (
+    <Paper withBorder={!flat} p={flat ? 0 : 'md'} radius="md">
+      <Stack gap="md">
+        <Stack gap={4} align="center">
+          <Tooltip label={`${Math.round(total).toLocaleString()} points`} withArrow>
+            <Text
+              size="2rem"
+              fw={700}
+              c={total < 0 ? 'red' : 'green'}
+              lh={1.2}
+              style={{ cursor: 'help' }}
+            >
+              {abbreviate
+                ? abbreviateNumber(total, { decimals: 1 })
+                : Math.round(total).toLocaleString()}
+            </Text>
+          </Tooltip>
+          <Text size="sm" c="dimmed">
+            Creator Score
+          </Text>
+          {/* Spell out that this is a reputation axis (content earned minus content
+              removed), distinct from the strike-based Account Standing badge above —
+              the two can legitimately disagree (negative score, no active strikes). */}
+          <Text size="xs" c="dimmed" ta="center" maw={260}>
+            Reputation from your content, minus content removed for violations
+          </Text>
+        </Stack>
+
+        <Divider />
+
+        <Stack gap="sm">
+          {categoryPool > 0 ? (
+            <>
+              {/* Section hover → the category amount + share. */}
+              <Progress.Root size="xl" radius="xl">
+                {scoreCategories.map(({ key, label, color }, index) => {
+                  const value = categoryValues[index];
+                  if (value <= 0) return null;
+                  const percentage = (value / categoryPool) * 100;
+                  return (
+                    <Tooltip
+                      key={key}
+                      label={`${label}: ${Math.round(value).toLocaleString()} (${formatPercentage(
+                        value,
+                        percentage
+                      )})`}
+                      withArrow
+                    >
+                      {/* minWidth keeps a real-but-tiny category (e.g. <1%) a visible sliver;
+                          must clear the radius="xl" rounded corner (~8-10px) to show. */}
+                      <Progress.Section value={percentage} color={color} style={{ minWidth: 12 }} />
+                    </Tooltip>
+                  );
+                })}
+              </Progress.Root>
+
+              {/* macOS-storage-style legend: dot + label, dot hover → description. Only
+                  categories the user actually has (value > 0) appear, matching the bar —
+                  no orphan dot for a category with no segment. */}
+              <Group gap="md" wrap="wrap">
+                {scoreCategories.map(({ key, label, color, tooltip }, index) => {
+                  if (categoryValues[index] <= 0) return null;
+                  return (
+                    <Group key={key} gap={6} wrap="nowrap">
+                      <Tooltip label={tooltip} multiline w={220} withArrow>
+                        <ColorSwatch
+                          color={`var(--mantine-color-${color}-6)`}
+                          size={10}
+                          radius="xl"
+                          style={{ cursor: 'help' }}
+                        />
+                      </Tooltip>
+                      <Text size="sm">
+                        {label}{' '}
+                        <Text span size="sm" c="dimmed" className="tabular-nums">
+                          {abbreviate
+                            ? abbreviateNumber(categoryValues[index], { decimals: 1 })
+                            : Math.round(categoryValues[index]).toLocaleString()}
+                        </Text>
+                      </Text>
+                    </Group>
+                  );
+                })}
+              </Group>
+            </>
+          ) : (
+            <Text size="sm" c="dimmed" ta="center">
+              No positive score contributions yet
+            </Text>
+          )}
+        </Stack>
+
+        {/* Non-moderators don't get the full Reports block, so each report score that moves the
+            total shows as a tinted callout instead. Neither is in the bar above, which sums only
+            the content categories. */}
+        {!showReports && reportsAgainstScore < 0 && (
+          <ScoreCallout
+            color="red"
+            icon={
+              <IconFlag size={16} color="var(--mantine-color-red-6)" style={{ flexShrink: 0 }} />
+            }
+            label="Reports against"
+            tooltip={creatorScorePenalty}
+            value={reportsAgainstScore}
+            abbreviate
+          />
+        )}
+
+        {!showReports && reportsActionedScore > 0 && (
+          <ScoreCallout
+            color="green"
+            icon={
+              <IconShieldCheck
+                size={16}
+                color="var(--mantine-color-green-6)"
+                style={{ flexShrink: 0 }}
+              />
+            }
+            label={creatorScoreSources.reportsActioned.label}
+            tooltip={creatorScoreSources.reportsActioned.earnedBy}
+            value={reportsActionedScore}
+            abbreviate={abbreviate}
+          />
+        )}
+
+        {staffAwardedScore > 0 && (
+          <ScoreCallout
+            color="yellow"
+            icon={
+              <IconAward
+                size={16}
+                color="var(--mantine-color-yellow-6)"
+                style={{ flexShrink: 0 }}
+              />
+            }
+            label={creatorScoreStaffAwarded.label}
+            tooltip={creatorScoreStaffAwarded.earnedBy}
+            value={staffAwardedScore}
+            abbreviate={abbreviate}
+          />
+        )}
+
+        {showReports && (
+          <>
+            <Divider label="Reports" labelPosition="left" />
+            <Stack gap="sm">
+              {reportCategories.map((category) => {
+                const { key, color, icon: Icon } = category;
+                const value = scores[key] ?? 0;
+                return (
+                  <ScoreRow
+                    key={key}
+                    icon={<Icon size={16} />}
+                    label={owner ? category.ownerLabel : category.label}
+                    tooltip={owner ? category.ownerTooltip : category.tooltip}
+                  >
+                    <Text size="sm" fw={600} c={color}>
+                      {Math.round(value).toLocaleString()} pts
+                    </Text>
+                  </ScoreRow>
+                );
+              })}
+            </Stack>
+          </>
+        )}
+      </Stack>
+    </Paper>
+  );
+}
+
+// A real (non-zero) category whose share rounds to 0% shows "<1%" instead, so a
+// tiny-but-present category never reads as zero.
+function formatPercentage(value: number, percentage: number) {
+  if (value > 0 && percentage < 1) return '<1%';
+  return `${Math.round(percentage)}%`;
+}
+
+function ScoreRow({
+  icon,
+  label,
+  tooltip,
+  children,
+}: {
+  icon: ReactNode;
+  label: string;
+  tooltip: string;
+  children: ReactNode;
+}) {
+  return (
+    <Group gap="sm" wrap="nowrap">
+      <div style={{ flexShrink: 0 }}>{icon}</div>
+      <Text size="sm" miw={70}>
+        {label}
+      </Text>
+      <Tooltip label={tooltip} multiline w={220} withArrow>
+        <IconInfoCircle
+          size={14}
+          style={{ flexShrink: 0, cursor: 'help' }}
+          color="var(--mantine-color-dimmed)"
+        />
+      </Tooltip>
+      {children}
+    </Group>
+  );
+}
+
+function ScoreCallout({
+  color,
+  icon,
+  label,
+  tooltip,
+  value,
+  abbreviate,
+}: {
+  color: 'red' | 'green' | 'yellow';
+  icon: ReactNode;
+  label: string;
+  tooltip: string;
+  value: number;
+  abbreviate: boolean;
+}) {
+  return (
+    <Group
+      justify="space-between"
+      wrap="nowrap"
+      gap="sm"
+      px="sm"
+      py={8}
+      style={{
+        backgroundColor: `var(--mantine-color-${color}-light)`,
+        borderRadius: 'var(--mantine-radius-md)',
+      }}
+    >
+      <Group gap={8} wrap="nowrap">
+        {icon}
+        <Text size="sm">{label}</Text>
+        <Tooltip label={tooltip} multiline w={240} withArrow>
+          <IconInfoCircle
+            size={14}
+            style={{ flexShrink: 0, cursor: 'help' }}
+            color="var(--mantine-color-dimmed)"
+          />
+        </Tooltip>
+      </Group>
+      <Tooltip label={`${Math.round(value).toLocaleString()} points`} withArrow>
+        <Text size="sm" fw={700} c={color} style={{ whiteSpace: 'nowrap', cursor: 'help' }}>
+          {abbreviate
+            ? abbreviateNumber(value, { decimals: 1 })
+            : Math.round(value).toLocaleString()}{' '}
+          pts
+        </Text>
+      </Tooltip>
+    </Group>
+  );
+}

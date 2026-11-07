@@ -1,0 +1,259 @@
+import { ActionIcon, Badge, Text } from '@mantine/core';
+import { memo } from 'react';
+import { IconDotsVertical, IconLayoutGrid, IconUser } from '@tabler/icons-react';
+import clsx from 'clsx';
+import cardClasses from '~/components/Cards/Cards.module.css';
+import { FeedCard } from '~/components/Cards/FeedCard';
+import { CollectionContextMenu } from '~/components/Collections/components/CollectionContextMenu';
+import { collectionTypeData } from '~/components/Collections/collection.utils';
+import { EdgeMedia } from '~/components/EdgeMedia/EdgeMedia';
+import { ImageGuard2 } from '~/components/ImageGuard/ImageGuard2';
+import { MediaHash } from '~/components/ImageHash/ImageHash';
+import { UserAvatarSimple } from '~/components/UserAvatar/UserAvatarSimple';
+import { DEFAULT_EDGE_IMAGE_WIDTH } from '~/server/common/constants';
+import type { NsfwLevel } from '~/server/common/enums';
+import type { SimpleUser } from '~/server/selectors/user.selector';
+import { MediaType } from '~/shared/utils/prisma/enums';
+import type { CollectionGetInfinite } from '~/types/router';
+import { abbreviateNumber } from '~/utils/number-helpers';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+
+type ImageProps = {
+  id: number;
+  nsfwLevel: NsfwLevel;
+  postId?: number | null;
+  width?: number | null;
+  height?: number | null;
+  needsReview?: string | null;
+  userId?: number;
+  user?: SimpleUser;
+  url: string;
+  type: MediaType;
+  name?: string | null;
+  poi?: boolean;
+  minor?: boolean;
+};
+
+export const CollectionCard = memo(function CollectionCard({ data }: Props) {
+  const getCoverImages = () => {
+    if (data.image) return [data.image];
+
+    if (data.images) {
+      return data.images ?? [];
+    }
+
+    return [];
+  };
+
+  const getCoverSrcs = () => {
+    if (data.image) return [];
+
+    if (data.srcs) {
+      return data.srcs ?? [];
+    }
+
+    return [];
+  };
+
+  const coverImages: ImageProps[] = getCoverImages();
+  const coverSrcs: string[] = getCoverSrcs();
+  const isMultiImage = coverImages.length !== 0 ? coverImages.length > 1 : coverSrcs.length > 1;
+  const coverImagesCount = coverImages.length || coverSrcs.length;
+  const contributorCount = data._count?.contributors || data.metrics?.contributorCount || 0;
+  const itemCount = data._count?.items || data.metrics?.itemCount || 0;
+
+  return (
+    <FeedCard
+      impressions={[{ entityType: 'Collection', entityId: data.id }]}
+      className={coverImages.length === 0 ? cardClasses.noImage : undefined}
+      href={`/collections/${data.id}`}
+    >
+      <div
+        className={clsx({
+          [cardClasses.root]: true,
+          [cardClasses.noHover]: isMultiImage,
+        })}
+      >
+        <div
+          className={
+            isMultiImage
+              ? clsx({
+                  [cardClasses.imageGroupContainer]: true,
+                  [cardClasses.imageGroupContainer4x4]: coverImagesCount > 2,
+                })
+              : cardClasses.imageGroupContainer
+          }
+        >
+          {coverImages.length > 0 && (
+            <ImageCover data={data} coverImages={coverImages.slice(0, 4)} />
+          )}
+          {coverSrcs.length > 0 && coverImages.length === 0 && (
+            <ImageSrcCover data={data} coverSrcs={coverSrcs} />
+          )}
+        </div>
+
+        <div
+          className={clsx('flex flex-col gap-2', cardClasses.contentOverlay, cardClasses.bottom)}
+        >
+          {data.user.id !== -1 && <UserAvatarSimple {...data.user} />}
+          <Text className={cardClasses.dropShadow} size="xl" fw={700} lineClamp={2} lh={1.2}>
+            {data.name}
+          </Text>
+          <div className="flex flex-nowrap gap-1">
+            <Badge
+              className={clsx(cardClasses.statChip, cardClasses.chip)}
+              classNames={{ label: 'flex flex-nowrap gap-2' }}
+              variant="light"
+              radius="xl"
+            >
+              <div className="flex items-center gap-0.5">
+                <IconLayoutGrid size={14} stroke={2.5} />
+                <Text fw="bold" size="xs">
+                  {abbreviateNumber(itemCount)}
+                </Text>
+              </div>
+              <div className="flex items-center gap-0.5">
+                <IconUser size={14} stroke={2.5} />
+                <Text fw="bold" size="xs">
+                  {abbreviateNumber(contributorCount)}
+                </Text>
+              </div>
+            </Badge>
+          </div>
+        </div>
+      </div>
+    </FeedCard>
+  );
+});
+
+type HeaderData = Pick<Props['data'], 'id' | 'userId' | 'type' | 'mode'>;
+
+function CollectionCardHeader({
+  data,
+  withinImageGuard = true,
+}: {
+  data: HeaderData;
+  withinImageGuard?: boolean;
+}) {
+  return (
+    <div
+      className={clsx(
+        cardClasses.contentOverlay,
+        cardClasses.top,
+        'flex flex-nowrap items-center justify-between gap-1'
+      )}
+    >
+      <div className="flex flex-nowrap items-center gap-2.5">
+        {withinImageGuard && <ImageGuard2.BlurToggle className={cardClasses.chip} radius="xl" />}
+        <Badge className={clsx(cardClasses.infoChip, cardClasses.chip)} variant="light" radius="xl">
+          <Text c="white" size="xs" tt="capitalize">
+            {data.type ? `${collectionTypeData[data.type].label}s` : 'Mixed'}
+          </Text>
+        </Badge>
+      </div>
+      <CollectionContextMenu
+        collectionId={data.id}
+        ownerId={data.userId}
+        position="left-start"
+        mode={data.mode}
+      >
+        <LegacyActionIcon
+          variant="transparent"
+          p={0}
+          onClick={(e: React.MouseEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+        >
+          <IconDotsVertical />
+        </LegacyActionIcon>
+      </CollectionContextMenu>
+    </div>
+  );
+}
+
+export function ImageCover({ data, coverImages }: { data: HeaderData; coverImages: ImageProps[] }) {
+  const isMultiImage = coverImages.length > 1;
+  const coverImagesCount = coverImages.length;
+
+  return (
+    <>
+      {coverImages.map((image, i) => (
+        <ImageGuard2 key={image.id} image={image} connectType="collection" connectId={data.id}>
+          {(safe) => (
+            <>
+              {/* TODO - update  ImageGuard2 to allow blurToggle to be given an image from outside of context */}
+              {i === 0 && <CollectionCardHeader data={data} withinImageGuard />}
+              {safe ? (
+                <EdgeMedia
+                  src={image.url}
+                  type="image"
+                  transcode={image.type === MediaType.video}
+                  className={cardClasses.image}
+                  name={image.name ?? image.id.toString()}
+                  alt={image.name ?? undefined}
+                  placeholder="empty"
+                  loading="lazy"
+                  width={DEFAULT_EDGE_IMAGE_WIDTH}
+                  anim={false}
+                />
+              ) : (
+                <MediaHash
+                  {...image}
+                  style={
+                    isMultiImage
+                      ? {
+                          position: 'relative',
+                          width: '50%',
+                          height: coverImagesCount > 2 ? '50%' : 'auto',
+                        }
+                      : {}
+                  }
+                />
+              )}
+            </>
+          )}
+        </ImageGuard2>
+      ))}
+
+      {coverImages.length === 0 && (
+        <Text c="dimmed" style={{ width: '100%', height: '100%' }}>
+          This collection has no images
+        </Text>
+      )}
+    </>
+  );
+}
+
+export function ImageSrcCover({ data, coverSrcs }: { data: HeaderData; coverSrcs: string[] }) {
+  return (
+    <>
+      {coverSrcs.map((src) => (
+        <EdgeMedia
+          src={src}
+          type="image"
+          width={DEFAULT_EDGE_IMAGE_WIDTH}
+          placeholder="empty"
+          className={cardClasses.image}
+          loading="lazy"
+          key={src}
+          anim={false}
+        />
+      ))}
+      <CollectionCardHeader data={data} withinImageGuard={false} />
+    </>
+  );
+}
+
+type Props = {
+  data: Omit<CollectionGetInfinite[number], 'image' | 'images'> & {
+    metrics?: {
+      itemCount: number;
+      contributorCount: number;
+    } | null;
+    srcs?: string[] | null;
+    images?: ImageProps[] | null;
+  } & {
+    image?: ImageProps | null;
+  };
+};

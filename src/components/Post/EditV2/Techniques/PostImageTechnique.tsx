@@ -1,0 +1,145 @@
+import { ActionIcon, Collapse, Text, Textarea } from '@mantine/core';
+import { IconMessagePlus, IconTrash } from '@tabler/icons-react';
+import { useState } from 'react';
+import ConfirmDialog from '~/components/Dialog/Common/ConfirmDialog';
+import { dialogStore } from '~/components/Dialog/dialogStore';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { usePendingSave, usePostEditStore } from '~/components/Post/EditV2/PostEditProvider';
+import type { PostEditImageDetail } from '~/server/services/post.service';
+import { useDebouncer } from '~/utils/debouncer';
+import { showErrorNotification } from '~/utils/notifications';
+import { trpc } from '~/utils/trpc';
+
+export function PostImageTechnique({
+  image,
+  technique,
+}: {
+  image: PostEditImageDetail;
+  technique: PostEditImageDetail['techniques'][number];
+}) {
+  const debouncer = useDebouncer(1000);
+  const [opened, setOpened] = useState(!!technique.notes?.length);
+  const [notes, setNotes] = useState(technique.notes ?? '');
+  const updateImage = usePostEditStore((state) => state.updateImage);
+  const removeTechniqueMutation = trpc.image.removeTechniques.useMutation({
+    onSuccess: (response, { data }) => {
+      for (const { imageId, techniqueId } of data) {
+        updateImage(imageId, (image) => {
+          image.techniques = image.techniques.filter((x) => x.id !== techniqueId);
+        });
+      }
+    },
+    onError: (error: any) => showErrorNotification({ error: new Error(error.message) }),
+  });
+
+  const handleRemoveTechnique = () => {
+    if (!technique.notes)
+      removeTechniqueMutation.mutate({ data: [{ imageId: image.id, techniqueId: technique.id }] });
+    // trigger confirm dialog when technique has notes
+    else
+      dialogStore.trigger({
+        component: ConfirmDialog,
+        props: {
+          title: 'Remove technique',
+          message: 'Are you sure you want to remove this technique?',
+          labels: { cancel: `Cancel`, confirm: `Yes, I am sure` },
+          confirmProps: { color: 'red', loading: removeTechniqueMutation.isPending },
+          onConfirm: async () =>
+            await removeTechniqueMutation.mutateAsync({
+              data: [{ imageId: image.id, techniqueId: technique.id }],
+            }),
+        },
+      });
+  };
+
+  const updateTechniqueMutation = trpc.image.updateTechniques.useMutation({
+    // onMutate, not onSuccess: the provider snapshots the store into the `post.getEdit`
+    // cache on `routeChangeStart`, so a note flushed on the way out has not landed yet.
+    onMutate: ({ data }) => {
+      const previous: Record<number, string | null> = {};
+      for (const { imageId, techniqueId, notes } of data) {
+        updateImage(imageId, (image) => {
+          const technique = image.techniques.find((x) => x.id === techniqueId);
+          if (!technique) return;
+          previous[techniqueId] = technique.notes ?? null;
+          technique.notes = notes?.length ? notes : null;
+        });
+      }
+      return previous;
+    },
+    // Roll back, or the note reads as saved — `dirty` below compares against this value, so an
+    // optimistic write that the server rejected also clears the unsaved marker. Restored only
+    // where the store still holds what THIS request set.
+    onError: (error: any, { data }, previous) => {
+      for (const { imageId, techniqueId, notes } of data) {
+        updateImage(imageId, (image) => {
+          const technique = image.techniques.find((x) => x.id === techniqueId);
+          if (!technique || !previous || !(techniqueId in previous)) return;
+          if (technique.notes === (notes?.length ? notes : null)) technique.notes = previous[techniqueId];
+        });
+      }
+      showErrorNotification({ error: new Error(error.message) });
+    },
+  });
+  const handleUpdateTechnique = (notes: string) => {
+    debouncer(() => {
+      updateTechniqueMutation.mutate({
+        data: [{ imageId: image.id, techniqueId: technique.id, notes }],
+      });
+    });
+  };
+
+  usePendingSave(`technique:${image.id}:${technique.id}`, debouncer);
+
+  const dirty = notes.length && notes !== technique.notes;
+  const saving = updateTechniqueMutation.isPending;
+
+  return (
+    <div className="flex flex-col py-1">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-1">
+          <span>{technique.name}</span>
+          {!technique.notes && (
+            <Text
+              inline
+              color="blue"
+              className="cursor-pointer"
+              onClick={() => setOpened((o) => !o)}
+            >
+              <IconMessagePlus size={16} />
+            </Text>
+          )}
+        </div>
+
+        <LegacyActionIcon
+          color="red"
+          onClick={handleRemoveTechnique}
+          loading={removeTechniqueMutation.isPending}
+        >
+          <IconTrash size={16} />
+        </LegacyActionIcon>
+      </div>
+      <Collapse in={opened}>
+        <Textarea
+          autosize
+          size="sm"
+          placeholder={`How was ${technique.name} used?`}
+          value={notes}
+          onChange={(e) => {
+            setNotes(e.target.value.slice(0, 1000));
+            handleUpdateTechnique(e.target.value);
+          }}
+          classNames={{
+            input: `px-2 py-1 min-h-8 mb-2 ${
+              saving
+                ? '!border-green-6 dark:!border-green-8'
+                : dirty
+                ? '!border-yellow-6 dark:!border-yellow-8'
+                : ''
+            }`,
+          }}
+        />
+      </Collapse>
+    </div>
+  );
+}

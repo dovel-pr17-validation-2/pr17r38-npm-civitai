@@ -1,0 +1,213 @@
+import { useEffect, useMemo, useState } from 'react';
+import { ActionIcon, Badge, Group, Text } from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import {
+  IconArrowBackUp,
+  IconBookmark,
+  IconCopyPlus,
+  IconDeviceFloppy,
+  IconX,
+} from '@tabler/icons-react';
+
+import { dialogStore } from '~/components/Dialog/dialogStore';
+import { PopConfirm } from '~/components/PopConfirm/PopConfirm';
+import { SavePresetModal } from '~/components/generation_v2/preset/SavePresetModal';
+import { applyPreset } from '~/components/generation_v2/preset/applyPreset';
+import {
+  useGenerationFormBridge,
+  type GenerationFormBridge,
+} from '~/components/Generate/useGenerationFormBridge';
+import { constants } from '~/server/common/constants';
+
+const SYSTEM_USER_ID = constants.system.user.id;
+import {
+  filterPresetValues,
+  isPresetDirty,
+  useGenerationPresetStore,
+  type PresetValues,
+} from '~/store/generation-preset.store';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
+import { trpc } from '~/utils/trpc';
+
+type EcosystemLike = { ecosystem?: string };
+
+const makeIsComputed = (graph: GenerationFormBridge) => {
+  const computed = new Set(graph.getComputedKeys());
+  return (k: string) => computed.has(k);
+};
+
+/**
+ * Hook: publishes the current graph's ecosystem + snapshot-getter to the
+ * preset store so the header button (which lives outside the graph context)
+ * can use them.
+ */
+function usePresetGraphBridge(graph: GenerationFormBridge) {
+  const setBridge = useGenerationPresetStore((s) => s.setBridge);
+  const clearBridge = useGenerationPresetStore((s) => s.clearBridge);
+
+  useEffect(() => {
+    const getFilteredSnapshot = (): PresetValues =>
+      filterPresetValues(graph.getState(), makeIsComputed(graph));
+    const readEcosystem = () => (graph.getState() as EcosystemLike).ecosystem ?? null;
+
+    setBridge({ ecosystem: readEcosystem(), getFilteredSnapshot });
+
+    const unsub = graph.subscribeKey('ecosystem', () => {
+      setBridge({ ecosystem: readEcosystem() });
+    });
+
+    return () => {
+      unsub();
+      clearBridge();
+    };
+  }, [graph, setBridge, clearBridge]);
+}
+
+function useGraphChangeCounter(graph: GenerationFormBridge) {
+  const [counter, setCounter] = useState(0);
+  useEffect(() => graph.subscribe(() => setCounter((c) => c + 1)), [graph]);
+  return counter;
+}
+
+/**
+ * Active-preset indicator. Renders only when a preset is loaded. Shows the
+ * preset name, a dirty indicator, and icons for Save / Save-as / Close.
+ * The trigger button lives separately in the generation tabs header — see
+ * `PresetHeaderButton`.
+ */
+export function PresetControl() {
+  const graph = useGenerationFormBridge();
+  if (!graph) throw new Error('PresetControl must render inside a generation form provider');
+  usePresetGraphBridge(graph);
+
+  const changeCounter = useGraphChangeCounter(graph);
+  const filteredSnapshot = useMemo(
+    () => filterPresetValues(graph.getState(), makeIsComputed(graph)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- changeCounter forces recompute
+    [graph, changeCounter]
+  );
+
+  const activePresetId = useGenerationPresetStore((s) => s.activePresetId);
+  const activePresetName = useGenerationPresetStore((s) => s.activePresetName);
+  const activePresetUserId = useGenerationPresetStore((s) => s.activePresetUserId);
+  const activePresetValues = useGenerationPresetStore((s) => s.activePresetValues);
+  const closePreset = useGenerationPresetStore((s) => s.closePreset);
+  const markClean = useGenerationPresetStore((s) => s.markClean);
+  const isSystemPreset = activePresetUserId === SYSTEM_USER_ID;
+
+  const isDirty = useMemo(
+    () => isPresetDirty(activePresetValues, filteredSnapshot, makeIsComputed(graph)),
+    [activePresetValues, filteredSnapshot, graph]
+  );
+
+  const utils = trpc.useUtils();
+  const updatePreset = trpc.generationPreset.update.useMutation({
+    onSuccess: async (preset) => {
+      showSuccessNotification({ title: 'Preset updated', message: `Saved "${preset.name}"` });
+      markClean(preset.values as PresetValues);
+      await utils.generationPreset.getForEcosystem.invalidate();
+      await utils.generationPreset.getOwn.invalidate();
+    },
+    onError: (err) =>
+      showErrorNotification({
+        title: 'Failed to update preset',
+        error: new Error(err.message),
+      }),
+  });
+
+  if (activePresetId === null || !activePresetName) return null;
+
+  const openSaveAs = () => {
+    const values = { ...filteredSnapshot };
+    if (!values.ecosystem) return;
+    dialogStore.trigger({ id: 'save-preset', component: SavePresetModal });
+  };
+
+  const handleSaveDirty = () => {
+    if (!activePresetId) return;
+    const values = { ...filteredSnapshot };
+    if (!values.ecosystem) return;
+    updatePreset.mutate({ id: activePresetId, values });
+  };
+
+  const handleReset = () => {
+    if (
+      !activePresetId ||
+      !activePresetName ||
+      !activePresetValues ||
+      activePresetUserId === null
+    ) {
+      return;
+    }
+    applyPreset({
+      id: activePresetId,
+      name: activePresetName,
+      userId: activePresetUserId,
+      values: activePresetValues,
+    }).catch((err: Error) =>
+      showErrorNotification({ title: 'Failed to reset preset', error: err })
+    );
+  };
+
+  return (
+    <Group
+      gap="xs"
+      className="rounded border border-[var(--mantine-color-default-border)] bg-[var(--mantine-color-body)] px-2 py-1"
+    >
+      <IconBookmark size={14} />
+      <Text size="sm" fw={500} lineClamp={1} className="flex-1">
+        {activePresetName}
+      </Text>
+      {isDirty && (
+        <>
+          <Badge size="xs" color="yellow" variant="light">
+            Modified
+          </Badge>
+          {/* In-place Save is hidden for system presets — users fork via Save as. */}
+          {!isSystemPreset && (
+            <PopConfirm
+              message="Update preset with current values?"
+              onConfirm={handleSaveDirty}
+              withinPortal
+              position="bottom-end"
+            >
+              <Tooltip label="Save" withArrow>
+                <ActionIcon
+                  variant="subtle"
+                  size="sm"
+                  color="blue"
+                  disabled={updatePreset.isPending}
+                  loading={updatePreset.isPending}
+                >
+                  <IconDeviceFloppy size={16} />
+                </ActionIcon>
+              </Tooltip>
+            </PopConfirm>
+          )}
+          <Tooltip label="Save as new preset" withArrow>
+            <ActionIcon variant="subtle" size="sm" onClick={openSaveAs}>
+              <IconCopyPlus size={16} />
+            </ActionIcon>
+          </Tooltip>
+          <PopConfirm
+            message="Discard changes and reset to preset?"
+            onConfirm={handleReset}
+            withinPortal
+            position="bottom-end"
+          >
+            <Tooltip label="Reset to preset" withArrow>
+              <ActionIcon variant="subtle" size="sm" color="gray">
+                <IconArrowBackUp size={16} />
+              </ActionIcon>
+            </Tooltip>
+          </PopConfirm>
+        </>
+      )}
+      <Tooltip label="Close preset" withArrow>
+        <ActionIcon variant="subtle" size="sm" color="gray" onClick={closePreset}>
+          <IconX size={16} />
+        </ActionIcon>
+      </Tooltip>
+    </Group>
+  );
+}

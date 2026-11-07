@@ -1,0 +1,44 @@
+.raterBadge {
+  position: relative;
+  cursor: default;
+  border: 1px solid theme('colors.blue.5');
+  padding-left: 5px;
+  background-color: light-dark(
+    theme('colors.gray.0'),
+    theme('colors.dark.4')
+  );
+  
+  div {
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    background-color: theme('colors.blue.5');
+    opacity: 0.3;
+  }
+
+  span {
+    display: flex;
+    align-items: center;
+  }
+
+  svg {
+    margin-right: 5px;
+  }
+}
+
+.levelUp {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  overflow: visible;
+  // `fadeOut` is a global keyframes (src/styles/globals.css); kept global because
+  // no local @keyframes of that name exists in this module.
+  animation: fadeOut 500ms ease-in 2s forwards;
+  will-change: opacity;
+}

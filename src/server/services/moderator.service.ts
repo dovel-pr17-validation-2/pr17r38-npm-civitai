@@ -1,0 +1,251 @@
+import type { shownActivity } from '@civitai/shared/held-media';
+import { dbWrite } from '~/server/db/client';
+
+type TagActivities = 'moderateTag' | 'disableTag' | 'addTag' | 'deleteTag';
+
+type ModelModActivity = {
+  entityType: 'model';
+  activity:
+    | TagActivities
+    | 'review'
+    | 'moderateFlag'
+    | 'setMinor'
+    | 'unsetMinor'
+    | 'setSfwOnly'
+    | 'unsetSfwOnly'
+    | 'setPoi'
+    | 'unsetPoi'
+    | 'setMinorAutoHash'
+    | 'setMinorTextScan'
+    | 'rollbackMinorAutoHash'
+    | 'dismissMinorHashMatch'
+    | 'setPoiAutoHash'
+    | 'revertPoiAutoHash'
+    | 'dismissPoiHashMatch'
+    | 'approveLockReview'
+    | 'rejectLockReview'
+    // A ruling on a restricted-verdict lead in Needs review (`restrictedNsfwVerdict:keep`).
+    | `restrictedNsfwVerdict:${'keep' | 'dismiss' | 'rateNsfw' | 'autoApply'}`
+    // A moderator's model save added or removed one locked property (`lockProperty:poi`).
+    | `lockProperty:${string}`
+    | `unlockProperty:${string}`;
+};
+
+type ModelVersionModActivity = {
+  entityType: 'modelVersion';
+  activity: TagActivities | 'review';
+};
+
+type ImageTagModActivity = {
+  entityType: 'tag';
+  activity: TagActivities;
+};
+
+export type ImageModActivity = {
+  entityType: 'image';
+  activity:
+    | TagActivities
+    | 'review'
+    | 'setNsfwLevel'
+    | 'resolveAppeal'
+    | 'setNsfwLevelKono'
+    | 'heldMedia:view'
+    | ReturnType<typeof shownActivity>;
+};
+
+type ArticleModActivity = {
+  entityType: 'article';
+  activity: TagActivities | 'ratingReview';
+};
+
+type ReportModActivity = {
+  entityType: 'report';
+  activity: 'review';
+};
+
+type ImpersonateModActivity = {
+  entityType: 'impersonate';
+  activity: 'on' | 'off'; // off is currently not used
+};
+
+type UserModActivity = {
+  entityType: 'user';
+  activity:
+    | 'setRewardsEligibility'
+    | 'removeContent'
+    | 'autoMuteScam'
+    // The account was already muted by a moderator, so a scam verdict hid its content and opened no case.
+    | 'scamCleanup'
+    | 'mutePendingReview'
+    | 'overturnPendingReviewMute'
+    | 'mute'
+    | 'unmute'
+    | 'revokeTimedMute'
+    | 'createSystemAccount'
+    | 'mintSystemAccountApiKey'
+    | 'setSystemAccountProfile'
+    // A moderator gave a Stripe member free days (membership-extend.service). Counts toward its cooldown.
+    | 'extendMembership'
+    // A moderator set or undid cancel-at-period-end on a member's Stripe membership (membership-cancel.service).
+    | 'setMembershipCancel'
+    | 'undoMembershipCancel'
+    // A moderator re-read a member's Stripe subscription into CustomerSubscription (membership-resync.service).
+    | 'resyncMembership'
+    // A moderator released a built personal-data export to the account owner (personal-data-export.service).
+    | 'releasePersonalDataExport'
+    // Written from /api/admin/reaction-abuse so the moderator app can show that an account was
+    // dropped from reaction metrics/ranking, and by whom. Named for WHAT happened, not who did it —
+    // `userId` carries the actor (the -1 sentinel for the scheduled poller, a real moderator id when
+    // the caller asserts one), and the reversal is a human action often enough that folding "auto"
+    // into the name would record it as a cron's. The WHY is not here — ModActivity has no free-text
+    // column — it stays in ClickHouse `metricExcludedUsers.reason`, keyed by the same userId.
+    | 'reactionAbuseExclude'
+    | 'reactionAbuseUnexclude'
+    // `UserStrike` is the record of the strike; this is the record that a moderator issued one, which
+    // is the question the account-history panel answers. `userId` is the issuer, -1 for an auto-strike.
+    | 'strike'
+    // A moderator closed the account FOR its owner, which in practice means a data-subject erasure
+    // request from someone who cannot sign in to do it themselves. Distinct from `removeContent`,
+    // which strips what an account owns and leaves the account itself identifiable.
+    | 'deleteAccount'
+    // A moderator removed every reaction the account made, on its owner's request. One row per call;
+    // the per-table counts are on the ClickHouse audit row (`affected`).
+    | 'removeReactions'
+    // Support minted a membership code for this account (`mintMembershipCode:<tier>:<months>`). The
+    // daily per-moderator cap counts these rows; the code itself lives on RedeemableCode, never here.
+    | `mintMembershipCode:${string}`
+    // Support withdrew an unredeemed code it minted (`revokeMembershipCode:<tier>:<months>`).
+    | `revokeMembershipCode:${string}`
+    // Support ended a Buzz-purchased membership early (`endBuzzMembership:<productId>`).
+    | `endBuzzMembership:${string}`
+    // A moderator awarded Creator Score (`grantCreatorScore:<grantId>:<amount>`) or withdrew a grant
+    // (`revokeCreatorScore:<grantId>`). The grant itself lives on CreatorScoreGrant.
+    | `grantCreatorScore:${string}`
+    | `revokeCreatorScore:${string}`
+    // A moderator set or cleared the Creator Program ban
+    // (`creatorProgramBan:<set|clear>:<before>:<after>:<{reason,gateRef} JSON>`).
+    | `creatorProgramBan:${string}`
+    // A lost payment dispute on a payment this account made
+    // (`chargeback:<disputeId>:<banned|already-banned|skipped-moderator>`), written as the system user.
+    | `chargeback:${string}`
+    | `creditCryptoDeposit:${string}`;
+};
+
+type ComicProjectModActivity = {
+  entityType: 'comicProject';
+  activity: 'tosViolation' | 'unpublishChapter' | 'setNsfwLevel';
+};
+
+/** A sticker placement, not the image it sits on: entity ids are per-type, so recording a placement
+ *  under 'image' would collide with real image ids and show a takedown on an unrelated image. */
+type PlacementModActivity = {
+  entityType: 'placement';
+  activity: 'removePlacement';
+};
+
+/** A moderator hid an `app-block` report from the app's developer, or unhid it. */
+type FeedbackModActivity = {
+  entityType: 'feedback';
+  activity: 'hideFromOwner' | 'unhideFromOwner';
+};
+
+/** A moderator cleared a bounty entry file's check result
+ *  (`clearFileCheck:<{fileId,reason} JSON>`; the file holds it as `metadata.checkOverride`), or
+ *  undid that clear (`reblockFileCheck:<{fileId,reason} JSON>`). */
+type BountyEntryModActivity = {
+  entityType: 'bountyEntry';
+  activity: `clearFileCheck:${string}` | `reblockFileCheck:${string}`;
+};
+
+/** The CSAM report page opened an account's held media; the activity carries how many items. */
+type HeldMediaGridModActivity = {
+  entityType: 'user';
+  activity: `heldMedia:grid:${number}`;
+};
+
+/** A moderator changed someone else's storyline through its owner's controls. */
+export type StorylineModActivity = {
+  entityType: 'storyline';
+  activity:
+    | 'update'
+    | 'insertChapter'
+    | 'moveChapter'
+    | 'linkChapter'
+    | 'setCanon'
+    | 'removeCollaborator'
+    | 'removeChapter'
+    | 'delete';
+};
+
+type CrucibleModActivity = {
+  entityType: 'crucible';
+  activity: 'takeDown';
+};
+
+type SiteAlertModActivity = {
+  entityType: 'siteAlert';
+  activity: 'post' | 'edit' | 'extend' | 'end';
+};
+
+type CsamReportModActivity = {
+  entityType: 'csamReport';
+  activity: `generatorEvidence:view:${string}` | 'csamReport:clearUnconfirmedOpen';
+};
+
+type ModActivity = {
+  entityId?: number | number[];
+} & (
+  | CsamReportModActivity
+  | ModelModActivity
+  | ModelVersionModActivity
+  | ImageTagModActivity
+  | ImageModActivity
+  | ReportModActivity
+  | ArticleModActivity
+  | ImpersonateModActivity
+  | UserModActivity
+  | ComicProjectModActivity
+  | CrucibleModActivity
+  | PlacementModActivity
+  | FeedbackModActivity
+  | BountyEntryModActivity
+  | SiteAlertModActivity
+  | HeldMediaGridModActivity
+  | StorylineModActivity
+);
+
+// `ON CONFLICT DO NOTHING` carries NO conflict target on purpose: a targetless clause is valid whether or
+// not a unique index exists, so this survives the migration that drops ModActivity's
+// (activity, entityType, entityId) unique index and makes the table append-only. Naming the target would
+// fail with 42P10 once that index is gone; omitting the clause entirely would fail with 23505 while it is
+// still there. Do not add a target back.
+//
+// 🔴 The two databases disagree, and the clause is what makes both work. Production has the
+// `20260805120000_mod_activity_append_only` migration applied — no unique index, so nothing is ever
+// suppressed and a repeat action always gets its own row. `containers/db/docker-init/02_all_dll.sql` still
+// CREATES `ModActivity_activity_entityType_entityId_key`, so a database built from the local dump DOES
+// suppress the second row. Anything that reads this table as evidence differs between the two: notably
+// `MODERATOR_TAKEDOWN_ACTIVITIES` in `src/server/jobs/image-ingestion.ts`, where a suppressed row means a
+// takedown demoted to a delete-without-blob-retraction. That demotion is reproducible locally and cannot
+// happen in production — do not diagnose one from the other.
+export async function trackModActivity(
+  userId: number,
+  input: ModActivity,
+  client: Pick<typeof dbWrite, '$executeRaw'> = dbWrite
+) {
+  if (!input.entityId) {
+    await client.$executeRaw`
+      INSERT INTO "ModActivity" ("userId", "entityType", activity)
+      VALUES (${userId}, ${input.entityType}, ${input.activity})
+      ON CONFLICT DO NOTHING
+    `;
+    return;
+  }
+
+  if (input.entityId && !Array.isArray(input.entityId)) input.entityId = [input.entityId];
+  await client.$executeRaw`
+    INSERT INTO "ModActivity" ("userId", "entityType", activity, "entityId")
+    SELECT ${userId}, ${input.entityType}, ${input.activity}, UNNEST(${input.entityId})
+    ON CONFLICT DO NOTHING
+  `;
+}

@@ -1,0 +1,649 @@
+import { beforeEach, describe, expect, test, vi } from 'vitest';
+import { page } from 'vitest/browser';
+// `test/` lives outside `src`, so the `~` alias doesn't reach it — relative import.
+import { LOADABLE_IMAGE_DATA_URI, renderWithProviders } from '../../../test/component-setup';
+import type { ListingEditContext } from './offsiteEditConfig';
+
+/**
+ * W13 — `/apps/submit?edit=` EDIT mode of the External wizard (dual-mode
+ * `ExternalSubmitForm`). Browser-mode surface test: prefills fields + existing
+ * assets; a DRAFT edit applies IN PLACE (updateListing on the listing's own id, no
+ * revision submit); an APPROVED edit targets the SERVER-resolved SHADOW for the
+ * scalar write (updateRevisionDraft) + submits it (submitListingRevision), shows the
+ * approved-notice; slug is read-only; the OG auto-pull re-fire is non-destructive.
+ *
+ * 🔴 REGRESSION GUARD (audit #3010): removing a prefilled screenshot while editing
+ * an APPROVED listing must target the SHADOW's row id (the id `getMyListingForEdit`
+ * returns — it resolves the shadow server-side), NEVER the live parent's row —
+ * otherwise the delete hits the served listing, bypassing review. The service test
+ * `offsite-listing.edit-consolidate.service.test.ts` proves the server returns
+ * shadow-owned rows; this proves the client removes by exactly that row id.
+ */
+
+const mocks = vi.hoisted(() => ({
+  meta: { data: undefined, isFetching: false, isError: false, isSuccess: false } as {
+    data?: unknown;
+    isFetching?: boolean;
+    isError?: boolean;
+    isSuccess?: boolean;
+  },
+  // The query's `refetch` — a same-url Autofill re-click calls it (staleTime:Infinity +
+  // retry:false makes `setMetaUrl(sameUrl)` a no-op), so we assert it fired on re-click.
+  refetch: vi.fn(),
+  updateListing: vi.fn(),
+  updateRevision: vi.fn(),
+  submitRevision: vi.fn(),
+  removeScreenshot: vi.fn(),
+  setRedMedia: vi.fn(),
+  invalidate: vi.fn(),
+}));
+
+// Runs as a developer who has accepted the App Developer Terms.
+vi.mock('~/components/Apps/AppDeveloperTerms/AppDeveloperTermsCheckbox', () => ({
+  AppDeveloperTermsCheckbox: () => null,
+  useAppDeveloperTermsAccepted: () => true,
+}));
+
+vi.mock('~/utils/trpc', () => {
+  const noopMutation = () => ({ mutate: vi.fn(), mutateAsync: vi.fn().mockResolvedValue({}), isPending: false });
+  const recording = (fn: (v: unknown) => unknown, result: unknown = {}) => () => ({
+    mutate: vi.fn(),
+    mutateAsync: (vars: unknown) => Promise.resolve(fn(vars) ?? result),
+    isPending: false,
+  });
+  return {
+    setTrpcBatchingEnabled: vi.fn(),
+    trpc: {
+      useUtils: () => ({
+        appListings: {
+          listMySubmissions: { invalidate: mocks.invalidate },
+          getMyListingForEdit: { invalidate: mocks.invalidate },
+        },
+      }),
+      appListings: {
+        fetchListingMetaFromUrl: { useQuery: () => ({ ...mocks.meta, refetch: mocks.refetch }) },
+        updateListing: { useMutation: recording(mocks.updateListing) },
+        updateRevisionDraft: { useMutation: recording(mocks.updateRevision) },
+        submitListingRevision: { useMutation: recording(mocks.submitRevision) },
+        removeScreenshot: { useMutation: recording(mocks.removeScreenshot) },
+        // ListingAssetStep procs not otherwise exercised.
+        persistAssetImage: { useMutation: noopMutation },
+        setRedMedia: { useMutation: recording(mocks.setRedMedia) },
+        ingestAssetFromUrl: { useMutation: noopMutation },
+        ingestAssetFromDataUri: { useMutation: noopMutation },
+        setIcon: { useMutation: noopMutation },
+        setCover: { useMutation: noopMutation },
+        addScreenshot: { useMutation: noopMutation },
+      },
+    },
+  };
+});
+
+vi.mock('~/hooks/useCFImageUpload', () => ({
+  useCFImageUpload: () => ({ uploadToCF: vi.fn(), files: [], resetFiles: vi.fn(), removeImage: vi.fn() }),
+}));
+
+vi.mock('~/utils/notifications', () => ({
+  showSuccessNotification: vi.fn(),
+  showErrorNotification: vi.fn(),
+}));
+
+const { ExternalSubmitForm } = await import('./ExternalSubmitForm');
+
+function makeCtx(overrides: Partial<ListingEditContext> = {}): ListingEditContext {
+  return {
+    parentId: 'apl_parent',
+    slug: 'vitrine',
+    status: 'draft',
+    hasPendingRevision: false,
+    shadowId: null,
+    scalars: {
+      name: 'Vitrine',
+      tagline: 'A gallery',
+      description: 'desc',
+      category: 'utility',
+      contentRating: 'g',
+      externalUrl: 'https://vitrine.civitai.com/',
+    },
+    assets: {
+      icon: { imageId: 10, url: 'https://cdn/icon.png' },
+      cover: { imageId: 20, url: 'https://cdn/cover.png' },
+      screenshots: [{ id: 'ss_row', imageId: 30, url: 'https://cdn/s1.png', caption: null, order: 0 }],
+    },
+    ...overrides,
+  };
+}
+
+/**
+ * An APPROVED edit context as `getMyListingForEdit` returns it: `shadowId` is set
+ * and every asset row id is the SHADOW's copy (server-resolved). `shadow-ss-1` is
+ * the SHADOW screenshot row — a removal must target it, not any parent row.
+ */
+function makeApprovedCtx(overrides: Partial<ListingEditContext> = {}): ListingEditContext {
+  return makeCtx({
+    status: 'approved',
+    shadowId: 'shadow-1',
+    assets: {
+      icon: { imageId: 11, url: 'https://cdn/shadow-icon.png' },
+      cover: { imageId: 21, url: 'https://cdn/shadow-cover.png' },
+      screenshots: [
+        { id: 'shadow-ss-1', imageId: 31, url: 'https://cdn/shadow-s1.png', caption: null, order: 0 },
+      ],
+    },
+    ...overrides,
+  });
+}
+
+beforeEach(() => {
+  mocks.meta = { data: undefined, isFetching: false, isError: false, isSuccess: false };
+  mocks.refetch.mockClear();
+  mocks.updateListing.mockClear();
+  mocks.updateRevision.mockClear();
+  mocks.submitRevision.mockClear();
+  mocks.removeScreenshot.mockClear();
+  mocks.setRedMedia.mockClear();
+  mocks.invalidate.mockClear();
+});
+
+describe('ExternalSubmitForm — edit mode', () => {
+  test('prefills the URL and (on Details) the name; slug is read-only', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx()} />);
+    await expect
+      .element(page.getByTestId('apps-offsite-edit-url'))
+      .toHaveValue('https://vitrine.civitai.com/');
+    await page.getByRole('button', { name: 'Next' }).click();
+    await expect.element(page.getByRole('textbox', { name: /^Name/ })).toHaveValue('Vitrine');
+    const slug = page.getByTestId('apps-offsite-edit-slug');
+    await expect.element(slug).toHaveValue('vitrine');
+    expect(slug.element().hasAttribute('readonly')).toBe(true);
+  });
+
+  test('shows the existing icon + cover previews on the Assets step', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx()} />);
+    // URL → Details → Assets.
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page.getByRole('button', { name: 'Next' }).click();
+    await expect
+      .element(page.getByTestId('apps-offsite-current-icon-preview'))
+      .toBeInTheDocument();
+    await expect
+      .element(page.getByTestId('apps-offsite-current-cover-preview'))
+      .toBeInTheDocument();
+  });
+
+  test('a DRAFT edit saves IN PLACE (updateListing on the listing id, no revision submit)', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx({ status: 'draft' })} />);
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page.getByRole('textbox', { name: /^Name/ }).fill('Vitrine Renamed');
+    await page.getByTestId('apps-offsite-edit-save').click();
+
+    await vi.waitFor(() => expect(mocks.updateListing).toHaveBeenCalledTimes(1));
+    expect(mocks.updateListing).toHaveBeenCalledWith(
+      expect.objectContaining({ listingId: 'apl_parent', patch: { name: 'Vitrine Renamed' } })
+    );
+    // No revision for a draft in-place edit.
+    expect(mocks.submitRevision).not.toHaveBeenCalled();
+  });
+
+  test('🔴 an APPROVED edit clears a civitai.red cover ON THE SHADOW, and Save submits that revision for review', async () => {
+    renderWithProviders(
+      <ExternalSubmitForm
+        edit={makeApprovedCtx({
+          redMedia: {
+            available: true,
+            icon: { imageId: null, url: null },
+            cover: { imageId: 41, url: LOADABLE_IMAGE_DATA_URI },
+          },
+        })}
+      />
+    );
+    // URL → Details → Assets.
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page.getByTestId('apps-offsite-remove-red-cover').click();
+    await vi.waitFor(() =>
+      expect(mocks.setRedMedia).toHaveBeenCalledWith({
+        listingId: 'shadow-1',
+        slot: 'cover',
+        imageId: null,
+      })
+    );
+    await page.getByTestId('apps-offsite-edit-save').click();
+    await vi.waitFor(() =>
+      expect(mocks.submitRevision).toHaveBeenCalledWith({ shadowId: 'shadow-1' })
+    );
+    expect(mocks.updateListing).not.toHaveBeenCalled();
+  });
+
+  test('a MODERATOR with no revision yet saves on the live listing, and submits the revision a material change opens', async () => {
+    mocks.updateListing.mockReturnValueOnce({ requiresReview: true, shadowId: 'shadow-new' });
+    renderWithProviders(
+      <ExternalSubmitForm edit={makeApprovedCtx({ role: 'moderator', shadowId: null })} />
+    );
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page.getByRole('textbox', { name: /^Name/ }).fill('Mod Rename');
+    await page.getByTestId('apps-offsite-edit-save').click();
+
+    await vi.waitFor(() =>
+      expect(mocks.submitRevision).toHaveBeenCalledWith({ shadowId: 'shadow-new' })
+    );
+    expect(mocks.updateListing).toHaveBeenCalledWith(
+      expect.objectContaining({ listingId: 'apl_parent', patch: { name: 'Mod Rename' } })
+    );
+    expect(mocks.updateRevision).not.toHaveBeenCalled();
+  });
+
+  test('an OWNER on an approved listing with no revision id still cannot save (the control)', async () => {
+    renderWithProviders(
+      <ExternalSubmitForm edit={makeApprovedCtx({ role: 'owner', shadowId: null })} />
+    );
+    await expect.element(page.getByTestId('apps-offsite-edit-save')).toBeDisabled();
+  });
+
+  test('an APPROVED edit writes the scalar patch to the SHADOW and submits the revision', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeApprovedCtx()} />);
+    // The approved-notice renders.
+    await expect
+      .element(page.getByTestId('apps-offsite-edit-approved-notice'))
+      .toBeInTheDocument();
+
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page.getByRole('textbox', { name: /^Name/ }).fill('Vitrine Live Edit');
+    await page.getByTestId('apps-offsite-edit-save').click();
+
+    await vi.waitFor(() => expect(mocks.submitRevision).toHaveBeenCalledWith({ shadowId: 'shadow-1' }));
+    // The scalar patch targeted the SHADOW, not the live parent (no updateListing).
+    expect(mocks.updateRevision).toHaveBeenCalledWith(
+      expect.objectContaining({ shadowId: 'shadow-1', patch: { name: 'Vitrine Live Edit' } })
+    );
+    expect(mocks.updateListing).not.toHaveBeenCalled();
+  });
+
+  test('🔴 removing a prefilled screenshot on an APPROVED edit targets the SHADOW row id (not the parent)', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeApprovedCtx()} />);
+    // URL → Details → Assets.
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page.getByRole('button', { name: 'Next' }).click();
+    // The prefilled shadow screenshot renders with a Remove control.
+    await page.getByTestId('apps-offsite-screenshot-remove-0').click();
+    await vi.waitFor(() => expect(mocks.removeScreenshot).toHaveBeenCalledTimes(1));
+    // Removal MUST key off the SHADOW's row id — never a live parent row.
+    expect(mocks.removeScreenshot).toHaveBeenCalledWith({ screenshotId: 'shadow-ss-1' });
+  });
+
+  test('shows the derived scopes READ-ONLY + editable SENSITIVE justifications and saves the scope patch', async () => {
+    // A connect listing: the client allows ModelsRead(4)|ModelsWrite(8) = 12.
+    // ModelsWrite is SENSITIVE (gets a required input); ModelsRead is not (collapsed).
+    const ctx = makeCtx({
+      status: 'draft',
+      connectClientId: 'oauth-1',
+      connectAllowedScopes: 12,
+      connectRequestedScopes: 12,
+      connectScopeJustifications: { ModelsWrite: 'original reason' },
+    });
+    renderWithProviders(<ExternalSubmitForm edit={ctx} />);
+    // URL → Details (the scope disclosure lives on Details).
+    await page.getByRole('button', { name: 'Next' }).click();
+    await expect.element(page.getByTestId('apps-offsite-scope-readonly')).toBeInTheDocument();
+    expect(page.getByTestId('sensitive-scope-badge').elements().length).toBeGreaterThan(0);
+    // The non-sensitive ModelsRead(4) has NO justification input (it's collapsed).
+    expect(page.getByTestId('apps-offsite-justification-4').elements()).toHaveLength(0);
+
+    // Edit the ModelsWrite (bit 8) SENSITIVE justification, then save.
+    await page.getByTestId('apps-offsite-justification-8').fill('updated reason');
+    await page.getByTestId('apps-offsite-edit-save').click();
+
+    await vi.waitFor(() => expect(mocks.updateListing).toHaveBeenCalledTimes(1));
+    expect(mocks.updateListing).toHaveBeenCalledWith(
+      expect.objectContaining({
+        listingId: 'apl_parent',
+        patch: expect.objectContaining({
+          requestedScopes: 12,
+          scopeJustifications: { ModelsWrite: 'updated reason' },
+        }),
+      })
+    );
+    // A justification-only edit on a DRAFT is in-place — no revision.
+    expect(mocks.submitRevision).not.toHaveBeenCalled();
+  });
+
+  test('a SENSITIVE justification is REQUIRED on save — an empty one blocks the save', async () => {
+    // UserRead(1) is sensitive; the prefill has no justification for it.
+    const ctx = makeCtx({
+      status: 'draft',
+      connectClientId: 'oauth-1',
+      connectAllowedScopes: 1,
+      connectRequestedScopes: 1,
+      connectScopeJustifications: {},
+    });
+    renderWithProviders(<ExternalSubmitForm edit={ctx} />);
+    await page.getByRole('button', { name: 'Next' }).click();
+    // Change the name so there IS a scalar change to save.
+    await page.getByRole('textbox', { name: /^Name/ }).fill('Renamed');
+    await page.getByTestId('apps-offsite-edit-save').click();
+    // Save is blocked — no mutation fires — and the required error is surfaced.
+    await expect
+      .element(page.getByText('A justification is required for this permission.'))
+      .toBeInTheDocument();
+    expect(mocks.updateListing).not.toHaveBeenCalled();
+    // Filling the justification unblocks the save.
+    await page.getByTestId('apps-offsite-justification-1').fill('needed to greet the user');
+    await page.getByTestId('apps-offsite-edit-save').click();
+    await vi.waitFor(() => expect(mocks.updateListing).toHaveBeenCalledTimes(1));
+  });
+
+  test('an existing listing with a BLANK App URL is grandfathered — prompts but does not block', async () => {
+    const ctx = makeCtx({
+      status: 'draft',
+      scalars: {
+        name: 'Vitrine',
+        tagline: null,
+        description: null,
+        category: null,
+        contentRating: 'g',
+        externalUrl: '', // pre-existing blank URL
+      },
+    });
+    renderWithProviders(<ExternalSubmitForm edit={ctx} />);
+    // The URL step prompts to add one (does NOT hard-block).
+    await expect.element(page.getByTestId('apps-offsite-edit-url-prompt')).toBeInTheDocument();
+    // Advancing is allowed despite the blank URL.
+    await page.getByTestId('apps-offsite-wizard-next-url').click();
+    await page.getByRole('textbox', { name: /^Name/ }).fill('Vitrine Renamed');
+    await page.getByTestId('apps-offsite-edit-save').click();
+    await vi.waitFor(() => expect(mocks.updateListing).toHaveBeenCalledTimes(1));
+    expect(mocks.updateListing).toHaveBeenCalledWith(
+      expect.objectContaining({ listingId: 'apl_parent', patch: { name: 'Vitrine Renamed' } })
+    );
+  });
+
+  test('a listing with no connect client shows no scope section', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx({ connectClientId: null })} />);
+    await page.getByRole('button', { name: 'Next' }).click();
+    expect(page.getByTestId('apps-offsite-scope-disclosure').elements()).toHaveLength(0);
+  });
+
+  test('the OG auto-pull re-fire is non-destructive (a prefilled name is not clobbered)', async () => {
+    // Simulate the auto-pull returning a different name suggestion.
+    mocks.meta = {
+      data: { name: 'Some OG Title', tagline: '', coverImageUrl: undefined, iconImageUrl: undefined },
+      isFetching: false,
+      isSuccess: true,
+    };
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx()} />);
+    // Re-advance the URL (fires the auto-pull) then check Details.
+    await page.getByRole('button', { name: 'Next' }).click();
+    // Name stays the prefilled value — the OG suggestion only fills a BLANK name.
+    await expect.element(page.getByRole('textbox', { name: /^Name/ })).toHaveValue('Vitrine');
+  });
+});
+
+
+/**
+ * Auto-trigger + assets-step "Re-pull from site" (edit wizard). The manual "Autofill
+ * from website" button was REMOVED: a CHANGE of the App URL to a valid https URL now
+ * auto-fires the OG pull (the prefilled URL does NOT auto-fire on mount), a subtle
+ * inline status reports the four-state outcome, and the assets step carries the manual
+ * retry. Non-destructive: a suggestion is only actionable for an EMPTY slot.
+ */
+function makeEmptyAssetsCtx(overrides: Partial<ListingEditContext> = {}): ListingEditContext {
+  return makeCtx({
+    assets: {
+      icon: { imageId: null, url: null },
+      cover: { imageId: null, url: null },
+      screenshots: [],
+    },
+    ...overrides,
+  });
+}
+
+describe('ExternalSubmitForm — edit mode auto-trigger + re-pull', () => {
+  const fullMeta = {
+    data: {
+      description: 'Pulled description',
+      coverImageUrl: 'https://cdn/og-cover.png',
+      iconImageUrl: 'https://cdn/og-icon.png',
+    },
+    isFetching: false,
+    isSuccess: true,
+  };
+
+  test('the manual "Autofill from website" button is GONE (auto-trigger replaces it)', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeEmptyAssetsCtx()} />);
+    expect(page.getByTestId('apps-offsite-edit-autofill').elements()).toHaveLength(0);
+  });
+
+  test('CHANGING the URL to a new valid URL auto-fires and surfaces "Use this" icon/cover for EMPTY slots', async () => {
+    mocks.meta = fullMeta;
+    renderWithProviders(<ExternalSubmitForm edit={makeEmptyAssetsCtx()} />);
+    // Change the prefilled URL to a NEW one and blur → auto-fire.
+    await page.getByTestId('apps-offsite-edit-url').fill('https://new-url.example.com');
+    await page.getByTestId('apps-offsite-edit-url').element().blur();
+    await expect
+      .element(page.getByTestId('apps-offsite-edit-autofill-applied'))
+      .toBeInTheDocument();
+    // URL → Details → Assets.
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page.getByRole('button', { name: 'Next' }).click();
+    await expect.element(page.getByTestId('apps-offsite-accept-icon')).toBeInTheDocument();
+    await expect.element(page.getByTestId('apps-offsite-accept-cover')).toBeInTheDocument();
+  });
+
+  test('a fully-populated listing + a URL change shows the honest empty (already-set) note, not "applied"', async () => {
+    // The listing already has an attached icon + cover; a suggestion for a filled slot
+    // is not actionable, so the note is the honest "already set", never "applied".
+    mocks.meta = fullMeta;
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx()} />);
+    await page.getByTestId('apps-offsite-edit-url').fill('https://new-url.example.com');
+    await page.getByTestId('apps-offsite-edit-url').element().blur();
+    await expect
+      .element(page.getByTestId('apps-offsite-edit-autofill-empty'))
+      .toBeInTheDocument();
+    expect(page.getByTestId('apps-offsite-edit-autofill-applied').elements()).toHaveLength(0);
+  });
+
+  test('the assets-step "Re-pull from site" button re-runs the pull and surfaces suggestions for empty slots', async () => {
+    mocks.meta = fullMeta;
+    renderWithProviders(<ExternalSubmitForm edit={makeEmptyAssetsCtx()} />);
+    // Navigate to Assets WITHOUT changing the URL — the prefilled URL does not auto-fire
+    // on mount, so no suggestions yet.
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page.getByRole('button', { name: 'Next' }).click();
+    expect(page.getByTestId('apps-offsite-accept-icon').elements()).toHaveLength(0);
+    // Re-pull fires the query → suggestions surface as accept tiles.
+    await page.getByTestId('apps-offsite-assets-repull').click();
+    await expect.element(page.getByTestId('apps-offsite-accept-icon')).toBeInTheDocument();
+    await expect.element(page.getByTestId('apps-offsite-accept-cover')).toBeInTheDocument();
+  });
+
+  test('an errored pull (via a URL change) shows the error note', async () => {
+    mocks.meta = { data: undefined, isFetching: false, isError: true };
+    renderWithProviders(<ExternalSubmitForm edit={makeEmptyAssetsCtx()} />);
+    await page.getByTestId('apps-offsite-edit-url').fill('https://broken.example.com');
+    await page.getByTestId('apps-offsite-edit-url').element().blur();
+    await expect
+      .element(page.getByTestId('apps-offsite-edit-autofill-error'))
+      .toBeInTheDocument();
+  });
+});
+
+/**
+ * 🔴 KIND-AWARE EDIT SURFACE, pinned in BOTH directions.
+ *
+ * The canonical authoring page (`/apps/listing/<id>/edit`) defaults to its DETAILS tab,
+ * so an ON-SITE owner clicking "Edit" now lands in this form — a population it never saw
+ * while the block-keyed editor opened on the manifest tab. The form itself is the
+ * OFF-SITE submit wizard in edit mode, so without a kind branch it offers an on-site app
+ * an "App URL" step and an OAuth-scope disclosure that describe nothing it has.
+ *
+ * Asserting only the on-site absence would pass on a form that shows the URL step to
+ * NOBODY, which would break the off-site listings the step exists for — so each case
+ * asserts the presence AND the absence.
+ */
+describe('ExternalSubmitForm (edit) — kind-aware wizard shape', () => {
+  test('🔴 an ON-SITE listing gets NO App URL step and NO scope disclosure', async () => {
+    renderWithProviders(
+      <ExternalSubmitForm edit={makeCtx({ kind: 'onsite', connectClientId: 'oc_1' })} />
+    );
+    // The DETAILS step is the commit proof — it must render, and it is where an on-site
+    // edit now opens (there is no earlier step to sit on).
+    await expect
+      .element(page.getByTestId('apps-offsite-wizard-step-details'))
+      .toBeInTheDocument();
+    expect(page.getByTestId('apps-offsite-wizard-step-url').elements()).toHaveLength(0);
+    expect(page.getByTestId('apps-offsite-scope-disclosure').elements()).toHaveLength(0);
+  });
+
+  test('an OFF-SITE listing STILL gets the App URL step (the control)', async () => {
+    renderWithProviders(
+      <ExternalSubmitForm edit={makeCtx({ kind: 'offsite', connectClientId: 'oc_1' })} />
+    );
+    await expect.element(page.getByTestId('apps-offsite-wizard-step-url')).toBeInTheDocument();
+  });
+
+  test('a context with NO kind still gets the URL step — unchanged behaviour', async () => {
+    // Every pre-existing caller and fixture predates the field; absent must mean off-site.
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx()} />);
+    await expect.element(page.getByTestId('apps-offsite-wizard-step-url')).toBeInTheDocument();
+  });
+});
+
+/**
+ * 🔴 THE EDIT HEADER, pinned in BOTH directions — the last piece of the form that was
+ * NOT kind-aware.
+ *
+ * Observed in production on the canonical editor for an ON-SITE listing: an
+ * external-link icon over "Update your external-link app. Change the link, details, or
+ * assets across the steps below, then save." — about an app that has no link, on a
+ * wizard that (correctly) renders it no URL step. The shape was fixed; the header was
+ * not, so the page contradicted itself.
+ *
+ * 🔴 ASSERTED AS STATE, NOT AS SPELLING. The two branches render DIFFERENT elements
+ * (`apps-listing-edit-header-onsite` / `-offsite`), so the primary assertion is which
+ * element exists — a check no other feature's copy can satisfy by coincidence. The
+ * word-level assertion is SCOPED to that element rather than to the page, for the same
+ * reason: a page-wide "does the body contain 'link'" search is satisfied by the Assets
+ * step, the OG re-pull button, or any future control that happens to say it.
+ */
+describe('ExternalSubmitForm (edit) — the kind-aware header', () => {
+  test('🔴 an ON-SITE listing gets the on-site header, and it does NOT promise a link', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx({ kind: 'onsite' })} />);
+
+    // 🔴 AWAITED PRESENT ELEMENT FIRST. `locator.elements()` is SYNCHRONOUS, so an
+    // absence asserted before React has committed passes whatever the component renders.
+    const header = page.getByTestId('apps-listing-edit-header-onsite');
+    await expect.element(header).toBeInTheDocument();
+
+    // The STATE: the off-site header is not the one that rendered.
+    expect(page.getByTestId('apps-listing-edit-header-offsite').elements()).toHaveLength(0);
+
+    // …and the sentence inside THAT element makes no claim about a link.
+    await expect.element(header).not.toHaveTextContent(/\blinks?\b/i);
+    await expect.element(header).not.toHaveTextContent(/external/i);
+    // It still says what an on-site owner CAN change, so this is not "delete the copy".
+    await expect.element(header).toHaveTextContent(/details/i);
+    await expect.element(header).toHaveTextContent(/assets/i);
+    // The slug title is untouched by the kind branch.
+    await expect.element(header).toHaveTextContent(/Editing vitrine/i);
+  });
+
+  test('🔴 the ON-SITE header carries the app icon, not the external-link icon', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx({ kind: 'onsite' })} />);
+    const header = page.getByTestId('apps-listing-edit-header-onsite');
+    await expect.element(header).toBeInTheDocument();
+    // An external-link glyph is the same wrong claim in pictorial form. Asserted on the
+    // icon COMPONENT that rendered (its own class), scoped inside the header.
+    const el = header.element();
+    expect(el.querySelector('svg.tabler-icon-apps')).not.toBeNull();
+    expect(el.querySelector('svg.tabler-icon-external-link')).toBeNull();
+  });
+
+  test('an OFF-SITE listing STILL gets the off-site header, link and all (the control)', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx({ kind: 'offsite' })} />);
+    const header = page.getByTestId('apps-listing-edit-header-offsite');
+    await expect.element(header).toBeInTheDocument();
+    expect(page.getByTestId('apps-listing-edit-header-onsite').elements()).toHaveLength(0);
+    await expect.element(header).toHaveTextContent(/Change the link, details, or assets/i);
+    expect(header.element().querySelector('svg.tabler-icon-external-link')).not.toBeNull();
+  });
+
+  test('a context with NO kind keeps the OFF-SITE header — unchanged behaviour', async () => {
+    // Every pre-existing caller and fixture predates the field; absent must mean off-site,
+    // exactly as it does for the URL step.
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx()} />);
+    await expect.element(page.getByTestId('apps-listing-edit-header-offsite')).toBeInTheDocument();
+  });
+
+  /**
+   * 🔴 THE SEAM, asserted on the RENDERED page rather than on two pure functions: the
+   * header may mention a link EXACTLY when the URL step exists. This is the contradiction
+   * the defect actually was — a header describing a step that is not on screen.
+   */
+  test('🔴 the header mentions the link exactly when the URL step is rendered', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx({ kind: 'onsite' })} />);
+    await expect.element(page.getByTestId('apps-listing-edit-header-onsite')).toBeInTheDocument();
+    expect(page.getByTestId('apps-offsite-wizard-step-url').elements()).toHaveLength(0);
+
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx({ kind: 'offsite' })} />);
+    await expect.element(page.getByTestId('apps-offsite-wizard-step-url')).toBeInTheDocument();
+    await expect
+      .element(page.getByTestId('apps-listing-edit-header-offsite'))
+      .toHaveTextContent(/link/i);
+  });
+});
+
+describe('ExternalSubmitForm (edit) — source repository', () => {
+  const REPO = 'https://github.com/civitai/vitrine';
+
+  test('prefills the field and sends the edited value in the scalar patch', async () => {
+    const ctx = makeCtx({ scalars: { ...makeCtx().scalars, sourceRepoUrl: REPO } });
+    renderWithProviders(<ExternalSubmitForm edit={ctx} />);
+    // URL → Details (the source-repo input lives on Details, beside Description).
+    await page.getByRole('button', { name: 'Next' }).click();
+
+    const input = page.getByTestId('apps-offsite-edit-source-repo');
+    await expect.element(input).toHaveValue(REPO);
+    await input.fill('https://gitlab.com/other/app');
+    await page.getByTestId('apps-offsite-edit-save').click();
+
+    await vi.waitFor(() => expect(mocks.updateListing).toHaveBeenCalledTimes(1));
+    expect(mocks.updateListing).toHaveBeenCalledWith(
+      expect.objectContaining({
+        patch: expect.objectContaining({ sourceRepoUrl: 'https://gitlab.com/other/app' }),
+      })
+    );
+  });
+
+  test('🔴 CLEARING the field sends an explicit null (an empty string would not clear it)', async () => {
+    const ctx = makeCtx({ scalars: { ...makeCtx().scalars, sourceRepoUrl: REPO } });
+    renderWithProviders(<ExternalSubmitForm edit={ctx} />);
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page.getByTestId('apps-offsite-edit-source-repo').fill('');
+    await page.getByTestId('apps-offsite-edit-save').click();
+
+    await vi.waitFor(() => expect(mocks.updateListing).toHaveBeenCalledTimes(1));
+    const arg = mocks.updateListing.mock.calls[0][0] as { patch: Record<string, unknown> };
+    expect('sourceRepoUrl' in arg.patch).toBe(true);
+    expect(arg.patch.sourceRepoUrl).toBeNull();
+  });
+
+  test('an INVALID link surfaces the server validator’s message and BLOCKS the save', async () => {
+    renderWithProviders(<ExternalSubmitForm edit={makeCtx()} />);
+    await page.getByRole('button', { name: 'Next' }).click();
+    await page
+      .getByTestId('apps-offsite-edit-source-repo')
+      .fill('https://raw.githubusercontent.com/o/r/main/x.sh');
+    await page.getByTestId('apps-offsite-edit-save').click();
+
+    await expect.element(page.getByText(/not an accepted source host/)).toBeInTheDocument();
+    expect(mocks.updateListing).not.toHaveBeenCalled();
+  });
+
+  test('the field’s help text warns that an edit needs moderator re-review', async () => {
+    // A source-repo change is MATERIAL, so on an approved listing it stages a shadow
+    // revision. An author who is not told that reads the unchanged live page as a bug.
+    renderWithProviders(<ExternalSubmitForm edit={makeApprovedCtx()} />);
+    await page.getByRole('button', { name: 'Next' }).click();
+    await expect.element(page.getByText(/moderator re-review/i)).toBeInTheDocument();
+  });
+});

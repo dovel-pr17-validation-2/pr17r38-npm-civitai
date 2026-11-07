@@ -1,0 +1,62 @@
+import type { SyntheticEvent } from 'react';
+import { forwardRef, useCallback, useImperativeHandle, useRef } from 'react';
+import styles from './EdgeImage.module.scss';
+import clsx from 'clsx';
+import { setMediaDragData } from '~/components/EdgeMedia/media-drag-data';
+import type { EdgeUrlProps } from '~/client-utils/cf-images-utils';
+import { useEdgeUrl } from '~/client-utils/cf-images-utils';
+import { edgeImageUrlOptions } from '~/client-utils/edge-url';
+
+export type EdgeImageProps = React.ImgHTMLAttributes<HTMLImageElement> & {
+  src: string;
+  fadeIn?: boolean;
+  options: Omit<EdgeUrlProps, 'src'>;
+  /** Database image ID — included in drag data so drop targets can look up metadata server-side */
+  imageId?: number;
+  /** Also serve a variant sized for a 2x display. See `useEdgeUrl`. */
+  hiDpi?: boolean;
+};
+
+export const EdgeImage = forwardRef<HTMLImageElement, EdgeImageProps>(
+  (
+    { className, fadeIn, src, options, style, onLoad, onError, imageId, hiDpi, ...props },
+    forwardedRef
+  ) => {
+    // const ref = useRef<HTMLImageElement>(null);
+    const { url, srcSet } = useEdgeUrl(src, edgeImageUrlOptions(options), hiDpi);
+
+    // useImperativeHandle(forwardedRef, () => ref.current as HTMLImageElement);
+
+    const handleLoad = useCallback(
+      (e: SyntheticEvent<HTMLImageElement, Event>) => {
+        if (fadeIn) e.currentTarget.style.opacity = '1';
+        onLoad?.(e);
+      },
+      [fadeIn]
+    );
+
+    const handleError = useCallback((e: SyntheticEvent<HTMLImageElement, Event>) => {
+      e.currentTarget.classList.add(styles.loadError);
+      onError?.(e);
+    }, []);
+
+    return (
+      // eslint-disable-next-line jsx-a11y/alt-text, @next/next/no-img-element
+      <img
+        ref={forwardedRef}
+        className={clsx(styles.image, { [styles.fadeIn]: fadeIn }, className)}
+        onLoad={handleLoad}
+        onError={handleError}
+        src={url}
+        srcSet={srcSet}
+        style={{ maxWidth: options?.width ? options.width : undefined, ...style }}
+        onDragStart={(e) => {
+          setMediaDragData(e.dataTransfer, { url, mediaId: imageId || undefined, type: 'image' });
+        }}
+        {...props}
+      />
+    );
+  }
+);
+
+EdgeImage.displayName = 'EdgeImage';

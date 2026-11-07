@@ -1,0 +1,282 @@
+import {
+  ActionIcon,
+  Badge,
+  Box,
+  Button,
+  Center,
+  Divider,
+  Group,
+  Highlight,
+  Image,
+  Loader,
+  Stack,
+  Text,
+  TextInput,
+  Modal,
+} from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import { ChatMemberStatus } from '~/shared/utils/prisma/enums';
+import {
+  IconCloudOff,
+  IconSearch,
+  IconSend,
+  IconUsers,
+  IconUserX,
+  IconX,
+} from '@tabler/icons-react';
+import produce from 'immer';
+import React, { useEffect, useState } from 'react';
+import { useChatStore } from '~/components/Chat/ChatProvider';
+import { UserAvatar } from '~/components/UserAvatar/UserAvatar';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import type { ChatListMessage } from '~/types/router';
+import { showErrorNotification } from '~/utils/notifications';
+import { trpc } from '~/utils/trpc';
+import { useDialogContext } from '~/components/Dialog/DialogProvider';
+import chatClasses from './Chat.module.scss';
+import classes from './ChatList.module.css';
+import { clsx } from 'clsx';
+import { chatPreviewText } from '~/components/Chat/util';
+
+export default function ChatShareModal(props: { message: string }) {
+  const dialog = useDialogContext();
+
+  const currentUser = useCurrentUser();
+  const queryUtils = trpc.useUtils();
+  const [filteredData, setFilteredData] = useState<ChatListMessage[]>([]);
+  const [searchInput, setSearchInput] = useState<string>('');
+  const [selectedChat, setSelectedChat] = useState<number | undefined>(undefined);
+  const [isSending, setIsSending] = useState(false);
+
+  const { data, isLoading } = trpc.chat.getAllByUser.useQuery();
+
+  useEffect(() => {
+    if (!data) return;
+
+    const activeData = data.filter((d) => {
+      const tStatus = d.chatMembers.find((cm) => cm.userId === currentUser?.id)?.status;
+      if (tStatus === ChatMemberStatus.Joined) return d;
+    });
+
+    const activeFiltered =
+      searchInput.length > 0
+        ? activeData.filter((d) => {
+            if (
+              d.chatMembers
+                .filter((cm) => cm.userId !== currentUser?.id)
+                .some((cm) => cm.user.username?.toLowerCase().includes(searchInput))
+            )
+              return d;
+          })
+        : activeData;
+
+    activeFiltered.sort((a, b) => {
+      const aDate = a.messages[0]?.createdAt ?? a.createdAt;
+      const bDate = b.messages[0]?.createdAt ?? b.createdAt;
+      return aDate < bDate ? 1 : -1;
+    });
+
+    setFilteredData(activeFiltered);
+  }, [currentUser?.id, data, searchInput]);
+
+  const { mutate } = trpc.chat.createMessage.useMutation({
+    onSuccess(data) {
+      queryUtils.chat.getInfiniteMessages.setInfiniteData(
+        { chatId: data.chatId },
+        produce((old) => {
+          if (!old) return old;
+
+          // The backend returns messages grouped in chunks (pages).
+          // `old.pages[0]` contains the newest chunk of messages.
+          const newestPage = old.pages[0];
+          newestPage.items.push(data);
+        })
+      );
+
+      queryUtils.chat.getAllByUser.setData(
+        undefined,
+        produce((old) => {
+          if (!old) return old;
+
+          const thisChat = old.find((o) => o.id === data.chatId);
+          if (!thisChat) return old;
+          thisChat.messages = [
+            {
+              content: data.content,
+              userId: data.userId,
+              contentType: data.contentType,
+              createdAt: new Date(data.createdAt),
+            },
+          ];
+        })
+      );
+      useChatStore.setState({ existingChatId: selectedChat, open: true, isSettingsOpen: false });
+      dialog.onClose();
+      setIsSending(false);
+    },
+    onError(error) {
+      setIsSending(false);
+      showErrorNotification({
+        title: 'Failed to send message.',
+        error: new Error(error.message),
+        autoClose: false,
+      });
+    },
+  });
+
+  const handleClick = () => {
+    if (!selectedChat) return;
+
+    setIsSending(true);
+    mutate({
+      chatId: selectedChat,
+      content: props.message,
+    });
+  };
+
+  return (
+    // The content is capped at the viewport; flexing the body down into it keeps the
+    // list the only scroller, so Message and Send stay on screen at short heights.
+    // Everything but the list is shrink-0: Button is overflow:hidden, so it would
+    // otherwise shrink to nothing once the list fills the cap.
+    <Modal
+      {...dialog}
+      title="Send Chat"
+      size="sm"
+      classNames={{
+        content: clsx(chatClasses.tokens, 'flex flex-col'),
+        body: 'flex min-h-0 flex-1 flex-col',
+      }}
+    >
+      <Stack gap={0} className="min-h-0 flex-1">
+        <Box p="sm" pt={0} className="shrink-0">
+          <TextInput
+            leftSection={<IconSearch size={16} />}
+            placeholder="Filter by user"
+            value={searchInput}
+            onChange={(event) => setSearchInput(event.currentTarget.value.toLowerCase())}
+            rightSection={
+              <ActionIcon
+                onClick={() => {
+                  setSearchInput('');
+                }}
+                disabled={!searchInput.length}
+              >
+                <IconX size={16} />
+              </ActionIcon>
+            }
+          />
+        </Box>
+        <Divider className="shrink-0" />
+        <Box mah={500} className="min-h-0 flex-auto overflow-y-auto">
+          {isLoading ? (
+            <Center h="100%">
+              <Loader />
+            </Center>
+          ) : !filteredData || filteredData.length === 0 ? (
+            <Stack p="sm" align="center">
+              <Text>No chats.</Text>
+              <IconCloudOff size={36} />
+            </Stack>
+          ) : (
+            <Stack p="xs" gap={4}>
+              {filteredData.map((d) => {
+                const myMember = d.chatMembers.find((cm) => cm.userId === currentUser?.id);
+                const otherMembers = d.chatMembers.filter((cm) => cm.userId !== currentUser?.id);
+                const isModSender = !!otherMembers.find(
+                  (om) => om.isOwner === true && om.user.isModerator === true
+                );
+                const hasMod = otherMembers.some((om) => om.user.isModerator === true);
+
+                return (
+                  <Group
+                    key={d.id}
+                    wrap="nowrap"
+                    className={clsx(classes.selectChat, {
+                      [classes.selectedChat]: d.id === selectedChat,
+                    })}
+                    onClick={() => {
+                      setSelectedChat(d.id);
+                    }}
+                  >
+                    <Box>
+                      {otherMembers.length > 1 ? (
+                        <IconUsers width={26} />
+                      ) : otherMembers.length === 0 ? (
+                        <IconUserX width={26} />
+                      ) : (
+                        <UserAvatar user={otherMembers[0].user} />
+                      )}
+                    </Box>
+                    <Stack style={{ overflow: 'hidden' }} gap={0}>
+                      <Highlight
+                        size="sm"
+                        fw={500}
+                        style={{
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          minWidth: 0,
+                        }}
+                        color={hasMod ? 'red' : undefined}
+                        highlight={searchInput}
+                      >
+                        {otherMembers.map((cm) => cm.user.username).join(', ')}
+                      </Highlight>
+                      {/* TODO this is kind of a hack, we should be returning only valid latest message */}
+                      {!!d.messages[0]?.content && myMember?.status === ChatMemberStatus.Joined && (
+                        <Text
+                          size="xs"
+                          style={{
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            minWidth: 0,
+                          }}
+                        >
+                          {chatPreviewText({
+                            message: d.messages[0],
+                            viewerId: currentUser?.id,
+                            otherMembers,
+                          })}
+                        </Text>
+                      )}
+                    </Stack>
+                    <Group style={{ marginLeft: 'auto' }} wrap="nowrap" gap={6}>
+                      {isModSender && (
+                        <Tooltip
+                          withArrow={false}
+                          label="Moderator chat"
+                          style={{ border: '1px solid gray' }}
+                        >
+                          <Image src="/images/civ-c.png" alt="Moderator" className="size-4" />
+                        </Tooltip>
+                      )}
+                    </Group>
+                  </Group>
+                );
+              })}
+            </Stack>
+          )}
+        </Box>
+        <Divider className="shrink-0" />
+        <Group py="sm" className="shrink-0">
+          <Badge>Message:</Badge>
+          <Text size="sm" fs="italic">
+            {props.message}
+          </Text>
+        </Group>
+        <Divider className="shrink-0" />
+        <Button
+          className="shrink-0"
+          loading={isSending}
+          disabled={!selectedChat}
+          leftSection={<IconSend />}
+          onClick={handleClick}
+        >
+          Send
+        </Button>
+      </Stack>
+    </Modal>
+  );
+}

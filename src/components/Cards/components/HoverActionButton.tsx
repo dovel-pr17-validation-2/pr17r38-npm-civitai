@@ -1,0 +1,90 @@
+import React from 'react';
+import type { MantineColor, ThemeIconProps, UnstyledButtonProps } from '@mantine/core';
+import { Badge, ThemeIcon } from '@mantine/core';
+import { IconArrowRight } from '@tabler/icons-react';
+import classes from './HoverActionButton.module.scss';
+import clsx from 'clsx';
+
+const CUSTOM_VARIANTS = ['white'] as const;
+type CustomVariantType = (typeof CUSTOM_VARIANTS)[number];
+
+// forwardRef so it can be a Mantine `Menu.Target`.
+const HoverActionButton = React.forwardRef<HTMLButtonElement, Props>(function HoverActionButton(
+  {
+    label,
+    children,
+    size,
+    themeIconProps = {},
+    color = 'green',
+    variant = 'filled',
+    onClick,
+    keepIconOnHover = false,
+    style,
+    className,
+    ...props
+  },
+  ref
+) {
+  const isCustomVariant = CUSTOM_VARIANTS.includes(color as CustomVariantType);
+  const colorCustomVariant = color as CustomVariantType;
+
+  return (
+    <button
+      ref={ref}
+      style={{
+        ...style,
+        // @ts-ignore
+        '--size': `${size}px`,
+      }}
+      onClick={onClick}
+      {...props}
+      // After the spread, and merged rather than replaced: as a Mantine
+      // `Menu.Target` this component is cloned with a `className` of the
+      // popover's own, which would otherwise drop `wrapper` and take the icon
+      // layout and hover-expand animation with it.
+      className={clsx(
+        classes.wrapper,
+        isCustomVariant ? classes[colorCustomVariant] : undefined,
+        className
+      )}
+    >
+      <Badge className={classes.label} size="xs" variant={variant} color={color}>
+        {label}
+      </Badge>
+      <ThemeIcon
+        {...themeIconProps}
+        className={classes.icon}
+        color={color}
+        radius="xl"
+        size={size}
+        variant={variant}
+      >
+        {children}
+      </ThemeIcon>
+      {!keepIconOnHover && (
+        <ThemeIcon
+          {...themeIconProps}
+          className={classes.hover}
+          color={color}
+          radius="xl"
+          size={size}
+          variant={variant}
+        >
+          <IconArrowRight size={16} stroke={2.5} />
+        </ThemeIcon>
+      )}
+    </button>
+  );
+});
+
+type Props = UnstyledButtonProps & {
+  label: string;
+  children: React.ReactNode;
+  variant?: 'light' | 'filled';
+  themeIconProps?: Omit<ThemeIconProps, 'children' | 'size' | 'color' | 'variant'>;
+  size: number;
+  color?: MantineColor | CustomVariantType;
+  onClick?: (e: React.MouseEvent<HTMLButtonElement>) => void;
+  keepIconOnHover?: boolean;
+};
+export default HoverActionButton;

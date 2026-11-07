@@ -1,0 +1,516 @@
+/**
+ * App Store Listings (W13) — submissions-table view-model logic (PURE, no React):
+ * the text filter, the column comparators, the per-app version-collapse and the
+ * currently-published version. Extracted so each piece is
+ * unit-testable without mounting a table.
+ *
+ * The two row shapes differ (onsite has a block id + version; offsite has a slug +
+ * external URL), so every helper here is GENERIC over the row type `T` and reads
+ * the sortable / filterable / identity fields through a small `SubmissionAccessors`
+ * adapter the caller supplies. That keeps this module free of any dependency on the
+ * concrete `Submission` / `OffsiteSubmission` types.
+ */
+
+// ── layout ─────────────────────────────────────────────────────────────────────
+
+/**
+ * The horizontal floor (px) for the /apps/my-submissions table, handed to
+ * Mantine's `Table.ScrollContainer` as `minWidth`.
+ *
+ * ⚠ The onsite table it was measured on (`MySubmissionsList`) has been deleted; the
+ * prose below is the history of that measurement, and the value now serves only the
+ * offsite table, whose own natural width has never been measured.
+ *
+ * Why it exists: both lists render `<Table>` inside `<Card withBorder p={0}>`, and
+ * Mantine's `.mantine-Card-root` sets `overflow: hidden`. The onsite row's action
+ * cell is a `<Group wrap="nowrap">` of up to six buttons (Open live · Unpublish /
+ * Republish · Edit · Listing images · Revenue · History), so the row has a hard
+ * min-content width that the card SILENTLY CLIPPED — measured at 1497 px viewport:
+ * card `clientWidth 1286` vs `scrollWidth 1424`, i.e. 138 px of row actions cut off
+ * with no scrollbar and no other affordance. Wrapping the table in a scroll
+ * container converts that silent clip into a real horizontal scroll.
+ *
+ * The value is seeded from that measurement: 1424 px is the onsite table's measured
+ * natural width with the full action set, so the table scrolls exactly when the
+ * card is narrower than 1424 and not otherwise.
+ *
+ * 🔴 THE FLOOR ALONE WAS NOT ENOUGH — see {@link MY_SUBMISSIONS_CONTAINER_SIZE}.
+ * The page's container was `AppsPageLayout`'s default `'xl'`, i.e. Mantine's 1320 px
+ * token, which is a MAX-width: at every viewport >= 1320 px the card computed a
+ * constant 1320 − 32 (Container padding) − 2 (Card border) = 1286 px. 1286 < 1424,
+ * so a scroll container on its own left a permanent ~138 px scroll region on EVERY
+ * desktop viewport — the clip became a scrollbar rather than going away. The page
+ * therefore also widens its container past this floor.
+ *
+ * 🔴 The wrapper clips on BOTH axes. Mantine's `Table.ScrollContainer` sets only
+ * `overflow-x`; per the CSS overflow spec a non-`visible` value on one axis computes
+ * the other to `auto`, so `overflow-y` is `auto` too (browser-confirmed). That is
+ * safe today only because the two in-cell overlays these rows render explicitly pass
+ * `withinPortal` (`AppAnalyticsInline`'s `Tooltip` and `ListingProblemsIndicator`'s
+ * `HoverCard`) — and the repo theme sets `Popover: { defaultProps: { withinPortal: false } }`
+ * GLOBALLY, so any future non-portaled `Popover`/`HoverCard`/`Menu` rendered inside
+ * a cell WILL be clipped by this wrapper. Portal it, or it will be cut off.
+ *
+ * 🔴 SHARED BY BOTH LISTS ON PURPOSE. The offsite table (6 columns) is narrower
+ * today and would not need this large a floor on its own, but:
+ *   - the two tables are stacked sections of the SAME page, and a shared floor keeps
+ *     them the same width instead of stepping against each other;
+ *   - the offsite action cell is converging on the onsite one (Edit · Unpublish /
+ *     Republish · Withdraw · History · problems indicator · revision badge), so a
+ *     shared floor stops it silently re-acquiring the same clip as it grows;
+ *   - any separate offsite number would be invented — nobody has measured that
+ *     table's natural width.
+ * Accepted cost: on the offsite table this introduces horizontal scrolling at
+ * container widths between its own natural width and 1424 where there is none today.
+ * If someone measures the offsite table and wants its own floor, split this into two
+ * constants HERE — do not hardcode a literal at a call site.
+ */
+export const SUBMISSIONS_TABLE_MIN_WIDTH = 1424;
+
+/*
+ * 🔴 THE LEFT RAIL WIDENS THE BAND THAT SCROLLS, AND THAT COST WAS ACCEPTED RATHER THAN
+ * EXEMPTED. Recorded here, at the constant, because "why does `/apps/build` scroll
+ * sideways on my laptop" is a question asked of this number.
+ *
+ * The rail takes 276px off the body on every `/apps/*` route, so the container width the
+ * table sees drops by that much and this floor bites at wider viewports than before.
+ * Measured, as VIEWPORT widths (each already net of a 10px reserved scrollbar and the
+ * Container's 32px gutter):
+ *
+ *   viewport   today      rail OPEN   rail COLLAPSED
+ *   1440       SCROLLS    SCROLLS     SCROLLS
+ *   1600       fits       SCROLLS     fits
+ *   1920       fits       fits        fits
+ *
+ * 🔴 THE FIRST ROW IS THE ONE THAT SETTLES IT: `/apps/build` ALREADY SCROLLS AT 1440
+ * TODAY — by this paragraph's own method (net of the 10px reserved scrollbar and the
+ * 32px gutter) the container yields `1440 − 10 − 32 = 1398` against this 1424 floor,
+ * 26px short — so the rail does not INTRODUCE horizontal scrolling on this page, it
+ * widens a band that already exists by one viewport step (1600).
+ *
+ * ⚠️ An earlier revision wrote "1408 … 16px short", which deducts the gutter but NOT the
+ * scrollbar — inconsistent with the sentence two lines above that says both are already
+ * netted out. The conclusion is unaffected (1398 and 1408 are both below 1424, so the
+ * row still reads SCROLLS); the arithmetic was simply wrong, and a reader re-deriving it
+ * would not reproduce it. The table has carried a real
+ * `Table.ScrollContainer` since it was written, so the affordance is present and works.
+ *
+ * 🔴 NO EXEMPTION WAS ADDED, DELIBERATELY. The two ways to exempt it are both worse than
+ * the scroll. (a) Hiding the rail on `/apps/build` re-creates the per-route chrome that
+ * `AppsPageLayout` exists to have deleted, and would break the 12-route alignment ledger
+ * in `AppsPageLayout.chromeAlignment.browser.test.tsx` by design. (b) Shrinking this
+ * floor is a column-legibility decision about a table nobody re-measured, taken to work
+ * around a layout change — the exact shape of the `/apps/review` cap that had to be
+ * deleted later (see `APPS_PAGE_CONTAINER_WIDTH`). A viewer who wants the width back has
+ * a one-click, persisted answer: collapse the rail, which restores 1600.
+ *
+ * (A plain block comment, deliberately — NOT a JSDoc. It documents the constant ABOVE
+ * it, and a doc comment in this position binds to the declaration BELOW, which is a
+ * different constant. An earlier revision made it a JSDoc and left it dangling between
+ * SUBMISSIONS_TABLE_MIN_WIDTH's own doc comment and the declaration that comment was
+ * written for.)
+ */
+
+/**
+ * Chrome (px) that `AppsPageLayout` + the submissions `Card` take out of the
+ * container width before the table sees it: Mantine `Container` pads `2 x 16`, and
+ * `<Card withBorder>` draws a `1 px` border on each side.
+ */
+export const SUBMISSIONS_CONTAINER_CHROME = 34;
+
+/**
+ * 🔴 `MY_SUBMISSIONS_CONTAINER_SIZE` LIVED HERE AND IS GONE, AND SO HAS ITS SUCCESSOR.
+ * `/apps/my-submissions` merged into `/apps/mine` and 301s there, so the alias moved to
+ * `MY_APPS_CONTAINER_SIZE` in `myAppsView.ts` — and that is now gone too: every `/apps/*`
+ * route renders in the single `APPS_PAGE_CONTAINER_WIDTH` (2560 since the ultrawide
+ * pass; it was 1920 when this note was written) container, so there is no
+ * per-page width left to alias. `/apps/mine` takes no body measure either, precisely so the
+ * table below clears the floor. The relationship that used to be implied by the alias is
+ * asserted directly in `__tests__/appsPageWidths.test.ts`:
+ * `APPS_PAGE_CONTAINER_WIDTH − SUBMISSIONS_CONTAINER_CHROME > SUBMISSIONS_TABLE_MIN_WIDTH`.
+ * {@link SUBMISSIONS_CONTAINER_CHROME} stays here because the scroll-floor arithmetic it
+ * belongs to is still this module's.
+ */
+
+/** Sortable columns shared by both tables. */
+export type SortColumn = 'app' | 'status' | 'submitted' | 'reviewed';
+export type SortDirection = 'asc' | 'desc';
+export type SortState = { column: SortColumn; direction: SortDirection };
+
+/**
+ * Status sort order (pending → approved → rejected → withdrawn): active/actionable
+ * first, terminal last. An unknown status sorts after all known ones (kept stable
+ * by an alphabetical tiebreak) so a future status degrades gracefully.
+ */
+export const STATUS_SORT_ORDER: Readonly<Record<string, number>> = {
+  pending: 0,
+  approved: 1,
+  rejected: 2,
+  withdrawn: 3,
+};
+
+export function statusRank(status: string): number {
+  return STATUS_SORT_ORDER[status] ?? Number.MAX_SAFE_INTEGER;
+}
+
+/** Coerce a `string | Date | null | undefined` timestamp to a `Date | null`. */
+export function toDate(d: string | Date | null | undefined): Date | null {
+  if (d == null) return null;
+  const date = typeof d === 'string' ? new Date(d) : d;
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/**
+ * Field adapters for a concrete row type. `name` is the human app name (fall back
+ * to the slug when a row has none), `slug` the URL slug, `identity` the
+ * version-collapse key (offsite = slug, onsite = the block/app id).
+ */
+export type SubmissionAccessors<T> = {
+  identity: (row: T) => string;
+  name: (row: T) => string;
+  slug: (row: T) => string;
+  status: (row: T) => string;
+  submittedAt: (row: T) => Date | null;
+  reviewedAt: (row: T) => Date | null;
+};
+
+/** A collapsed per-app group: the newest request + the older ones (newest-first). */
+export type SubmissionGroup<T> = {
+  identity: string;
+  latest: T;
+  older: T[];
+  versionCount: number;
+};
+
+// ── comparators (pure, primitive-typed — unit-tested independently) ────────────
+
+/** Case-insensitive text compare (App column). */
+export function compareText(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { sensitivity: 'base' });
+}
+
+/** Status compare by {@link statusRank}, alphabetical tiebreak for equal ranks. */
+export function compareStatus(a: string, b: string): number {
+  const ra = statusRank(a);
+  const rb = statusRank(b);
+  if (ra !== rb) return ra < rb ? -1 : 1;
+  return a.localeCompare(b);
+}
+
+/** Date compare; a null date sorts as the OLDEST (so direction flips it cleanly). */
+export function compareDate(a: Date | null, b: Date | null): number {
+  const ta = a ? a.getTime() : -Infinity;
+  const tb = b ? b.getTime() : -Infinity;
+  if (ta === tb) return 0;
+  return ta < tb ? -1 : 1;
+}
+
+// ── filter ─────────────────────────────────────────────────────────────────────
+
+/** Case-insensitive substring match of a query against a row's name OR slug. */
+export function matchesQuery(name: string, slug: string, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (q.length === 0) return true;
+  return name.toLowerCase().includes(q) || slug.toLowerCase().includes(q);
+}
+
+// ── group / collapse ─────────────────────────────────────────────────────────
+
+/**
+ * Collapse rows by app identity. Groups preserve first-seen order; within a group
+ * the rows are sorted newest-first by `submittedAt`, so `latest` is the newest
+ * request and `older` the rest (newest-first). PURE — never mutates the input.
+ */
+export function groupSubmissionsByApp<T>(
+  rows: readonly T[],
+  identityOf: (row: T) => string,
+  submittedAtOf: (row: T) => Date | null
+): SubmissionGroup<T>[] {
+  const buckets = new Map<string, T[]>();
+  for (const row of rows) {
+    const id = identityOf(row);
+    const bucket = buckets.get(id);
+    if (bucket) bucket.push(row);
+    else buckets.set(id, [row]);
+  }
+  const result: SubmissionGroup<T>[] = [];
+  for (const [identity, members] of buckets) {
+    const sorted = [...members].sort(
+      (a: T, b: T) =>
+        (submittedAtOf(b)?.getTime() ?? -Infinity) - (submittedAtOf(a)?.getTime() ?? -Infinity)
+    );
+    const latest = sorted[0];
+    if (latest === undefined) continue; // unreachable (buckets never empty) — type guard
+    result.push({ identity, latest, older: sorted.slice(1), versionCount: sorted.length });
+  }
+  return result;
+}
+
+/**
+ * The id of a listing's "currently-published" (live) version, or `null` if none.
+ *
+ * Given a listing's version list ordered NEWEST-FIRST (exactly what
+ * {@link groupSubmissionsByApp} yields as `[group.latest, ...group.older]`), the
+ * currently-published version is the newest version whose status is `'approved'`:
+ *   - the latest version if it is approved,
+ *   - else the most-recent PREVIOUSLY-approved version,
+ *   - else `null` — nothing has been approved yet, so nothing is live.
+ *
+ * This is the SINGLE SOURCE OF TRUTH for the "live" badge + the "Open live"
+ * button, so the two can never disagree about which version is live. PURE — reads
+ * only `id`/`status` and never mutates the input.
+ */
+export function currentlyPublishedVersionId(
+  versionsNewestFirst: readonly { readonly id: string; readonly status: string }[]
+): string | null {
+  for (const v of versionsNewestFirst) {
+    if (v.status === 'approved') return v.id;
+  }
+  return null;
+}
+
+// ── filter + sort over the grouped view ────────────────────────────────────────
+
+/** Keep a group if ANY of its versions matches the query (name or slug). */
+export function filterGroups<T>(
+  groups: readonly SubmissionGroup<T>[],
+  query: string,
+  accessors: SubmissionAccessors<T>
+): SubmissionGroup<T>[] {
+  const q = query.trim();
+  if (q.length === 0) return [...groups];
+  return groups.filter((g: SubmissionGroup<T>) =>
+    [g.latest, ...g.older].some((row: T) =>
+      matchesQuery(accessors.name(row), accessors.slug(row), q)
+    )
+  );
+}
+
+/**
+ * Sort groups by the chosen column's value on each group's `latest` request.
+ * Stable (Array.prototype.sort is stable), non-mutating. `direction` flips the
+ * base comparator.
+ */
+export function sortGroups<T>(
+  groups: readonly SubmissionGroup<T>[],
+  sort: SortState,
+  accessors: SubmissionAccessors<T>
+): SubmissionGroup<T>[] {
+  const factor = sort.direction === 'asc' ? 1 : -1;
+  const base = (a: SubmissionGroup<T>, b: SubmissionGroup<T>): number => {
+    const la = a.latest;
+    const lb = b.latest;
+    switch (sort.column) {
+      case 'app':
+        return compareText(accessors.name(la), accessors.name(lb));
+      case 'status':
+        return compareStatus(accessors.status(la), accessors.status(lb));
+      case 'submitted':
+        return compareDate(accessors.submittedAt(la), accessors.submittedAt(lb));
+      case 'reviewed':
+        return compareDate(accessors.reviewedAt(la), accessors.reviewedAt(lb));
+    }
+  };
+  return [...groups].sort((a: SubmissionGroup<T>, b: SubmissionGroup<T>) => factor * base(a, b));
+}
+
+/** The next sort state when a column header is clicked: toggle direction on the
+ *  same column, else switch to the new column with a sensible default direction
+ *  (text/status default asc, dates default desc = newest first). */
+export function nextSortState(current: SortState, column: SortColumn): SortState {
+  if (current.column === column) {
+    return { column, direction: current.direction === 'asc' ? 'desc' : 'asc' };
+  }
+  const defaultDirection: SortDirection =
+    column === 'submitted' || column === 'reviewed' ? 'desc' : 'asc';
+  return { column, direction: defaultDirection };
+}
+
+/** `aria-sort` value for a header, given the active sort state. */
+export function ariaSortFor(
+  sort: SortState,
+  column: SortColumn
+): 'ascending' | 'descending' | 'none' {
+  if (sort.column !== column) return 'none';
+  return sort.direction === 'asc' ? 'ascending' : 'descending';
+}
+
+// ── status sections (UX pass) ──────────────────────────────────────────────────
+
+/**
+ * The status SECTIONS the /apps/my-submissions lists render, in display order.
+ * A group is bucketed by its `latest` submission's status:
+ *   - `approved` → **Live** (the row badge still distinguishes the onsite deploy
+ *     sub-state building/deploying/live/failed — we DON'T split approved by it),
+ *   - `pending` → **Pending**,
+ *   - `rejected` → **Rejected** (its own default-collapsed section),
+ *   - `withdrawn` → **Withdrawn** (default-collapsed),
+ *   - any other/unknown status → **Withdrawn** (a safe closed default so a future
+ *     status degrades gracefully rather than vanishing).
+ *
+ * `mod-removed` is NOT derived from a submission status — it is an OVERRIDE bucket
+ * for a listing a moderator took down (backing `AppListing.status='removed'` whose
+ * last moderation event is a mod action, not the owner's own `owner-unpublish`).
+ * The caller supplies it via {@link bucketGroupsByStatus}'s `overrideBucketOf`; it
+ * takes precedence over the any-approved→Live rule so a once-live-now-removed app
+ * lands in its own default-collapsed section instead of masquerading as Live.
+ */
+export type StatusBucket = 'live' | 'pending' | 'rejected' | 'withdrawn' | 'mod-removed';
+
+/**
+ * The MOD-view status buckets (Live / Pending / Rejected / **Removed** / Draft).
+ * The owner (submitter) view uses {@link StatusBucket} — a listing an author can
+ * `withdraw`; the moderator view manages the durable `AppListing` lifecycle
+ * (`draft|pending|approved|rejected|removed`), where the terminal takedown state
+ * is `removed` (not `withdrawn`) and an un-submitted `draft` still exists. Kept a
+ * DISTINCT union (rather than widening `StatusBucket`) so the owner lists' bucket
+ * SET stays exactly its four sections — see {@link StatusBucketConfig}.
+ */
+export type ModStatusBucket = 'live' | 'pending' | 'rejected' | 'removed' | 'draft';
+
+/** Every bucket ANY consumer can render (owner ∪ mod) — the section-META key set. */
+export type AnyStatusBucket = StatusBucket | ModStatusBucket;
+
+/**
+ * The OWNER section render order (Live → Pending → Rejected → Withdrawn →
+ * Removed-by-a-moderator). The moderator-takedown section sits LAST — it's the most
+ * terminal state (the owner can't self-republish), so it trails the other
+ * default-collapsed sections.
+ */
+export const STATUS_SECTION_ORDER: readonly StatusBucket[] = [
+  'live',
+  'pending',
+  'rejected',
+  'withdrawn',
+  'mod-removed',
+];
+
+/**
+ * The MOD section render order (Live → Pending → Rejected → Removed → Draft). A
+ * `draft` listing (author hasn't submitted, or an abandoned draft) is surfaced in
+ * a de-emphasised trailing section rather than DROPPED, so an all-status mod read
+ * never silently hides a row.
+ */
+export const MOD_STATUS_SECTION_ORDER: readonly ModStatusBucket[] = [
+  'live',
+  'pending',
+  'rejected',
+  'removed',
+  'draft',
+];
+
+/** Map a raw submission status → its OWNER display section. Unknown → `withdrawn`. */
+export function statusBucket(status: string): StatusBucket {
+  switch (status) {
+    case 'approved':
+      return 'live';
+    case 'pending':
+      return 'pending';
+    case 'rejected':
+      return 'rejected';
+    case 'withdrawn':
+      return 'withdrawn';
+    default:
+      return 'withdrawn';
+  }
+}
+
+/**
+ * Map a raw `AppListing.status` → its MOD display section. `approved` → **live**,
+ * `removed` → **removed** (the mod takedown state), `draft` → **draft**. Unknown →
+ * `draft` (a safe closed default that keeps a future status visible-but-quiet
+ * rather than vanishing).
+ */
+export function modStatusBucket(status: string): ModStatusBucket {
+  switch (status) {
+    case 'approved':
+      return 'live';
+    case 'pending':
+      return 'pending';
+    case 'rejected':
+      return 'rejected';
+    case 'removed':
+      return 'removed';
+    case 'draft':
+      return 'draft';
+    default:
+      return 'draft';
+  }
+}
+
+/**
+ * A per-consumer bucketing config: which buckets exist (the render/init key set)
+ * and how a raw status maps into one. Lets the owner lists keep their exact four
+ * sections while the mod table uses its five — see {@link bucketGroupsByStatus}.
+ */
+export type StatusBucketConfig<B extends string> = {
+  buckets: readonly B[];
+  bucketOf: (status: string) => B;
+};
+
+/** The OWNER (submitter) bucketing config — the default for {@link bucketGroupsByStatus}. */
+export const OWNER_STATUS_BUCKETS: StatusBucketConfig<StatusBucket> = {
+  buckets: STATUS_SECTION_ORDER,
+  bucketOf: statusBucket,
+};
+
+/** The MOD (moderator listings table) bucketing config. */
+export const MOD_STATUS_BUCKETS: StatusBucketConfig<ModStatusBucket> = {
+  buckets: MOD_STATUS_SECTION_ORDER,
+  bucketOf: modStatusBucket,
+};
+
+/**
+ * Groups partitioned into a consumer's status sections. Generic over the bucket
+ * key `B` so the owner view yields exactly `{live,pending,rejected,withdrawn}` and
+ * the mod view yields its own set.
+ */
+export type BucketedGroups<T, B extends string = StatusBucket> = Record<B, SubmissionGroup<T>[]>;
+
+/**
+ * Partition already-grouped submissions into a consumer's status sections
+ * (default: the OWNER config → the original four buckets, unchanged). Preserves
+ * the incoming group order within each bucket (so a pre-applied sort is retained).
+ * PURE — never mutates the input.
+ *
+ * A group that has ANY approved (currently-published) version buckets to **live**,
+ * EVEN IF its `latest` submission is an in-flight pending/rejected/withdrawn UPDATE.
+ * This keeps a live app in the always-expanded Live section (its "live" badge lives
+ * on the published version within the group) instead of burying it in the
+ * default-collapsed Rejected/Withdrawn section — reachable normally when a live app
+ * gets an update that's then rejected or withdrawn. Only groups that have NEVER been
+ * approved bucket by their `latest` submission's status (see the config's `bucketOf`).
+ * (For the mod table each row is a single listing — one "version" — so the
+ * any-approved→live rule reduces to "an `approved` listing is Live".)
+ *
+ * `overrideBucketOf` (optional) gets FIRST refusal on each group: when it returns a
+ * bucket, that wins over BOTH the any-approved→Live rule and the latest-status
+ * bucketing. The owner lists use it to route a moderator-removed listing (its backing
+ * `AppListing.status='removed'` + a non-owner last moderation event) into the
+ * `mod-removed` section even though the group still has an approved version — the fix
+ * for a taken-down-but-once-live app misfiling under Live. A bucket the config doesn't
+ * declare is ignored (defensively falls through to the default logic) so a stray
+ * override can never crash on an uninitialised key.
+ */
+export function bucketGroupsByStatus<T, B extends string = StatusBucket>(
+  groups: readonly SubmissionGroup<T>[],
+  statusOf: (row: T) => string,
+  config: StatusBucketConfig<B> = OWNER_STATUS_BUCKETS as unknown as StatusBucketConfig<B>,
+  overrideBucketOf?: (group: SubmissionGroup<T>) => B | null
+): BucketedGroups<T, B> {
+  const result = {} as BucketedGroups<T, B>;
+  for (const b of config.buckets) result[b] = [];
+  for (const group of groups) {
+    const override = overrideBucketOf?.(group) ?? null;
+    if (override !== null && result[override] !== undefined) {
+      result[override].push(group);
+      continue;
+    }
+    const hasPublishedVersion = [group.latest, ...group.older].some(
+      (v) => statusOf(v) === 'approved'
+    );
+    const bucket = hasPublishedVersion ? ('live' as B) : config.bucketOf(statusOf(group.latest));
+    result[bucket].push(group);
+  }
+  return result;
+}

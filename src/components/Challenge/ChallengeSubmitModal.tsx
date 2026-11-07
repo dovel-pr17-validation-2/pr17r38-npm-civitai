@@ -1,0 +1,734 @@
+import {
+  ActionIcon,
+  Badge,
+  Button,
+  Checkbox,
+  Group,
+  Loader,
+  Modal,
+  Select,
+  Stack,
+  Tabs,
+  Text,
+  useComputedColorScheme,
+  useMantineTheme,
+} from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import {
+  IconClockHour4,
+  IconInfoCircle,
+  IconPhoto,
+  IconSparkles,
+  IconUpload,
+  IconX,
+} from '@tabler/icons-react';
+import { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import { create } from 'zustand';
+import { immer } from 'zustand/middleware/immer';
+import { BuzzTransactionButton } from '~/components/Buzz/BuzzTransactionButton';
+import { CurrencyBadge } from '~/components/Currency/CurrencyBadge';
+import { CurrencyIcon } from '~/components/Currency/CurrencyIcon';
+import { AlertWithIcon } from '~/components/AlertWithIcon/AlertWithIcon';
+import { CooldownBanner } from '~/components/Challenge/CooldownBanner';
+import { useDialogContext } from '~/components/Dialog/DialogProvider';
+import type { GeneratorMediaCandidate } from '~/components/EntrySubmit/GeneratorMediaPicker';
+import {
+  GeneratorMediaPicker,
+  useGeneratorSelectionStore,
+} from '~/components/EntrySubmit/GeneratorMediaPicker';
+import { MediaDropzone } from '~/components/Image/ImageDropzone/MediaDropzone';
+import ImagesInfinite from '~/components/Image/Infinite/ImagesInfinite';
+import { MasonryContainer } from '~/components/MasonryColumns/MasonryContainer';
+import { MasonryProvider } from '~/components/MasonryColumns/MasonryProvider';
+import { ScrollArea } from '~/components/ScrollArea/ScrollArea';
+import { ChallengeSelectableImageCardMemoized } from '~/components/Challenge/ChallengeSelectableImageCard';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useCFImageUpload } from '~/hooks/useCFImageUpload';
+import { constants } from '~/server/common/constants';
+import { ImageSort } from '~/server/common/enums';
+import {
+  ChallengeReviewCostType,
+  ChallengeSource,
+  ChallengeStatus,
+  Currency,
+} from '~/shared/utils/prisma/enums';
+import {
+  CHALLENGE_ENTRY_HOUSE_CUT,
+  getEntryPoolContribution,
+} from '~/shared/constants/challenge.constants';
+import {
+  addSimpleImagePostInput,
+  bulkSaveCollectionItemsInput,
+} from '~/server/schema/collection.schema';
+import type { ChallengeDetail } from '~/server/schema/challenge.schema';
+import type { ImageGetInfinite } from '~/types/router';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
+import { downloadGeneratorImages } from '~/utils/generator-import';
+import { trpc } from '~/utils/trpc';
+import { useCollection } from '~/components/Collections/collection.utils';
+import {
+  parseBitwiseBrowsingLevel,
+  browsingLevelLabels,
+  nsfwLevelColors,
+} from '~/shared/constants/browsingLevel.constants';
+import { IMAGE_MIME_TYPE, VIDEO_MIME_TYPE } from '~/shared/constants/mime-types';
+import { isDefined } from '~/utils/type-guards';
+import { hideNotification, showNotification } from '@mantine/notifications';
+import { ownContentPickerFilters } from '~/components/Image/image.utils';
+
+// ---------------------------------------------------------------------------
+// Selection store (same pattern as AddUserContentModal)
+// ---------------------------------------------------------------------------
+type StoreState = {
+  selected: Record<number, boolean>;
+  toggleSelected: (value: number) => void;
+  deselectAll: () => void;
+};
+
+const useStore = create<StoreState>()(
+  immer((set) => ({
+    selected: {},
+    toggleSelected: (value) => {
+      set((state) => {
+        if (state.selected[value]) delete state.selected[value];
+        else state.selected[value] = true;
+      });
+    },
+    deselectAll: () => {
+      set((state) => {
+        state.selected = {};
+      });
+    },
+  }))
+);
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Main Modal
+// ---------------------------------------------------------------------------
+type Props = {
+  challengeId: number;
+  collectionId: number;
+};
+
+export function ChallengeSubmitModal({ challengeId, collectionId }: Props) {
+  const dialog = useDialogContext();
+  const currentUser = useCurrentUser();
+  const queryUtils = trpc.useUtils();
+  const theme = useMantineTheme();
+  const colorScheme = useComputedColorScheme('dark');
+
+  const { collection } = useCollection(collectionId);
+  const [activeTab, setActiveTab] = useState<string | null>('library');
+  const [error, setError] = useState('');
+  const [tagId, setTagId] = useState<number | null>(null);
+  const [guaranteeReview, setGuaranteeReview] = useState(false);
+
+  // Selection state
+  const selectedImageIds = useStore((state) => Object.keys(state.selected).map(Number));
+  const deselectAll = useStore((state) => state.deselectAll);
+  const generatorSelected = useGeneratorSelectionStore((state) => state.selected);
+  const deselectAllGenerator = useGeneratorSelectionStore((state) => state.deselectAll);
+
+  // Upload state
+  const { files: uploadedFiles, uploadToCF, resetFiles, removeImage } = useCFImageUpload();
+
+  // Challenge data
+  const { data: challenge } = trpc.challenge.getById.useQuery({ id: challengeId });
+  const { data: userEntryData } = trpc.challenge.getUserEntryCount.useQuery(
+    { challengeId },
+    { enabled: !!currentUser }
+  );
+  const userEntryCount = userEntryData?.count ?? 0;
+  const maxEntries = challenge?.maxEntriesPerUser ?? 20;
+  const remainingEntries = Math.max(0, maxEntries - userEntryCount);
+
+  // Warn when under an hour remains — late entries may not be judged before the
+  // challenge closes (the participation prize is still awarded for compliant entries).
+  const minutesUntilClose = challenge
+    ? Math.floor((new Date(challenge.endsAt).getTime() - Date.now()) / 60000)
+    : null;
+  const nearDeadline =
+    challenge?.status === ChallengeStatus.Active &&
+    minutesUntilClose !== null &&
+    minutesUntilClose >= 0 &&
+    minutesUntilClose < 60;
+
+  // Parse allowed NSFW levels for display
+  const allowedLevels = useMemo(() => {
+    if (!challenge) return [];
+    return parseBitwiseBrowsingLevel(challenge.allowedNsfwLevel);
+  }, [challenge]);
+
+  const getGeneratorEligibility = useCallback(
+    ({ nsfwLevel, resourceIds }: GeneratorMediaCandidate) => {
+      const reasons: string[] = [];
+      if (challenge && nsfwLevel !== null && nsfwLevel !== 0) {
+        if ((nsfwLevel & challenge.allowedNsfwLevel) === 0) reasons.push('NSFW restricted');
+      }
+      if (challenge && challenge.modelVersionIds.length > 0) {
+        if (!resourceIds.some((vid) => challenge.modelVersionIds.includes(vid)))
+          reasons.push('Wrong model');
+      }
+      return { eligible: reasons.length === 0, reasons };
+    },
+    [challenge]
+  );
+
+  const availableTags = (collection?.tags ?? []).filter((t) => !t.filterableOnly);
+
+  // ---- Mutations ----
+  const addSimpleImagePostMutation = trpc.collection.addSimpleImagePost.useMutation();
+  const bulkSaveItemsMutation = trpc.collection.bulkSaveItems.useMutation();
+  const requestReviewMutation = trpc.challenge.requestReview.useMutation();
+
+  const handleClose = () => {
+    resetFiles();
+    deselectAll();
+    deselectAllGenerator();
+    setError('');
+    setGuaranteeReview(false);
+    dialog.onClose();
+  };
+
+  const handleSuccess = async (submittedImageIds?: number[]) => {
+    // If guarantee review is checked, request paid review for the submitted entries
+    if (
+      guaranteeReview &&
+      challenge?.reviewCostType === ChallengeReviewCostType.PerEntry &&
+      challenge?.reviewCost &&
+      submittedImageIds?.length
+    ) {
+      try {
+        await requestReviewMutation.mutateAsync({
+          challengeId,
+          imageIds: submittedImageIds,
+        });
+      } catch (e) {
+        // Entries were saved successfully but paid review failed — still close
+        showErrorNotification({
+          title: 'Entries submitted, but paid review failed',
+          error: e instanceof Error ? e : new Error('Failed to request paid review'),
+        });
+      }
+    }
+
+    handleClose();
+    showSuccessNotification({
+      message: guaranteeReview
+        ? 'Your images have been submitted and queued for guaranteed review.'
+        : 'Your images have been submitted to the challenge for review.',
+    });
+    await queryUtils.image.getInfinite.invalidate();
+    await queryUtils.collection.getById.invalidate({ id: collectionId });
+    await queryUtils.challenge.getUserEntryCount.invalidate({ challengeId });
+    await queryUtils.challenge.getUserUnjudgedEntries.invalidate({ challengeId });
+    await queryUtils.challenge.getById.invalidate({ id: challengeId });
+  };
+
+  const handleMutationError = (error: { message: string }) => {
+    showErrorNotification({
+      title: 'Unable to submit entries',
+      error: new Error(error.message),
+    });
+  };
+
+  /** Returns true if count is valid; sets error and returns false otherwise. */
+  const validateEntryCount = (count: number): boolean => {
+    if (count === 0) {
+      setError('You must select at least one image.');
+      return false;
+    }
+    if (count > remainingEntries) {
+      setError(
+        `You can only submit ${remainingEntries} more ${
+          remainingEntries === 1 ? 'entry' : 'entries'
+        }.`
+      );
+      return false;
+    }
+    return true;
+  };
+
+  // Submit library images (bulk save existing image IDs)
+  const handleSubmitLibrary = async () => {
+    setError('');
+    if (!validateEntryCount(selectedImageIds.length)) return;
+
+    const data = { collectionId, imageIds: selectedImageIds, tagId };
+    const results = bulkSaveCollectionItemsInput.safeParse(data);
+    if (!results.success) {
+      setError('You must select at least one image.');
+      return;
+    }
+
+    try {
+      await bulkSaveItemsMutation.mutateAsync(data);
+      await handleSuccess(selectedImageIds);
+    } catch (e) {
+      handleMutationError(e as { message: string });
+    }
+  };
+
+  // Submit generator images (download + upload + create post)
+  const handleSubmitGenerator = async () => {
+    setError('');
+    if (!validateEntryCount(generatorSelected.length)) return;
+
+    const importNotifId = `challenge-import-${Date.now()}`;
+    showNotification({
+      id: importNotifId,
+      loading: true,
+      autoClose: false,
+      withCloseButton: false,
+      message: `Importing ${generatorSelected.length} image${
+        generatorSelected.length !== 1 ? 's' : ''
+      } from generator...`,
+    });
+
+    try {
+      const downloadedFiles = await downloadGeneratorImages(generatorSelected);
+
+      if (downloadedFiles.length === 0) {
+        hideNotification(importNotifId);
+        setError('Failed to download generator images. Please try again.');
+        return;
+      }
+
+      // Upload to CF and collect image data for the mutation
+      const uploaded = await Promise.all(
+        downloadedFiles.map(async ({ file, meta }) => {
+          try {
+            const result = await uploadToCF(file);
+            return { ...result, meta };
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      hideNotification(importNotifId);
+
+      // The CF image ID (uuid) is what imageSchema expects as `url`
+      const images = uploaded.filter(isDefined).map((u) => ({
+        url: u.id,
+        type: u.type,
+        hash: u.hash,
+        width: u.width,
+        height: u.height,
+        mimeType: u.mimeType,
+        meta: u.meta,
+      }));
+
+      if (images.length === 0) {
+        setError('Upload failed. Please try again.');
+        return;
+      }
+
+      try {
+        const result = await addSimpleImagePostMutation.mutateAsync({ collectionId, images });
+        await handleSuccess(result.imageIds);
+      } catch (e) {
+        handleMutationError(e as { message: string });
+      }
+    } catch (e) {
+      hideNotification(importNotifId);
+      setError('An error occurred during import.');
+    }
+  };
+
+  // Submit uploaded files
+  const handleSubmitUploads = async () => {
+    setError('');
+    const successFiles = uploadedFiles.filter((f) => f.status === 'success');
+    if (!validateEntryCount(successFiles.length)) return;
+
+    const images = successFiles.map((f) => ({
+      url: f.url,
+      type: f.type,
+      hash: f.hash,
+      width: f.width,
+      height: f.height,
+      mimeType: f.mimeType,
+      meta: f.meta,
+    }));
+
+    const data = { collectionId, images };
+    const results = addSimpleImagePostInput.safeParse(data);
+    if (!results.success) {
+      setError('You must upload at least one image.');
+      return;
+    }
+
+    try {
+      const result = await addSimpleImagePostMutation.mutateAsync(data);
+      await handleSuccess(result.imageIds);
+    } catch (e) {
+      handleMutationError(e as { message: string });
+    }
+  };
+
+  // Route submit to correct handler based on active tab
+  const handleSubmit = () => {
+    if (activeTab === 'library') handleSubmitLibrary();
+    else if (activeTab === 'generator') handleSubmitGenerator();
+    else if (activeTab === 'upload') handleSubmitUploads();
+  };
+
+  const uploading = uploadedFiles.some((f) => f.status === 'uploading');
+  const loading =
+    uploading || addSimpleImagePostMutation.isPending || bulkSaveItemsMutation.isPending;
+
+  const buzzType = challenge?.buzzType === 'green' ? 'green' : 'yellow';
+  const entryFeeInfo =
+    challenge?.source === ChallengeSource.User && challenge.entryFee > 0
+      ? {
+          entryFee: challenge.entryFee,
+          // Mirrors chargeEntryFees: the house cut is capped at the fee, never exceeds it.
+          houseCut: Math.min(challenge.entryFee, CHALLENGE_ENTRY_HOUSE_CUT),
+          perEntryToPool: getEntryPoolContribution(challenge.entryFee),
+        }
+      : null;
+
+  // Count for submit button (users can only select eligible images)
+  const submitCount =
+    activeTab === 'library'
+      ? selectedImageIds.length
+      : activeTab === 'generator'
+      ? generatorSelected.length
+      : uploadedFiles.filter((f) => f.status === 'success').length;
+
+  // Everything this submission will charge. The entry fee (judging cut + pool cut) is charged by
+  // the server on submit, the guaranteed-review fee only when opted in — the balance check has to
+  // cover both or a user without enough Buzz gets through the modal and fails server-side.
+  //
+  // BuzzTransactionButton checks the DOMAIN's Buzz account, which is the right one here only
+  // because a user challenge is domain-gated to its own buzzType (isChallengeHiddenByDomainCurrency)
+  // — nobody who can reach this button is on the other domain. Passing accountTypes wouldn't
+  // help either: useAvailableBuzz strips green/yellow and re-adds the domain's own.
+  const guaranteeCost =
+    guaranteeReview &&
+    challenge?.reviewCostType === ChallengeReviewCostType.PerEntry &&
+    challenge.reviewCost > 0
+      ? challenge.reviewCost * submitCount
+      : 0;
+  const entryCost = entryFeeInfo ? entryFeeInfo.entryFee * submitCount : 0;
+  const totalBuzzCost = entryCost + guaranteeCost;
+
+  return (
+    <Modal
+      {...dialog}
+      title={
+        <Stack gap={2}>
+          <Text fw={600}>Submit Challenge Entry</Text>
+          <Text size="sm" c="dimmed">
+            Your Entries: {userEntryCount} / {maxEntries}
+          </Text>
+          {allowedLevels.length > 0 && (
+            <Group gap={4}>
+              <Text size="xs" c="dimmed">
+                Allowed Ratings:
+              </Text>
+              {allowedLevels.map((level) => (
+                <Badge key={level} size="xs" color={nsfwLevelColors[level]} variant="filled">
+                  {browsingLevelLabels[level as keyof typeof browsingLevelLabels]}
+                </Badge>
+              ))}
+            </Group>
+          )}
+        </Stack>
+      }
+      size="80%"
+      onClose={handleClose}
+      centered
+    >
+      <Stack gap="md">
+        {error && (
+          <AlertWithIcon color="red" iconColor="red" size="sm" icon={<IconInfoCircle size={16} />}>
+            {error}
+          </AlertWithIcon>
+        )}
+
+        {remainingEntries === 0 && (
+          <AlertWithIcon color="yellow" size="sm" icon={<IconInfoCircle size={16} />}>
+            You have reached the maximum number of entries for this challenge.
+          </AlertWithIcon>
+        )}
+
+        {challenge && (
+          <CooldownBanner
+            challengeId={challengeId}
+            status={challenge.status}
+            source={challenge.source}
+          />
+        )}
+
+        {nearDeadline && (
+          <AlertWithIcon
+            color="yellow"
+            iconColor="yellow"
+            size="sm"
+            icon={<IconClockHour4 size={16} />}
+          >
+            Less than an hour left in this challenge. Entries are judged only after an automated
+            content scan, which can lag behind submission when the queue is busy. If a scan finishes
+            after the challenge closes, that entry may not make it into judging in time — but
+            you&apos;ll still receive the participation prize for any entries that meet the
+            requirements.
+          </AlertWithIcon>
+        )}
+
+        <Tabs value={activeTab} onChange={setActiveTab} classNames={{ panel: 'pt-4' }}>
+          <Tabs.List>
+            <Tabs.Tab value="library" leftSection={<IconPhoto size={16} />}>
+              My Images
+            </Tabs.Tab>
+            <Tabs.Tab value="generator" leftSection={<IconSparkles size={16} />}>
+              From Generator
+            </Tabs.Tab>
+            <Tabs.Tab value="upload" leftSection={<IconUpload size={16} />}>
+              Upload New
+            </Tabs.Tab>
+          </Tabs.List>
+
+          {/* My Images Tab */}
+          <Tabs.Panel value="library">
+            {challenge && (
+              <ChallengeContext.Provider value={challenge}>
+                <ScrollArea
+                  scrollRestore={{ enabled: false, key: 'challenge-submit-library' }}
+                  style={{ maxHeight: 440, overflowY: 'auto' }}
+                >
+                  <MasonryProvider
+                    columnWidth={constants.cardSizes.image}
+                    maxColumnCount={4}
+                    maxSingleColumnWidth={450}
+                  >
+                    <MasonryContainer m={0} p={0} px={0}>
+                      <ImagesInfinite
+                        filters={{
+                          ...ownContentPickerFilters(currentUser?.id),
+                          collectionId: undefined,
+                          period: 'AllTime',
+                          sort: ImageSort.Newest,
+                          hidden: undefined,
+                          types: ['image'],
+                          withMeta: undefined,
+                          followed: undefined,
+                          fromPlatform: undefined,
+                          hideAutoResources: undefined,
+                          hideManualResources: undefined,
+                          includeBaseModel: true,
+                        }}
+                        renderItem={LibraryImageCard}
+                        disableStoreFilters
+                      />
+                    </MasonryContainer>
+                  </MasonryProvider>
+                </ScrollArea>
+              </ChallengeContext.Provider>
+            )}
+          </Tabs.Panel>
+
+          {/* From Generator Tab */}
+          <Tabs.Panel value="generator">
+            <GeneratorMediaPicker getEligibility={getGeneratorEligibility} />
+          </Tabs.Panel>
+
+          {/* Upload New Tab */}
+          <Tabs.Panel value="upload">
+            <Stack gap="md" py="md">
+              <MediaDropzone
+                onDrop={(args) => {
+                  args.forEach(({ file }) => uploadToCF(file));
+                }}
+                accept={[...IMAGE_MIME_TYPE, ...VIDEO_MIME_TYPE]}
+                disabled={remainingEntries === 0}
+                className="rounded-lg"
+              />
+              {uploadedFiles.length > 0 && (
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-2">
+                  {uploadedFiles.map((f) => (
+                    <div key={f.url} className="relative overflow-hidden rounded-lg">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={f.objectUrl}
+                        alt={f.file.name}
+                        className="h-[140px] w-full object-cover"
+                      />
+                      {f.status === 'uploading' && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+                          <Loader size="sm" color="white" />
+                        </div>
+                      )}
+                      {f.status === 'error' && (
+                        <Badge
+                          color="red"
+                          variant="filled"
+                          size="xs"
+                          className="absolute bottom-1 left-1"
+                        >
+                          Failed
+                        </Badge>
+                      )}
+                      <ActionIcon
+                        size="sm"
+                        color="dark"
+                        variant="filled"
+                        radius="xl"
+                        className="absolute right-1 top-1"
+                        onClick={() => removeImage(f.url)}
+                      >
+                        <IconX size={12} />
+                      </ActionIcon>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Stack>
+          </Tabs.Panel>
+        </Tabs>
+
+        {/* Category tag dropdown */}
+        {(availableTags?.length ?? 0) > 0 && (
+          <Select
+            label="Category"
+            withAsterisk={!collection?.metadata?.disableTagRequired}
+            placeholder="Select a category for your submission"
+            data={(availableTags ?? []).map((tag) => ({
+              value: tag.id.toString(),
+              label: tag.name,
+            }))}
+            onChange={(value) => setTagId(value ? Number(value) : null)}
+            value={tagId?.toString() ?? null}
+            clearable
+          />
+        )}
+
+        {/* Paid Review Checkbox */}
+        {challenge &&
+          challenge.reviewCostType === ChallengeReviewCostType.PerEntry &&
+          challenge.reviewCost > 0 &&
+          submitCount > 0 && (
+            <Checkbox
+              label={
+                <Group gap={4}>
+                  <Text size="sm">Guarantee entries get judged</Text>
+                  <CurrencyBadge
+                    currency={Currency.BUZZ}
+                    unitAmount={challenge.reviewCost * submitCount}
+                    size="sm"
+                  />
+                </Group>
+              }
+              checked={guaranteeReview}
+              onChange={(e) => setGuaranteeReview(e.currentTarget.checked)}
+            />
+          )}
+
+        {/* Footer */}
+        <Stack
+          gap={8}
+          mx="-lg"
+          px="lg"
+          pt="lg"
+          style={{
+            borderTop: `1px solid ${
+              colorScheme === 'dark' ? theme.colors.dark[4] : theme.colors.gray[2]
+            }`,
+          }}
+        >
+          <Group gap="xs" justify="flex-end">
+            <Button variant="default" onClick={handleClose}>
+              Cancel
+            </Button>
+            {totalBuzzCost > 0 ? (
+              <BuzzTransactionButton
+                buzzAmount={totalBuzzCost}
+                onPerformTransaction={handleSubmit}
+                loading={loading || requestReviewMutation.isPending}
+                disabled={submitCount === 0 || remainingEntries === 0}
+                label={`Submit ${submitCount} ${submitCount === 1 ? 'Entry' : 'Entries'}`}
+                showPurchaseModal
+              />
+            ) : (
+              <Button
+                onClick={handleSubmit}
+                loading={loading || requestReviewMutation.isPending}
+                disabled={submitCount === 0 || remainingEntries === 0}
+              >
+                {submitCount > 0
+                  ? `Submit ${submitCount} ${submitCount === 1 ? 'Entry' : 'Entries'}`
+                  : 'Submit'}
+              </Button>
+            )}
+          </Group>
+
+          {entryFeeInfo && (
+            <Group gap={4} justify="flex-end" wrap="nowrap">
+              <CurrencyIcon currency={Currency.BUZZ} type={buzzType} size={14} />
+              <Text size="xs" c="dimmed">
+                {submitCount > 0 ? (
+                  <>
+                    <b>{totalBuzzCost.toLocaleString()}</b> total
+                  </>
+                ) : (
+                  <>
+                    <b>{entryFeeInfo.entryFee.toLocaleString()}</b> per entry
+                  </>
+                )}{' '}
+                &middot; {(entryFeeInfo.houseCut * Math.max(submitCount, 1)).toLocaleString()} for
+                AI judging &middot;{' '}
+                {(entryFeeInfo.perEntryToPool * Math.max(submitCount, 1)).toLocaleString()} to the
+                prize pool
+                {guaranteeCost > 0 && (
+                  <> &middot; {guaranteeCost.toLocaleString()} for guaranteed review</>
+                )}
+              </Text>
+              <Tooltip
+                label="The AI judging cost is non-refundable. The prize-pool portion is returned if the challenge is cancelled."
+                maw={260}
+                multiline
+                withArrow
+              >
+                <IconInfoCircle size={14} className="text-dimmed" />
+              </Tooltip>
+            </Group>
+          )}
+        </Stack>
+      </Stack>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Library image card wrapper (passes challenge context to selectable card)
+// ---------------------------------------------------------------------------
+function LibraryImageCard({ data: image }: { data: ImageGetInfinite[number] }) {
+  const toggleSelected = useStore((state) => state.toggleSelected);
+  const selected = useStore(useCallback((state) => !!state.selected[image.id], [image.id]));
+  const challenge = useChallengeContext();
+
+  if (!challenge) return null;
+
+  return (
+    <ChallengeSelectableImageCardMemoized
+      image={image}
+      challenge={challenge}
+      selected={selected}
+      onToggle={toggleSelected}
+    />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Simple context for passing challenge data to library cards
+// ---------------------------------------------------------------------------
+const ChallengeContext = createContext<Pick<
+  ChallengeDetail,
+  'allowedNsfwLevel' | 'startsAt' | 'modelVersionIds'
+> | null>(null);
+
+function useChallengeContext() {
+  return useContext(ChallengeContext);
+}

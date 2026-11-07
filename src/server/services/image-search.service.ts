@@ -1,0 +1,398 @@
+import type { NextApiRequest } from 'next';
+import type { SessionUser } from '~/types/session';
+import { resolveClientIpOrNull } from '~/server/utils/client-ip';
+import { INT4_MAX } from '~/server/schema/base.schema';
+import { throwBadRequestError } from '~/server/utils/errorHandling';
+
+import { getEdgeUrl } from '~/client-utils/edge-url';
+import { getFeatureFlags } from '~/server/services/feature-flags.service';
+import { buildSearchActor } from '~/server/meilisearch/client';
+import { isMeiliOff } from '~/server/services/feed-primary.service';
+import {
+  getAllImages,
+  getImagesFromFeedSearch,
+  getImagesFromFeedServiceForRest,
+} from '~/server/services/image.service';
+import { parseFeedCursor } from '~/server/common/feed-cursor';
+import { imageMetaCache, thumbnailCache } from '~/server/redis/caches';
+import type { PublicVideoThumbnail } from '~/server/utils/public-video-thumbnail';
+import { getPublicVideoThumbnail } from '~/server/utils/public-video-thumbnail';
+import {
+  getNsfwLevelDeprecatedReverseMapping,
+  NsfwLevelDeprecated,
+} from '~/shared/constants/browsingLevel.constants';
+import { MediaType } from '~/shared/utils/prisma/enums';
+import { Flags } from '~/shared/utils/flags';
+import { isDefined } from '~/utils/type-guards';
+
+/**
+ * Shared image-search + response-shaping body extracted verbatim from
+ * `/api/v1/images/index.ts` so the public endpoint AND the block-scoped catalog
+ * endpoint (`/api/v1/blocks/images.ts`) build the SAME response from the SAME
+ * query path (legacy `getAllImages` / feed
+ * `getImagesFromFeedSearch`, the `withMeta` enrichment, and the JSON shaping).
+ *
+ * The ONLY maturity lever is `browsingLevel`, supplied by the caller. The public
+ * endpoint passes its existing region/`?nsfw=`-derived value UNCHANGED; the
+ * block endpoint passes a value already CLAMPED to the token's domain ceiling.
+ * There is NO `nsfw`-passthrough widening for images: the public endpoint maps
+ * `?nsfw=` into `browsingLevel` BEFORE this helper runs (unlike models, where a
+ * separate per-image `nsfw` flag widened the image list), so the per-image
+ * `nsfwLevel` filter that `getAllImages*`/feed-search apply is driven SOLELY by
+ * `browsingLevel`. A SFW-clamped block can therefore never surface a mature
+ * image — no separate passthrough exists to re-widen it.
+ *
+ * Maturity policy is NOT decided here — this helper is a pure executor. The
+ * caller is the single place that derives the effective `browsingLevel`.
+ */
+
+// The validated params an image search needs, minus the maturity knobs (`nsfw`
+// / `browsingLevel`) which the caller resolves into the single `browsingLevel`
+// context field, and minus `page`/`limit`/`cursor` which are passed explicitly.
+export type RunImageSearchInput = {
+  /** Per-page take (the validated `limit`). */
+  limit: number;
+  /** Offset-paging skip (public endpoint only; undefined for cursor paths). */
+  skip?: number;
+  /** Cursor — bigint|number|string|Date, matching the public endpoint's parsed union. */
+  cursor?: bigint | number | string | Date;
+  /** MediaType filter (the public endpoint's `type`, forwarded as `types: [type]`). */
+  type?: MediaType;
+  withMeta: boolean;
+  flatMeta?: boolean;
+  withTags: boolean;
+  /**
+   * Serve `data.postId`'s images in the uploader's order instead of by `sort`. Only the DB path
+   * keeps that order; feed search ranks the whole post first, so re-sorting a page of it is not
+   * the same thing.
+   */
+  postOrder?: boolean;
+  /**
+   * Let the feed service answer feed-search requests behind its flag, and accept the `feed:`
+   * cursors it hands out. Only the public endpoint opts in.
+   */
+  feedService?: boolean;
+  /** The remaining `...data` fields off the parsed schema (postId/modelId/username/etc). */
+  data: Record<string, unknown>;
+};
+
+export type RunImageSearchContext = {
+  /**
+   * The EFFECTIVE browsing-level flag. The caller is the single source of
+   * truth: the public endpoint passes its region/nsfw-derived value; the block
+   * endpoint passes a value already clamped to the token's domain ceiling.
+   */
+  browsingLevel: number;
+  /** The viewer (session user) — undefined for anon. */
+  user?: SessionUser;
+  /** Used for feature flags, region read by the caller, and the search actor. */
+  req: NextApiRequest;
+};
+
+export type ShapedImage = {
+  id: number;
+  url: string;
+  hash: unknown;
+  width: unknown;
+  height: unknown;
+  nsfwLevel: NsfwLevelDeprecated;
+  type: unknown;
+  nsfw: boolean;
+  browsingLevel: number;
+  createdAt: unknown;
+  postId: unknown;
+  /** A JPEG still and its dimensions; null unless `type` is video. */
+  thumbnail: PublicVideoThumbnail | null;
+  stats: {
+    cryCount: number;
+    laughCount: number;
+    likeCount: number;
+    dislikeCount: number;
+    heartCount: number;
+    commentCount: number;
+  };
+  meta: unknown;
+  username: unknown;
+  baseModel: unknown;
+  modelVersionIds: unknown;
+  tags?: Array<{ id: number; name: string }>;
+};
+
+// The feed emits `${offset}|${sortAtUnix}` and reads only the offset, via `parseInt(...) || 0`
+// (event-engine-common/feeds/base.ts), so anything else silently restarts at page one.
+const FEED_OFFSET_CURSOR = /^(-?\d+)(?:\|[^|]*)?$/;
+
+function assertFeedOffsetCursor(cursor: RunImageSearchInput['cursor'], allowFeedCursor: boolean) {
+  if (cursor === undefined || cursor === '') return;
+  const value = cursor instanceof Date ? cursor.toISOString() : String(cursor);
+  if (allowFeedCursor && parseFeedCursor(value)) return;
+  const match = FEED_OFFSET_CURSOR.exec(value);
+  if (!match) return throwBadRequestError(`Invalid cursor: not a feed offset "${value}"`);
+  const offset = Number(match[1]);
+  if (offset < 0 || offset > INT4_MAX)
+    throwBadRequestError(`Invalid cursor: out of range "${value}"`);
+}
+
+/**
+ * Run the image search and shape the response. Behavior-preserving extraction
+ * of the body of `/api/v1/images/index.ts`. The caller owns: param parsing,
+ * pagination math, the bulkhead slot, the REST timer, the region clamp, and —
+ * critically — the EFFECTIVE `browsingLevel`. This function decides no policy.
+ */
+export async function runImageSearch(
+  input: RunImageSearchInput,
+  ctx: RunImageSearchContext
+): Promise<{ items: ShapedImage[]; nextCursor?: string }> {
+  const { browsingLevel, user, req } = ctx;
+  const { limit, skip, cursor, type, withMeta, flatMeta, withTags, postOrder, feedService, data } =
+    input;
+
+  const features = getFeatureFlags({ user, req });
+
+  // Always route modelId/imageId/ids lookups through legacy getAllImages — the
+  // Meili feed query builder does not filter on any of them, so they'd silently
+  // return the global feed.
+  //
+  // 🔴 The mechanism is the QUERY BUILDER, not the index schema, and an earlier
+  // version of this comment had that wrong ("it indexes postedToId/
+  // modelVersionId only"). Image `id` IS a filterable attribute — on the metrics
+  // index (`metrics-images.search-index.ts` filterableAttributes) and on the
+  // images index (`imagesFilterableAttributes`), where the note reads "`id` is
+  // filterable on every index because the keyset cleanup scan pages on it". What
+  // is missing is the CLAUSE: `ImagesFeed.queryDocuments`
+  // (event-engine-common/feeds/images.feed.ts) never destructures `ids` and
+  // never pushes an `id IN [...]` filter, while its sibling `models.feed.ts`
+  // does (line 558). So an `ids` key reaching the feed is dropped on the floor
+  // and the caller gets a 200 full of the global feed — measured on a dev server
+  // 2026-08-27: `ids: [140383933]` returned image `12097475`. Anyone "fixing"
+  // this by adding the filter to the feed must delete the `ids` arm below in the
+  // same change, not leave both.
+  //
+  // `.length > 0`, not truthiness: an empty array is not a batch, and forcing
+  // the DB path for it would run getAllImages with no id clause at all (see the
+  // `if (ids && ids.length > 0)` guard at image.service.ts:1798) — i.e. the same
+  // global-feed answer, just from Postgres. The REST schemas reject `ids` with
+  // fewer than one entry for the same reason.
+  //
+  // When both modelId and modelVersionId are passed, modelId is redundant
+  // (getAllImages also silently ignores it via an `else if` chain) — let those
+  // requests flow through the search index so engagement sorts
+  // (MostReactions/MostComments/MostCollected) work, since getAllImages's gallery
+  // sort branches for those are currently disabled. Fixes #2134.
+  //
+  // KNOWN LIMITATION: when only `modelId` is passed (no `modelVersionId`), the
+  // legacy DB path is the only option, and its MostReactions/MostComments/
+  // MostCollected branches are intentionally commented out at
+  // image.service.ts:1414-1422 with a `// TODO this causes the app to spike`
+  // note. As a result, those sorts collapse to newest-by-id for `modelId`-only
+  // queries. Callers that need engagement-sorted galleries should also pass a
+  // specific `modelVersionId`, which routes through the search index where
+  // those sorts are honored.
+  const batchIds = (data as { ids?: unknown }).ids;
+  const useLegacyMethod =
+    (Array.isArray(batchIds) && batchIds.length > 0) ||
+    (data as { imageId?: unknown }).imageId ||
+    (postOrder && (data as { postId?: unknown }).postId)
+      ? true
+      : !!(data as { modelId?: unknown }).modelId &&
+        !(data as { modelVersionId?: unknown }).modelVersionId;
+
+  // Under FEED_SERVICE_MEILI_OFF every caller takes the feed service, opted in or not.
+  const meiliOff =
+    !useLegacyMethod &&
+    (await isMeiliOff({ currentUserId: user?.id, isModerator: user?.isModerator }));
+  const viaFeedService = !!feedService || meiliOff;
+  if (!useLegacyMethod) assertFeedOffsetCursor(cursor, viaFeedService);
+
+  // ATTRIBUTION surface: this feeds the anonymous search-actor hash, whose only
+  // job is to keep distinct callers in distinct actor labels. The fail-closed
+  // derivation would collapse every non-edge caller into ONE label, which is the
+  // opposite of what a per-caller label is for.
+  //
+  // Moving this site KEEPS it in agreement with the two `ctx.ip`-fed
+  // `buildSearchActor` calls in `image.controller.ts`; it does not repair a
+  // disagreement, because there was none.
+  //
+  // 🔴 The three sites AGREED before this change, and the reason is worth
+  // stating so nobody "discovers" a bug here that never existed: all three
+  // resolved the SAME request through the SAME library resolver, differing only
+  // in sentinel (`string | null` here, `?? ''` in `ctx.ip`) — and
+  // `buildSearchActor` hashes `ip ?? ''`, which folds `null` and `''` to one
+  // input. Measured across every fixture that could distinguish them, including
+  // a request carrying two competing addresses: identical `anon:` hashes.
+  //
+  // What WOULD have broken the agreement is this PR itself. It moves `ctx.ip`
+  // onto the shared predicate, so leaving this one call site on the library
+  // resolver would have INTRODUCED the divergence — one caller hashed to two
+  // different actors depending on which entry point served the request.
+  // (Measured: on a request the two derivations resolve differently, the
+  // left-behind form and `ctx.ip` produce different hashes.) The sites moved
+  // together, so the agreement is preserved rather than newly won.
+  //
+  // The `OrNull` form matches this call site's own nullable parameter. Between
+  // `null` and `''` the choice is inert: passing `resolveClientIpOrNull(req) ?? ''`
+  // would be byte-equivalent, for the same `ip ?? ''` fold above.
+  //
+  // ⚠️ That freedom does NOT extend to the shared label. `resolveClientIp` would
+  // hand this site the literal `'unknown'`, which does not fold — it hashes as
+  // itself and would put this entry point on a different actor from the two
+  // `ctx.ip`-fed siblings for every unresolvable request. So: the DERIVATION must
+  // match across the three sites, `null` and `''` are interchangeable, and the
+  // label is not. That is exactly the distinction `resolveClientIpOrNull` exists
+  // to carry — see its own note in `~/server/utils/client-ip`.
+  const actor = buildSearchActor({
+    userId: user?.id,
+    ip: resolveClientIpOrNull(req),
+    userAgent: req.headers['user-agent'],
+  });
+
+  // Cast through `unknown` at this single seam: the caller supplies `data` as
+  // the parsed schema's `...data` rest (the public endpoint a full parsed value
+  // carrying schema defaults like period/sort; the block endpoint the same
+  // selector rest), but the static type erases those keys to a Record. The
+  // runtime contract is identical to the pre-refactor endpoint — period/sort
+  // are always present in `data` since the destructure only pulls out
+  // limit/page/cursor/maturity/type/meta flags. The image service reads them at
+  // runtime, so this is byte-equivalent to the original inline call.
+  const include = ['tagIds', 'profilePictures', ...(withTags ? ['tags' as const] : [])];
+  const dbQuery = {
+    ...data,
+    types: type ? [type] : undefined,
+    limit,
+    skip,
+    cursor,
+    // Only fetch tagIds and profilePictures here; metaSelect is fetched
+    // on-demand in the controller below to avoid query filtering.
+    include,
+    periodMode: 'published',
+    headers: { src: '/api/v1/images' },
+    browsingLevel,
+    withMeta: false,
+    user,
+    disableMinor: true,
+    disablePoi: true,
+    includeBaseModel: true,
+    dbTarget: features.datapacketRead ? 'datapacket' : 'read',
+  } as unknown as Parameters<typeof getAllImages>[0];
+  const searchQuery = {
+    ...data,
+    types: type ? [type] : undefined,
+    limit,
+    skip,
+    cursor,
+    include,
+    periodMode: 'published',
+    browsingLevel,
+    withMeta: false,
+    currentUserId: user?.id,
+    isModerator: user?.isModerator,
+    disableMinor: true,
+    disablePoi: true,
+    actor,
+  } as unknown as Parameters<typeof getImagesFromFeedSearch>[0];
+
+  // A `feed:` cursor is a later page of a feed-served scroll. Clients walking whole
+  // back-catalogues spend nearly all their requests there, on images rarely read again, so those
+  // pages don't write the per-image caches; first pages, which pollers repeat, still do.
+  const cacheWriteBack = parseFeedCursor(cursor) === undefined;
+  const fromFeedService =
+    viaFeedService && !useLegacyMethod
+      ? await getImagesFromFeedServiceForRest(
+          { ...searchQuery, headers: { src: '/api/v1/images' } },
+          { ...dbQuery, cacheWriteBack },
+          { meiliOff }
+        )
+      : undefined;
+  const { items, nextCursor } = useLegacyMethod
+    ? await getAllImages(dbQuery)
+    : fromFeedService ?? (await getImagesFromFeedSearch(searchQuery));
+
+  let imageMetas: Record<number, { id: number; meta?: any }> = {};
+  if (withMeta && items.length > 0) {
+    imageMetas = await imageMetaCache.fetch(
+      items.map((img) => img.id),
+      { writeBack: !fromFeedService || cacheWriteBack }
+    );
+  }
+
+  const videoIds = items.filter((img) => img.type === MediaType.video).map((img) => img.id);
+  const customThumbnails = videoIds.length > 0 ? await thumbnailCache.fetch(videoIds) : {};
+
+  const shaped: ShapedImage[] = items.map((image) => {
+    const nsfw = getNsfwLevelDeprecatedReverseMapping(image.nsfwLevel);
+
+    return {
+      id: image.id,
+      url: getEdgeUrl(image.url, { original: true, type: image.type }),
+      hash: image.hash,
+      width: image.width,
+      height: image.height,
+      nsfwLevel: nsfw,
+      type: image.type,
+      nsfw: nsfw !== NsfwLevelDeprecated.None,
+      browsingLevel: image.nsfwLevel,
+      createdAt: image.createdAt,
+      postId: image.postId,
+      thumbnail: getPublicVideoThumbnail({
+        image,
+        customThumbnail: customThumbnails[image.id],
+        browsingLevel,
+      }),
+      stats: {
+        cryCount: image.stats?.cryCountAllTime ?? 0,
+        laughCount: image.stats?.laughCountAllTime ?? 0,
+        likeCount: image.stats?.likeCountAllTime ?? 0,
+        dislikeCount: image.stats?.dislikeCountAllTime ?? 0,
+        heartCount: image.stats?.heartCountAllTime ?? 0,
+        commentCount: image.stats?.commentCountAllTime ?? 0,
+      },
+      meta: (() => {
+        if (!withMeta) return null;
+        const imageMeta = imageMetas[image.id]?.meta ?? null;
+        const useFlat = flatMeta !== undefined ? flatMeta : !useLegacyMethod;
+        return useFlat ? imageMeta : { id: image.id, meta: imageMeta };
+      })(),
+      // `/api/v1/images` publishes `username` as a STRING, and a typed client
+      // fails to decode the whole 200 when it is not one — which is how #4768
+      // was reported (civitai/cli#513: "cannot unmarshal number into Go struct
+      // field .items.username of type string").
+      //
+      // The real repair is upstream, in the feed's entity cache, which used to
+      // infer a field's type from its stored text and so read the all-digit
+      // username `0222` back as the number `222`
+      // (`event-engine-common/caches/value-codec.ts`). This is a belt on the
+      // published contract, nothing more: it can keep a number from reaching the
+      // wire, but it CANNOT recover a name the cache already lost — `222` casts
+      // to `'222'`, which is still not `'0222'`. Do not read it as the fix.
+      //
+      // Only a `number` is coerced. `String()` on its own would be a regression:
+      // the legacy DB branch can carry a null username for a deleted account,
+      // and `String(null)` is the four-character string `'null'`.
+      username:
+        typeof image.user.username === 'number' ? String(image.user.username) : image.user.username,
+      baseModel: image.baseModel,
+      modelVersionIds: image.modelVersionIds,
+      tags: withTags ? image.tags?.map((t) => ({ id: t.id, name: t.name })) ?? [] : undefined,
+    };
+  });
+
+  return { items: shaped, nextCursor };
+}
+
+/**
+ * Leaves out the images above the held gallery level of their post's minor or SFW-only model, for
+ * searches that pick images by id and so name no model to hold them by.
+ */
+export async function withoutHeldImages<T extends Pick<ShapedImage, 'postId' | 'browsingLevel'>>(
+  items: T[]
+) {
+  // Loaded on demand: the model service's import graph is large.
+  const { getHeldLevelsByPost } = await import('~/server/services/model.service');
+  const postIdOf = (image: T) => (typeof image.postId === 'number' ? image.postId : undefined);
+  const held = await getHeldLevelsByPost(items.map(postIdOf).filter(isDefined));
+  return items.filter((image) => {
+    const postId = postIdOf(image);
+    const hold = postId ? held.get(postId) : undefined;
+    return !hold || Flags.intersects(hold.level, image.browsingLevel);
+  });
+}

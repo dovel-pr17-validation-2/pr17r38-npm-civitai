@@ -1,0 +1,570 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { NextApiRequest, NextApiResponse } from 'next';
+import { TRPCError } from '@trpc/server';
+
+import {
+  sfwBrowsingLevelsFlag,
+  allBrowsingLevelsFlag,
+} from '~/shared/constants/browsingLevel.constants';
+import type { BlockTokenClaims } from '~/server/middleware/block-scope.middleware';
+import { IMAGE_IDS_BATCH_MAX } from '~/server/common/constants';
+import { verifyReactTicket } from '~/server/services/blocks/react-ticket.service';
+
+/**
+ * Endpoint-wiring security tests for /api/v1/blocks/images (the sibling of
+ * /api/v1/blocks/models).
+ *
+ * These prove the handler delegates to runImageSearch with the CLAMPED browsing
+ * level (never the client's), for green / blue / red / missing-claim tokens —
+ * even when the client tries to pass nsfw=true / browsingLevel=31 (which the
+ * schema doesn't accept, so they can't reach the search at all).
+ *
+ * withBlockScope is mocked as a passthrough that stamps req.blockClaims (the
+ * real token-verify path is covered by block-scope.middleware tests). The image
+ * search service is mocked so no Prisma/Meili/Flipt is loaded.
+ */
+
+const { mockRunImageSearch, mockCheckRateLimit, mockGetHeldGalleryLevel, mockWithoutHeld } =
+  vi.hoisted(() => ({
+    mockWithoutHeld: vi.fn(),
+    mockRunImageSearch: vi.fn(),
+    mockCheckRateLimit: vi.fn(),
+    mockGetHeldGalleryLevel: vi.fn(),
+  }));
+
+const claimsBox: { claims: BlockTokenClaims | undefined } = { claims: undefined };
+
+vi.mock('~/server/services/image-search.service', () => ({
+  runImageSearch: mockRunImageSearch,
+  withoutHeldImages: mockWithoutHeld,
+}));
+
+vi.mock('~/server/services/model.service', () => ({
+  getHeldGalleryLevel: mockGetHeldGalleryLevel,
+}));
+
+// Per-token catalog rate limiter — mocked so the existing maturity-clamp tests
+// are unaffected (default: allowed). Its own logic is covered in
+// server/utils/__tests__/block-catalog-rate-limit.test.ts.
+vi.mock('~/server/utils/block-catalog-rate-limit', () => ({
+  checkBlockCatalogRateLimit: mockCheckRateLimit,
+}));
+
+vi.mock('~/server/middleware/block-scope.middleware', () => ({
+  withBlockScope: (handler: any) => (req: any, res: any) => {
+    req.blockClaims = claimsBox.claims;
+    return handler(req, res);
+  },
+}));
+
+vi.mock('@civitai/next-axiom', () => ({
+  withAxiom: (handler: any) => handler,
+}));
+
+// Controllable region state — default unrestricted so existing tests are
+// unaffected; flip `regionBox.restricted` per-test to exercise the geo clamp.
+const regionBox = { restricted: false };
+vi.mock('~/server/utils/region-blocking', () => ({
+  getRegion: () => ({
+    countryCode: regionBox.restricted ? 'GB' : 'US',
+    regionCode: null,
+    fullLocationCode: regionBox.restricted ? 'GB' : 'US',
+  }),
+  isRegionRestricted: () => regionBox.restricted,
+}));
+
+vi.mock('~/server/utils/pagination-helpers', () => ({
+  getNextPage: () => ({ baseUrl: { origin: 'https://civitai.com' }, nextPage: undefined }),
+  getPagination: () => ({ skip: 0 }),
+}));
+
+// Bulkhead: always grant a slot.
+vi.mock('~/server/utils/request-bulkhead', () => ({
+  acquireBulkheadSlot: () => () => undefined,
+  BulkheadFullError: class extends Error {},
+  HEAVY_REQUEST_CONCURRENCY: 10,
+}));
+
+function fakeClaims(over: Partial<BlockTokenClaims>): BlockTokenClaims {
+  return {
+    iss: 'civitai',
+    aud: 'civitai-app-block',
+    sub: 'user:42',
+    iat: 0,
+    exp: 0,
+    jti: 'jti',
+    blockId: 'blk',
+    appId: 'app',
+    appBlockId: 'apb_test',
+    blockInstanceId: 'bki_test',
+    ctx: {},
+    // No catalog:read (retired): the endpoint accepts ANY valid block token
+    // (withBlockScope with no requiredScope). The handler never reads `scopes` —
+    // its only authority is the maturity clamp on claims.maxBrowsingLevel.
+    scopes: [],
+    ...over,
+  };
+}
+
+function fakeRes() {
+  const res: Partial<NextApiResponse> & {
+    statusCode?: number;
+    body?: unknown;
+    headers: Record<string, unknown>;
+    headersSent?: boolean;
+  } = {
+    headersSent: false,
+    headers: {},
+    setHeader(k: string, v: unknown) {
+      this.headers[k] = v;
+      return this as never;
+    },
+    status(code: number) {
+      this.statusCode = code;
+      return this as never;
+    },
+    json(b: unknown) {
+      this.body = b;
+      return this as never;
+    },
+    end() {
+      return this as never;
+    },
+  };
+  return res as NextApiResponse & { statusCode?: number; body?: any };
+}
+
+async function invoke(query: Record<string, unknown>) {
+  const mod = await import('~/pages/api/v1/blocks/images');
+  const handler = mod.default as (req: NextApiRequest, res: NextApiResponse) => Promise<void>;
+  const req = {
+    method: 'GET',
+    query,
+    headers: {},
+    url: '/api/v1/blocks/images',
+  } as unknown as NextApiRequest;
+  const res = fakeRes();
+  await handler(req, res);
+  return res;
+}
+
+describe('/api/v1/blocks/images — authoritative clamp wiring', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    regionBox.restricted = false;
+    mockRunImageSearch.mockResolvedValue({ items: [], nextCursor: undefined });
+    // Default: under the per-token ceiling (existing clamp tests must be served).
+    mockCheckRateLimit.mockResolvedValue({ allowed: true });
+  });
+
+  it('GREEN token + nsfw=true → search called with SFW level (clamped)', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag, domain: 'green' });
+    const res = await invoke({ nsfw: 'true', browsingLevel: '31' });
+
+    expect(res.statusCode).toBe(200);
+    expect(mockRunImageSearch).toHaveBeenCalledTimes(1);
+    const [, ctx] = mockRunImageSearch.mock.calls[0];
+    expect(ctx.browsingLevel).toBe(sfwBrowsingLevelsFlag);
+    // No mature bits leak.
+    expect(ctx.browsingLevel & (4 | 8 | 16)).toBe(0);
+    // The viewer is never threaded (catalog is public; clamp is the authority).
+    expect(ctx.user).toBeUndefined();
+  });
+
+  it('BLUE token + browsingLevel=31 → still clamped to SFW', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag, domain: 'blue' });
+    await invoke({ browsingLevel: '31', nsfw: 'true' });
+    const [, ctx] = mockRunImageSearch.mock.calls[0];
+    expect(ctx.browsingLevel).toBe(sfwBrowsingLevelsFlag);
+  });
+
+  it('RED token → unclamped (mature allowed)', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: allBrowsingLevelsFlag, domain: 'red' });
+    await invoke({});
+    const [, ctx] = mockRunImageSearch.mock.calls[0];
+    expect(ctx.browsingLevel).toBe(allBrowsingLevelsFlag);
+  });
+
+  it('RED token from a RESTRICTED region → narrowed to SFW (geo clamp wiring)', async () => {
+    regionBox.restricted = true;
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: allBrowsingLevelsFlag, domain: 'red' });
+    await invoke({});
+    const [, ctx] = mockRunImageSearch.mock.calls[0];
+    // Region restriction overrides the red ceiling down to SFW.
+    expect(ctx.browsingLevel).toBe(sfwBrowsingLevelsFlag);
+    expect(ctx.browsingLevel & (4 | 8 | 16)).toBe(0);
+  });
+
+  it('MISSING claim (legacy/pre-#2670 token) → fails closed to SFW', async () => {
+    claimsBox.claims = fakeClaims({}); // no maxBrowsingLevel
+    await invoke({ nsfw: 'true', browsingLevel: '31' });
+    const [, ctx] = mockRunImageSearch.mock.calls[0];
+    expect(ctx.browsingLevel).toBe(sfwBrowsingLevelsFlag);
+  });
+
+  it('client maturity fields are NEVER forwarded to the search input', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    await invoke({ nsfw: 'true', browsingLevel: '31', someJunk: 'x' });
+
+    const [input] = mockRunImageSearch.mock.calls[0];
+    // The schema strips unknown + maturity keys; the ...data rest carries none.
+    expect(input.data).not.toHaveProperty('nsfw');
+    expect(input.data).not.toHaveProperty('browsingLevel');
+    expect(input.data).not.toHaveProperty('someJunk');
+  });
+
+  it.each([{ ids: '1,2' }, { imageId: '2' }])(
+    'leaves out held images from a search by image id (%o)',
+    async (query) => {
+      claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+      const found = [{ id: 1 }, { id: 2 }];
+      mockRunImageSearch.mockResolvedValue({ items: found, nextCursor: undefined });
+      mockWithoutHeld.mockResolvedValue([{ id: 1 }]);
+
+      const res = await invoke(query);
+
+      expect(mockWithoutHeld).toHaveBeenCalledWith(found);
+      expect(res.body?.items.map((image: { id: number }) => image.id)).toEqual([1]);
+    }
+  );
+
+  it('does not filter a search that names no image id', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    await invoke({ username: 'someone' });
+
+    expect(mockWithoutHeld).not.toHaveBeenCalled();
+  });
+
+  it('forwards the selector params (type/limit/sort/modelId/postId/username)', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    await invoke({
+      type: 'image',
+      limit: '20',
+      sort: 'Newest',
+      modelId: '123',
+      postId: '456',
+      username: 'someone',
+    });
+
+    const [input] = mockRunImageSearch.mock.calls[0];
+    expect(input.type).toBe('image');
+    expect(input.limit).toBe(20);
+    expect(input.data.sort).toBe('Newest');
+    expect(input.data.modelId).toBe(123);
+    expect(input.data.postId).toBe(456);
+    expect(input.data.username).toBe('someone');
+  });
+
+  it('429s when paging past the offset cap (guard mirrors public endpoint)', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    const res = await invoke({ page: '11', limit: '100' });
+    expect(res.statusCode).toBe(429);
+    expect(mockRunImageSearch).not.toHaveBeenCalled();
+  });
+
+  it('401s when no block claims were stamped (defense-in-depth; e.g. no token)', async () => {
+    // The middleware (real) rejects anon before reaching here; this guards the
+    // handler-internal `if (!claims) 401` path that fires if claims is absent.
+    claimsBox.claims = undefined;
+    const res = await invoke({});
+    expect(res.statusCode).toBe(401);
+    expect(mockRunImageSearch).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-GET', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    const mod = await import('~/pages/api/v1/blocks/images');
+    const handler = mod.default as (req: NextApiRequest, res: NextApiResponse) => Promise<void>;
+    const req = { method: 'POST', query: {}, headers: {}, url: '/x' } as unknown as NextApiRequest;
+    const res = fakeRes();
+    await handler(req, res);
+    expect(res.statusCode).toBe(405);
+    expect(mockRunImageSearch).not.toHaveBeenCalled();
+  });
+
+  it('over the per-token ceiling → 429 + Retry-After, search NOT called', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    mockCheckRateLimit.mockResolvedValueOnce({ allowed: false, retryAfterSeconds: 6 });
+    const res = await invoke({});
+
+    expect(res.statusCode).toBe(429);
+    expect((res as unknown as { headers: Record<string, unknown> }).headers['Retry-After']).toBe(
+      '6'
+    );
+    // Keyed on the stable blockInstanceId from the claims.
+    expect(mockCheckRateLimit).toHaveBeenCalledWith('bki_test');
+    // The bulkhead slot + the expensive image search must be short-circuited.
+    expect(mockRunImageSearch).not.toHaveBeenCalled();
+  });
+
+  it('limiter redis failure is FAIL-OPEN — request is still served (200)', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    // The helper itself catches redis errors and returns allowed:true; model
+    // that here so the endpoint never 429/500s when the limiter's redis is down.
+    mockCheckRateLimit.mockResolvedValueOnce({ allowed: true });
+    const res = await invoke({});
+
+    expect(res.statusCode).toBe(200);
+    expect(mockRunImageSearch).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Transient Meili → retryable 503 (audit 🟡 #2) ──────────────────────────
+  // The sibling now uses the SAME isTransientMeiliError predicate the public
+  // /api/v1/images handler uses, and attaches no-store + Retry-After: 2 so the
+  // 503 carries the same retryable contract (the doc claims it mirrors the
+  // public endpoint). isTransientMeiliError is NOT mocked here — the real
+  // predicate runs.
+  it('maps a transient Meili error to a retryable 503 (no-store + Retry-After)', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    // meilisearch-js 0.33 MeiliSearchCommunicationError(503) shape — a transport
+    // brownout the inner SDK throws, which used to bubble as a hard 500 here.
+    const transient = new Error('Service Unavailable') as Error & {
+      name: string;
+      statusCode: number;
+    };
+    transient.name = 'MeiliSearchCommunicationError';
+    transient.statusCode = 503;
+    mockRunImageSearch.mockRejectedValueOnce(transient);
+
+    const res = await invoke({});
+
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toEqual({ error: 'Image search is temporarily overloaded — please retry.' });
+    const headers = (res as unknown as { headers: Record<string, unknown> }).headers;
+    expect(headers['Cache-Control']).toBe('no-store');
+    expect(headers['Retry-After']).toBe('2');
+  });
+
+  it('a TRPCError SERVICE_UNAVAILABLE (service-wrapped) → 503 WITH no-store + Retry-After', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    const trpcError = Object.assign(
+      new Error('Image search is temporarily overloaded — please retry.'),
+      { code: 'SERVICE_UNAVAILABLE', name: 'TRPCError' }
+    );
+    mockRunImageSearch.mockRejectedValueOnce(trpcError);
+
+    const res = await invoke({});
+
+    expect(res.statusCode).toBe(503);
+    const headers = (res as unknown as { headers: Record<string, unknown> }).headers;
+    expect(headers['Cache-Control']).toBe('no-store');
+    expect(headers['Retry-After']).toBe('2');
+  });
+
+  it('does NOT mask a deterministic ApiError 500 (JSON body) as 503 — surfaces a non-503 status, no Retry-After', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    // Structured-JSON Meili 500 → deterministic, must NOT be reclassified.
+    const apiError500 = new Error('internal') as Error & { name: string; httpStatus: number };
+    apiError500.name = 'MeiliSearchApiError';
+    apiError500.httpStatus = 500;
+    mockRunImageSearch.mockRejectedValueOnce(apiError500);
+
+    const res = await invoke({});
+
+    expect(res.statusCode).not.toBe(503);
+    const headers = (res as unknown as { headers: Record<string, unknown> }).headers;
+    expect(headers['Retry-After']).toBeUndefined();
+  });
+
+  // `runImageSearch` rejects a malformed feed-offset cursor this way; the route must keep the 400.
+  it('[invariant] keeps a BAD_REQUEST from the search (invalid feed cursor) as a 400', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    mockRunImageSearch.mockRejectedValueOnce(
+      new TRPCError({ code: 'BAD_REQUEST', message: 'Invalid cursor: out of range "-5"' })
+    );
+
+    const res = await invoke({ cursor: '-5' });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toEqual({ error: 'Invalid cursor: out of range "-5"', code: 'BAD_REQUEST' });
+  });
+});
+
+describe('/api/v1/blocks/images — a held model or version', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    regionBox.restricted = false;
+    mockRunImageSearch.mockResolvedValue({ items: [], nextCursor: undefined });
+    mockCheckRateLimit.mockResolvedValue({ allowed: true });
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: allBrowsingLevelsFlag, domain: 'red' });
+  });
+  afterEach(() => mockGetHeldGalleryLevel.mockReset());
+
+  it.each([
+    ['modelId', { modelId: '5' }, { modelId: 5 }],
+    ['modelVersionId', { modelVersionId: '50' }, { modelVersionId: 50 }],
+    ['postId', { postId: '500' }, { postId: 500 }],
+  ])('serves ?%s= only at the held level', async (_name, query, selector) => {
+    mockGetHeldGalleryLevel.mockResolvedValue(1);
+
+    const res = await invoke(query);
+
+    expect(res.statusCode).toBe(200);
+    expect(mockGetHeldGalleryLevel).toHaveBeenCalledWith(expect.objectContaining(selector));
+    expect(mockRunImageSearch.mock.calls[0][1].browsingLevel).toBe(1);
+  });
+
+  it('returns an empty page, searching nothing, when the token allows no held level', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: 28, domain: 'red' });
+    mockGetHeldGalleryLevel.mockResolvedValue(1);
+
+    const res = await invoke({ modelVersionId: '50' });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.items).toEqual([]);
+    expect(mockRunImageSearch).not.toHaveBeenCalled();
+  });
+
+  it('leaves an unheld model at the token level', async () => {
+    mockGetHeldGalleryLevel.mockResolvedValue(undefined);
+
+    await invoke({ modelId: '5' });
+
+    expect(mockRunImageSearch.mock.calls[0][1].browsingLevel).toBe(allBrowsingLevelsFlag);
+  });
+});
+
+// ── Batch by id (`?ids=`) — civitai/civitai-app-starters#429 ────────────────
+//
+// The block route gets the same one-round-trip batch lookup as the public one:
+// this is the endpoint the retired `GET_IMAGES_BY_IDS` bridge message becomes,
+// and a block's results grid is the shape that needs it.
+//
+// The load-bearing claim here is `blocks-ids-clamp`: `ids` is a FILTER and never
+// a maturity bypass. It cannot be, structurally — `browsingLevel` is resolved
+// from the token before the search is called and reaches `getAllImages` as its
+// own independent SQL clause — but "structurally impossible" is what a guard is
+// for, since the whole reason this route exists is that the public one's
+// maturity surface was not acceptable for blocks.
+describe('/api/v1/blocks/images — ?ids= batch', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    regionBox.restricted = false;
+    mockRunImageSearch.mockResolvedValue({ items: [], nextCursor: undefined });
+    mockCheckRateLimit.mockResolvedValue({ allowed: true });
+  });
+
+  it('forwards a comma-delimited batch to the search input', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    const res = await invoke({ ids: '11,22,33' });
+
+    expect(res.statusCode).toBe(200);
+    const [input] = mockRunImageSearch.mock.calls[0];
+    expect(input.data.ids).toEqual([11, 22, 33]);
+  });
+
+  it('blocks-ids-clamp: a GREEN token naming ids is still served at the SFW ceiling', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag, domain: 'green' });
+    // Every lever a caller could reach for, together: named ids AND both
+    // maturity knobs the schema refuses to declare.
+    await invoke({ ids: '11,22,33', nsfw: 'true', browsingLevel: '31' });
+
+    const [input, ctx] = mockRunImageSearch.mock.calls[0];
+    expect(ctx.browsingLevel).toBe(sfwBrowsingLevelsFlag);
+    expect(ctx.browsingLevel & (4 | 8 | 16)).toBe(0);
+    // The ids survive; the maturity knobs do not become readable alongside them.
+    expect(input.data.ids).toEqual([11, 22, 33]);
+    expect(input.data).not.toHaveProperty('nsfw');
+    expect(input.data).not.toHaveProperty('browsingLevel');
+  });
+
+  it('blocks-ids-clamp: a restricted region still narrows a RED token that names ids', async () => {
+    regionBox.restricted = true;
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: allBrowsingLevelsFlag, domain: 'red' });
+    await invoke({ ids: '11,22,33' });
+
+    const [, ctx] = mockRunImageSearch.mock.calls[0];
+    expect(ctx.browsingLevel).toBe(sfwBrowsingLevelsFlag);
+  });
+
+  it(`rejects more than ${IMAGE_IDS_BATCH_MAX} ids with 400, before the search`, async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    const many = Array.from({ length: IMAGE_IDS_BATCH_MAX + 1 }, (_, i) => i + 1);
+    const res = await invoke({ ids: many.join(',') });
+
+    expect(res.statusCode).toBe(400);
+    expect(mockRunImageSearch).not.toHaveBeenCalled();
+  });
+
+  it(`accepts exactly ${IMAGE_IDS_BATCH_MAX} ids`, async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    const many = Array.from({ length: IMAGE_IDS_BATCH_MAX }, (_, i) => i + 1);
+    const res = await invoke({ ids: many.join(',') });
+
+    expect(res.statusCode).toBe(200);
+    expect(mockRunImageSearch.mock.calls[0][0].data.ids).toEqual(many);
+  });
+
+  it.each([
+    ['empty', ''],
+    ['non-numeric', 'abc'],
+    ['zero', '0'],
+    ['negative', '-5'],
+  ])('rejects a %s ids param with 400', async (_label, raw) => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    const res = await invoke({ ids: raw });
+
+    expect(res.statusCode).toBe(400);
+    expect(mockRunImageSearch).not.toHaveBeenCalled();
+  });
+
+  it('still counts against the per-token catalog rate limit', async () => {
+    claimsBox.claims = fakeClaims({ maxBrowsingLevel: sfwBrowsingLevelsFlag });
+    mockCheckRateLimit.mockResolvedValueOnce({ allowed: false, retryAfterSeconds: 6 });
+    const res = await invoke({ ids: '11,22,33' });
+
+    expect(res.statusCode).toBe(429);
+    expect(mockRunImageSearch).not.toHaveBeenCalled();
+  });
+});
+
+describe('/api/v1/blocks/images — reactTicket (app reactions provenance)', () => {
+  const SECRET = 'images-endpoint-secret';
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubEnv('NEXTAUTH_SECRET', SECRET);
+    regionBox.restricted = false;
+    mockCheckRateLimit.mockResolvedValue({ allowed: true });
+    mockRunImageSearch.mockResolvedValue({
+      items: [{ id: 501 }, { id: 502 }],
+      nextCursor: undefined,
+    });
+  });
+
+  it('attaches a ticket per item that verifies for exactly (that image, this app, this viewer)', async () => {
+    claimsBox.claims = fakeClaims({ sub: 'user:42', appBlockId: 'apb_test' });
+    const res = await invoke({});
+    expect(res.statusCode).toBe(200);
+    const items = res.body.items as Array<{ id: number; reactTicket?: string }>;
+    expect(items.map((i) => i.id)).toEqual([501, 502]);
+    for (const item of items) {
+      const subject = {
+        entityType: 'image' as const,
+        entityId: item.id,
+        appBlockId: 'apb_test',
+        sub: 'user:42',
+      };
+      expect(verifyReactTicket(item.reactTicket, subject, { secret: SECRET }).ok).toBe(true);
+      // Bound to the image: the other item's id does not verify with this ticket.
+      expect(
+        verifyReactTicket(
+          item.reactTicket,
+          { ...subject, entityId: item.id === 501 ? 502 : 501 },
+          { secret: SECRET }
+        ).ok
+      ).toBe(false);
+    }
+  });
+
+  it('attaches NO ticket for an anonymous token', async () => {
+    claimsBox.claims = fakeClaims({ sub: 'anon' });
+    const res = await invoke({});
+    expect(res.statusCode).toBe(200);
+    for (const item of res.body.items) expect(item).not.toHaveProperty('reactTicket');
+  });
+});
+
+// The ticket cases stub a signing secret; hand it back so no case added later inherits one.
+afterEach(() => {
+  vi.unstubAllEnvs();
+});

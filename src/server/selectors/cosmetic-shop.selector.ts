@@ -1,0 +1,31 @@
+import { Prisma } from '@prisma/client';
+import { simpleCosmeticSelect } from '~/server/selectors/cosmetic.selector';
+import { userWithCosmeticsSelect } from '~/server/selectors/user.selector';
+
+export const cosmeticShopItemSelect = Prisma.validator<Prisma.CosmeticShopItemSelect>()({
+  id: true,
+  unitAmount: true,
+  availableFrom: true,
+  availableTo: true,
+  availableQuantity: true,
+  title: true,
+  description: true,
+  archivedAt: true,
+  createdAt: true,
+  cosmetic: {
+    // creator = attribution for creator-made cosmetics featured in official
+    // sections (null for official cosmetics).
+    select: {
+      ...simpleCosmeticSelect,
+      videoUrl: true,
+      // So the tray's shop can hide a sticker kept off the image being decorated.
+      flags: true,
+      creator: { select: userWithCosmeticsSelect },
+    },
+  },
+  cosmeticId: true,
+  addedById: true,
+  // A pack has no cosmetic, so cards attribute it to its lister instead.
+  addedBy: { select: userWithCosmeticsSelect },
+  meta: true,
+});

@@ -1,0 +1,201 @@
+import { describe, expect, it } from 'vitest';
+import {
+  domainSpendType,
+  getAllowedAccountTypes,
+  getBlockAllowedAccountTypes,
+  getBuzzBulkMultiplier,
+  isPayoutEligibleBuzz,
+  orderBlockCurrencyTypes,
+  PAYOUT_ELIGIBLE_BUZZ_TYPES,
+} from '~/server/utils/buzz-helpers';
+import type { FeatureAccess } from '~/server/services/feature-flags.service';
+
+const features = (isGreen: boolean) => ({ isGreen } as unknown as FeatureAccess);
+
+describe('domainSpendType — the one currency a placement may be paid in', () => {
+  it('is green on the green domain and yellow otherwise', () => {
+    expect(domainSpendType(features(true))).toBe('green');
+    expect(domainSpendType(features(false))).toBe('yellow');
+  });
+
+  // Never blue. A placement that took non-transferable Buzz and paid it out
+  // would be a transfer channel for it.
+  it('never returns a currency the escrow refuses', () => {
+    for (const isGreen of [true, false])
+      expect(domainSpendType(features(isGreen))).not.toBe('blue');
+  });
+
+  // One derivation, not two. If this ever disagrees with the generator's list
+  // the button and the escrow would offer different currencies.
+  it('is the domain currency the generator would spend', () => {
+    for (const isGreen of [true, false])
+      expect([domainSpendType(features(isGreen))]).toEqual(
+        getAllowedAccountTypes(features(isGreen))
+      );
+  });
+});
+
+describe('getBlockAllowedAccountTypes — App Blocks currency parity', () => {
+  it('SFW (green/blue, isGreen=true) → blue then green (blue-first)', () => {
+    expect(getBlockAllowedAccountTypes(true)).toEqual(['blue', 'green']);
+  });
+
+  it('mature (.red, isGreen=false) → blue then yellow (blue-first)', () => {
+    expect(getBlockAllowedAccountTypes(false)).toEqual(['blue', 'yellow']);
+  });
+
+  it('is blue-first in BOTH branches (orchestrator drains in array order)', () => {
+    expect(getBlockAllowedAccountTypes(true)[0]).toBe('blue');
+    expect(getBlockAllowedAccountTypes(false)[0]).toBe('blue');
+  });
+
+  it('matches on-site getAllowedAccountTypes(["blue"]) for the same maturity', () => {
+    // The block helper must mirror the on-site generator's
+    // resolveGenerationCurrencies fallback (getAllowedAccountTypes(features, ['blue'])).
+    expect(getBlockAllowedAccountTypes(true)).toEqual(
+      getAllowedAccountTypes(features(true), ['blue'])
+    );
+    expect(getBlockAllowedAccountTypes(false)).toEqual(
+      getAllowedAccountTypes(features(false), ['blue'])
+    );
+  });
+
+  it('never includes red (disabled) or duplicate currencies', () => {
+    for (const isGreen of [true, false]) {
+      const types = getBlockAllowedAccountTypes(isGreen);
+      expect(types).not.toContain('red');
+      expect(new Set(types).size).toBe(types.length);
+    }
+  });
+});
+
+describe('isPayoutEligibleBuzz — payout-safety allowlist', () => {
+  it('yellow (purchased/earned) is payout-eligible', () => {
+    expect(isPayoutEligibleBuzz('yellow')).toBe(true);
+  });
+
+  it('blue (free generation Buzz) is EXCLUDED', () => {
+    expect(isPayoutEligibleBuzz('blue')).toBe(false);
+  });
+
+  it('green (paid/purchasable) is payout-eligible', () => {
+    expect(isPayoutEligibleBuzz('green')).toBe(true);
+  });
+
+  it('red (disabled) is EXCLUDED', () => {
+    expect(isPayoutEligibleBuzz('red')).toBe(false);
+  });
+
+  it('null / undefined / unknown types are EXCLUDED (fail-closed)', () => {
+    expect(isPayoutEligibleBuzz(null)).toBe(false);
+    expect(isPayoutEligibleBuzz(undefined)).toBe(false);
+    expect(isPayoutEligibleBuzz('bogus')).toBe(false);
+    expect(isPayoutEligibleBuzz('')).toBe(false);
+  });
+
+  it('the allowlist is the PAID types green + yellow (free blue excluded — guards against silent widening)', () => {
+    expect([...PAYOUT_ELIGIBLE_BUZZ_TYPES].sort()).toEqual(['green', 'yellow']);
+  });
+
+  it('of the currencies a block can SPEND, only the free type (blue) is excluded from payout', () => {
+    // Cross-check the parity widening against the payout gate: blocks spend
+    // blue/green/yellow; blue is the ONLY free type, so it is the only one
+    // excluded — the paid domain currency (green on .com, yellow on .red) is
+    // payout-eligible (a real, non-farmable spend).
+    const sfwSpendable = getBlockAllowedAccountTypes(true); // ['blue','green']
+    const matureSpendable = getBlockAllowedAccountTypes(false); // ['blue','yellow']
+    // blue (free) is never payout-eligible in either branch.
+    expect(isPayoutEligibleBuzz('blue')).toBe(false);
+    // SFW block: the paid domain currency (green) is eligible; blue is not.
+    expect(sfwSpendable.filter(isPayoutEligibleBuzz)).toEqual(['green']);
+    // Mature block: the paid domain currency (yellow) is eligible; blue is not.
+    expect(matureSpendable.filter(isPayoutEligibleBuzz)).toEqual(['yellow']);
+  });
+});
+
+describe('orderBlockCurrencyTypes — preferred-first + domain clamp', () => {
+  it('no pick → the allowed set UNCHANGED (byte-identical to Auto), both domains', () => {
+    // SFW.
+    expect(orderBlockCurrencyTypes(true, undefined)).toEqual({
+      ordered: getBlockAllowedAccountTypes(true),
+      disallowed: false,
+    });
+    expect(orderBlockCurrencyTypes(true, undefined).ordered).toEqual(['blue', 'green']);
+    // Mature.
+    expect(orderBlockCurrencyTypes(false, undefined)).toEqual({
+      ordered: getBlockAllowedAccountTypes(false),
+      disallowed: false,
+    });
+    expect(orderBlockCurrencyTypes(false, undefined).ordered).toEqual(['blue', 'yellow']);
+  });
+
+  it('allowed pick → moved to the FRONT with the rest as fallback (SFW green)', () => {
+    // allowed ['blue','green'] + pick green → ['green','blue'].
+    expect(orderBlockCurrencyTypes(true, 'green')).toEqual({
+      ordered: ['green', 'blue'],
+      disallowed: false,
+    });
+  });
+
+  it('allowed pick → moved to the FRONT with the rest as fallback (mature yellow)', () => {
+    // allowed ['blue','yellow'] + pick yellow → ['yellow','blue'].
+    expect(orderBlockCurrencyTypes(false, 'yellow')).toEqual({
+      ordered: ['yellow', 'blue'],
+      disallowed: false,
+    });
+  });
+
+  it('picking blue (already first) keeps blue-first + fallback intact', () => {
+    expect(orderBlockCurrencyTypes(true, 'blue')).toEqual({
+      ordered: ['blue', 'green'],
+      disallowed: false,
+    });
+  });
+
+  it('disallowed pick → flagged disallowed, allowed set returned UNCHANGED (no widening)', () => {
+    // yellow is NOT spendable on a SFW block; green is NOT spendable on a mature block.
+    const sfw = orderBlockCurrencyTypes(true, 'yellow');
+    expect(sfw.disallowed).toBe(true);
+    expect(sfw.ordered).toEqual(['blue', 'green']); // set never widened to include yellow
+    const mature = orderBlockCurrencyTypes(false, 'green');
+    expect(mature.disallowed).toBe(true);
+    expect(mature.ordered).toEqual(['blue', 'yellow']); // never widened to include green
+  });
+});
+
+describe('getBuzzBulkMultiplier — a bad multiplier never zero-credits a paid purchase', () => {
+  // The paid-purchase path (Stripe/Paddle) feeds the result straight into a buzz transaction, then
+  // writes an idempotency marker — so a zero credit is unrepairable by retry. A non-finite or sub-1
+  // multiplier must floor to 1 (base Buzz granted, no bonus), never to 0. ClickUp 868m0axkg.
+  const cases: [string, number][] = [
+    ['NaN (Math.max fold of a bad row against membership)', NaN],
+    ['negative', -3],
+    ['zero', 0],
+    ['Infinity', Infinity],
+    ['below 1', 0.5],
+  ];
+
+  it.each(cases)('grants the full purchase and no bonus at %s', (_label, multiplier) => {
+    const result = getBuzzBulkMultiplier({ buzzAmount: 1000, purchasesMultiplier: multiplier });
+    // On revert (raw multiplier) totalCustomBuzz goes to 0 / negative / NaN / Infinity — never 1000.
+    expect(result.totalCustomBuzz).toBe(1000);
+    expect(result.mainBuzzAdded).toBe(0);
+    expect(result.purchasesMultiplier).toBe(1);
+  });
+
+  it('still applies a real membership multiplier', () => {
+    const result = getBuzzBulkMultiplier({ buzzAmount: 1000, purchasesMultiplier: 1.2 });
+    expect(result.mainBuzzAdded).toBe(200);
+    expect(result.totalCustomBuzz).toBe(1200);
+  });
+
+  it('coerces a numeric-string multiplier rather than dropping the bonus', () => {
+    // Matches the defensive `Number()` on buzzAmount: a DB-typed value can arrive as a string.
+    const result = getBuzzBulkMultiplier({
+      buzzAmount: 1000,
+      purchasesMultiplier: '1.2' as unknown as number,
+    });
+    expect(result.mainBuzzAdded).toBe(200);
+    expect(result.totalCustomBuzz).toBe(1200);
+  });
+});

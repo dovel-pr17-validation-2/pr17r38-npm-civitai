@@ -1,0 +1,678 @@
+import { describe, expect, it } from 'vitest';
+import { jwtVerify } from 'jose';
+import { createPublicKey } from 'crypto';
+// The block-token RSA keypair is provisioned globally in the test setup
+// (src/__tests__/setup.ts wires BLOCK_TOKEN_{PRIVATE,PUBLIC}_KEY into the
+// mocked ~/env/server, which the service reads). The same public PEM is
+// re-exported here so this test verifies the JWT against the key the service
+// actually signed with. Doing it in setup is required because env/server.ts
+// snapshots its values at import time — well before any per-file beforeAll.
+import { TEST_BLOCK_TOKEN_PUBLIC_PEM } from '~/__tests__/setup';
+
+const publicPem = TEST_BLOCK_TOKEN_PUBLIC_PEM;
+// jose v6 requires a KeyObject/CryptoKey/JWK for RS256 verification — a raw
+// PEM Buffer is rejected. Convert once and reuse for every jwtVerify call.
+const publicKey = createPublicKey(publicPem);
+
+describe('BlockTokenService.sign — JWT round-trip', () => {
+  it('produces a token verifiable with the public key, with RS256 + correct claims', async () => {
+    // Late-import so the env above is in place when the module evaluates.
+    const { BlockTokenService } = await import('../block-token.service');
+
+    const result = await BlockTokenService.sign({
+      userId: 42,
+      blockId: 'blk_test',
+      appId: 'app_test',
+      appBlockId: 'apb_test',
+      blockInstanceId: 'bki_test',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 12345 },
+    });
+
+    expect(result.token.split('.').length).toBe(3);
+    expect(new Date(result.expiresAt).getTime()).toBeGreaterThan(Date.now());
+
+    // Decode protected header to verify algorithm — guards against alg-confusion
+    // regressions (e.g. someone accidentally switching to HS256).
+    const header = JSON.parse(
+      Buffer.from(result.token.split('.')[0], 'base64url').toString('utf8')
+    );
+    expect(header.alg).toBe('RS256');
+    expect(header.kid).toBeTruthy();
+
+    const { payload } = await jwtVerify(result.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(payload.sub).toBe('user:42');
+    expect(payload.blockInstanceId).toBe('bki_test');
+    expect(payload.scopes).toEqual(['models:read:self']);
+    expect((payload as { ctx: { modelId: number } }).ctx.modelId).toBe(12345);
+    expect(payload.buzzBudget).toBeUndefined();
+  });
+
+  it('includes buzzBudget only when supplied', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const withBudget = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['ai:write:budgeted'],
+      ctx: { modelId: 1 },
+      buzzBudget: 200,
+    });
+    const { payload } = await jwtVerify(withBudget.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(payload.buzzBudget).toBe(200);
+  });
+
+  it('stamps reviewRunForReal:true ONLY when supplied (absent otherwise)', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const withFlag = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['ai:write:budgeted'],
+      ctx: {},
+      buzzBudget: 50,
+      dev: true,
+      reviewRunForReal: true,
+    });
+    const withoutFlag = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['user:read:self'],
+      ctx: {},
+    });
+    const { payload: withPayload } = await jwtVerify(withFlag.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    const { payload: withoutPayload } = await jwtVerify(withoutFlag.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(withPayload.reviewRunForReal).toBe(true);
+    expect(withoutPayload.reviewRunForReal).toBeUndefined();
+  });
+
+  it('[REG] stamps privateRun:true ONLY when supplied (absent otherwise)', async () => {
+    // The SIGN half of the private-run claim plumbing. The two money arms — the
+    // spend-attribution void and the author-fee refusal — read this claim and
+    // nothing else, so if it is not stamped both arms are inert.
+    const { BlockTokenService } = await import('../block-token.service');
+    const withFlag = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['ai:write:budgeted'],
+      ctx: {},
+      buzzBudget: 137,
+      privateRun: true,
+    });
+    const withoutFlag = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['user:read:self'],
+      ctx: {},
+    });
+    const { payload: withPayload } = await jwtVerify(withFlag.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    const { payload: withoutPayload } = await jwtVerify(withoutFlag.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(withPayload.privateRun).toBe(true);
+    expect(withoutPayload.privateRun).toBeUndefined();
+    // 🔴 `privateRun` MUST NOT DRAG `dev` IN WITH IT. `claims.dev === true` SKIPS
+    // the per-app velocity reservation, so a private-run token that also carried
+    // `dev` would hand a moderator an uncapped per-app spend surface on an app the
+    // platform has taken down. The budget (137) is asserted too, so a mutant that
+    // routed privateRun through the dev branch — which would also change the
+    // lifetime — cannot pass by coincidence.
+    expect(withPayload.dev).toBeUndefined();
+    expect(withPayload.buzzBudget).toBe(137);
+  });
+
+  it('[REG] REFUSES privateRun combined with dev — the cap-skip combination', async () => {
+    // 🔴 THE RULE WAS PROSE ONLY UNTIL A REVIEW LANE SAID SO. `claims.dev === true`
+    // skips the per-app velocity reservation, so a `dev` private-run token is an
+    // uncapped per-app spend surface on a taken-down app. The docblock declared it a
+    // MUST-NEVER; nothing enforced it, and `sign` stamped both happily.
+    const { BlockTokenService } = await import('../block-token.service');
+    await expect(
+      BlockTokenService.sign({
+        userId: 1,
+        blockId: 'b',
+        appId: 'a',
+        appBlockId: 'apb_a',
+        blockInstanceId: 'bki',
+        scopes: ['ai:write:budgeted'],
+        ctx: {},
+        buzzBudget: 137,
+        privateRun: true,
+        dev: true,
+      })
+    ).rejects.toThrow(/privateRun and dev must not be combined/);
+  });
+
+  it('[INV] each flag ALONE still signs — the refusal is the combination, not either flag', async () => {
+    // The negative control for the guard above. Without it, a mutant that refused
+    // every `privateRun` token, or every `dev` token, would pass that test.
+    const { BlockTokenService } = await import('../block-token.service');
+    const base = {
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['ai:write:budgeted'] as string[],
+      ctx: {},
+      buzzBudget: 137,
+    };
+    await expect(BlockTokenService.sign({ ...base, privateRun: true })).resolves.toBeTruthy();
+    await expect(BlockTokenService.sign({ ...base, dev: true })).resolves.toBeTruthy();
+  });
+
+  it('[INV] privateRun does not change the token lifetime (the 4h cap is `dev`-only)', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    // 🔴 NOT `as const`. It makes `scopes` a `readonly ['user:read:self']`, which is
+    // not assignable to `SignBlockTokenInput.scopes: string[]` — two TS2345s that
+    // `pnpm typecheck` CANNOT SEE, because `tsconfig` excludes `src/**/__tests__/**`.
+    // A test-review lane found them by running the compiler over these files directly.
+    const base = {
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['user:read:self'] as string[],
+      ctx: {},
+    };
+    const plain = await BlockTokenService.sign({ ...base });
+    const privateRun = await BlockTokenService.sign({ ...base, privateRun: true });
+    // Compare the LIFETIME, not the absolute instant — the two signs happen
+    // milliseconds apart, so asserting equal `expiresAt` would be flaky. Both
+    // decode to the default 15-minute window.
+    const lifetime = async (token: string) => {
+      const { payload } = await jwtVerify(token, publicKey, {
+        issuer: 'civitai',
+        audience: 'civitai-app-block',
+        algorithms: ['RS256'],
+      });
+      return (payload.exp as number) - (payload.iat as number);
+    };
+    expect(await lifetime(privateRun.token)).toBe(await lifetime(plain.token));
+    expect(await lifetime(privateRun.token)).toBe(900);
+  });
+
+  it('stamps maxBrowsingLevel + domain claims when supplied (SFW domain)', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['ai:write:budgeted'],
+      ctx: { modelId: 1 },
+      domain: 'green',
+      maxBrowsingLevel: 3, // sfwBrowsingLevelsFlag (PG | PG13)
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(payload.maxBrowsingLevel).toBe(3);
+    expect(payload.domain).toBe('green');
+  });
+
+  it('stamps the mature ceiling for a red domain', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['ai:write:budgeted'],
+      ctx: { modelId: 1 },
+      domain: 'red',
+      maxBrowsingLevel: 31, // allBrowsingLevelsFlag
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(payload.maxBrowsingLevel).toBe(31);
+    expect(payload.domain).toBe('red');
+  });
+
+  it('omits the maturity claims entirely when not supplied (legacy path)', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 1 },
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(payload.maxBrowsingLevel).toBeUndefined();
+    expect(payload.domain).toBeUndefined();
+  });
+
+  it('omits the domain claim when null (host did not resolve a color) but keeps the ceiling', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 1 },
+      domain: null,
+      maxBrowsingLevel: 3, // still the fail-closed SFW ceiling
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(payload.domain).toBeUndefined();
+    expect(payload.maxBrowsingLevel).toBe(3);
+  });
+
+  it('signs anon subjects as sub="anon"', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: null,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 1 },
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(payload.sub).toBe('anon');
+  });
+});
+
+/**
+ * JWT classic-attack regression tests. The middleware uses
+ * jose.jwtVerify with `algorithms: ['RS256']`, which by spec rejects:
+ *  - alg=none tokens
+ *  - HS256 tokens that use the public PEM as the HMAC secret (alg confusion)
+ *  - tokens past their exp
+ *  - wrong iss/aud
+ * These tests pin those guarantees so a regression (e.g. someone widening
+ * the algorithm list) is caught at CI.
+ */
+describe('JWT classic attacks', () => {
+  it('rejects alg=none tokens', async () => {
+    // alg=none JWT — header.payload with no signature.
+    const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(
+      JSON.stringify({ sub: 'user:1', iss: 'civitai', aud: 'civitai-app-block', exp: 1e10 })
+    ).toString('base64url');
+    const token = `${header}.${payload}.`;
+    await expect(
+      jwtVerify(token, publicKey, {
+        issuer: 'civitai',
+        audience: 'civitai-app-block',
+        algorithms: ['RS256'],
+      })
+    ).rejects.toThrow();
+  });
+
+  it('rejects HS256 token signed with the public PEM as the HMAC secret', async () => {
+    const { SignJWT } = await import('jose');
+    // Attempt to sign the same claims with HS256 using the public PEM bytes
+    // as the symmetric secret. jose accepts the signing call; jwtVerify
+    // with algorithms:['RS256'] rejects.
+    const hsToken = await new SignJWT({
+      blockId: 'b',
+      appId: 'a',
+      blockInstanceId: 'bki',
+      scopes: [],
+      ctx: {},
+    })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuer('civitai')
+      .setAudience('civitai-app-block')
+      .setSubject('user:1')
+      .setExpirationTime('1h')
+      .setIssuedAt()
+      .sign(Buffer.from(publicPem));
+    await expect(
+      jwtVerify(hsToken, Buffer.from(publicPem), {
+        issuer: 'civitai',
+        audience: 'civitai-app-block',
+        algorithms: ['RS256'],
+      })
+    ).rejects.toThrow();
+  });
+
+  it('rejects expired tokens', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    // Sign now, then fast-forward past the 15-min expiry.
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 1 },
+    });
+    // Wait by manipulating `now` argument to jwtVerify.
+    const farFuture = Math.floor(Date.now() / 1000) + 60 * 60 * 24;
+    await expect(
+      jwtVerify(r.token, publicKey, {
+        issuer: 'civitai',
+        audience: 'civitai-app-block',
+        algorithms: ['RS256'],
+        currentDate: new Date(farFuture * 1000),
+      })
+    ).rejects.toThrow();
+  });
+
+  it('rejects tokens with wrong issuer', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 1 },
+    });
+    await expect(
+      jwtVerify(r.token, publicKey, {
+        issuer: 'NOT_CIVITAI',
+        audience: 'civitai-app-block',
+        algorithms: ['RS256'],
+      })
+    ).rejects.toThrow();
+  });
+
+  it('rejects tokens with wrong audience', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 1 },
+    });
+    await expect(
+      jwtVerify(r.token, publicKey, {
+        issuer: 'civitai',
+        audience: 'some-other-audience',
+        algorithms: ['RS256'],
+      })
+    ).rejects.toThrow();
+  });
+});
+
+describe('Settings-scope tokens get a shorter lifetime (audit H-2 partial)', () => {
+  it('block:settings:read carries a 5-minute exp instead of 15-minute', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['block:settings:read'],
+      ctx: { modelId: 1 },
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    const ttl = (payload.exp as number) - (payload.iat as number);
+    expect(ttl).toBeLessThanOrEqual(300);
+    expect(ttl).toBeGreaterThan(290);
+  });
+
+  it('non-settings scopes still get 15-minute exp', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 1 },
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    const ttl = (payload.exp as number) - (payload.iat as number);
+    expect(ttl).toBeLessThanOrEqual(900);
+    expect(ttl).toBeGreaterThan(890);
+  });
+
+  it('dev:true tokens carry a ~4h exp + a dev:true claim (overrides the default 15min)', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 1 },
+      dev: true,
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    const ttl = (payload.exp as number) - (payload.iat as number);
+    expect(ttl).toBeLessThanOrEqual(4 * 60 * 60);
+    expect(ttl).toBeGreaterThan(4 * 60 * 60 - 10);
+    expect(payload.dev).toBe(true);
+  });
+
+  it('dev:true OVERRIDES the settings-scope 5min branch (4h wins)', async () => {
+    // Defensive precedence assertion — dev page tokens never carry settings
+    // scopes in practice, but if both were ever set, dev (4h) must win.
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['block:settings:read'],
+      ctx: { modelId: 1 },
+      dev: true,
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    const ttl = (payload.exp as number) - (payload.iat as number);
+    expect(ttl).toBeGreaterThan(4 * 60 * 60 - 10);
+  });
+
+  it('omits the dev claim entirely when dev is not set (byte-identical to today)', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 1 },
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(payload.dev).toBeUndefined();
+    const ttl = (payload.exp as number) - (payload.iat as number);
+    expect(ttl).toBeLessThanOrEqual(900);
+    expect(ttl).toBeGreaterThan(890);
+  });
+
+  it('sets a not-before claim matching iat (M-3)', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const r = await BlockTokenService.sign({
+      userId: 1,
+      blockId: 'b',
+      appId: 'a',
+      appBlockId: 'apb_a',
+      blockInstanceId: 'bki',
+      scopes: ['models:read:self'],
+      ctx: { modelId: 1 },
+    });
+    const { payload } = await jwtVerify(r.token, publicKey, {
+      issuer: 'civitai',
+      audience: 'civitai-app-block',
+      algorithms: ['RS256'],
+    });
+    expect(payload.nbf).toBeDefined();
+    expect(payload.nbf).toBe(payload.iat);
+  });
+});
+
+/**
+ * 🔴 THE PRIVATE-RUN SIGNER REFUSALS — added because they were covered NOWHERE.
+ *
+ * ⚠️ Review found two production lines with no test at all: the throw on a LONE
+ * `privateRunAudience`, and the STAMPING of the audience claim. The mint suite mocks
+ * `BlockTokenService` wholesale, and the verifier suite uses a `signRaw` helper that
+ * bypasses the signer by construction — so both mutations (delete the throw; never stamp
+ * the claim) survived the whole repo. This file drives the real signer.
+ */
+describe('BlockTokenService.sign — private-run claim production [REG]', () => {
+  const base = {
+    userId: 8801,
+    blockId: 'signer-fixture',
+    appId: 'appblk-signer-fixture',
+    appBlockId: 'apb_signer',
+    blockInstanceId: 'page_apb_signer',
+    scopes: ['user:read:self'],
+    ctx: { slotId: 'app.page', entityType: 'none' },
+  } as Parameters<typeof BlockTokenService.sign>[0];
+
+  it('stamps BOTH the marker and the audience when both are given', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    for (const audience of ['owner', 'editor', 'moderator'] as const) {
+      const { token } = await BlockTokenService.sign({
+        ...base,
+        privateRun: true,
+        privateRunAudience: audience,
+      } as Parameters<typeof BlockTokenService.sign>[0]);
+      const claims = JSON.parse(
+        Buffer.from(token.split('.')[1], 'base64url').toString('utf8')
+      ) as Record<string, unknown>;
+      expect(claims.privateRun, `audience=${audience}`).toBe(true);
+      expect(claims.privateRunAudience).toBe(audience);
+      // 🔴 AND NEVER `dev` — the cap-skip pair, refused three layers deep.
+      expect(claims.dev).toBeUndefined();
+    }
+  });
+
+  it('🔴 THROWS on a LONE audience with no marker', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    // A half-stamped token is exempt from nothing (the approval verdict keys on the
+    // PAIR) while reading, to anyone inspecting it, as a private-run token. Refusing the
+    // shape at the producer keeps the pair the only representable state.
+    await expect(
+      BlockTokenService.sign({
+        ...base,
+        privateRunAudience: 'moderator',
+      } as Parameters<typeof BlockTokenService.sign>[0])
+    ).rejects.toThrow(/privateRunAudience requires privateRun/);
+  });
+
+  it('🔴 THROWS on the privateRun + dev PAIR', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    // `dev` skips the per-app velocity reservation, so this combination would hand every
+    // admitted viewer an uncapped per-app surface on a taken-down app.
+    await expect(
+      BlockTokenService.sign({
+        ...base,
+        privateRun: true,
+        privateRunAudience: 'owner',
+        dev: true,
+      } as Parameters<typeof BlockTokenService.sign>[0])
+    ).rejects.toThrow(/privateRun and dev must not be combined/);
+  });
+
+  it('a bare marker with NO audience still signs — the throw is about the lone AUDIENCE', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    // The negative control on both throws. Without it, a signer that rejected every
+    // private-run input would pass the two rows above while breaking the feature.
+    const { token } = await BlockTokenService.sign({
+      ...base,
+      privateRun: true,
+    } as Parameters<typeof BlockTokenService.sign>[0]);
+    const claims = JSON.parse(
+      Buffer.from(token.split('.')[1], 'base64url').toString('utf8')
+    ) as Record<string, unknown>;
+    expect(claims.privateRun).toBe(true);
+    expect(claims.privateRunAudience).toBeUndefined();
+  });
+
+  it('an ordinary token carries NEITHER claim — prod is byte-identical', async () => {
+    const { BlockTokenService } = await import('../block-token.service');
+    const { token } = await BlockTokenService.sign(base);
+    const claims = JSON.parse(
+      Buffer.from(token.split('.')[1], 'base64url').toString('utf8')
+    ) as Record<string, unknown>;
+    expect(claims.privateRun).toBeUndefined();
+    expect(claims.privateRunAudience).toBeUndefined();
+  });
+});

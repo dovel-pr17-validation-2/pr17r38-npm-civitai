@@ -1,0 +1,326 @@
+import { chunk } from 'lodash-es';
+import type { MetricProcessorRunContext } from '~/server/metrics/base.metrics';
+import { createMetricProcessor } from '~/server/metrics/base.metrics';
+import { SearchIndexUpdateQueueAction } from '~/server/common/enums';
+// NOTE: `articlesSearchIndex` ('~/server/search-index') and `articleStatCache`
+// ('~/server/redis/caches') are imported LAZILY inside update() rather than at the
+// top level. Statically they form a circular import back into this module; under
+// Next 16 / Turbopack these become async modules, which opened a cold-start window
+// where this module's `articleMetrics` export was read before it was assigned →
+// `ReferenceError: Cannot access 'S' before initialization` → 500s on api-heavy.
+// Both are only used at runtime inside update(), so deferring the import is safe and
+// breaks the cycle. These are the only two imports unique to article.metrics vs the
+// other 14 metric processors, which is why only this one threw.
+import { createLogger } from '~/utils/logging';
+import type { Task } from '~/server/utils/concurrency-helpers';
+import { limitConcurrency } from '~/server/utils/concurrency-helpers';
+import {
+  executeRefresh,
+  getAffected,
+  reactionCountKeys,
+  snippets,
+} from '~/server/metrics/metric-helpers';
+import { getCollectionItemCountTasks } from '~/server/metrics/collection-item-counts';
+import { getMetricExcludedUserIdsOrThrow } from '~/server/services/metric-excluded-users.service';
+import type { ArticleMetric } from '~/shared/utils/prisma/models';
+import { templateHandler } from '~/server/db/db-helpers';
+
+const log = createLogger('metrics:article');
+
+export const articleMetrics = createMetricProcessor({
+  name: 'Article',
+  async update(baseCtx) {
+    // Update the context to include the update record
+    const ctx = baseCtx as MetricContext;
+    ctx.updates = {};
+    ctx.idKey = 'articleId';
+
+    // Get the metric tasks
+    //---------------------------------------
+    const fetchTasks = (await Promise.all([
+      getReactionTasks(ctx),
+      getCommentTasks(ctx),
+      getCollectionTasks(ctx),
+      getBuzzTasks(ctx),
+      getEngagementTasks(ctx),
+      getViewTasks(ctx),
+    ]).then((x) => x.flat())) as Task[];
+    log('articleMetrics update', fetchTasks.length, 'tasks');
+    await limitConcurrency(fetchTasks, 5);
+
+    // Update the article metrics
+    //---------------------------------------
+    const metricInsertColumns = metrics.map((key) => `"${key}" INT`).join(', ');
+    const metricInsertKeys = metrics.map((key) => `"${key}"`).join(', ');
+    const metricValues = metrics
+      .map((key) => `COALESCE(d."${key}", im."${key}", 0) as "${key}"`)
+      .join(',\n');
+    const metricOverrides = metrics.map((key) => `"${key}" = EXCLUDED."${key}"`).join(',\n');
+
+    const updateTasks = chunk(Object.values(ctx.updates), 100).map((batch, i) => async () => {
+      ctx.jobContext.checkIfCanceled();
+      log('update metrics', i + 1, 'of', updateTasks.length);
+      await executeRefresh(ctx)`
+        -- update article metrics
+        WITH data AS (SELECT * FROM jsonb_to_recordset(${batch}::jsonb) AS x("articleId" INT, ${metricInsertColumns}))
+        INSERT INTO "ArticleMetric" ("articleId", "timeframe", "updatedAt", ${metricInsertKeys})
+        SELECT
+          d."articleId",
+          'AllTime'::"MetricTimeframe" AS timeframe,
+          NOW() as "updatedAt",
+          ${metricValues}
+        FROM data d
+        LEFT JOIN "ArticleMetric" im ON im."articleId" = d."articleId" AND im."timeframe" = 'AllTime'
+        WHERE EXISTS (SELECT 1 FROM "Article" WHERE id = d."articleId") -- ensure the article exists
+        ON CONFLICT ("articleId", "timeframe") DO UPDATE
+          SET
+            ${metricOverrides},
+            "updatedAt" = NOW()
+      `;
+      log('update metrics', i + 1, 'of', updateTasks.length, 'done');
+    });
+    await limitConcurrency(updateTasks, 10);
+
+    // Update the search index
+    //---------------------------------------
+    const affectedArticleIds = Object.keys(ctx.updates).map((id) => parseInt(id, 10));
+    log('update search index', affectedArticleIds.length, 'articles');
+    // Lazy import — breaks the static circular import (see top-of-file note).
+    const { articlesSearchIndex } = await import('~/server/search-index');
+    await articlesSearchIndex.queueUpdate(
+      affectedArticleIds.map((id) => ({
+        id,
+        action: SearchIndexUpdateQueueAction.Update,
+      }))
+    );
+
+    // Bust article stat cache for all affected articles
+    //---------------------------------------
+    log('bust article stat cache', affectedArticleIds.length, 'articles');
+    if (affectedArticleIds.length > 0) {
+      // Lazy import — breaks the static circular import (see top-of-file note).
+      const { articleStatCache } = await import('~/server/redis/caches');
+      await articleStatCache.bust(affectedArticleIds);
+    }
+  },
+  rank: {
+    table: 'ArticleRank',
+    primaryKey: 'articleId',
+  },
+});
+
+async function getReactionTasks(ctx: MetricContext) {
+  log('getReactionTasks', ctx.lastUpdate);
+  const excludedFilter = snippets.excludedReactorFilter(await getMetricExcludedUserIdsOrThrow());
+  const affected = await getAffected(ctx)`
+    -- get recent article reactions
+    SELECT
+      "articleId" AS id
+    FROM "ArticleReaction"
+    WHERE "createdAt" > ${ctx.lastUpdate}
+  `;
+
+  const tasks = chunk(affected, 1000).map((ids, i) => async () => {
+    ctx.jobContext.checkIfCanceled();
+    log('getReactionTasks', i + 1, 'of', tasks.length);
+    // An entity whose remaining reactions are all excluded yields NO ROW from the
+    // aggregate below, and a missing row means "no change" to every writer downstream —
+    // so the pre-exclusion total would survive even a full recompute. Seeding zeros
+    // first makes the absence of a row mean zero; the aggregate overwrites whatever it
+    // does return.
+    for (const id of ids) {
+      const row = (ctx.updates[id] ??= { [ctx.idKey]: id });
+      for (const key of reactionCountKeys) row[key] ??= 0;
+    }
+    await getMetrics(ctx)`
+      -- get article reaction metrics
+      SELECT
+        r."articleId",
+        'AllTime'::"MetricTimeframe" AS timeframe,
+        SUM(CASE WHEN r.reaction = 'Heart' THEN 1 ELSE 0 END)::int AS "heartCount",
+        SUM(CASE WHEN r.reaction = 'Like' THEN 1 ELSE 0 END)::int AS "likeCount",
+        SUM(CASE WHEN r.reaction = 'Dislike' THEN 1 ELSE 0 END)::int AS "dislikeCount",
+        SUM(CASE WHEN r.reaction = 'Laugh' THEN 1 ELSE 0 END)::int AS "laughCount",
+        SUM(CASE WHEN r.reaction = 'Cry' THEN 1 ELSE 0 END)::int AS "cryCount"
+      FROM "ArticleReaction" r
+      WHERE r."articleId" IN (${ids})
+        AND r."articleId" BETWEEN ${ids[0]} AND ${ids[ids.length - 1]}
+        ${excludedFilter}
+      GROUP BY r."articleId"
+    `;
+    log('getReactionTasks', i + 1, 'of', tasks.length, 'done');
+  });
+
+  return tasks;
+}
+
+async function getCommentTasks(ctx: MetricContext) {
+  const affected = await getAffected(ctx)`
+    -- get recent article comments
+    SELECT c."entityId" as id
+    FROM "CommentV3" c
+    WHERE c."entityType" = 'article' AND c."parentId" IS NULL AND c."createdAt" > ${ctx.lastUpdate}
+  `;
+
+  const tasks = chunk(affected, 1000).map((ids, i) => async () => {
+    ctx.jobContext.checkIfCanceled();
+    log('getCommentTasks', i + 1, 'of', tasks.length);
+    await getMetrics(ctx)`
+      -- get article comment metrics
+      SELECT
+        c."entityId" AS "articleId",
+        'AllTime'::"MetricTimeframe" AS timeframe,
+        COUNT(c.id)::int AS "commentCount"
+      FROM "CommentV3" c
+      WHERE c."entityType" = 'article' AND c."parentId" IS NULL AND c."deletedAt" IS NULL
+        AND c."tosViolation" = false
+        AND c."entityId" IN (${ids})
+        AND c."entityId" BETWEEN ${ids[0]} AND ${ids[ids.length - 1]}
+      GROUP BY c."entityId"
+    `;
+    log('getCommentTasks', i + 1, 'of', tasks.length, 'done');
+  });
+
+  return tasks;
+}
+
+async function getCollectionTasks(ctx: MetricContext) {
+  return getCollectionItemCountTasks(ctx)('Article');
+}
+
+async function getBuzzTasks(ctx: MetricContext) {
+  const affected = await getAffected(ctx)`
+    -- get recent article tips
+    SELECT "entityId" as id
+    FROM "BuzzTip"
+    WHERE "entityType" = 'Article' AND ("createdAt" > ${ctx.lastUpdate} OR "updatedAt" > ${ctx.lastUpdate})
+  `;
+
+  const tasks = chunk(affected, 1000).map((ids, i) => async () => {
+    ctx.jobContext.checkIfCanceled();
+    log('getBuzzTasks', i + 1, 'of', tasks.length);
+    await getMetrics(ctx)`
+      -- get article tip metrics
+      SELECT
+        bt."entityId" AS "articleId",
+        'AllTime'::"MetricTimeframe" AS timeframe,
+        COUNT(*)::int AS "tippedCount",
+        SUM(bt.amount)::int AS "tippedAmountCount"
+      FROM "BuzzTip" bt
+      WHERE bt."entityId" IN (${ids})
+        AND bt."entityId" BETWEEN ${ids[0]} AND ${ids[ids.length - 1]}
+        AND bt."entityType" = 'Article'
+      GROUP BY bt."entityId"
+    `;
+    log('getBuzzTasks', i + 1, 'of', tasks.length, 'done');
+  });
+
+  return tasks;
+}
+
+async function getEngagementTasks(ctx: MetricContext) {
+  const affected = await getAffected(ctx)`
+    -- get recent article engagements
+    SELECT
+      "articleId" as id
+    FROM "ArticleEngagement"
+    WHERE "createdAt" > ${ctx.lastUpdate}
+  `;
+
+  const tasks = chunk(affected, 1000).map((ids, i) => async () => {
+    ctx.jobContext.checkIfCanceled();
+    log('getEngagementTasks', i + 1, 'of', tasks.length);
+    await getMetrics(ctx)`
+      -- get article engagement metrics
+      SELECT
+        ae."articleId",
+        'AllTime'::"MetricTimeframe" AS timeframe,
+        COUNT(*)::int AS "hideCount"
+      FROM "ArticleEngagement" ae
+      WHERE ae."articleId" IN (${ids})
+        AND ae."articleId" BETWEEN ${ids[0]} AND ${ids[ids.length - 1]}
+        AND ae.type = 'Hide'
+      GROUP BY ae."articleId"
+    `;
+    log('getEngagementTasks', i + 1, 'of', tasks.length, 'done');
+  });
+
+  return tasks;
+}
+
+type ArticleViews = {
+  entityId: number;
+  all_time: number;
+};
+async function getViewTasks(ctx: MetricContext) {
+  const viewed = await ctx.ch.$query<ArticleViews>`
+    SELECT
+      entityId,
+      sum(view_count) AS all_time
+    FROM uniqueViewsDaily
+    WHERE type = 'ArticleView'
+      AND entityId IN (
+        SELECT entityId
+        FROM views
+        WHERE type = 'ArticleView'
+          AND time >= ${ctx.lastUpdate}
+        GROUP BY entityId
+      )
+    GROUP BY entityId;
+  `;
+
+  const tasks = chunk(viewed, 1000).map((batch, i) => async () => {
+    ctx.jobContext.checkIfCanceled();
+    log('getViewTasks', i + 1, 'of', tasks.length);
+
+    // Add view metrics to ctx.updates
+    for (const row of batch) {
+      const entityId = row.entityId;
+      ctx.updates[entityId] ??= { [ctx.idKey]: entityId };
+      ctx.updates[entityId].viewCount = Number(row.all_time);
+    }
+
+    log('getViewTasks', i + 1, 'of', tasks.length, 'done');
+  });
+
+  return tasks;
+}
+
+type MetricKey = keyof ArticleMetric;
+type MetricContext = MetricProcessorRunContext & {
+  updates: Record<number, Record<string, number>>;
+  idKey: string;
+};
+const metrics = [
+  'heartCount',
+  'likeCount',
+  'dislikeCount',
+  'laughCount',
+  'cryCount',
+  'commentCount',
+  'viewCount',
+  'hideCount',
+  'collectedCount',
+  'tippedCount',
+  'tippedAmountCount',
+] as const;
+
+function getMetrics(ctx: MetricContext) {
+  return templateHandler(async (sql) => {
+    const query = await ctx.pg.cancellableQuery<ArticleMetric>(sql);
+    ctx.jobContext.on('cancel', query.cancel);
+    const data = await query.result();
+    if (!data.length) return;
+
+    for (const row of data) {
+      const entityId = row.articleId;
+      ctx.updates[entityId] ??= { [ctx.idKey]: entityId };
+      for (const key of Object.keys(row) as MetricKey[]) {
+        if (key === ctx.idKey || key === 'timeframe') continue;
+        const value = row[key];
+        if (value == null) continue;
+        ctx.updates[entityId][key] = Number(value);
+      }
+    }
+  });
+}

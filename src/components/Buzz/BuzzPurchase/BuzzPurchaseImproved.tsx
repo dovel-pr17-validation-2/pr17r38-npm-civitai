@@ -1,0 +1,1392 @@
+import {
+  Accordion,
+  Anchor,
+  Button,
+  Center,
+  Group,
+  Input,
+  Loader,
+  Stack,
+  Text,
+  ThemeIcon,
+  Badge,
+  Card,
+  Paper,
+  SimpleGrid,
+  Title,
+  Divider,
+  useComputedColorScheme,
+} from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import {
+  IconBolt,
+  IconCreditCard,
+  IconInfoCircle,
+  IconMoodDollar,
+  IconTrendingUp,
+} from '@tabler/icons-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment } from 'react';
+import PaddleTransactionModal from '~/components/Paddle/PaddleTransacionModal';
+import { useMutatePaddle } from '~/components/Paddle/util';
+import { usePaymentProvider } from '~/components/Payments/usePaymentProvider';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { NumberInputWrapper } from '~/libs/form/components/NumberInputWrapper';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { buzzBulkBonusMultipliers } from '~/server/common/constants';
+import type { Price } from '~/shared/utils/prisma/models';
+import type { BlockAttribution } from '~/server/schema/blocks/attribution.schema';
+import {
+  formatCurrencyForDisplay,
+  formatPriceForDisplay,
+  numberWithCommas,
+} from '~/utils/number-helpers';
+
+import { useQueryBuzzPackages } from '~/components/Buzz/useQueryBuzzPackages';
+import { CurrencyIcon } from '~/components/Currency/CurrencyIcon';
+import { dialogStore } from '~/components/Dialog/dialogStore';
+import { BuzzCoinbaseButton } from '~/components/Buzz/BuzzPurchase/Buttons/BuzzCoinbaseButton';
+import { useAppContext, useServerDomains } from '~/providers/AppProvider';
+import { useBuzzPurchaseCalculation } from '~/components/Buzz/useBuzzPurchaseCalculation';
+import { useActiveSubscription } from '~/components/Stripe/memberships.util';
+import { useUserMultipliers } from '~/components/Buzz/useBuzz';
+import { outerCardStyle } from '~/components/Buzz/CryptoDeposit/crypto-deposit.constants';
+import classes from '~/components/Buzz/BuzzPurchase/BuzzPurchaseImproved.module.scss';
+import clsx from 'clsx';
+import type { SubscriptionProductMetadata } from '~/server/schema/subscriptions.schema';
+import type { PaymentIntentMetadataSchema } from '~/server/schema/stripe.schema';
+import { Currency } from '~/shared/utils/prisma/enums';
+import { showErrorNotification } from '~/utils/notifications';
+import { trpc } from '~/utils/trpc';
+import { CurrencyBadge } from '~/components/Currency/CurrencyBadge';
+import { Modal } from '@mantine/core';
+import { useDialogContext } from '~/components/Dialog/DialogProvider';
+import { Elements, PaymentElement } from '@stripe/react-stripe-js';
+import { useStripePromise } from '~/providers/StripeProvider';
+import { useStripeTransaction } from '~/components/Buzz/useStripeTransaction';
+import type { StripeElementsOptions, StripePaymentElementOptions } from '@stripe/stripe-js';
+import type { CaptchaState } from '~/components/TurnstileWidget/TurnstileWidget';
+import {
+  TurnstilePrivacyNotice,
+  TurnstileWidget,
+} from '~/components/TurnstileWidget/TurnstileWidget';
+import type { BuzzSpendType } from '~/shared/constants/buzz.constants';
+import { buzzAmountToUnitAmount } from '~/shared/utils/buzz-charge';
+import { BuzzTypeSelector } from '~/components/Buzz/BuzzPurchase/BuzzTypeSelector';
+import { useBuzzCurrencyConfig } from '~/components/Currency/useCurrencyConfig';
+import { GreenEnvironmentRedirect } from '~/components/Purchase/GreenEnvironmentRedirect';
+import { InlineMembershipUpsell } from '~/components/Stripe/InlineMembershipUpsell';
+import { QS } from '~/utils/qs';
+import { useSyncAccount } from '~/hooks/useSyncAccount';
+import { buzzConstants } from '~/shared/constants/buzz.constants';
+import { getAccountTypeLabel } from '~/utils/buzz';
+import { openGreenPurchaseAcknowledgement } from '~/components/Stripe/GreenPurchaseAcknowledgement';
+import { useTrackEvent } from '~/components/TrackView/track.utils';
+
+type SelectablePackage = Pick<Price, 'id' | 'unitAmount'> & { buzzAmount?: number | null };
+
+export type BuzzPurchaseImprovedProps = {
+  message?: string;
+  purchaseSuccessMessage?: (purchasedBalance: number) => React.ReactNode;
+  onPurchaseSuccess?: () => void;
+  minBuzzAmount?: number;
+  onCancel?: () => void;
+  initialBuzzType?: BuzzSpendType;
+  onSelectedUnitAmountChange?: (unitAmount: number | undefined) => void;
+  /**
+   * App Blocks attribution — populated by IframeHost when the purchase
+   * is initiated from inside a block iframe. Pass-through only: stamped
+   * into the payment-provider metadata so the webhook can write a
+   * block_buzz_attribution row. Undefined for all non-block purchases.
+   */
+  attribution?: BlockAttribution;
+};
+
+const BuzzPurchasePaymentButton = ({
+  unitAmount,
+  buzzAmount,
+  onValidate,
+  onPurchaseSuccess,
+  purchaseSuccessMessage,
+  disabled,
+  buzzType,
+  attribution,
+}: Pick<
+  BuzzPurchaseImprovedProps,
+  'onPurchaseSuccess' | 'purchaseSuccessMessage' | 'attribution'
+> & {
+  disabled: boolean;
+  unitAmount: number;
+  buzzAmount: number;
+  onValidate: () => boolean;
+  buzzType?: BuzzSpendType;
+}) => {
+  const features = useFeatureFlags();
+  const paymentProvider = usePaymentProvider();
+  const currentUser = useCurrentUser();
+  const buzzConfig = useBuzzCurrencyConfig(buzzType);
+
+  const successMessage = useMemo(
+    () =>
+      purchaseSuccessMessage ? (
+        purchaseSuccessMessage(buzzAmount)
+      ) : (
+        <Stack>
+          <Text>Thank you for your purchase!</Text>
+          <Text>Purchased Buzz has been credited to your account.</Text>
+        </Stack>
+      ),
+    [buzzAmount, purchaseSuccessMessage]
+  );
+
+  const { processCompleteBuzzTransaction } = useMutatePaddle();
+
+  const { completeStripeBuzzPurchaseMutation } = useQueryBuzzPackages({
+    onPurchaseSuccess: () => {
+      onPurchaseSuccess?.();
+    },
+  });
+
+  const proceedWithStripePayment = () => {
+    if (!currentUser) {
+      return;
+    }
+
+    // App Blocks revenue-share attribution. The spread is a no-op for
+    // non-block purchases (attribution undefined). Stripe stringifies
+    // everything for the wire — the schema's z.coerce.number on
+    // blockModelId will parse it back on the way out.
+    const metadata: PaymentIntentMetadataSchema = {
+      type: 'buzzPurchase',
+      unitAmount,
+      buzzAmount,
+      userId: currentUser.id as number,
+      buzzType: buzzType,
+      ...(attribution
+        ? {
+            blockAppId: attribution.appId,
+            blockAppBlockId: attribution.appBlockId,
+            blockInstanceId: attribution.blockInstanceId,
+            blockScope: attribution.scope,
+            ...(attribution.modelId != null ? { blockModelId: attribution.modelId } : {}),
+            // FIN-1: slot id lets the server re-validate the install. The
+            // server re-derives every block field from the resolved row;
+            // these are sent for resolution only, never trusted as-is.
+            ...(attribution.slotId != null ? { blockSlotId: attribution.slotId } : {}),
+          }
+        : {}),
+    };
+
+    // Open Stripe payment modal which will handle captcha and payment intent creation
+    dialogStore.trigger({
+      component: StripeTransactionModal,
+      props: {
+        unitAmount,
+        buzzAmount,
+        metadata,
+        message: (
+          <Stack>
+            <Text>
+              You are about to purchase{' '}
+              <CurrencyBadge currency={Currency.BUZZ} unitAmount={buzzAmount} type={buzzType} />.
+            </Text>
+            {buzzType === 'green' && (
+              <Text size="sm" c="green" fw={500}>
+                Green Buzz can only be used on Civitai.green for Safe-For-Work content.
+              </Text>
+            )}
+            <Text>Please fill in your data and complete your purchase.</Text>
+          </Stack>
+        ),
+        successMessage,
+        onSuccess: async (stripePaymentIntentId) => {
+          // Complete the buzz purchase transaction
+          await completeStripeBuzzPurchaseMutation({
+            amount: buzzAmount,
+            details: metadata,
+            stripePaymentIntentId,
+          });
+
+          onPurchaseSuccess?.();
+        },
+      },
+    });
+  };
+
+  const handleStripeSubmit = async () => {
+    if (!onValidate()) {
+      return;
+    }
+
+    if (!currentUser) {
+      return;
+    }
+
+    // Show acknowledgement modal for green buzz purchases
+    if (buzzType === 'green') {
+      openGreenPurchaseAcknowledgement(proceedWithStripePayment, 'buzz');
+    } else {
+      proceedWithStripePayment();
+    }
+  };
+
+  const handlePaddleSubmit = async () => {
+    if (!onValidate()) {
+      return;
+    }
+
+    if (!currentUser) {
+      return;
+    }
+
+    dialogStore.trigger({
+      component: PaddleTransactionModal,
+      props: {
+        unitAmount,
+        currency: 'USD',
+        message: (
+          <Stack>
+            <Text>
+              You are about to purchase{' '}
+              <CurrencyBadge currency={Currency.BUZZ} unitAmount={buzzAmount} />
+            </Text>
+            <Text>Please fill in your data and complete your purchase.</Text>
+          </Stack>
+        ),
+        successMessage,
+        onSuccess: async (transactionId) => {
+          await processCompleteBuzzTransaction({ id: transactionId });
+          onPurchaseSuccess?.();
+        },
+      },
+    });
+  };
+
+  // Force Stripe for green buzz, otherwise use default provider
+  const shouldUseStripe = buzzType === 'green' || paymentProvider === 'Stripe';
+  const shouldUsePaddle = buzzType !== 'green' && paymentProvider === 'Paddle';
+
+  return (
+    <Button
+      disabled={disabled || features.disablePayments}
+      onClick={
+        shouldUsePaddle ? handlePaddleSubmit : shouldUseStripe ? handleStripeSubmit : undefined
+      }
+      size="md"
+      radius="md"
+      variant="light"
+      color={buzzConfig.color}
+      fw={500}
+      leftSection={<IconBolt size={18} />}
+    >
+      {features.disablePayments ? (
+        <span>Credit Card</span>
+      ) : (
+        <Group gap="sm">
+          <Text size="sm" fw={500}>
+            {buzzType === 'green' ? 'Pay with Card' : 'Complete Purchase'}
+          </Text>
+        </Group>
+      )}
+    </Button>
+  );
+};
+
+export const BuzzPurchaseImproved = ({
+  message,
+  onPurchaseSuccess,
+  minBuzzAmount,
+  onCancel,
+  purchaseSuccessMessage,
+  initialBuzzType,
+  onSelectedUnitAmountChange,
+  attribution,
+}: BuzzPurchaseImprovedProps) => {
+  const features = useFeatureFlags();
+  const currentUser = useCurrentUser();
+  const { region } = useAppContext();
+  const serverDomains = useServerDomains();
+  const syncAccount = useSyncAccount();
+  const [selectedPrice, setSelectedPrice] = useState<SelectablePackage | null>(null);
+  const [error, setError] = useState('');
+  const [customBuzzAmount, setCustomBuzzAmount] = useState<number | undefined>();
+  const [customAmount, setCustomAmount] = useState<number | undefined>();
+  const [activeControl, setActiveControl] = useState<string | null>(null);
+  // Green uses Stripe which has a higher minimum charge due to processing fees
+  const effectiveMinCharge = features.isGreen
+    ? buzzConstants.minStripeChargeAmount
+    : buzzConstants.minChargeAmount;
+  // On green site: default to green
+  // On yellow site: default to yellow (skip the selector entirely)
+  const [selectedBuzzType, setSelectedBuzzType] = useState<BuzzSpendType | undefined>(
+    features.isGreen ? 'green' : initialBuzzType ?? 'yellow'
+  );
+  const ctaEnabled = !!selectedPrice?.unitAmount || (!!customAmount && customAmount > 0);
+
+  const buzzConfig = useBuzzCurrencyConfig(selectedBuzzType);
+  const { packages = [], isLoading, processing } = useQueryBuzzPackages({});
+
+  const unitAmount = (selectedPrice?.unitAmount ?? customAmount) as number;
+  const buzzAmount = customAmount
+    ? customAmount * 10
+    : selectedPrice?.buzzAmount ?? (selectedPrice?.unitAmount ?? 0) * 10;
+
+  useEffect(() => {
+    onSelectedUnitAmountChange?.(unitAmount || undefined);
+  }, [unitAmount, onSelectedUnitAmountChange]);
+
+  // Calculate total buzz including bonuses
+  const buzzCalculation = useBuzzPurchaseCalculation(buzzAmount);
+  const { subscription, tier } = useActiveSubscription();
+  const { multipliers } = useUserMultipliers();
+
+  // Calculate percentages safely
+  const membershipMultiplier = multipliers.purchasesMultiplier ?? 1;
+  const membershipBonusPercent =
+    membershipMultiplier > 1 ? Math.round((membershipMultiplier - 1) * 100) : 0;
+  const bulkMultiplier = buzzCalculation.bulkBuzzMultiplier ?? 1;
+  const bulkBonusPercent = bulkMultiplier > 1 ? Math.round((bulkMultiplier - 1) * 100) : 0;
+  // Get membership tier
+  const subscriptionMeta = subscription?.product.metadata as SubscriptionProductMetadata;
+  const resolvedTier = subscriptionMeta?.tier ?? tier;
+  const membershipTier =
+    resolvedTier && resolvedTier !== 'free'
+      ? resolvedTier.charAt(0).toUpperCase() + resolvedTier.slice(1)
+      : null;
+
+  const onValidate = () => {
+    if (!selectedPrice && !customAmount) {
+      setError('Please choose one option');
+      return false;
+    }
+
+    if (unitAmount < effectiveMinCharge) {
+      setError(`Minimum amount is $${formatPriceForDisplay(effectiveMinCharge)} USD`);
+      return false;
+    }
+
+    if (!currentUser) {
+      setError('Please log in to continue');
+      return false;
+    }
+
+    if (!unitAmount) {
+      setError('Please enter the amount you wish to buy');
+      return false;
+    }
+
+    return true;
+  };
+
+  // const onValidate = () => {
+
+  useEffect(() => {
+    if (packages.length && !selectedPrice && !minBuzzAmount && !customAmount) {
+      setSelectedPrice(packages[0]);
+    }
+
+    if (minBuzzAmount) {
+      setSelectedPrice(null);
+      setActiveControl('customAmount');
+      setCustomAmount(Math.max(buzzAmountToUnitAmount(minBuzzAmount), effectiveMinCharge));
+    }
+  }, [packages, minBuzzAmount, selectedPrice]);
+
+  useEffect(() => {
+    if (selectedBuzzType === 'green' && !features.isGreen) {
+      // Redirect:
+      const query = { minBuzzAmount: minBuzzAmount };
+
+      window.open(
+        syncAccount(`//${serverDomains.green}/purchase/buzz?${QS.stringify(query)}`),
+        '_blank',
+        'noreferrer'
+      );
+    }
+  }, [selectedBuzzType, features.isGreen, minBuzzAmount, serverDomains.green, syncAccount]);
+
+  // Same derivation as the effect above that seeds `customAmount`, so the placeholder shows the
+  // amount the user will actually be charged. Previously an un-ceiled `/ 10`: for a fractional
+  // minimum the placeholder advertised one price and the seeded field held a higher one.
+  const minBuzzAmountPrice = minBuzzAmount
+    ? Math.max(buzzAmountToUnitAmount(minBuzzAmount), effectiveMinCharge)
+    : effectiveMinCharge;
+
+  // If no buzz type is selected, show selection screen
+  if (!selectedBuzzType) {
+    return <BuzzTypeSelector onSelect={setSelectedBuzzType} onCancel={onCancel} />;
+  }
+
+  if (!features.isGreen && selectedBuzzType === 'green') {
+    return (
+      <GreenEnvironmentRedirect
+        destinationPath="/purchase/buzz"
+        queryParams={{ minBuzzAmount }}
+        title="Redirecting to Green Buzz Purchase"
+        heading="Redirecting to Green Buzz Purchase"
+        description="A new window should open and redirect you to the Green Buzz purchase screen."
+        buttonText="Go to Green Buzz Purchase Page"
+        fullPageLayout={false}
+        onGoBack={() => setSelectedBuzzType(undefined)}
+      />
+    );
+  }
+
+  return (
+    <div
+      className={classes.wrapper}
+      style={{
+        // @ts-ignore
+        '--buzz-color': buzzConfig.colorRgb,
+        '--buzz-gradient': buzzConfig.css?.gradient,
+      }}
+    >
+      <Stack gap="md">
+        {message && (
+          <Card className={classes.messageCard} padding="md" radius="md">
+            <Group gap="sm" align="center">
+              <ThemeIcon size="md" variant="light" color="blue" radius="md">
+                <IconInfoCircle size={20} />
+              </ThemeIcon>
+              <div style={{ flex: 1 }}>
+                <Text size="sm" fw={500} lh={1.4}>
+                  {message}
+                </Text>
+              </div>
+            </Group>
+          </Card>
+        )}
+
+        {isLoading || processing ? (
+          <Center py="md">
+            <Stack align="center" gap="xs">
+              <Loader type="bars" size="md" color="accent.6" />
+              <Text size="sm" c="dimmed">
+                Loading packages...
+              </Text>
+            </Stack>
+          </Center>
+        ) : (
+          <Paper
+            className={classes.packageSection}
+            p="md"
+            radius="md"
+            withBorder
+            style={outerCardStyle}
+          >
+            <Stack gap="md">
+              <div>
+                <Title order={3} size="lg" mb={0}>
+                  Choose Your Package
+                </Title>
+                <Text c="dimmed" size="sm">
+                  Select from our packages or enter a custom amount
+                </Text>
+              </div>
+
+              <Input.Wrapper error={error}>
+                <Stack gap="md" mb={error ? 5 : undefined}>
+                  <SimpleGrid
+                    cols={{ base: 2, sm: 3, md: packages.length >= 4 ? 4 : packages.length }}
+                    spacing="sm"
+                  >
+                    {packages.map((buzzPackage, index) => {
+                      if (!buzzPackage.unitAmount) return null;
+
+                      const price = buzzPackage.unitAmount / 100;
+                      const buzzAmount = buzzPackage.buzzAmount ?? buzzPackage.unitAmount * 10;
+                      const disabled = !!minBuzzAmount ? buzzAmount < minBuzzAmount : false;
+                      const isSelected = selectedPrice?.id === buzzPackage.id;
+
+                      return (
+                        <Card
+                          key={buzzPackage.id}
+                          className={clsx(
+                            classes.packageCard,
+                            isSelected && classes.selected,
+                            disabled && classes.packageCardDisabled
+                          )}
+                          padding="md"
+                          radius="md"
+                          onClick={() => {
+                            if (disabled) return;
+                            setCustomAmount(undefined);
+                            setCustomBuzzAmount(undefined);
+                            setError('');
+                            setSelectedPrice(buzzPackage);
+                            setActiveControl(null);
+                          }}
+                        >
+                          {/* Absolute positioned popular badge */}
+                          <Stack align="center" gap="xs">
+                            <div>
+                              <BuzzTierIcon
+                                tier={index + 1}
+                                totalPackages={packages.length}
+                                size="sm"
+                              />
+                            </div>
+
+                            <div className="text-center">
+                              <Text size="lg" fw={700} className={classes.packageBuzzAmount}>
+                                {numberWithCommas(buzzAmount)}
+                              </Text>
+                              <Text size="xs" fw={600} mb="xs" className="text-buzz">
+                                Buzz
+                              </Text>
+                              <Text size="xl" fw={800} className={classes.packagePrice}>
+                                ${price}
+                              </Text>
+                            </div>
+                          </Stack>
+                        </Card>
+                      );
+                    })}
+                  </SimpleGrid>
+
+                  {/* Inline Membership Upsell */}
+                  <InlineMembershipUpsell
+                    selectedUnitAmount={unitAmount}
+                    className={classes.inlineUpsellCard}
+                  />
+
+                  {/* Custom Amount Section */}
+                  <Card className={classes.customAmountCard} padding="sm" radius="md">
+                    <Accordion
+                      variant="subtle"
+                      className={classes.customAmountAccordion}
+                      value={activeControl}
+                      onChange={(value) => {
+                        setSelectedPrice(null);
+                        setError('');
+                        setActiveControl(value);
+                      }}
+                    >
+                      <Accordion.Item value="customAmount">
+                        <Accordion.Control py="sm">
+                          <Group gap="sm" wrap="nowrap">
+                            <ThemeIcon size="sm" variant="light" color={buzzConfig.color}>
+                              <IconMoodDollar size={16} />
+                            </ThemeIcon>
+                            <Text size="sm" fw={600}>
+                              Custom Amount
+                            </Text>
+                          </Group>
+                        </Accordion.Control>
+                        <Accordion.Panel>
+                          <Stack gap="sm" mt="sm">
+                            <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
+                              <NumberInputWrapper
+                                label="Buzz Amount"
+                                placeholder={`Min ${numberWithCommas(minBuzzAmountPrice * 10)}`}
+                                leftSection={
+                                  <CurrencyIcon
+                                    currency={Currency.BUZZ}
+                                    size={16}
+                                    type={selectedBuzzType}
+                                  />
+                                }
+                                value={customBuzzAmount}
+                                clampBehavior="blur"
+                                min={1000}
+                                max={buzzConstants.maxChargeAmount * 10}
+                                onChange={(value) => {
+                                  setError('');
+                                  setSelectedPrice(null);
+                                  const newCustomBuzzAmount = value ? Number(value) : undefined;
+                                  setCustomBuzzAmount(newCustomBuzzAmount);
+                                  if (newCustomBuzzAmount) {
+                                    // This field is free-typed, so a Buzz amount that is
+                                    // not a multiple of 10 — 10,004 — divides to 1000.4
+                                    // cents, which Stripe answers with `Invalid integer`.
+                                    // `buzzAmountToUnitAmount` owns the rule (and why it
+                                    // ceils); it is the only derivation that reaches every
+                                    // provider. All four provider schemas now carry `.int()`
+                                    // as well, so this is no longer the sole defence.
+                                    // The USD field beside this one needs no such guard:
+                                    // NumberInputWrapper already applies
+                                    // `Math.ceil(value * 100)` to a `format="currency"`
+                                    // input.
+                                    setCustomAmount(buzzAmountToUnitAmount(newCustomBuzzAmount));
+                                  } else {
+                                    setCustomAmount(undefined);
+                                  }
+                                }}
+                                step={1000}
+                                size="sm"
+                              />
+
+                              <NumberInputWrapper
+                                label="USD Amount"
+                                placeholder={`Min $${formatPriceForDisplay(minBuzzAmountPrice)}`}
+                                leftSection={
+                                  <CurrencyIcon currency="USD" size={16} fill="transparent" />
+                                }
+                                value={customAmount}
+                                min={100}
+                                step={100}
+                                clampBehavior="blur"
+                                max={buzzConstants.maxChargeAmount}
+                                allowDecimal
+                                fixedDecimalScale
+                                decimalScale={2}
+                                currency="USD"
+                                onChange={(value) => {
+                                  setError('');
+                                  setSelectedPrice(null);
+                                  const newCustomAmount = value ? Number(value) : undefined;
+                                  setCustomAmount(newCustomAmount);
+                                  if (newCustomAmount) {
+                                    setCustomBuzzAmount(newCustomAmount * 10);
+                                  } else {
+                                    setCustomBuzzAmount(undefined);
+                                  }
+                                }}
+                                format="currency"
+                                size="sm"
+                              />
+                            </SimpleGrid>
+
+                            <Text size="xs" c="dimmed" ta="center">
+                              Min: {numberWithCommas(effectiveMinCharge * 10)} Buzz or $
+                              {formatPriceForDisplay(effectiveMinCharge)}
+                            </Text>
+                          </Stack>
+                        </Accordion.Panel>
+                      </Accordion.Item>
+                    </Accordion>
+                  </Card>
+                </Stack>
+              </Input.Wrapper>
+
+              {/* Bulk Purchase Benefits */}
+              <Card className={classes.bulkBenefitsCard} padding="sm" radius="md">
+                <Accordion variant="subtle">
+                  <Accordion.Item value="bulkBenefits">
+                    <Accordion.Control py="sm">
+                      <Group gap="sm" wrap="nowrap">
+                        <ThemeIcon size="sm" variant="light" color="blue">
+                          <IconTrendingUp size={16} />
+                        </ThemeIcon>
+                        <Text size="sm" fw={600}>
+                          Bulk Purchase Benefits
+                        </Text>
+                      </Group>
+                    </Accordion.Control>
+                    <Accordion.Panel>
+                      <Stack gap="sm">
+                        {/* Bonus Stacking Explanation */}
+                        <Card padding="sm" radius="sm" bg="blue.0" withBorder>
+                          <Stack gap={4}>
+                            <Text size="sm" fw={600} c="dark.6">
+                              How bonuses work:
+                            </Text>
+                            <Text size="xs" c="dark.5" lh={1.4}>
+                              Membership and bulk purchase bonuses{' '}
+                              <Text span fw={600}>
+                                don&apos;t stack
+                              </Text>
+                              . Your membership bonus ({getAccountTypeLabel(selectedBuzzType)} Buzz)
+                              takes priority over bulk bonuses.
+                              {buzzAmount &&
+                                (membershipBonusPercent > 0 || bulkBonusPercent > 0) && (
+                                  <>
+                                    {' '}
+                                    For your {numberWithCommas(buzzAmount)} Buzz purchase:
+                                    {membershipBonusPercent > 0 && bulkBonusPercent > 0 ? (
+                                      <>
+                                        {' '}
+                                        with {bulkBonusPercent}% bulk + {membershipBonusPercent}%
+                                        membership bonus, you get{' '}
+                                        {numberWithCommas(
+                                          Math.floor(
+                                            buzzAmount *
+                                              Math.max(membershipMultiplier, bulkMultiplier) -
+                                              buzzAmount
+                                          )
+                                        )}{' '}
+                                        total bonus (
+                                        {numberWithCommas(buzzCalculation.yellowBuzzBonus)}{' '}
+                                        {getAccountTypeLabel(selectedBuzzType)} +{' '}
+                                        {numberWithCommas(buzzCalculation.blueBuzzBonus)} Blue).
+                                      </>
+                                    ) : membershipBonusPercent > 0 ? (
+                                      <>
+                                        {' '}
+                                        you get {numberWithCommas(
+                                          buzzCalculation.yellowBuzzBonus
+                                        )}{' '}
+                                        bonus {getAccountTypeLabel(selectedBuzzType)} Buzz from your{' '}
+                                        {membershipBonusPercent}% membership.
+                                      </>
+                                    ) : bulkBonusPercent > 0 ? (
+                                      <>
+                                        {' '}
+                                        you get {numberWithCommas(
+                                          buzzCalculation.blueBuzzBonus
+                                        )}{' '}
+                                        bonus Blue Buzz from the {bulkBonusPercent}% bulk discount.
+                                      </>
+                                    ) : null}
+                                  </>
+                                )}
+                            </Text>
+                          </Stack>
+                        </Card>
+
+                        <div className={classes.bulkTable}>
+                          <Stack gap="xs">
+                            {buzzBulkBonusMultipliers.map(([min, multiplier]) => {
+                              const bonusPercent = Math.round((multiplier - 1) * 100);
+                              const totalAmount = Math.floor(min * multiplier);
+                              const bonusAmount = totalAmount - min;
+
+                              return (
+                                <Group
+                                  key={min}
+                                  justify="space-between"
+                                  wrap="nowrap"
+                                  className={classes.bulkRow}
+                                  p="sm"
+                                >
+                                  <div>
+                                    <Group gap="xs" wrap="nowrap">
+                                      <CurrencyIcon
+                                        size={16}
+                                        currency={Currency.BUZZ}
+                                        type={selectedBuzzType}
+                                      />
+                                      <Text size="sm" fw={600}>
+                                        {numberWithCommas(min)}
+                                      </Text>
+                                      <Text size="sm" c="dimmed">
+                                        →
+                                      </Text>
+                                      <CurrencyIcon
+                                        size={16}
+                                        currency={Currency.BUZZ}
+                                        type="blue"
+                                      />
+                                      <Text size="sm" fw={600} c="blue.6">
+                                        {numberWithCommas(totalAmount)}
+                                      </Text>
+                                    </Group>
+
+                                    {bonusPercent > 0 && (
+                                      <Text size="xs" c="dimmed" mt={2}>
+                                        +{numberWithCommas(bonusAmount)} bonus Blue Buzz
+                                      </Text>
+                                    )}
+                                  </div>
+
+                                  {bonusPercent > 0 ? (
+                                    <Badge variant="light" color="blue" size="sm">
+                                      +{bonusPercent}%
+                                    </Badge>
+                                  ) : (
+                                    <Badge variant="light" color="gray" size="sm">
+                                      Base
+                                    </Badge>
+                                  )}
+                                </Group>
+                              );
+                            })}
+                          </Stack>
+                        </div>
+                      </Stack>
+                    </Accordion.Panel>
+                  </Accordion.Item>
+                </Accordion>
+              </Card>
+
+              {/* Payment Section */}
+              <Card className={classes.paymentSection} padding="md" radius="md">
+                <Stack gap="xs">
+                  {/* Purchase Summary */}
+                  <div>
+                    <Text size="md" fw={600} mb={0}>
+                      Complete Purchase
+                    </Text>
+                    {unitAmount ? (
+                      <Stack gap="xs">
+                        <Group gap="xs" mb={4}>
+                          <Text size="sm" c="dimmed">
+                            You Pay:
+                          </Text>
+                          <Text size="xl" fw={700} className={classes.totalAmount}>
+                            $
+                            {formatCurrencyForDisplay(unitAmount, undefined, {
+                              decimals: false,
+                            })}
+                          </Text>
+                        </Group>
+
+                        <Group gap="xs" align="flex-start">
+                          <Text size="sm" c="dimmed">
+                            You Get:
+                          </Text>
+                          <div>
+                            <Group gap="xs" justify="flex-start" align="center" className="-mt-1">
+                              {buzzCalculation.hasBonus && !buzzCalculation.isLoading ? (
+                                <>
+                                  <CurrencyIcon
+                                    currency={Currency.BUZZ}
+                                    type={selectedBuzzType}
+                                    size={20}
+                                  />
+                                  <Text
+                                    size="xl"
+                                    fw={600}
+                                    c="white"
+                                    className="-ml-2 -mt-1"
+                                    style={{ opacity: 0.5 }}
+                                  >
+                                    {numberWithCommas(buzzAmount)}
+                                  </Text>
+                                  <Text size="lg" c="dimmed" fw={500}>
+                                    →
+                                  </Text>
+                                  <CurrencyIcon
+                                    currency={Currency.BUZZ}
+                                    type={selectedBuzzType}
+                                    size={20}
+                                  />
+                                  <Text size="xl" fw={700} c={buzzConfig.color} className="-mt-1">
+                                    {numberWithCommas(buzzCalculation.totalBuzz ?? 0)}
+                                  </Text>
+                                </>
+                              ) : (
+                                <>
+                                  <CurrencyIcon
+                                    currency={Currency.BUZZ}
+                                    type={selectedBuzzType}
+                                    size={20}
+                                  />
+                                  <Text
+                                    size="xl"
+                                    fw={700}
+                                    c={buzzConfig.color}
+                                    className="-ml-2 -mt-1"
+                                  >
+                                    {numberWithCommas(buzzCalculation.totalBuzz ?? 0)}
+                                  </Text>
+                                </>
+                              )}
+                            </Group>
+
+                            {/* Show bonus breakdown inline if there are bonuses */}
+                            {buzzCalculation.hasBonus && !buzzCalculation.isLoading && (
+                              <Stack gap={2} mt={2}>
+                                {buzzCalculation.yellowBuzzBonus > 0 && membershipTier && (
+                                  <Text size="xs" c="dimmed">
+                                    +{numberWithCommas(buzzCalculation.yellowBuzzBonus)} bonus{' '}
+                                    {getAccountTypeLabel(selectedBuzzType)} Buzz with{' '}
+                                    {membershipBonusPercent}% {membershipTier} member bonus
+                                  </Text>
+                                )}
+
+                                {buzzCalculation.blueBuzzBonus > 0 && (
+                                  <Group gap={4}>
+                                    <Text size="xs" c="dimmed">
+                                      +{numberWithCommas(buzzCalculation.blueBuzzBonus)} bonus Blue
+                                      Buzz from bulk purchase
+                                    </Text>
+                                    <Tooltip
+                                      label="Blue Buzz can only be used for generations"
+                                      position="left"
+                                      withArrow
+                                    >
+                                      <IconInfoCircle size={14} strokeWidth={2.5} />
+                                    </Tooltip>
+                                  </Group>
+                                )}
+                              </Stack>
+                            )}
+                          </div>
+                        </Group>
+                      </Stack>
+                    ) : (
+                      <Card className={classes.selectionPrompt} padding="md" radius="sm">
+                        <Stack gap="sm" align="center">
+                          <ThemeIcon size="lg" variant="light" color={buzzConfig.color}>
+                            <IconInfoCircle size={24} />
+                          </ThemeIcon>
+                          <div style={{ textAlign: 'center' }}>
+                            <Text size="sm" fw={600} className="text-buzz" mb="xs">
+                              Ready to Purchase Buzz?
+                            </Text>
+                            <Text size="xs" c="dimmed">
+                              Please select a package above or set a custom amount to continue
+                            </Text>
+                          </div>
+                        </Stack>
+                      </Card>
+                    )}
+                  </div>
+
+                  {/* Checkout */}
+                  <div>
+                    {selectedBuzzType === 'green' ? (
+                      <BuzzPurchasePaymentButton
+                        unitAmount={unitAmount}
+                        buzzAmount={buzzAmount}
+                        onPurchaseSuccess={onPurchaseSuccess}
+                        onValidate={onValidate}
+                        disabled={!ctaEnabled}
+                        purchaseSuccessMessage={purchaseSuccessMessage}
+                        buzzType={selectedBuzzType}
+                        attribution={attribution}
+                      />
+                    ) : (
+                      features.coinbasePayments && (
+                        <BuzzCoinbaseButton
+                          unitAmount={unitAmount}
+                          buzzAmount={buzzAmount}
+                          onPurchaseSuccess={onPurchaseSuccess}
+                          disabled={!ctaEnabled}
+                          purchaseSuccessMessage={purchaseSuccessMessage}
+                          buzzType={selectedBuzzType}
+                        />
+                      )
+                    )}
+                  </div>
+
+                  {/* Footer Info */}
+                  <Stack gap={4}>
+                    {(features.nowpaymentPayments || features.coinbasePayments) &&
+                      selectedBuzzType === 'yellow' && (
+                        <Text size="xs" c="dimmed">
+                          Need help getting started with crypto payments?{' '}
+                          <Anchor
+                            href="https://education.civitai.com/civitais-guide-to-purchasing-buzz-with-crypto/"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            size="xs"
+                            className={classes.cryptoLink}
+                          >
+                            Read our step-by-step guide
+                          </Anchor>
+                        </Text>
+                      )}
+                    {onCancel && (
+                      <Group>
+                        <Button
+                          variant="subtle"
+                          color="gray"
+                          onClick={onCancel}
+                          size="sm"
+                          className={classes.cancelButton}
+                        >
+                          Cancel
+                        </Button>
+                      </Group>
+                    )}
+                  </Stack>
+                </Stack>
+              </Card>
+            </Stack>
+          </Paper>
+        )}
+      </Stack>
+    </div>
+  );
+};
+
+// Stripe Transaction Modal Component
+type StripeTransactionModalProps = {
+  unitAmount: number;
+  buzzAmount: number;
+  metadata: PaymentIntentMetadataSchema;
+  message?: React.ReactNode;
+  successMessage?: React.ReactNode;
+  onSuccess?: (paymentIntentId: string) => Promise<void>;
+};
+
+const StripeTransactionModal = ({
+  unitAmount,
+  buzzAmount,
+  metadata,
+  message,
+  successMessage,
+  onSuccess,
+}: StripeTransactionModalProps) => {
+  const dialog = useDialogContext();
+  const stripePromise = useStripePromise();
+  const colorScheme = useComputedColorScheme('dark');
+  const [captchaState, setCaptchaState] = useState<CaptchaState>({
+    status: null,
+    token: null,
+    error: null,
+  });
+  const [clientSecret, setClientSecret] = useState<string | null>(null);
+
+  const getPaymentIntentMutation = trpc.stripe.getPaymentIntent.useMutation({
+    onError: (error) => {
+      showErrorNotification({
+        title: 'Could not create payment intent',
+        error: new Error(error.message),
+      });
+    },
+    onSuccess: (result) => {
+      if (result.clientSecret) {
+        setClientSecret(result.clientSecret);
+      }
+    },
+  });
+
+  // Create payment intent when captcha is successful
+  useEffect(() => {
+    if (captchaState.status === 'success' && captchaState.token && !clientSecret) {
+      getPaymentIntentMutation.mutate({
+        unitAmount,
+        currency: Currency.USD,
+        metadata,
+        recaptchaToken: captchaState.token,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captchaState.status, captchaState.token, clientSecret, unitAmount, metadata]);
+
+  const options: StripeElementsOptions | undefined = clientSecret
+    ? {
+        clientSecret,
+        appearance: {
+          theme: colorScheme === 'dark' ? 'night' : 'stripe',
+          variables: {
+            colorPrimary: 'rgb(var(--buzz-color))',
+            borderRadius: '8px',
+          },
+        },
+        locale: 'en',
+      }
+    : undefined;
+
+  // Show loading state while waiting for captcha or payment intent
+  if (!clientSecret || getPaymentIntentMutation.isPending) {
+    return (
+      <Modal {...dialog} size="lg" withCloseButton={false}>
+        <Stack gap="md">
+          <div>
+            <Title order={3} size="lg" mb="xs">
+              Complete Payment
+            </Title>
+            <Text c="dimmed" size="sm">
+              Secure payment powered by Stripe
+            </Text>
+          </div>
+
+          {message && (
+            <Card padding="md" radius="md" withBorder>
+              <div>{message}</div>
+            </Card>
+          )}
+
+          <Card padding="md" radius="md" withBorder>
+            <Stack gap="md">
+              <Group justify="space-between" align="flex-start">
+                <Text size="md" fw={600}>
+                  Payment Summary
+                </Text>
+                <div style={{ textAlign: 'right' }}>
+                  <Text size="xl" fw={700} c="green">
+                    ${formatCurrencyForDisplay(unitAmount, undefined, { decimals: false })}
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    For {numberWithCommas(buzzAmount)} Buzz
+                  </Text>
+                </div>
+              </Group>
+            </Stack>
+          </Card>
+
+          <Center py="md">
+            <Loader type="bars" size="md" />
+          </Center>
+
+          {captchaState.status === 'error' && captchaState.error && (
+            <Card padding="md" radius="md" withBorder>
+              <Group gap="sm">
+                <ThemeIcon size="sm" variant="light" color="red">
+                  <IconInfoCircle size={14} />
+                </ThemeIcon>
+                <Text c="red" size="sm" style={{ flex: 1 }}>
+                  {captchaState.error}
+                </Text>
+              </Group>
+            </Card>
+          )}
+
+          <TurnstilePrivacyNotice />
+          <TurnstileWidget
+            onSuccess={(token) => setCaptchaState({ status: 'success', token, error: null })}
+            onError={(error) =>
+              setCaptchaState({
+                status: 'error',
+                token: null,
+                error: `There was an error generating the captcha: ${error}`,
+              })
+            }
+            onExpire={(token) =>
+              setCaptchaState({ status: 'expired', token, error: 'Captcha token expired' })
+            }
+          />
+        </Stack>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal {...dialog} size="lg" withCloseButton={false}>
+      <Stack gap="md">
+        <div>
+          <Title order={3} size="lg" mb="xs">
+            Complete Payment
+          </Title>
+          <Text c="dimmed" size="sm">
+            Secure payment powered by Stripe
+          </Text>
+        </div>
+
+        {message && (
+          <Card padding="md" radius="md" withBorder>
+            <div>{message}</div>
+          </Card>
+        )}
+
+        <Card padding="md" radius="md" withBorder>
+          <Stack gap="md">
+            <Group justify="space-between" align="flex-start">
+              <Text size="md" fw={600}>
+                Payment Summary
+              </Text>
+              <div style={{ textAlign: 'right' }}>
+                <Text size="xl" fw={700} c="green">
+                  ${formatCurrencyForDisplay(unitAmount, undefined, { decimals: false })}
+                </Text>
+                <Text size="xs" c="dimmed">
+                  For {numberWithCommas(buzzAmount)} Buzz
+                </Text>
+              </div>
+            </Group>
+          </Stack>
+        </Card>
+
+        {stripePromise && options && (
+          <Elements stripe={stripePromise} key={clientSecret} options={options}>
+            <StripePaymentForm
+              clientSecret={clientSecret}
+              onSuccess={onSuccess}
+              onCancel={dialog.onClose}
+              successMessage={successMessage}
+              metadata={metadata}
+            />
+          </Elements>
+        )}
+      </Stack>
+    </Modal>
+  );
+};
+
+const StripePaymentForm = ({
+  clientSecret,
+  onSuccess,
+  onCancel,
+  successMessage,
+  metadata,
+}: {
+  clientSecret: string;
+  onSuccess?: (paymentIntentId: string) => Promise<void>;
+  onCancel: () => void;
+  successMessage?: React.ReactNode;
+  metadata: PaymentIntentMetadataSchema;
+}) => {
+  const { trackAction } = useTrackEvent();
+  // PurchaseFunds_Confirm must fire at most once per payment. onPaymentSuccess
+  // can run more than once on the polling-resolution path (a poll tick may
+  // observe `succeeded` again before the interval is torn down), so the
+  // analytics emit is guarded by this one-shot ref.
+  const hasTrackedConfirmRef = useRef(false);
+  const { errorMessage, onConfirmPayment, processingPayment, paymentIntentStatus } =
+    useStripeTransaction({
+      clientSecret,
+      onPaymentSuccess: async (paymentIntent) => {
+        // Re-instrument the purchase-completion analytics event. This emit
+        // regressed on 2024-08-30 when buzz purchases moved to redirect-based
+        // providers and the legacy StripeTransactionModal (which carried it)
+        // stopped being used.
+        //
+        // onPaymentSuccess can fire more than once on the polling-resolution
+        // path, so the emit is guarded by a one-shot ref to avoid
+        // double-counting completions. onSuccess is intentionally left
+        // unguarded — it runs every time and is idempotent on the server.
+        // The emit reads buzz-specific fields off `metadata` (buzzAmount,
+        // unitAmount) — `metadata` is always present and typed via
+        // PaymentIntentMetadataSchema.
+        if (!hasTrackedConfirmRef.current) {
+          hasTrackedConfirmRef.current = true;
+
+          // On the confirm path `payment_method` is the expanded PaymentMethod
+          // object (Stripe.js expands it via confirmParams.expand). On the
+          // polling-resolution path it comes back as an unexpanded string ID —
+          // the client-side retrievePaymentIntent API cannot expand it — and it
+          // may also be null. Only treat it as expanded when it is a non-null
+          // object; for a string ID, null, or undefined fall back to
+          // payment_method_types[0] (e.g. 'card') instead of the generic
+          // provider name. (typeof null === 'object', so the null check is
+          // required to avoid silently skipping the fallback.)
+          const pm = paymentIntent.payment_method;
+          const paymentMethodType =
+            typeof pm === 'object' && pm !== null
+              ? pm.type
+              : paymentIntent.payment_method_types?.[0];
+          trackAction({
+            type: 'PurchaseFunds_Confirm',
+            details: {
+              buzzAmount: metadata.buzzAmount,
+              unitAmount: metadata.unitAmount,
+              method: paymentMethodType ?? 'stripe',
+            },
+          }).catch(() => undefined);
+        }
+
+        if (onSuccess) {
+          await onSuccess(paymentIntent.id);
+        }
+      },
+    });
+
+  const paymentElementOptions: StripePaymentElementOptions = {
+    layout: 'tabs',
+  };
+
+  if (paymentIntentStatus === 'succeeded') {
+    return (
+      <Card padding="md" radius="md" withBorder>
+        <Stack align="center" gap="md">
+          <ThemeIcon size="xl" variant="light" color="green" radius="xl">
+            <IconBolt size={24} />
+          </ThemeIcon>
+          <div style={{ textAlign: 'center' }}>
+            <Text size="lg" fw={600} c="green" mb="xs">
+              Payment Successful!
+            </Text>
+            {successMessage || (
+              <Text size="sm" c="dimmed">
+                Your Buzz has been added to your account.
+              </Text>
+            )}
+          </div>
+          <Button onClick={onCancel} color="green" variant="light" fullWidth>
+            Close
+          </Button>
+        </Stack>
+      </Card>
+    );
+  }
+
+  return (
+    <form
+      onSubmit={async (e) => {
+        e.preventDefault();
+        await onConfirmPayment();
+      }}
+    >
+      <Stack gap="md">
+        <Card padding="md" radius="md" withBorder>
+          <Stack gap="md">
+            <Text size="md" fw={600} mb="xs">
+              Payment Information
+            </Text>
+            <PaymentElement options={paymentElementOptions} />
+          </Stack>
+        </Card>
+
+        {errorMessage && (
+          <Card padding="md" radius="md" withBorder>
+            <Group gap="sm">
+              <ThemeIcon size="sm" variant="light" color="red">
+                <IconInfoCircle size={14} />
+              </ThemeIcon>
+              <Text c="red" size="sm" style={{ flex: 1 }}>
+                {errorMessage}
+              </Text>
+            </Group>
+          </Card>
+        )}
+
+        <Divider />
+
+        <Group justify="space-between">
+          <Button
+            variant="outline"
+            color="gray"
+            onClick={onCancel}
+            disabled={processingPayment}
+            size="md"
+          >
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            disabled={processingPayment}
+            loading={processingPayment}
+            size="md"
+            leftSection={<IconCreditCard size={18} />}
+          >
+            {processingPayment ? 'Processing Payment...' : 'Complete Payment'}
+          </Button>
+        </Group>
+      </Stack>
+    </form>
+  );
+};
+
+interface BuzzTierIconProps {
+  tier: number;
+  totalPackages?: number;
+  size?: 'sm' | 'md' | 'lg';
+}
+
+const iconSizeMap = {
+  sm: [14, 16, 18, 20],
+  md: [18, 20, 22, 24],
+  lg: [22, 24, 26, 28],
+};
+
+const BuzzTierIcon = ({ tier, totalPackages = 3, size = 'md' }: BuzzTierIconProps) => {
+  const sizes = iconSizeMap[size];
+
+  // Calculate how many bolts to show based on tier and total packages
+  let maxBolts;
+  let numBolts;
+
+  if (totalPackages <= 4) {
+    // For 4 or fewer packages, show that many bolt positions and use tier directly
+    maxBolts = totalPackages;
+    numBolts = tier;
+  } else {
+    // For more than 4 packages, cap at 4 bolts and distribute evenly
+    maxBolts = 4;
+    const ratio = tier / totalPackages;
+    if (ratio <= 0.25) numBolts = 1;
+    else if (ratio <= 0.5) numBolts = 2;
+    else if (ratio <= 0.75) numBolts = 3;
+    else numBolts = 4;
+  }
+
+  const activeBolts = Math.min(numBolts, maxBolts);
+
+  return (
+    <Group gap={-4} wrap="nowrap">
+      {Array.from({ length: maxBolts }).map((_, i) => (
+        <IconBolt
+          key={i}
+          size={sizes[i] || sizes[sizes.length - 1]} // Use last size if we run out
+          color={i < activeBolts ? 'rgb(var(--buzz-color))' : 'currentColor'}
+          fill={i < activeBolts ? 'rgb(var(--buzz-color))' : 'currentColor'}
+          opacity={i < activeBolts ? 1 : 0.3}
+        />
+      ))}
+    </Group>
+  );
+};

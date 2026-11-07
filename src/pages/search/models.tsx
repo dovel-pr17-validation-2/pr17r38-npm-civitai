@@ -1,0 +1,289 @@
+import { Stack, Center, Loader, Title, Text, ThemeIcon, Checkbox } from '@mantine/core';
+import { useInstantSearch } from 'react-instantsearch';
+
+import {
+  BrowsingLevelFilter,
+  ChipRefinementList,
+  ClearRefinements,
+  DateRangeRefinement,
+  SearchableMultiSelectRefinementList,
+  SortBy,
+} from '~/components/Search/CustomSearchComponents';
+import { useEffect, useMemo, useState } from 'react';
+import { ModelCard } from '~/components/Cards/ModelCard';
+import { useSearchEventDecorations } from '~/components/Decorations/useSearchEventDecorations';
+import { ModelCardContextProvider, useModelSaleBadges } from '~/components/Cards/ModelCardContext';
+import { SearchHeader } from '~/components/Search/SearchHeader';
+import { TimeoutLoader } from '~/components/Search/TimeoutLoader';
+import { IconCloudOff } from '@tabler/icons-react';
+import { SearchLayout } from '~/components/Search/SearchLayout';
+import { MODELS_SEARCH_INDEX } from '~/server/common/constants';
+import { ModelSearchIndexSortBy } from '~/components/Search/parsers/model.parser';
+import { useRouter } from 'next/router';
+import { InViewLoader } from '~/components/InView/InViewLoader';
+import { useInfiniteHitsTransformed } from '~/components/Search/search.utils2';
+import { useApplyHiddenPreferences } from '~/components/HiddenPreferences/useApplyHiddenPreferences';
+import { MasonryGrid } from '~/components/MasonryColumns/MasonryGrid';
+import { NoContent } from '~/components/NoContent/NoContent';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useEngagedModelsPrefetch } from '~/hooks/useEngagedModelMembership';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { paidModelsSearchFilterClause } from '~/components/Search/paid-model-search-filter';
+import { Availability } from '~/shared/utils/prisma/enums';
+import { useBrowsingSettingsAddons } from '~/providers/BrowsingSettingsAddonsProvider';
+import { isDefined } from '~/utils/type-guards';
+import { buildMinorExclusionFilter } from '~/components/Search/search-filters';
+import { nsfwRestrictedBaseModels } from '~/server/common/constants';
+import { renderBaseModelOption } from '~/components/SfwOnlyBadge/SfwOnlyBadge';
+import { nsfwBrowsingLevelsArray } from '~/shared/constants/browsingLevel.constants';
+import { SEARCH_FACET_LIMIT } from '~/shared/constants/search.constants';
+import { searchHitCanGenerate } from '~/shared/generation/coverage-fields';
+import { trpc } from '~/utils/trpc';
+
+export default function ModelsSearch() {
+  return (
+    <SearchLayout.Root>
+      <SearchLayout.Content>
+        <SearchHeader />
+        <ModelsHitList />
+      </SearchLayout.Content>
+    </SearchLayout.Root>
+  );
+}
+
+const RenderFilters = () => {
+  const currentUser = useCurrentUser();
+  const browsingSettingsAddons = useBrowsingSettingsAddons();
+  const features = useFeatureFlags();
+  const [hidePaid, setHidePaid] = useState(false);
+
+  const filters = [
+    browsingSettingsAddons.settings.disablePoi
+      ? `poi != true${currentUser?.id ? ` OR user.id = ${currentUser.id}` : ''}`
+      : null,
+    buildMinorExclusionFilter({
+      targetIndex: 'models',
+      addons: browsingSettingsAddons.settings,
+      currentUser,
+    }),
+    `availability != ${Availability.Private}${
+      currentUser?.id ? ` OR user.id = ${currentUser.id}` : ''
+    }`,
+    paidModelsSearchFilterClause(features.paidModelSearchFilter, hidePaid),
+    `NOT (nsfwLevel IN [${nsfwBrowsingLevelsArray.join(
+      ', '
+    )}] AND version.baseModel IN [${nsfwRestrictedBaseModels
+      .map((model) => `'${model}'`)
+      .join(', ')}])`,
+  ].filter(isDefined);
+
+  return (
+    <>
+      <BrowsingLevelFilter indexKey="models" filters={filters} />
+      <SortBy
+        title="Sort models by"
+        items={[
+          { label: 'Relevancy', value: ModelSearchIndexSortBy[0] as string },
+          { label: 'Highest Rated', value: ModelSearchIndexSortBy[1] as string },
+          { label: 'Most Downloaded', value: ModelSearchIndexSortBy[2] as string },
+          { label: 'Most Liked', value: ModelSearchIndexSortBy[3] as string },
+          { label: 'Most Discussed', value: ModelSearchIndexSortBy[4] as string },
+          { label: 'Most Collected', value: ModelSearchIndexSortBy[5] as string },
+          { label: 'Most Buzz', value: ModelSearchIndexSortBy[6] as string },
+          { label: 'Newest', value: ModelSearchIndexSortBy[7] as string },
+        ]}
+      />
+      <SearchableMultiSelectRefinementList
+        title="Filter by Base Model"
+        attribute="versions.baseModel"
+        sortBy={['name']}
+        limit={SEARCH_FACET_LIMIT}
+        searchable
+        remoteSearch={false}
+        renderOption={renderBaseModelOption}
+      />
+      <ChipRefinementList
+        title="Filter by Model Type"
+        attribute="type"
+        sortBy={['name']}
+        limit={SEARCH_FACET_LIMIT}
+      />
+      <ChipRefinementList
+        title="Filter by Checkpoint Type"
+        sortBy={['name']}
+        attribute="checkpointType"
+      />
+      <DateRangeRefinement title="Filter by Last Updated At" attribute="lastVersionAtUnix" />
+      <ChipRefinementList title="Filter by File Format" sortBy={['name']} attribute="fileFormats" />
+      <ChipRefinementList
+        title="Filter by Category"
+        sortBy={['name']}
+        attribute="category.name"
+        limit={SEARCH_FACET_LIMIT}
+      />
+      <SearchableMultiSelectRefinementList title="Users" attribute="user.username" searchable />
+      <SearchableMultiSelectRefinementList
+        title="Tags"
+        attribute="tags.name"
+        operator="and"
+        searchable
+      />
+      {features.paidModelSearchFilter && (
+        <Checkbox
+          label="Hide Early Access & paid models"
+          checked={hidePaid}
+          onChange={(event) => setHidePaid(event.currentTarget.checked)}
+        />
+      )}
+      <ClearRefinements />
+    </>
+  );
+};
+
+export function ModelsHitList() {
+  const { hits, showMore, isLastPage } = useInfiniteHitsTransformed<'models'>();
+  const { status, uiState } = useInstantSearch();
+  const activeBaseModels =
+    uiState[MODELS_SEARCH_INDEX]?.refinementList?.['versions.baseModel'] ?? [];
+  const router = useRouter();
+  const modelId = router.query.model ? Number(router.query.model) : undefined;
+
+  const { loadingPreferences, items, hiddenCount } = useApplyHiddenPreferences({
+    type: 'models',
+    data: hits,
+  });
+
+  useEffect(() => {
+    if (!modelId) {
+      return;
+    }
+
+    if (modelId && !hits.find((item) => item.id === modelId) && status === 'idle') {
+      // Forcefully loads more until the item is found
+      showMore?.();
+    }
+  }, [modelId, status, showMore, isLastPage, hits]);
+
+  // Must stay above every early return below — a hook called after one changes the hook
+  // count between the loading and loaded renders (React error #310).
+  const itemIds = (items as { id: number }[]).map((x) => x.id);
+  const salesByModelId = useModelSaleBadges(itemIds);
+  useEngagedModelsPrefetch(itemIds);
+  const decorated = useSearchEventDecorations(hits, items as typeof hits, { entity: 'Model' });
+  // The live rule until the audience loads: the next rule would offer free viewers cold checkpoints.
+  const { data: audience } = trpc.generation.getCoverageAudience.useQuery(undefined, {
+    staleTime: 5 * 60_000,
+  });
+  const withCreate = useMemo(
+    () =>
+      decorated.map((hit) => ({
+        ...hit,
+        canGenerate: searchHitCanGenerate(hit, {
+          coverageNext: audience?.next ?? false,
+          member: audience?.member ?? true,
+        }),
+      })),
+    [decorated, audience]
+  );
+
+  if (hits.length === 0) {
+    const NotFound = (
+      <div className="flex items-center justify-center">
+        <Stack gap="md" align="center" maw={800}>
+          {hiddenCount > 0 && (
+            <Text c="dimmed">{hiddenCount} models have been hidden due to your settings.</Text>
+          )}
+          <ThemeIcon size={128} radius={100} className="opacity-50">
+            <IconCloudOff size={80} />
+          </ThemeIcon>
+          <Title order={1} lh={1}>
+            No models found
+          </Title>
+          <Text align="center">
+            We have a bunch of models, but it looks like we couldn&rsquo;t find any matching your
+            query.
+          </Text>
+        </Stack>
+      </div>
+    );
+
+    const loading = status === 'loading' || status === 'stalled';
+
+    if (loading) {
+      return (
+        <div>
+          <Center mt="md">
+            <Loader />
+          </Center>
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <Center mt="md">
+          {/* Just enough time to avoid blank random page */}
+          <TimeoutLoader renderTimeout={() => <>{NotFound}</>} delay={150} />
+        </Center>
+      </div>
+    );
+  }
+
+  if (loadingPreferences) {
+    return (
+      <div>
+        <Center mt="md">
+          <Loader />
+        </Center>
+      </div>
+    );
+  }
+
+  return (
+    <Stack>
+      {hiddenCount > 0 && (
+        <Text c="dimmed">{hiddenCount} models have been hidden due to your settings.</Text>
+      )}
+      <ModelCardContextProvider
+        activeBaseModels={activeBaseModels}
+        useModelVersionRedirect={activeBaseModels.length > 0}
+        hasSaleProvider
+        salesByModelId={salesByModelId}
+      >
+        <MasonryGrid
+          data={withCreate as any}
+          render={ModelCard}
+          itemId={(x) => x.id}
+          empty={<NoContent />}
+          withAds
+        />
+      </ModelCardContextProvider>
+      {hits.length > 0 && !isLastPage && (
+        <InViewLoader
+          loadFn={showMore}
+          loadCondition={status === 'idle'}
+          style={{ gridColumn: '1/-1' }}
+        >
+          <Center p="xl" style={{ height: 36 }} mt="md">
+            <Loader />
+          </Center>
+        </InViewLoader>
+      )}
+    </Stack>
+  );
+}
+
+ModelsSearch.getLayout = function getLayout(page: React.ReactNode) {
+  return (
+    <SearchLayout
+      indexName={MODELS_SEARCH_INDEX}
+      leftSidebar={
+        <SearchLayout.Filters>
+          <RenderFilters />
+        </SearchLayout.Filters>
+      }
+    >
+      {page}
+    </SearchLayout>
+  );
+};

@@ -1,0 +1,751 @@
+import * as z from 'zod';
+import { constants } from '~/server/common/constants';
+import { ModelSort } from '~/server/common/enums';
+import type { UnpublishReason } from '~/server/common/moderation-helpers';
+import type { TextScanFlags } from '~/server/services/text-scan/flag-snapshot';
+import { unpublishReasons } from '~/server/common/moderation-helpers';
+import {
+  baseQuerySchema,
+  getByIdSchema,
+  infiniteQuerySchema,
+  keysetCursorSchema,
+  paginationSchema,
+  periodModeSchema,
+  userPreferencesSchema,
+} from '~/server/schema/base.schema';
+import { modelVersionUpsertSchema } from '~/server/schema/model-version.schema';
+import { tagSchema } from '~/server/schema/tag.schema';
+import { publishedDateSchema } from '~/shared/utils/published-range';
+import { getSanitizedStringSchema } from '~/server/schema/utils.schema';
+import {
+  AssociationType,
+  Availability,
+  CheckpointType,
+  CollectionItemStatus,
+  CommercialUse,
+  MetricTimeframe,
+  ModelModifier,
+  ModelStatus,
+  ModelType,
+  ModelUploadType,
+  TrainingStatus,
+} from '~/shared/utils/prisma/enums';
+import { postgresSlugify } from '~/utils/string-helpers';
+import {
+  metricVisibilityChoicesSchema,
+  metricVisibilityMetaFromChoices,
+  type MetricVisibilitySettings,
+} from '~/server/utils/model-metric-privacy';
+import { booleanString, commaDelimitedNumberArray } from '~/utils/zod-helpers';
+import type { ProfanityEvaluation } from '~/libs/profanity-simple';
+import type { MatureLockAttribution } from '~/shared/constants/mature-lock-reason.constants';
+import { MODEL_NAME_MAX_LENGTH } from '~/shared/constants/model-name.constants';
+import {
+  SFW_DESCRIPTION_MAX_LENGTH,
+  SFW_DESCRIPTION_TOO_LONG_MESSAGE,
+  SFW_NAME_TOO_LONG_MESSAGE,
+} from '~/shared/utils/model-sfw-face';
+
+const licensingSchema = z.object({
+  allowNoCredit: z.boolean().optional(),
+  allowCommercialUse: z
+    .preprocess((val) => {
+      if (!val) return undefined;
+      return Array.isArray(val) ? val : [val];
+    }, z.enum(CommercialUse).array().optional())
+    .optional(),
+  allowDerivatives: z.boolean().optional(),
+  allowDifferentLicense: z.boolean().optional(),
+});
+
+export type GetModelByIdSchema = z.infer<typeof getModelByIdSchema>;
+export const getModelByIdSchema = z.object({
+  id: z.number(),
+  excludeTrainingData: z.boolean().optional(),
+  /** The editor's read: owners and mods get the stored .red name/description, not the .com face. */
+  forEditor: z.boolean().optional(),
+});
+
+export const getAllModelsSchema = z.object({
+  ...baseQuerySchema.shape,
+  ...licensingSchema.shape,
+  ...userPreferencesSchema.shape,
+
+  limit: z.preprocess((val) => Number(val), z.number().min(0).max(100)).optional(),
+  page: z.preprocess((val) => Number(val), z.number().min(1)).optional(),
+  cursor: keysetCursorSchema.optional(),
+  query: z.string().optional(),
+  tag: z.string().optional(),
+  tagname: z.string().optional(),
+  user: z.string().optional(),
+  username: z
+    .string()
+    .transform((data) => postgresSlugify(data))
+    .optional(),
+  types: z
+    .union([z.enum(ModelType), z.enum(ModelType).array()])
+    .optional()
+    .transform((rel) => (!rel ? undefined : Array.isArray(rel) ? rel : [rel]))
+    .optional(),
+  // TODO [bw]: do we need uploadType in here?
+  status: z
+    .union([z.enum(ModelStatus), z.enum(ModelStatus).array()])
+    .optional()
+    .transform((rel) => (!rel ? undefined : Array.isArray(rel) ? rel : [rel]))
+    .optional(),
+  checkpointType: z.enum(CheckpointType).optional(),
+  baseModels: z
+    .union([z.string(), z.string().array()])
+    .transform((rel) => {
+      if (!rel) return undefined;
+      return Array.isArray(rel) ? rel : [rel];
+    })
+    .optional(),
+  sort: z.enum(ModelSort).default(constants.modelFilterDefaults.sort),
+  period: z.enum(MetricTimeframe).default(constants.modelFilterDefaults.period),
+  periodMode: periodModeSchema,
+  /** First and last day published, UTC `YYYY-MM-DD`, both inclusive. */
+  publishedFrom: publishedDateSchema.optional(),
+  publishedTo: publishedDateSchema.optional(),
+  rating: z
+    .preprocess((val) => Number(val), z.number())
+    .transform((val) => Math.floor(val))
+    .optional(),
+  // The query-string booleans — `favorites` through `archived` below — are booleanString(),
+  // never z.coerce.boolean(): /api/v1/models parses this schema against raw req.query, where
+  // coerce runs JS Boolean() and makes `=false` true. This does NOT describe the whole object:
+  // `pending`, `disablePoi`, `disableMinor`, `isFeatured`, `poiOnly`, `minorOnly` and the
+  // spread-in `allow*` fields are plain z.boolean() on purpose — they reject a string outright,
+  // so the endpoint 400s rather than returning the wrong set.
+  favorites: booleanString().optional().default(false),
+  hidden: booleanString().optional().default(false),
+  needsReview: booleanString().optional(),
+  earlyAccess: booleanString().optional(),
+  paidAccess: booleanString().optional(),
+  /** Exclude every model with a live paid gate, timed or permanent. */
+  hidePaid: booleanString().optional(),
+  /** Models with a live scheduled sale on a permanent paid-access version. */
+  onSale: booleanString().optional(),
+  ids: commaDelimitedNumberArray().optional(),
+  modelVersionIds: commaDelimitedNumberArray().optional(),
+  supportsGeneration: booleanString().optional(),
+  fromPlatform: booleanString().optional(),
+  followed: booleanString().optional(),
+  // Restrict to creators currently on the "new & upcoming" board. Server resolves
+  // the board from this flag plus the request domain; the client sends no user list.
+  newCreators: booleanString().optional(),
+  archived: booleanString().optional(),
+  collectionId: z.number().optional(),
+  collectionItemStatus: z.array(z.enum(CollectionItemStatus)).optional(),
+  fileFormats: z.enum(constants.modelFileFormats).array().optional(),
+  pending: z.boolean().optional(),
+  collectionTagId: z.number().optional(),
+  availability: z.enum(Availability).optional(),
+  disablePoi: z.boolean().optional(),
+  disableMinor: z.boolean().optional(),
+  isFeatured: z.boolean().optional(),
+  // Mod only:
+  poiOnly: z.boolean().optional(),
+  minorOnly: z.boolean().optional(),
+});
+
+export type GetAllModelsInput = z.input<typeof getAllModelsSchema>;
+export type GetAllModelsOutput = z.infer<typeof getAllModelsSchema>;
+
+/** Query contract for /api/v1/models, which parses it off `req.query` where every value is a string. */
+export const modelsEndpointSchema = getAllModelsSchema
+  // Not part of the documented public contract.
+  .omit({ publishedFrom: true, publishedTo: true })
+  .extend({
+    limit: z.preprocess((val) => Number(val), z.number().min(0).max(100)).default(100),
+    nsfw: booleanString().optional(),
+    primaryFileOnly: booleanString().optional(),
+    favorites: booleanString().optional().default(false),
+    hidden: booleanString().optional().default(false),
+  });
+
+export type ModelInput = z.infer<typeof modelSchema>;
+export const modelSchema = licensingSchema.extend({
+  id: z.number().optional(),
+  name: z.string().min(1, 'Name cannot be empty.'),
+  description: getSanitizedStringSchema().nullish(),
+  type: z.enum(ModelType),
+  uploadType: z.enum(ModelUploadType),
+  status: z.enum(ModelStatus),
+  checkpointType: z.enum(CheckpointType).nullish(),
+  tagsOnModels: z.array(tagSchema).nullish(),
+  nsfw: z.boolean().optional(),
+  poi: z.boolean().optional(),
+  locked: z.boolean().optional(),
+  modelVersions: z
+    .array(modelVersionUpsertSchema)
+    .min(1, 'At least one model version is required.'),
+  // mergePermissions: licensingSchema.array().optional(),
+});
+
+export type MergePermissionInput = z.infer<typeof mergePermissionInput>;
+export const mergePermissionInput = licensingSchema.extend({
+  modelId: z.number(),
+  permissionDate: z.date().default(new Date()),
+});
+
+export const deleteModelSchema = getByIdSchema.extend({ permanently: z.boolean().optional() });
+export type DeleteModelSchema = z.infer<typeof deleteModelSchema>;
+
+export const templateOmittableFields = ['description', 'tags'] as const;
+export type TemplateOmittableField = (typeof templateOmittableFields)[number];
+export const getModelTemplateFieldsSchema = getByIdSchema.extend({
+  omit: z.array(z.enum(templateOmittableFields)).optional(),
+});
+export type GetModelTemplateFieldsInput = z.infer<typeof getModelTemplateFieldsSchema>;
+
+export const getDownloadSchema = z.object({
+  modelId: z.coerce.number(),
+  modelVersionId: z.coerce.number().optional(),
+  type: z.enum(constants.modelFileTypes).optional(),
+  format: z.enum(constants.modelFileFormats).optional(),
+});
+export type GetDownloadSchema = z.infer<typeof getDownloadSchema>;
+
+export type ModelGallerySettingsSchema = {
+  users?: number[] | undefined;
+  tags?: number[] | undefined;
+  images?: number[] | undefined;
+  level?: number | undefined;
+  hiddenImages?: Record<string, number[]> | undefined;
+  pinnedPosts?: Record<string, number[]> | undefined;
+};
+
+export type ModelGallerySettingsInput = z.infer<typeof modelGallerySettingsInput>;
+export const modelGallerySettingsInput = z.object({
+  hiddenUsers: z.object({ id: z.number(), username: z.string().nullable() }).array(),
+  hiddenTags: z.object({ id: z.number(), name: z.string() }).array(),
+  hiddenImages: z.record(z.string(), z.number().array()).optional(),
+  level: z.number().optional(),
+  pinnedPosts: z
+    .record(z.string(), z.number().array().max(constants.modelGallery.maxPinnedPosts))
+    .optional(),
+});
+
+export type ModelUpsertInput = z.infer<typeof modelUpsertSchema>;
+export const checkSfwFaceSchema = z.object({
+  sfwName: z.string().trim().max(MODEL_NAME_MAX_LENGTH).optional(),
+  sfwDescription: z.string().max(SFW_DESCRIPTION_MAX_LENGTH).optional(),
+  modelId: z.number().optional(),
+});
+export type CheckSfwFaceInput = z.infer<typeof checkSfwFaceSchema>;
+
+export const draftSfwFaceSchema = z.object({
+  // The .red name, which may predate its own cap.
+  name: z.string().trim().min(1).max(255),
+  description: z.string().max(SFW_DESCRIPTION_MAX_LENGTH).nullish(),
+  modelId: z.number().optional(),
+});
+
+export const modelUpsertSchema = z.object({
+  ...licensingSchema.shape,
+  id: z.coerce.number().optional(),
+  name: z.string().trim().min(1, 'Name cannot be empty.'),
+  description: getSanitizedStringSchema({ allowBlurbs: true }).nullish(),
+  sfwName: z.string().trim().max(MODEL_NAME_MAX_LENGTH, SFW_NAME_TOO_LONG_MESSAGE).nullish(),
+  sfwDescription: getSanitizedStringSchema()
+    .pipe(z.string().max(SFW_DESCRIPTION_MAX_LENGTH, SFW_DESCRIPTION_TOO_LONG_MESSAGE))
+    .nullish(),
+  coverImageId: z.number().int().positive().nullish(),
+  sfwCoverImageId: z.number().int().positive().nullish(),
+  type: z.enum(ModelType),
+  uploadType: z.enum(ModelUploadType),
+  status: z.enum(ModelStatus),
+  checkpointType: z.enum(CheckpointType).nullish(),
+  tagsOnModels: z.array(tagSchema).nullish(),
+  poi: z.boolean().optional(),
+  locked: z.boolean().optional(),
+  templateId: z.coerce.number().optional(),
+  bountyId: z.coerce.number().optional(),
+  nsfw: z.boolean().optional(),
+  lockedProperties: z.string().array().optional(),
+  minor: z.boolean().default(false).optional(),
+  sfwOnly: z.boolean().default(false).optional(),
+  meta: z
+    .looseObject({
+      showcaseCollectionId: z.coerce.number().nullish(),
+      commentsLocked: z.boolean().default(false),
+      hideBuzz: z.boolean().nullish(),
+      hideDownloads: z.boolean().nullish(),
+      hideGenerations: z.boolean().nullish(),
+      metricVisibility: metricVisibilityChoicesSchema.optional(),
+    })
+    .transform(
+      ({ metricVisibility, ...val }) =>
+        (metricVisibility
+          ? { ...val, ...metricVisibilityMetaFromChoices(metricVisibility) }
+          : val) as ModelMeta | null
+    )
+    .nullish(),
+  availability: z.enum(Availability).optional(),
+});
+
+export type UpdateGallerySettingsInput = z.infer<typeof updateGallerySettingsSchema>;
+export const updateGallerySettingsSchema = z.object({
+  id: z.number(),
+  gallerySettings: modelGallerySettingsInput.nullable(),
+});
+
+const creatorGalleryHiddenUserNote = z
+  .string()
+  .trim()
+  .max(constants.modelGallery.maxCreatorHiddenUserNoteLength)
+  .nullish();
+
+export type UpsertCreatorGalleryHiddenUserInput = z.infer<
+  typeof upsertCreatorGalleryHiddenUserSchema
+>;
+export const upsertCreatorGalleryHiddenUserSchema = z.object({
+  userId: z.number().int().positive(),
+  note: creatorGalleryHiddenUserNote,
+});
+
+export type RemoveCreatorGalleryHiddenUserInput = z.infer<
+  typeof removeCreatorGalleryHiddenUserSchema
+>;
+export const removeCreatorGalleryHiddenUserSchema = z.object({
+  userId: z.number().int().positive(),
+});
+
+export type CopyGallerySettingsInput = z.infer<typeof copyGallerySettingsSchema>;
+export const copyGallerySettingsSchema = z.object({ id: z.number() });
+
+export type ReorderModelVersionsSchema = z.infer<typeof reorderModelVersionsSchema>;
+export const reorderModelVersionsSchema = z.object({
+  id: z.number(),
+  modelVersions: z.array(
+    z.object({ id: z.number(), name: z.string(), index: z.number().nullable() })
+  ),
+});
+
+export type PublishModelSchema = z.infer<typeof publishModelSchema>;
+export const publishModelSchema = z.object({
+  id: z.number(),
+  versionIds: z.array(z.number()).optional(),
+  publishedAt: z.date().optional(),
+});
+
+export type UnpublishModelSchema = z.infer<typeof unpublishModelSchema>;
+const UnpublishReasons = Object.keys(unpublishReasons);
+export const unpublishModelSchema = z.object({
+  id: z.number(),
+  reason: z.custom<UnpublishReason>((x) => UnpublishReasons.includes(x as string)).optional(),
+  customMessage: z.string().optional(),
+  // Owner's explicit consent to refund all active early access purchases (debited from their
+  // account) as part of unpublishing. Ignored for moderator unpublishes.
+  refundEarlyAccess: z.boolean().optional(),
+  // What the confirm dialog priced, echoed back so the server can refuse when the world moved
+  // underneath it. `refundEarlyAccess: true` is a yes with no ceiling on its own: a sibling going
+  // down between the dialog's read and the mutation widens an unpublish from one version to a whole
+  // model and can debit the owner more Buzz than the figure they agreed to.
+  expected: z
+    .object({
+      scope: z.enum(['model', 'version']),
+      totalBuzz: z.number().int().nonnegative(),
+    })
+    .optional(),
+});
+
+export type ToggleModelLockInput = z.infer<typeof toggleModelLockSchema>;
+export const toggleModelLockSchema = z.object({
+  id: z.number(),
+  locked: z.boolean(),
+});
+
+export type SetModelMinorInput = z.infer<typeof setModelMinorSchema>;
+export const setModelMinorSchema = z.object({ id: z.number(), minor: z.boolean() });
+
+export type SetModelSfwOnlyInput = z.infer<typeof setModelSfwOnlySchema>;
+export const setModelSfwOnlySchema = z.object({ id: z.number(), sfwOnly: z.boolean() });
+export type SetModelPoiInput = z.infer<typeof setModelPoiSchema>;
+export const setModelPoiSchema = z.object({ id: z.number(), poi: z.boolean() });
+
+export type MinorFlagSnapshot = {
+  at: string;
+  source: 'auto' | 'manual' | 'text-scan';
+  confirmedFrom?: 'auto' | 'manual' | 'text-scan';
+  confirmedAt?: string;
+  confirmedBy?: number;
+  /** Absent on snapshots written before it was kept. */
+  prevMinor?: boolean;
+  prevNsfw?: boolean;
+  prevSfwOnly?: boolean;
+  prevGalleryLevel?: number | null;
+  prevLockedProperties?: string[];
+  prevMinorImageIds?: number[];
+  /** When a lift ended this flag or a moderator ruled on the rating: a later lift restores nothing from it. */
+  supersededAt?: string;
+};
+
+/** Written when the hash match applies the real-person flag, so a revert can restore what it changed. */
+export type PoiFlagSnapshot = {
+  at: string;
+  source: 'auto' | 'manual';
+  confirmedFrom?: 'auto';
+  confirmedAt?: string;
+  confirmedBy?: number;
+  prevNsfw?: boolean;
+  prevSfwOnly?: boolean;
+  prevGalleryLevel?: number | null;
+  prevLockedProperties?: string[];
+};
+
+type RestrictedNsfwPrior = {
+  nsfw: boolean;
+  sfwOnly: boolean;
+  lockedProperties: string[];
+  systemNsfwLock: { source: string; at: string } | null;
+};
+
+export type RestrictedNsfwVerdict = {
+  source: string;
+  at: string;
+  restriction: 'minor' | 'poi' | 'sfwOnly';
+  /** On an SFW-only model the scan applied the rating at once (SFW-only cleared); what it replaced. */
+  applied?: { at: string; prior: RestrictedNsfwPrior };
+  /** The flag was lifted other than by the owner's save; the lead waits for a moderator's ruling. */
+  liftedBy?: 'moderator' | 'appeal' | 'hashRevert';
+};
+
+/** One ruling on a restricted-verdict lead, with the values it replaced. `autoApply` is the scan's own
+ *  flip of an SFW-only model, by the system user; the others are a moderator's. */
+export type RestrictedNsfwVerdictRulingRecord = {
+  at: string;
+  by: number;
+  ruling: 'keep' | 'dismiss' | 'rateNsfw' | 'autoApply';
+  restriction: RestrictedNsfwVerdict['restriction'];
+  reason?: string | null;
+  verdict?: RestrictedNsfwVerdict;
+  prior: RestrictedNsfwPrior;
+};
+
+export type ComFaceRemovedReason = 'detected' | 'recheck-unverified';
+
+export type ModelMeta = Partial<{
+  /** Orchestrator workflow this Trained model was drafted from (Training Studio publish flow).
+   *  The idempotency key for `createDraftModelFromWorkflow`, and what the publish handler uses
+   *  to stamp the published model back onto the workflow. */
+  trainingStudioWorkflowId: string;
+  /** Set once the run passed the training moderation check (at materialization, or backfilled when
+   *  a later check reads the run as approved). A stamped model skips the publish-time check.
+   *  Server-owned. */
+  trainingStudioModerationApproved: boolean;
+  unpublishedReason: UnpublishReason;
+  customMessage: string;
+  needsReview: boolean;
+  unpublishedAt: string;
+  archivedAt: string;
+  archivedBy: number;
+  takenDownAt: string;
+  takenDownBy: number;
+  /** Written by a content wipe on a model it kept and hid; see model-removed-with-owner.service. */
+  removedWithOwner: boolean;
+  statusBeforeRemoval: string;
+  versionsUnpublishedByRemoval: { id: number; status: string }[];
+  bountyId: number;
+  unpublishedBy: number;
+  declinedReason: string;
+  declinedAt: string;
+  showcaseCollectionId: number;
+  cannotPromote: boolean;
+  cannotPublish: boolean;
+  commentsLocked: boolean;
+  profanityMatches: string[];
+  profanityEvaluation: Pick<ProfanityEvaluation, 'reason' | 'metrics'>;
+  /**
+   * XGuard text-moderation forensics. Surfaced to moderators through
+   * `getModelModerationDetail`; stripped from every client-facing path by
+   * `stripMinorHashMeta`. Sibling of `profanity`, not a replacement — a moderator
+   * looking at an older model needs to know which detector produced the finding.
+   *
+   * Scores rather than matched terms, because that is what these policies return:
+   * the labels v1 acts on are LLM-scored (they come back with `topToken` /
+   * `policyHash` and no `matchedTerms` key at all), so a term list would be
+   * permanently empty. `matchedTerms` is kept for the keyword-backed policies that
+   * do populate it, and is empty for the rest.
+   */
+  textModeration: {
+    /** The labels that triggered, with the score and threshold behind each. */
+    labels: { label: string; score: number; threshold: number }[];
+    matchedTerms: string[];
+    scannedAt: string;
+  };
+  minorFlagSnapshot: MinorFlagSnapshot;
+  /** What an owner's minor/POI declaration replaced when it cleared a locked nsfw. */
+  ownerFlagOverride: {
+    at: string;
+    flags: ('minor' | 'poi')[];
+    prevNsfw: boolean;
+    prevSfwOnly: boolean;
+    prevLockedProperties: string[];
+    /** Absent on records written before it was kept. */
+    prevGalleryLevel?: number | null;
+  };
+  /** Flags the owner declared, kept when a moderator's ruling drops `ownerFlagOverride`. Server-owned. */
+  ownerDeclaredFlags: { at: string; flags: ('minor' | 'poi')[] };
+  minorHashDismissed: { at: string; by: number };
+  minorHashCleared: { at: string };
+  minorHashAccepted: { at: string };
+  poiFlagSnapshot: PoiFlagSnapshot;
+  /** A file shared with a real-person model that nothing has been applied for: a moderator's lead. */
+  poiHashMatch: { at: string; hash: string };
+  /** A moderator lifted the real-person flag or dismissed the match; older files no longer match. */
+  poiHashCleared: { at: string };
+  /** A system check (not a moderator) added the nsfw lock. Server-owned. The save-time text
+   *  filter also records which field set it off, for the owner's explanation. */
+  systemNsfwLock: { source: string; at: string } & Partial<MatureLockAttribution>;
+  /** The listing re-check took the model off civitai.com: its .com cover was cleared, kept here so a
+   *  moderator can restore it. `reason` says whether the check flagged the listing or never got a
+   *  verdict; `detail` is the check's own reason, for moderators only. A save that sets a .com
+   *  cover clears it. Server-owned. */
+  comFaceRemoved: {
+    at: string;
+    sfwCoverImageId: number;
+    reason: ComFaceRemovedReason;
+    detail?: string;
+  };
+  /** The text scan rated a minor, POI or SFW-only model NSFW and left nsfw alone: a moderator's lead
+   *  in Needs review. Server-owned, moderator-only. */
+  restrictedNsfwVerdict: RestrictedNsfwVerdict;
+  /** Moderator rulings on past restricted-verdict leads, with the values each replaced. Moderator-only. */
+  restrictedNsfwVerdictRulings: RestrictedNsfwVerdictRulingRecord[];
+  /** A lead a moderator kept while the model was minor or POI: revived as a held lead when the owner
+   *  clears the flag. Server-owned, moderator-only. */
+  restrictedNsfwVerdictDormant: RestrictedNsfwVerdict;
+  textScanFlags: TextScanFlags;
+  /** The `ModelRules` text-scan match that unpublished the model. Moderator-only. */
+  modelRules: {
+    ruleIds: number[];
+    workflowId: string;
+    textHash: string;
+    at: string;
+    /** Absent for an LLM match. A literal one carries a synthetic `workflowId` of `literal:<textHash>`. */
+    source?: 'literal';
+  };
+  /**
+   * Rules a moderator approved by republishing, for the text they reviewed: a rescan of that same
+   * text does not act on them again, while edited text is judged afresh.
+   */
+  modelRulesCleared: { ruleIds: number[]; textHash: string };
+  // Creator Controls: hide public metrics (only while the owner has a valid
+  // Creator Program membership — see server/utils/model-metric-privacy.ts).
+  // Legacy: read as `true` = hide, otherwise inherit. Saves now write `metricVisibility` and clear these.
+  hideBuzz: boolean | null;
+  hideDownloads: boolean | null;
+  hideGenerations: boolean | null;
+  metricVisibility: MetricVisibilitySettings;
+}>;
+
+export type ChangeModelModifierSchema = z.infer<typeof changeModelModifierSchema>;
+export const changeModelModifierSchema = z.object({
+  id: z.number(),
+  mode: z.enum(ModelModifier).nullable(),
+});
+
+export type DeclineReviewSchema = z.infer<typeof declineReviewSchema>;
+export const declineReviewSchema = z.object({
+  id: z.number(),
+  reason: z.string().optional(),
+});
+
+export type GetModelsWithCategoriesSchema = z.infer<typeof getModelsWithCategoriesSchema>;
+export const getModelsWithCategoriesSchema = paginationSchema.extend({
+  userId: z.number().optional(),
+});
+
+export type SetModelsCategoryInput = z.infer<typeof setModelsCategorySchema>;
+export const setModelsCategorySchema = z.object({
+  modelIds: z.array(z.number()),
+  categoryId: z.number(),
+});
+
+// #region [Associated Models]
+export type FindResourcesToAssociateSchema = z.infer<typeof findResourcesToAssociateSchema>;
+export const findResourcesToAssociateSchema = z.object({
+  query: z.string(),
+  limit: z.number().default(5),
+});
+
+export type GetAssociatedResourcesInput = z.infer<typeof getAssociatedResourcesSchema>;
+export const getAssociatedResourcesSchema = baseQuerySchema.extend({
+  fromId: z.number(),
+  type: z.enum(AssociationType),
+});
+
+export type SetAssociatedResourcesInput = z.infer<typeof setAssociatedResourcesSchema>;
+export const setAssociatedResourcesSchema = z.object({
+  fromId: z.number(),
+  type: z.enum(AssociationType),
+  associations: z
+    .object({
+      // Association Id
+      id: z.number().optional(),
+      // Model | Article Id
+      resourceId: z.number(),
+      resourceType: z.enum(['model', 'article']),
+    })
+    .array()
+    .max(constants.modelAssociations.maxPerSave),
+  // Model ids the caller asked to link back. A request, not an instruction: the server keeps
+  // its own answer for which of them were added in this edit and which the owner owns, and
+  // narrows this list to that. Bounded by the same cap as the array above.
+  reciprocal: z.array(z.number()).max(constants.modelAssociations.maxPerSave).optional(),
+});
+// #endregion
+
+export type GetModelVersionsSchema = z.infer<typeof getModelVersionsSchema>;
+export const getModelVersionsSchema = z.object({
+  id: z.number(),
+  excludeUnpublished: z.boolean().optional(),
+});
+
+export type ImageModelDetail = z.infer<typeof imageModelDetailSchema>;
+export type CharacterModelDetail = z.infer<typeof characterModelDetailSchema>;
+export type TextModelDetail = z.infer<typeof textModelDetailSchema>;
+export type AudioModelDetail = z.infer<typeof audioModelDetailSchema>;
+
+export const imageModelDetailSchema = z.object({
+  type: z.enum(ModelType),
+  checkpointType: z.enum(CheckpointType).optional(),
+});
+export const characterModelDetailSchema = z.object({});
+export const textModelDetailSchema = z.object({});
+export const audioModelDetailSchema = z.object({});
+
+export type ModelByHashesInput = z.infer<typeof modelByHashesInput>;
+export const modelByHashesInput = z.object({
+  hashes: z.array(z.string()),
+});
+
+export type GetSimpleModelsInfiniteSchema = z.infer<typeof getSimpleModelsInfiniteSchema>;
+export const getSimpleModelsInfiniteSchema = infiniteQuerySchema.extend({
+  query: z.string().trim().optional(),
+  userId: z.number(),
+});
+
+export type ToggleCheckpointCoverageInput = z.infer<typeof toggleCheckpointCoverageSchema>;
+export const toggleCheckpointCoverageSchema = z.object({
+  id: z.number(),
+  versionId: z.number(),
+});
+
+export type SetModelCollectionShowcaseInput = z.infer<typeof setModelCollectionShowcaseSchema>;
+export const setModelCollectionShowcaseSchema = z.object({
+  id: z.number(),
+  collectionId: z.number().nullable(),
+});
+
+export type SetModelOfficialInput = z.infer<typeof setModelOfficialSchema>;
+export const setModelOfficialSchema = z.object({
+  id: z.number(),
+  isOfficial: z.boolean(),
+});
+
+export const resourceSelectTabs = [
+  'all',
+  'official',
+  'featured',
+  'recent',
+  'liked',
+  'mine',
+] as const;
+export const resourceSelectSources = [
+  'generation',
+  'training',
+  'addResource',
+  'modelVersion',
+  'auction',
+] as const;
+export const resourceSelectSorts = ['relevance', 'popularity', 'newest'] as const;
+
+export type GetResourceSelectInput = z.infer<typeof getResourceSelectSchema>;
+export const getResourceSelectSchema = z.object({
+  tab: z.enum(resourceSelectTabs),
+  selectSource: z.enum(resourceSelectSources),
+  query: z.string().optional(),
+  sort: z.enum(resourceSelectSorts).default('relevance'),
+  cursor: z.number().optional(),
+  limit: z.number().min(1).max(100).default(20),
+  resources: z
+    .object({
+      type: z.enum(ModelType),
+      baseModels: z.string().array().default([]),
+    })
+    .array()
+    .default([]),
+  filterTypes: z.enum(ModelType).array().default([]),
+  filterBaseModels: z.string().array().default([]),
+  filterLoaded: z.boolean().default(false),
+  filterTurbo: z.boolean().default(false),
+  tagName: z.string().optional(),
+  canGenerate: z.boolean().optional(),
+  hidePaid: z.boolean().optional(),
+  excludedVersionIds: z.number().array().default([]),
+  // recent → generation only: orchestrator history ids resolved client-side
+  restrictToIds: z.number().array().optional(),
+  // A pasted model / version link: the same query scoped to that id, without the type and
+  // base-model scope so the picker can say which of them hid it.
+  lookup: z
+    .object({
+      modelId: z.number().int().positive().optional(),
+      modelVersionId: z.number().int().positive().optional(),
+    })
+    .refine((x) => x.modelId || x.modelVersionId)
+    .optional(),
+});
+
+export type MigrateResourceToCollectionInput = z.infer<typeof migrateResourceToCollectionSchema>;
+export const migrateResourceToCollectionSchema = z.object({
+  id: z.coerce.number(),
+  collectionName: z.string().optional(),
+});
+
+export type LimitOnly = z.input<typeof limitOnly>;
+export const limitOnly = z.object({
+  take: z.number().optional(),
+});
+
+export type PrivateModelFromTrainingInput = z.infer<typeof privateModelFromTrainingSchema>;
+export const privateModelFromTrainingSchema = modelUpsertSchema.extend({
+  id: z.number(), // Model should already be created before hand.
+  modelVersionIds: z.array(z.number()).optional(),
+});
+
+export type PublishPrivateModelInput = z.infer<typeof publishPrivateModelSchema>;
+export const publishPrivateModelSchema = z.object({
+  modelId: z.number(),
+  publishVersions: z.boolean(),
+});
+
+// Training models list schema with filtering and sorting
+export const trainingModelsSortOptions = [
+  'startDesc',
+  'startAsc',
+  'createdDesc',
+  'createdAsc',
+  'endDesc',
+  'endAsc',
+  'updatedDesc',
+  'updatedAsc',
+] as const;
+export type TrainingModelsSort = (typeof trainingModelsSortOptions)[number];
+
+export type GetMyTrainingModelsSchema = z.infer<typeof getMyTrainingModelsSchema>;
+export const getMyTrainingModelsSchema = paginationSchema.extend({
+  query: z.string().optional(),
+  trainingStatus: z.array(z.enum(TrainingStatus)).optional(),
+  baseModel: z.string().optional(),
+  type: z.string().optional(),
+  sort: z.enum(trainingModelsSortOptions).default('startDesc'),
+});
+
+export type TransferModelOwnershipInput = z.infer<typeof transferModelOwnershipSchema>;
+export const transferModelOwnershipSchema = z.object({
+  modelIds: z.array(z.number().int().positive()).min(1),
+  targetUserId: z.number().int().positive(),
+});

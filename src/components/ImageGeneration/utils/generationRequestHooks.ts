@@ -1,0 +1,600 @@
+import { applyPatch, JsonPatchFactory } from '@civitai/orchestration-client';
+import type { InfiniteData } from '@tanstack/react-query';
+import { getQueryKey } from '@trpc/react-query';
+import produce from 'immer';
+import { cloneDeep } from 'lodash-es';
+import { useEffect, useMemo } from 'react';
+import type * as z from 'zod';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useFiltersContext } from '~/providers/FiltersProvider';
+import { GenerationReactType, GenerationSort } from '~/server/common/enums';
+import type {
+  GeneratedImageStepMetadata,
+  TextToImageStepImageMetadata,
+} from '~/server/schema/orchestrator/textToImage.schema';
+
+/**
+ * Client-facing step metadata shape for jsonPatch path typing: same as
+ * `GeneratedImageStepMetadata` but with the per-output dictionary under the
+ * client name (`output`) instead of the legacy `images` key. Patches written
+ * against this type target `output/*` paths, which the orchestrator stores as-is.
+ */
+type ClientStepMetadata = Omit<GeneratedImageStepMetadata, 'images'> & {
+  output?: GeneratedImageStepMetadata['images'];
+};
+import type {
+  GeneratedImagesQuerySchema,
+  PatchWorkflowParams,
+  PatchWorkflowStepParams,
+  TagsPatchSchema,
+  workflowQuerySchema,
+} from '~/server/schema/orchestrator/workflows.schema';
+import type { BlobData } from '~/shared/orchestrator/workflow-data';
+import { WorkflowData } from '~/shared/orchestrator/workflow-data';
+import type {
+  NormalizedStep,
+  queryGeneratedImageWorkflows2,
+} from '~/server/services/orchestrator/orchestration-new.service';
+import type {
+  IWorkflow,
+  IWorkflowsInfinite,
+} from '~/server/services/orchestrator/orchestrator.schema';
+import { WORKFLOW_TAGS } from '~/shared/constants/generation.constants';
+import { showErrorNotification } from '~/utils/notifications';
+import { removeEmpty } from '~/utils/object-helpers';
+import { queryClient, trpc } from '~/utils/trpc';
+import { useAppContext } from '~/providers/AppProvider';
+import { useBrowsingSettings } from '~/providers/BrowserSettingsProvider';
+import { registerSignalGroup } from '~/components/Signals/signals-registry.store';
+import { watchUnratedOutputs } from '~/components/ImageGeneration/utils/unratedOutputRefetch';
+
+export type InfiniteTextToImageRequests = InfiniteData<
+  AsyncReturnType<typeof queryGeneratedImageWorkflows2>
+>;
+
+/** Check whether a BlobData image passes the active marker-tag filter. */
+export function matchesMarkerTags(image: BlobData, tags?: string[]): boolean {
+  if (!tags?.length) return true;
+  const meta = image.outputMeta;
+  if (tags.includes(WORKFLOW_TAGS.FAVORITE) && !meta?.favorite) return false;
+  if (tags.includes(WORKFLOW_TAGS.FEEDBACK.LIKED) && meta?.feedback !== 'liked') return false;
+  if (tags.includes(WORKFLOW_TAGS.FEEDBACK.DISLIKED) && meta?.feedback !== 'disliked') return false;
+  return true;
+}
+
+export function useInvalidateWhatIf() {
+  const queryUtils = trpc.useUtils();
+  return function () {
+    queryUtils.orchestrator.whatIfFromGraph.invalidate();
+  };
+}
+
+/** The generator Queue's own input: Queue, Feed, their lightbox and the queue counter share it. */
+export const GENERATOR_QUEUE_INPUT = {
+  excludeAppWorkflows: true,
+} satisfies GeneratedImagesQuerySchema;
+
+export function useGetTextToImageRequests(
+  input?: GeneratedImagesQuerySchema,
+  options?: { enabled?: boolean; includeTags?: boolean; ignoreFilters?: boolean }
+) {
+  registerSignalGroup('generation');
+  const { domain } = useAppContext();
+  const nsfwEnabled = useBrowsingSettings((state) => state.showNsfw);
+  const currentUser = useCurrentUser();
+
+  const globalFilters = useFiltersContext((state) => state.generation);
+  const filters = options?.ignoreFilters
+    ? ({ sort: GenerationSort.Newest } as typeof globalFilters)
+    : globalFilters;
+
+  // Convert marker filter to tags
+  const markerTags = useMemo(() => {
+    switch (filters.marker) {
+      case GenerationReactType.Favorited:
+        return [WORKFLOW_TAGS.FAVORITE];
+      case GenerationReactType.Liked:
+        return [WORKFLOW_TAGS.FEEDBACK.LIKED];
+      case GenerationReactType.Disliked:
+        return [WORKFLOW_TAGS.FEEDBACK.DISLIKED];
+      default:
+        return [];
+    }
+  }, [filters.marker]);
+
+  // Build complete query tags including new filters
+  const queryTags = useMemo(() => {
+    const baseTags = [
+      WORKFLOW_TAGS.GENERATION,
+      ...(options?.includeTags === false ? [] : [...markerTags, ...(filters.tags ?? [])]),
+      ...(input?.tags ?? []),
+    ];
+
+    if (filters.baseModel) baseTags.push(filters.baseModel);
+    if (filters.processType) baseTags.push(filters.processType);
+
+    return baseTags;
+  }, [
+    markerTags,
+    filters.tags,
+    filters.baseModel,
+    filters.processType,
+    options?.includeTags,
+    input?.tags,
+  ]);
+
+  const { data, ...rest } = trpc.orchestrator.queryGeneratedImages.useInfiniteQuery(
+    {
+      ...input,
+      ascending: filters.sort === GenerationSort.Oldest,
+      tags: queryTags,
+      fromDate: filters.fromDate,
+      // The queue's date filter wins; otherwise the caller's own bound (the picker's, which ignores
+      // the queue's filters).
+      toDate: filters.toDate ?? input?.toDate,
+      excludeFailed: filters.excludeFailed,
+    },
+    {
+      getNextPageParam: (lastPage) => (!!lastPage ? lastPage.nextCursor : undefined),
+      enabled: !!currentUser && options?.enabled,
+    }
+  );
+
+  const flatData = useMemo(
+    () =>
+      data?.pages.flatMap((x) =>
+        (x.items ?? [])
+          .filter((workflow) => {
+            if (!!markerTags.length && workflow.tags.every((tag) => !markerTags.includes(tag)))
+              return false;
+            return true;
+          })
+          .map((workflow) => new WorkflowData(workflow, { domain, nsfwEnabled, holdUnrated: true }))
+      ) ?? [],
+    [data, nsfwEnabled, domain, markerTags]
+  );
+
+  // Unconditional: the watcher reads the raw cache, which includes outputs `flatData` hides
+  // (a 3D workflow's suppressed preview render, whose rating its mesh inherits).
+  useEffect(() => {
+    watchUnratedOutputs();
+  }, [flatData]);
+
+  return { data: flatData, markerTags, ...rest };
+}
+
+export function useGetTextToImageRequestsImages(input?: GeneratedImagesQuerySchema) {
+  const { data, markerTags, ...rest } = useGetTextToImageRequests(input);
+
+  return { requests: data, markerTags, ...rest };
+}
+
+function updateTextToImageRequests({
+  cb,
+  input,
+}: {
+  cb: (
+    data: InfiniteTextToImageRequests,
+    queryInput: z.input<typeof workflowQuerySchema> | undefined
+  ) => void;
+  input?: z.input<typeof workflowQuerySchema>;
+}) {
+  const queryKey = getQueryKey(trpc.orchestrator.queryGeneratedImages);
+  // Iterate per-cache so the callback can see each cache's filter input
+  // (needed when a mutation should drop a workflow from a cache whose filter it
+  // no longer matches — e.g. unliking while filtered to liked).
+  const entries = queryClient.getQueriesData<InfiniteTextToImageRequests>({
+    queryKey,
+    exact: false,
+  });
+  for (const [qk, data] of entries) {
+    if (!data) continue;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const queryInput = (qk as any)?.[1]?.input as z.input<typeof workflowQuerySchema> | undefined;
+    if (input) {
+      let skip = false;
+      for (const key in input) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        if ((queryInput as any)?.[key] !== (input as any)[key]) {
+          skip = true;
+          break;
+        }
+      }
+      if (skip) continue;
+    }
+    const next = produce(data, (old?: InfiniteTextToImageRequests) => {
+      if (!old) return;
+      cb(old, queryInput);
+    });
+    queryClient.setQueryData(qk, next);
+  }
+}
+
+function updateCachedWorkflow(
+  workflowId: string,
+  update: (items: InfiniteTextToImageRequests['pages'][number]['items'], index: number) => void
+) {
+  updateTextToImageRequests({
+    cb: (data) => {
+      for (const page of data.pages) {
+        const index = page.items.findIndex((x) => x.id === workflowId);
+        if (index > -1) {
+          update(page.items, index);
+          break;
+        }
+      }
+    },
+  });
+}
+
+/** Adds or removes a tag on a workflow in every cached queue list, as a tag patch would. */
+export function setCachedWorkflowTag(workflowId: string, tag: string, op: 'add' | 'remove') {
+  updateCachedWorkflow(workflowId, (items, index) => {
+    const tags = items[index].tags ?? [];
+    items[index].tags = op === 'add' ? [...new Set([...tags, tag])] : tags.filter((t) => t !== tag);
+  });
+}
+
+export function useUpdateWorkflow() {
+  return trpc.orchestrator.updateWorkflow.useMutation({
+    onSuccess: (response, { workflowId }) => {
+      updateCachedWorkflow(workflowId, (items, index) => {
+        items[index] = response as any;
+      });
+    },
+    onError: (error) => {
+      showErrorNotification({
+        title: 'Could not unlock this generation',
+        error: new Error(error.message),
+      });
+    },
+  });
+}
+
+export function useBoostWorkflow() {
+  const queryUtils = trpc.useUtils();
+  return trpc.orchestrator.boostWorkflow.useMutation({
+    onSuccess: (result, { workflowId }) => {
+      if (!result.boosted) {
+        queryUtils.orchestrator.getBoostCost.setData({ workflowId }, { cost: result.cost });
+        return;
+      }
+      updateCachedWorkflow(workflowId, (items, index) => {
+        if (result.workflow) items[index] = result.workflow as any;
+        else items[index].downloadPriority = 'high';
+      });
+    },
+    onError: (error) => {
+      showErrorNotification({
+        title: 'Could not boost this download',
+        error: new Error(error.message),
+      });
+    },
+  });
+}
+
+type CachedWorkflow = InfiniteTextToImageRequests['pages'][number]['items'][number];
+
+/**
+ * Puts a just-submitted workflow into each cached list it belongs in: first in a newest-first list,
+ * last in an oldest-first one whose last page is loaded. A list bounded by `toDate` takes it only
+ * when the bound is not before the workflow's creation time, as the server would list it.
+ */
+export function addSubmittedWorkflowToCaches(workflow: CachedWorkflow) {
+  const createdAt = workflow.createdAt ? new Date(workflow.createdAt) : new Date();
+  const endsBeforeIt = (queryInput?: { toDate?: Date | string }) =>
+    !!queryInput?.toDate && new Date(queryInput.toDate) < createdAt;
+
+  updateTextToImageRequests({
+    input: { ascending: false },
+    cb: (old, queryInput) => {
+      if (endsBeforeIt(queryInput)) return;
+      old.pages[0].items.unshift(workflow);
+    },
+  });
+  updateTextToImageRequests({
+    input: { ascending: true },
+    cb: (old, queryInput) => {
+      if (endsBeforeIt(queryInput)) return;
+      const index = old.pages.length - 1;
+      if (!old.pages[index].nextCursor) {
+        old.pages[index].items.push(workflow);
+      }
+    },
+  });
+}
+
+export function useGenerateFromGraph(args?: { onError?: (e: any) => void }) {
+  return trpc.orchestrator.generateFromGraph.useMutation({
+    onSuccess: (data) => addSubmittedWorkflowToCaches(data),
+    ...args,
+  });
+}
+
+export function useDeleteTextToImageRequest() {
+  return trpc.orchestrator.deleteWorkflow.useMutation({
+    onSuccess: (_, { workflowId }) => {
+      updateTextToImageRequests({
+        cb: (data) => {
+          for (const page of data.pages) {
+            const index = page.items.findIndex((x) => x.id === workflowId);
+            if (index > -1) page.items.splice(index, 1);
+          }
+        },
+      });
+    },
+    onError: (error) => {
+      showErrorNotification({
+        title: 'Error deleting request',
+        error: new Error(error.message),
+      });
+    },
+  });
+}
+
+export function useCancelTextToImageRequest() {
+  return trpc.orchestrator.cancelWorkflow.useMutation({
+    onError: (error) => {
+      showErrorNotification({
+        title: 'Error cancelling request',
+        error: new Error(error.message),
+      });
+    },
+  });
+}
+
+export type UpdateImageStepMetadataArgs = {
+  workflowId: string;
+  stepName: string;
+  images: Record<string, TextToImageStepImageMetadata>;
+};
+
+export function useUpdateImageStepMetadata(options?: { onSuccess?: () => void }) {
+  const queryKey = getQueryKey(trpc.orchestrator.queryGeneratedImages);
+  const { mutate, isPending: isLoading } = trpc.orchestrator.patch.useMutation({
+    onError: async (error) => {
+      // Rollback optimistic update by refetching from server
+      await queryClient.invalidateQueries({ queryKey, exact: false });
+      showErrorNotification({
+        title: 'Failed to update image',
+        error: new Error(error.message),
+      });
+    },
+  });
+
+  function updateImages(args: Array<UpdateImageStepMetadataArgs>, onError?: () => void) {
+    const allQueriesData = queryClient.getQueriesData<IWorkflowsInfinite>({
+      queryKey,
+      exact: false,
+    });
+
+    // add workflows from query cache to an array for quick reference
+    const workflows: IWorkflow[] = [];
+    loop: for (const [, queryData] of allQueriesData) {
+      for (const page of queryData?.pages ?? []) {
+        for (const workflow of page.items) {
+          const match = args.find((x) => x.workflowId === workflow.id);
+          if (match) workflows.push(workflow);
+          if (workflows.length === args.length) break loop;
+        }
+      }
+    }
+
+    const workflowPatches: PatchWorkflowParams[] = [];
+    const stepPatches: PatchWorkflowStepParams[] = [];
+    const updated: UpdateImageStepMetadataArgs[] = [];
+    const tags: { workflowId: string; tag: string; op: 'add' | 'remove' }[] = [];
+    const toDelete: string[] = [];
+
+    for (const workflow of workflows) {
+      const match = args.find((x) => x.workflowId === workflow.id);
+      if (!match) continue;
+      const { workflowId, stepName, images } = match;
+      for (const step of workflow.steps as unknown as NormalizedStep[]) {
+        if (step.name !== stepName) continue;
+        const metadata = (step.metadata ?? {}) as Record<string, unknown>;
+        // Raw orchestrator keys — used to decide init ops below. `output` is the
+        // current canonical key; `images` is the legacy key on pre-rename workflows.
+        // A legacy workflow has `images` populated but no `output` — our first patch
+        // must create `output` (ASP.NET jsonpatch rejects `add` on a missing parent).
+        const rawOutput = metadata.output as
+          | Record<string, TextToImageStepImageMetadata>
+          | undefined;
+        const legacyImages = metadata.images as
+          | Record<string, TextToImageStepImageMetadata>
+          | undefined;
+        // Merged view — used for per-field toggle decisions (e.g. was this image
+        // already liked?) so legacy feedback values are taken into account.
+        const mergedOutput: Record<string, TextToImageStepImageMetadata> = {
+          ...(legacyImages ?? {}),
+          ...(rawOutput ?? {}),
+        };
+
+        const jsonPatch = new JsonPatchFactory<ClientStepMetadata>();
+        // Create `output` on the orchestrator when it doesn't exist yet (legacy or brand-new workflow).
+        if (!rawOutput) jsonPatch.addOperation({ op: 'add', path: 'output', value: {} });
+        for (const imageId in images) {
+          // Per-id container must also be created when the `output` dict lacks this id —
+          // checked against RAW output, not merged (merged may be masking a legacy-only entry).
+          if (!rawOutput?.[imageId])
+            jsonPatch.addOperation({ op: 'add', path: `output/${imageId}`, value: {} });
+
+          const current = mergedOutput[imageId] ?? {};
+          const { hidden, feedback, comments, postId, favorite } = match.images[imageId];
+          if (hidden)
+            jsonPatch.addOperation({ op: 'add', path: `output/${imageId}/hidden`, value: true });
+          if (feedback) {
+            jsonPatch.addOperation({
+              op: feedback !== current.feedback ? 'add' : 'remove',
+              path: `output/${imageId}/feedback`,
+              value: feedback,
+            });
+          }
+          if (comments)
+            jsonPatch.addOperation({
+              op: 'add',
+              path: `output/${imageId}/comments`,
+              value: comments,
+            });
+          if (postId)
+            jsonPatch.addOperation({
+              op: 'add',
+              path: `output/${imageId}/postId`,
+              value: postId,
+            });
+          if (favorite !== undefined) {
+            jsonPatch.addOperation({
+              op: favorite ? 'add' : 'remove',
+              path: `output/${imageId}/favorite`,
+              value: true,
+            });
+          }
+        }
+
+        const clone = cloneDeep(metadata) as Record<string, unknown>;
+        applyPatch(clone, jsonPatch.operations);
+        const patchedOutput =
+          (clone.output as Record<string, TextToImageStepImageMetadata> | undefined) ?? {};
+        // Per-id merge of legacy and patched state. Used for tag-sync checks and the
+        // "all hidden?" deletion check so legacy feedback/favorite/hidden flags are
+        // counted alongside the new writes.
+        const patchedLegacy =
+          (clone.images as Record<string, TextToImageStepImageMetadata> | undefined) ?? {};
+        const mergedPatched: Record<string, TextToImageStepImageMetadata> = {
+          ...patchedLegacy,
+        };
+        for (const id in patchedOutput) {
+          mergedPatched[id] = { ...mergedPatched[id], ...patchedOutput[id] };
+        }
+
+        // Only remove the workflow once every user-visible step is fully hidden.
+        // Checking just this step would delete a whole batch upscale (one step per
+        // source image) on the first per-image delete. suppressOutput steps aren't
+        // viewable and can't be hidden, so they must not gate deletion.
+        const countStepHidden = (stepMeta: Record<string, unknown>) => {
+          const out = (stepMeta.output ?? {}) as Record<string, TextToImageStepImageMetadata>;
+          const leg = (stepMeta.images ?? {}) as Record<string, TextToImageStepImageMetadata>;
+          return Object.values({ ...leg, ...out }).filter((x) => x.hidden).length;
+        };
+        const workflowEmpty = (workflow.steps as unknown as NormalizedStep[])
+          .filter((s) => !s.metadata?.suppressOutput)
+          .every((s) => {
+            const hiddenCount =
+              s.name === stepName
+                ? Object.values(mergedPatched).filter((x) => x.hidden).length
+                : countStepHidden((s.metadata ?? {}) as Record<string, unknown>);
+            return s.output.length === hiddenCount;
+          });
+        if (workflowEmpty) {
+          toDelete.push(workflow.id);
+        } else {
+          const images = removeEmpty(patchedOutput);
+          // return transformed data
+          updated.push({ workflowId, stepName, images });
+
+          const hasTagFavorite = workflow.tags.includes(WORKFLOW_TAGS.FAVORITE);
+          const hasTagLike = workflow.tags.includes(WORKFLOW_TAGS.FEEDBACK.LIKED);
+          const hasTagDislike = workflow.tags.includes(WORKFLOW_TAGS.FEEDBACK.DISLIKED);
+
+          const hasFavoriteImages = Object.values(mergedPatched).some((x) => x.favorite);
+          const hasLikedImages = Object.values(mergedPatched).some((x) => x.feedback === 'liked');
+          const hasDislikedImages = Object.values(mergedPatched).some(
+            (x) => x.feedback === 'disliked'
+          );
+
+          if (hasTagFavorite && !hasFavoriteImages) {
+            tags.push({ workflowId, tag: WORKFLOW_TAGS.FAVORITE, op: 'remove' });
+          } else if (!hasTagFavorite && hasFavoriteImages) {
+            tags.push({ workflowId, tag: WORKFLOW_TAGS.FAVORITE, op: 'add' });
+          }
+
+          if (hasTagLike && !hasLikedImages) {
+            tags.push({ workflowId, tag: WORKFLOW_TAGS.FEEDBACK.LIKED, op: 'remove' });
+          } else if (!hasTagLike && hasLikedImages) {
+            tags.push({ workflowId, tag: WORKFLOW_TAGS.FEEDBACK.LIKED, op: 'add' });
+          }
+
+          if (hasTagDislike && !hasDislikedImages) {
+            tags.push({ workflowId, tag: WORKFLOW_TAGS.FEEDBACK.DISLIKED, op: 'remove' });
+          } else if (!hasTagDislike && hasDislikedImages) {
+            tags.push({ workflowId, tag: WORKFLOW_TAGS.FEEDBACK.DISLIKED, op: 'add' });
+          }
+
+          stepPatches.push({ workflowId, stepName, patches: jsonPatch.operations });
+        }
+      }
+    }
+
+    // Optimistically update the cache before mutation to ensure UI updates
+    // even if the component unmounts (e.g., menu closing)
+    updateTextToImageRequests({
+      cb: (old, queryInput) => {
+        const filterTags = (queryInput?.tags ?? []) as string[];
+        for (const page of old.pages) {
+          page.items = page.items.filter((x) => !toDelete.includes(x.id));
+          for (const workflow of page.items) {
+            const tagsToAdd = tags.filter((x) => x.workflowId === workflow.id && x.op === 'add');
+            const tagsToRemove = tags.filter(
+              (x) => x.workflowId === workflow.id && x.op === 'remove'
+            );
+            for (const tagOp of tagsToAdd) workflow.tags.push(tagOp.tag);
+            if (tagsToRemove.length) {
+              const tagsToRemoveSet = new Set(tagsToRemove.map((x) => x.tag));
+              workflow.tags = workflow.tags.filter((tag) => !tagsToRemoveSet.has(tag));
+            }
+
+            const toUpdate = updated.filter((x) => x.workflowId === workflow.id);
+            if (!toUpdate.length) continue;
+
+            for (const step of workflow.steps) {
+              const output = toUpdate.find((x) => x.stepName === step.name)?.images;
+              if (output) step.metadata = { ...step.metadata, output };
+            }
+          }
+          // Drop workflows that no longer match this cache's filter tags
+          // (e.g. unliking an image causes the workflow to lose `feedback:liked`
+          // and we're viewing the "liked" filter — the workflow should disappear).
+          if (filterTags.length) {
+            page.items = page.items.filter((workflow) =>
+              filterTags.every((tag) => workflow.tags.includes(tag))
+            );
+          }
+        }
+      },
+    });
+
+    mutate(
+      {
+        workflows: workflowPatches.length ? workflowPatches : undefined,
+        steps: stepPatches.length ? stepPatches : undefined,
+        remove: toDelete.length ? toDelete : undefined,
+        tags: tags.length ? tags : undefined,
+      },
+      {
+        onSuccess: () => {
+          const tagNames = [...new Set(tags.filter((x) => x.op === 'add').map((x) => x.tag))];
+          for (const tag of tagNames) {
+            const key = getQueryKey(trpc.orchestrator.queryGeneratedImages, { tags: [tag] });
+            queryClient.invalidateQueries({ queryKey: key, exact: false });
+          }
+
+          options?.onSuccess?.();
+        },
+        onError: () => {
+          onError?.();
+        },
+      }
+    );
+  }
+
+  return { updateImages, isLoading };
+}
+
+export function usePatchTags() {
+  const { mutate, isPending: isLoading } = trpc.orchestrator.patch.useMutation();
+  function patchTags(tags: TagsPatchSchema[]) {
+    mutate({ tags });
+  }
+
+  return { patchTags, isLoading };
+}

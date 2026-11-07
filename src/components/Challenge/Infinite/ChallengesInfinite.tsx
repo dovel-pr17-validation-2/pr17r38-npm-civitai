@@ -1,0 +1,55 @@
+import { Center, Loader, LoadingOverlay, Stack } from '@mantine/core';
+import type { ReactNode } from 'react';
+import { EndOfFeed } from '~/components/EndOfFeed/EndOfFeed';
+import { NoContent } from '~/components/NoContent/NoContent';
+import { MasonryGridVirtual } from '~/components/MasonryColumns/MasonryGridVirtual';
+import { InViewLoader } from '~/components/InView/InViewLoader';
+import { ChallengeCard } from '~/components/Cards/ChallengeCard';
+import { useQueryChallenges } from '~/components/Challenge/challenge.utils';
+import type { GetInfiniteChallengesInput } from '~/server/schema/challenge.schema';
+
+type Props = {
+  filters?: Partial<GetInfiniteChallengesInput>;
+  emptyAction?: ReactNode;
+};
+
+export function ChallengesInfinite({ filters, emptyAction }: Props) {
+  const { challenges, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage, isRefetching } =
+    useQueryChallenges(filters);
+
+  const isLoadingInitial = isLoading && challenges.length === 0;
+
+  return (
+    <Stack pos="relative">
+      <LoadingOverlay visible={isRefetching} zIndex={9} />
+
+      {isLoadingInitial ? (
+        <Center p="xl">
+          <Loader size="xl" />
+        </Center>
+      ) : challenges.length === 0 ? (
+        <NoContent message="No challenges found">{emptyAction}</NoContent>
+      ) : (
+        <>
+          <MasonryGridVirtual
+            data={challenges}
+            render={ChallengeCard}
+            itemId={(item) => item.id}
+            empty={<NoContent message="No challenges found" />}
+            aspectRatio="square"
+          />
+
+          {hasNextPage && (
+            <InViewLoader loadFn={fetchNextPage} loadCondition={!isFetchingNextPage && hasNextPage}>
+              <Center p="xl">
+                <Loader size="lg" />
+              </Center>
+            </InViewLoader>
+          )}
+
+          {!hasNextPage && challenges.length > 0 && <EndOfFeed />}
+        </>
+      )}
+    </Stack>
+  );
+}

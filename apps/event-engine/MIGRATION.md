@@ -1,0 +1,147 @@
+# metric-event-watcher → event-engine (monorepo migration)
+
+This directory is the **`metric-event-watcher`** service relocated into the civitai monorepo as
+`apps/event-engine` (**renamed** — see below), at its **clean committed HEAD** — none of the in-progress
+outbox / delete-side-effects work (the `feat/image-delete-side-effects` branch) is included.
+
+- **Worktree/branch:** `feat/metric-event-watcher-monorepo` (branched off `main`).
+- **Source:** `metric-event-watcher` @ HEAD via `git archive` (so no uncommitted local changes came across).
+- **event-engine-common:** vendored under `src/common/` at its clean submodule HEAD (`49b0d4f`) — no longer a
+  git submodule here. **Not** yet extracted into a shared package (deferred — see below); the standalone
+  `event-engine-common` submodule/repo will be examined separately.
+
+## Renamed to `event-engine`
+The app now reflects its broader scope (metrics + signals + CDC side effects), not just metrics. **Only the
+packaging/deploy-facing name was changed** — dir `apps/event-engine`, package `@civitai/event-engine`, and the
+Dockerfile filter/paths. **Runtime identifiers were intentionally left unchanged for continuity:**
+- Kafka **consumer group** default `metric-event-watcher` (`src/config/index.ts`, `scripts/reset-consumer-offsets.ts`)
+  — so the cutover resumes from existing offsets rather than reprocessing.
+- Prometheus **`app` label `metric-event-watcher`** + the **`mew_` metric prefix** (`src/metrics.ts`) — so existing
+  dashboards/alerts keep working. (The dashboard that keys on these now lives in the ops repo; the
+  legacy `k8s/grafana-dashboard.json` copy has since been deleted — see the `k8s/` bullet under
+  "What changed vs. the standalone repo".)
+- Kafka `clientId` (`src/index.ts`) — cosmetic; left as-is.
+
+Rename these later as a deliberate, separately-planned step (with an offset seed + dashboard update) if desired.
+
+## Approach: lift-and-shift (deliberately minimal)
+
+The goal was a faithful move, not a rewrite. So the app is **self-contained**: its own dependencies, its own
+`tsc && tsc-alias` (CommonJS) build, its own `tsconfig.json` (`@/*` path aliases), and EEC vendored in-tree.
+It drops into `apps/*` as a pnpm workspace and is auto-discovered — no `pnpm-workspace.yaml` / `turbo.json` /
+root changes were needed.
+
+### What changed vs. the standalone repo
+- `package.json`: name → `@civitai/event-engine`, `"private": true`; dropped repo-level scripts
+  (`sync:submodule`, `install:hooks`, `release*`). Deps/build/tsconfig kept as-is.
+- Removed `.gitmodules` (submodule retired → vendored) and `package-lock.json` (npm → the monorepo is pnpm).
+- `Dockerfile` rewritten to the monorepo pnpm-deploy pattern — **DRAFT, unverified**. (This bullet said
+  "see below"; no section describing that pattern was ever written. Read the `Dockerfile` itself.)
+- `.github/` **was** kept as legacy reference only and has since been **DELETED** (2026-09-15), together
+  with `scripts/release.mjs` — the standalone repo's release machinery, both members. The reason the
+  workflow was safe to delete is worth keeping: GitHub reads workflows only from the repo-root
+  `.github/workflows/`, so a nested copy is **structurally never scheduled** — verified against the
+  Actions API, which listed **zero** workflows under `apps/`. (Quote that zero, not a count of root
+  entries: the registry carries rows that do not correspond to the default branch's tree at all —
+  both for workflow files since deleted **and** for files that only ever existed on a branch — so the
+  root number it returns is larger than the tree's, and a re-verifier will not reproduce it. Measured
+  2026-09-15: 6 root rows against 4 tracked root workflow files.)
+  🔴 `scripts/release.mjs` was the dangerous half and was **not** inert: 437 lines, wired to no
+  `package.json` script and referenced by nothing, but executable. Run as
+  `node scripts/release.mjs` **from `apps/event-engine`** it would check out `release`, rebase it onto
+  `main`, bump this app's version, tag a bare `v<version>` and **push `release`** — an unreviewed
+  production deploy of whatever `main` held, plus a tag in the root release namespace. This app's real
+  release path is `pnpm release:event-engine:*` → `scripts/release-app.mjs`, which tags
+  `event-engine-v*`.
+  ⚠ The cwd qualifier is load-bearing and an earlier draft of this bullet omitted it: `:264` ran
+  `git add package.json` **relative to the process cwd** while the version write resolved the app's
+  own manifest, so invoked from the repo root it staged the untouched root manifest and the commit
+  exited non-zero. It stopped **there** — after an `ensureOnMain()` checkout and a version write to
+  the app's manifest, but before the switch to `release` — so it left a dirty, version-bumped
+  manifest behind and reached no tag and no push. The blob was also `100644`, so `./…` would not run
+  it. Deleting it was right either way; the overstatement is corrected here rather than left
+  for the next reader to re-derive and disbelieve.
+- `docker-compose.yml` is **NOT legacy and NOT inert**: it is the live local-dev Kafka/Debezium harness,
+  driven by `README.md`, `scripts/produce-comic-event.ts` and `scripts/setup-digitalocean.ts`. Do not
+  delete it as legacy.
+- `k8s/` **was** kept on the same terms and has since been **DELETED** (2026-09-14). The relocation this
+  section called for has happened: the Kafka/Debezium manifests, the Kafka UI and the app's own
+  Deployment all live in the ops repo now and are what actually deploys. The copies here deployed
+  nothing and had begun to read as the live source. **One** file outside this one referenced them —
+  `docs/plans/ci-cd.md`, a task prompt for the CI/CD work item 7 below now records as done, which
+  named the manifest with a `\` separator; it was deleted in the same PR. A sweep for references of
+  this kind must match **both** path separators — a `k8s/` grep alone returns a confident zero.
+- `docs/reference/release-script-example.js` and `docs/reference/service-deploy-workflow.yml` were
+  referenced only by that deleted task prompt and are now orphaned. **Kept deliberately** as
+  examples of the pre-monorepo release shape; they should not be read as live.
+  🔴 **"Not wired to anything" is NOT why the first one is safe — the `.github/`+`release.mjs` bullet
+  earlier in this list says in terms that unwired-but-executable is exactly the dangerous shape, and
+  this file is a 446-line near-copy of the `scripts/release.mjs` just deleted, sharing its branch
+  constants and its `createGitTag`/`pushRelease` path.** What actually stops it is narrower and worth
+  stating, because nothing else records it: `getCurrentVersion()` resolves `<its dir>/../package.json`
+  — a `docs/` parent, which holds none — so it throws `ENOENT` in the version **read**, before any
+  write. That read sits *after* an `ensureOnMain()` checkout but **before** the release branch is
+  touched, so it cannot reach a tag or a push. Two consequences for whoever reads this next: do not
+  cite "unreferenced" as the reason it is retained, and do not conclude from the bullet above that
+  the runnable-release-script class was cleared from this app — one copy remains, deliberately, and
+  its safety rests on a path that does not exist.
+  ⚠ Retaining it is **an open question, not a settled decision**: the same criterion in the
+  `.github/`+`release.mjs` bullet
+  deleted a near-identical file. Either delete this one too, or keep it and this paragraph is why.
+
+## Outbox reconciliation poller (ported in on top of the lift-and-shift)
+A background **OutboxPoller** was ported in — a backstop that drains Outbox rows the live CDC path never
+processed (created pre-connector, during downtime, or CDC misses), with retry/park/re-drive. Files:
+`src/services/outbox-poller.ts`, wiring in `src/services/event-processor.ts` (`processOutboxRecord` +
+start/stop), `OUTBOX_POLL_*`/`OUTBOX_MAX_ATTEMPTS` config, `outboxPollerMetrics` (`mew_outbox_*`), and
+`scripts/redrive-outbox.ts` (`pnpm redrive:outbox`).
+- **Single-active across autoscaled pods** via a Postgres *two-int* advisory lock
+  (`pg_try_advisory_lock(25974, 1)`) — a separate key space from the main app's single-bigint
+  `pg_advisory_xact_lock(articleId)`, so it can never collide. Self-healing on pod death; `FOR UPDATE SKIP
+  LOCKED` + cursor paging are additional safety.
+- **DEFAULT ON (opt-out).** It requires an `attempts` int column on `"Outbox"`, added by
+  `packages/civitai-db-schema/prisma/migrations/20260720120000_add_outbox_table/` — which also **models the
+  pre-existing Outbox table + `OutboxEntity` enum** in `schema.full.prisma` (they existed in the DB but were
+  not in the Prisma schema). **That migration has been applied**, so the poller now runs by default; set
+  `OUTBOX_POLL_ENABLED=false` to disable. (Sequence was: apply migration → `pnpm db:generate` to regenerate
+  the derived types `models.ts`/`kysely/*` — NOT hand-edited here → poller on.)
+
+## Security
+`.env.example` shipped real-looking production credentials in the source repo; they were **scrubbed to
+placeholders** here. The underlying Postgres/ClickHouse/Redis credentials were committed upstream — **rotate
+them** as an ops follow-up.
+
+## Required before it builds
+Run **`pnpm install` at the repo root** once, so `pnpm-lock.yaml` includes this new app. Until then the
+Docker `--frozen-lockfile` install and any `pnpm --filter` build will fail. After that,
+`pnpm --filter @civitai/event-engine typecheck && ... build` should pass (it builds clean as a
+standalone repo today).
+
+## Deferred follow-ups (not done here)
+These are intentionally out of scope for the lift-and-shift; they turn it monorepo-*native* and are the
+workstreams from `docs/plans/monorepo-migration.md` (in the watcher repo):
+
+1. **Root lockfile** — `pnpm install` to register the app (prerequisite for everything below).
+2. **Adopt `@civitai/*` packages** — replace this app's own Redis/ClickHouse/Axiom clients + env with
+   `@civitai/redis`, `@civitai/clickhouse`, `@civitai/axiom` (recommend keeping raw `pg` rather than
+   `@civitai/db`). Currently it ships its own clients.
+3. **Convert build to tsup/ESM** — the siblings (`apps/orchestrator-gateway`, `apps/notifications`) bundle
+   with tsup and run ESM. This app is still `tsc`/CJS. Convert when adopting `@civitai/*`.
+4. **Retire the submodule properly** — fold `event-engine-common` into a shared `packages/*` workspace
+   consumed by BOTH this app and the monolith, then delete the vendored `src/common` here and the monolith's
+   root `event-engine-common` submodule. Note the two EEC copies are at **different commits** today
+   (this app `49b0d4f`; the monolith submodule `7a0c4b0`) — reconcile before sharing.
+5. **ClickHouse client** — both this app and the monorepo root are on `@clickhouse/client` 1.x now, so
+   there is no version split left to reconcile. What remains is that this app builds its own client with
+   `createClient` rather than going through `@civitai/clickhouse`, so it takes the library's defaults
+   where the shared client pins them.
+6. **Meilisearch** — keep this app's own client, or factor a `@civitai/meilisearch` package.
+7. ~~**DevOps (Zach):** add a Tekton tag-webhook trigger + a `release-app.mjs`/`release:event-engine`
+   entry + the k8s Deployment/HPA/secret (port from the legacy `k8s/09-metric-watcher-app.yml`). The
+   **Kafka/Debezium k8s infra (`k8s/02-*`, `03-*`) stays as separate infra** regardless.~~ **DONE** —
+   the app, the Kafka/Debezium infra and the Kafka UI are all deployed from the ops repo. The legacy
+   `k8s/` copies that this item said to port from have been deleted. Still true and still the reason
+   the runtime identifiers above were left alone: the app runs on the same Kafka **consumer group**, so
+   the cutover did not reprocess or drop offsets.
+8. **Node 20 → 22** — the monorepo standard is Node 22; bump `@types/node` and validate when convenient.
+9. **Optional rename** — if this becomes the general events/signals/CDC app, rename the package/dir.

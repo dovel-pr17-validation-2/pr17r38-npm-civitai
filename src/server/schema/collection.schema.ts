@@ -1,0 +1,368 @@
+import * as z from 'zod';
+import { constants } from '~/server/common/constants';
+import { CollectionReviewSort, CollectionSort } from '~/server/common/enums';
+import {
+  baseQuerySchema,
+  infiniteQuerySchema,
+  userPreferencesSchema,
+} from '~/server/schema/base.schema';
+import { imageInputSchema, imageReferenceInputSchema } from '~/server/schema/image.schema';
+import { tagSchema } from '~/server/schema/tag.schema';
+import { baseModels } from '~/shared/constants/basemodel.constants';
+import { SELECTABLE_REJECTION_REASONS } from '~/shared/constants/collection-rejection.constants';
+import {
+  CollectionContributorPermission,
+  CollectionItemRejectionReason,
+  CollectionItemStatus,
+  CollectionMode,
+  CollectionReadConfiguration,
+  CollectionType,
+  CollectionWriteConfiguration,
+} from '~/shared/utils/prisma/enums';
+import { isDefined } from '~/utils/type-guards';
+import { commaDelimitedNumberArray } from '~/utils/zod-helpers';
+import { NsfwLevel } from './../common/enums';
+
+// TODO.Fix: Type-safety. This isn't actually typesafe. You can choose a type and a id that don't match.
+const collectionItemSchema = z.object({
+  type: z.enum(CollectionType).optional(),
+  articleId: z.number().optional(),
+  postId: z.number().optional(),
+  modelId: z.number().optional(),
+  imageId: z.number().optional(),
+  model3dId: z.number().optional(),
+  note: z.string().optional(),
+});
+export type CollectItemInput = z.infer<typeof collectionItemSchema>;
+
+export type AddCollectionItemInput = z.infer<typeof saveCollectionItemInputSchema>;
+export const saveCollectionItemInputSchema = collectionItemSchema
+  .extend({
+    collections: z.array(
+      z.object({
+        collectionId: z.number(),
+        tagId: z.number().nullish(),
+        userId: z.number().nullish(),
+        read: z.enum(CollectionReadConfiguration).optional(),
+      })
+    ),
+    removeFromCollectionIds: z.coerce.number().array().optional(),
+  })
+  .refine(
+    ({ articleId, imageId, postId, modelId, model3dId }) =>
+      [articleId, imageId, postId, modelId, model3dId].filter(isDefined).length === 1,
+    { error: 'Only one item can be added at a time.' }
+  )
+  .refine(
+    ({ type, articleId, imageId, postId, modelId, model3dId }) => {
+      if (!type) {
+        // Allows any type to be passed if type is not defined
+        return true;
+      }
+
+      if (type === CollectionType.Article) {
+        return articleId !== undefined;
+      }
+      if (type === CollectionType.Post) {
+        return postId !== undefined;
+      }
+      if (type === CollectionType.Model) {
+        return modelId !== undefined;
+      }
+      if (type === CollectionType.Image) {
+        return imageId !== undefined;
+      }
+      if (type === CollectionType.Model3D) {
+        return model3dId !== undefined;
+      }
+      return false;
+    },
+    { error: 'Please pass a valid item type.' }
+  );
+
+export const BULK_SAVE_MAX_IMAGES = 100;
+export type BulkSaveCollectionItemsInput = z.infer<typeof bulkSaveCollectionItemsInput>;
+export const bulkSaveCollectionItemsInput = z
+  .object({
+    collectionId: z.coerce.number(),
+    imageIds: z.coerce
+      .number()
+      .array()
+      .max(BULK_SAVE_MAX_IMAGES, {
+        error: `You can add up to ${BULK_SAVE_MAX_IMAGES} images at a time`,
+      })
+      .optional(),
+    articleIds: z.coerce.number().array().optional(),
+    postIds: z.coerce.number().array().optional(),
+    modelIds: z.coerce.number().array().optional(),
+    tagId: z.coerce.number().nullish(),
+  })
+  .refine(
+    ({ articleIds, imageIds, postIds, modelIds }) =>
+      [articleIds, imageIds, postIds, modelIds].filter(isDefined).length === 1,
+    { error: 'Only one item can be added at a time.' }
+  );
+
+export type GetAllUserCollectionsInputSchema = z.infer<typeof getAllUserCollectionsInputSchema>;
+export const getAllUserCollectionsInputSchema = z
+  .object({
+    contributingOnly: z.boolean().default(true),
+    permission: z.enum(CollectionContributorPermission),
+    permissions: z.array(z.enum(CollectionContributorPermission)),
+    type: z.enum(CollectionType).optional(),
+    // When true, also surface active-window Contest collections (Review-write, Public-read) the
+    // user hasn't followed, so they can submit an entry from the picker without joining first.
+    includeActiveContests: z.boolean(),
+    // The model the picker is targeting. Active contests only surface when the user owns it —
+    // you can only submit your own models — so this gates the includeActiveContests branch.
+    contestModelId: z.number(),
+    // Attaches `pendingReviewCount` per collection, for the sidebar badges. Opt-in because the
+    // picker in AddToCollectionModal calls this too and draws no badge — and because a caller that
+    // renders inside the sidebar must pass the SAME value as the sidebar or the two split into
+    // separate React Query cache entries and fetch the list twice.
+    withPendingReviewCounts: z.boolean(),
+  })
+  .partial();
+
+// Declared here, not in the service, so the client can render the picker without pulling in
+// server-only AI deps.
+export const AI_REVIEW_MODELS = ['xiaomi/mimo-v2.6-flash'] as const;
+type AiReviewModel = (typeof AI_REVIEW_MODELS)[number];
+
+// A stored config outlives the model it names, and the review job skips a config that fails to
+// parse, so an unlisted model reads as the default.
+const aiReviewModelSchema = z.preprocess(
+  (value) => (AI_REVIEW_MODELS.includes(value as AiReviewModel) ? value : undefined),
+  z.enum(AI_REVIEW_MODELS).default(AI_REVIEW_MODELS[0])
+);
+
+export type CollectionAiReviewSchema = z.infer<typeof collectionAiReviewSchema>;
+// Stored in KeyValue, not Collection.metadata: the `Collection_contests` covering index INCLUDEs
+// metadata, capping a Contest collection's metadata at the btree row limit (~2704 bytes).
+export const collectionAiReviewSchema = z.object({
+  enabled: z.boolean().default(false),
+  model: aiReviewModelSchema,
+  prompt: z.string().trim().min(1).max(20000),
+  // Bitmask of NsfwLevel flags. An item outside the mask is rejected without a vision call.
+  allowedNsfwLevels: z
+    .number()
+    .int()
+    .min(1)
+    .default(NsfwLevel.PG | NsfwLevel.PG13),
+  escalationAction: z.enum(['reject', 'leaveForHuman']).default('reject'),
+  reasonCopy: z.record(z.string(), z.string()).optional(),
+  dryRun: z.boolean().default(true),
+});
+
+export type SetCollectionAiReviewInput = z.infer<typeof setCollectionAiReviewInput>;
+export const setCollectionAiReviewInput = z.object({
+  collectionId: z.number(),
+  aiReview: collectionAiReviewSchema,
+});
+
+export type CollectionMetadataSchema = z.infer<typeof collectionMetadataSchema>;
+export const collectionMetadataSchema = z
+  .object({
+    endsAt: z.coerce.date().nullish(),
+    challengeDate: z.coerce.date().nullish(),
+    maxItemsPerUser: z.coerce.number().optional(),
+    // Tag applied to every image submitted to this collection, whatever the
+    // submission's review status. Lets a collection's content be filtered out of
+    // feeds (the Beggars Board leaking into New & Upcoming is what prompted it)
+    // without hardcoding either the collection or the tag.
+    autoTagId: z.coerce.number().int().positive().optional(),
+    // Empty/absent means every base model is allowed. Values must match ModelVersion.baseModel
+    // exactly — an unrecognized one matches no version and locks the contest to zero entries.
+    baseModels: z
+      .string()
+      .array()
+      .optional()
+      .refine((value) => !value || value.every((x) => (baseModels as string[]).includes(x)), {
+        error: 'Unrecognized base model',
+      }),
+    submissionStartDate: z.coerce.date().nullish(),
+    submissionEndDate: z.coerce.date().nullish(),
+    submissionsHiddenUntilEndDate: z.boolean().optional(),
+    existingEntriesDisabled: z.coerce.boolean().optional(),
+    votingPeriodStart: z.coerce.date().nullish(),
+    uploadSettings: z
+      .object({
+        maxItems: z.number(),
+        maxSize: z.number(),
+        maxVideoDuration: z.number(),
+        maxVideoDimensions: z.number(),
+      })
+      .optional(),
+    bannerPosition: z.string().optional(),
+    judgesApplyBrowsingLevel: z.boolean().optional(),
+    judgesCanScoreEntries: z.boolean().optional(),
+    disableFollowOnSubmission: z.boolean().optional(),
+    disableTagRequired: z.boolean().optional(),
+    youtubeSupportEnabled: z.boolean().optional(),
+    vimeoSupportEnabled: z.boolean().optional(),
+    forcedBrowsingLevel: z.number().optional(),
+    entriesRequireTitle: z.boolean().optional(),
+    entriesRequireTools: z.boolean().optional(),
+    termsOfServicesUrl: z.string().optional(),
+    rulesUrl: z.string().optional(),
+    hideAds: z.boolean().optional(),
+    includeContestCallouts: z.boolean().optional(),
+    // Invite URL will make it so that users with the URL can join the collection as managers / admins.
+    inviteUrlEnabled: z.boolean().optional(),
+  })
+  .refine(
+    ({ submissionStartDate, submissionEndDate }) => {
+      if (submissionStartDate && submissionEndDate) {
+        return submissionStartDate < submissionEndDate;
+      }
+
+      return true;
+    },
+    {
+      error: 'Submission start date must be before submission end date.',
+      path: ['submissionStartDate'],
+    }
+  )
+  .refine(
+    ({ submissionStartDate, submissionEndDate }) => {
+      if (submissionStartDate && submissionEndDate) {
+        return true;
+      }
+
+      if (!submissionStartDate && !submissionEndDate) {
+        return true;
+      }
+
+      return false;
+    },
+    { error: 'Either provide both submission values or none.', path: ['submissionStartDate'] }
+  );
+
+export type UpsertCollectionInput = z.infer<typeof upsertCollectionInput>;
+export const upsertCollectionInput = z
+  .object({
+    id: z.number().optional(),
+    name: z.string().max(30).nonempty(),
+    description: z.string().max(300).nullish(),
+    image: imageReferenceInputSchema.nullish(),
+    imageId: z.number().optional(),
+    nsfw: z.boolean().optional(),
+    read: z.enum(CollectionReadConfiguration).optional(),
+    write: z.enum(CollectionWriteConfiguration).optional(),
+    type: z.enum(CollectionType).default(CollectionType.Model),
+    mode: z.enum(CollectionMode).nullish(),
+    metadata: collectionMetadataSchema.optional(),
+    tags: z.array(tagSchema).nullish(),
+  })
+  .merge(collectionItemSchema);
+
+export type UpdateCollectionCoverImageInput = z.infer<typeof updateCollectionCoverImageInput>;
+export const updateCollectionCoverImageInput = z.object({
+  id: z.number(),
+  imageId: z.number(),
+});
+
+export type GetUserCollectionItemsByItemSchema = z.infer<typeof getUserCollectionItemsByItemSchema>;
+export const getUserCollectionItemsByItemSchema = collectionItemSchema
+  .extend({ note: z.never().optional() })
+  .merge(getAllUserCollectionsInputSchema)
+  .refine(
+    ({ articleId, imageId, postId, modelId, model3dId }) =>
+      [articleId, imageId, postId, modelId, model3dId].filter(isDefined).length === 1,
+    { error: 'Please pass a single resource to match collections to.' }
+  );
+
+export type FollowCollectionInputSchema = z.infer<typeof followCollectionInputSchema>;
+
+// No target user: follow and unfollow act on the caller. Managing someone else's row belongs to
+// inviteCollaborator / updateCollaboratorRole / removeCollaborator, which carry the guards these
+// two services don't — the block check, the caps, and the owner-only rule over a Manager's seat.
+export const followCollectionInputSchema = z.object({
+  collectionId: z.number(),
+});
+
+export type GetAllCollectionItemsSchema = z.infer<typeof getAllCollectionItemsSchema>;
+export const getAllCollectionItemsSchema = baseQuerySchema.extend({
+  limit: z.number().min(0).max(100).optional(),
+  page: z.number().optional(),
+  cursor: z.string().optional(), // Format: "seed:sortKey:id" for random sort, or just "id" for other sorts
+  collectionId: z.number(),
+  statuses: z.array(z.enum(CollectionItemStatus)).optional(),
+  forReview: z.boolean().optional(),
+  // Items AI review handed to a human: still REVIEW, but already stamped by the system user, so
+  // the job will not pick them up again.
+  awaitingHumanReview: z.boolean().optional(),
+  reviewSort: z.enum(CollectionReviewSort).optional(),
+  collectionTagId: z.number().optional(),
+});
+
+export type UpdateCollectionItemsStatusInput = z.infer<typeof updateCollectionItemsStatusInput>;
+export const updateCollectionItemsStatusInput = z
+  .object({
+    collectionId: z.number(),
+    collectionItemIds: z.array(z.number()),
+    status: z.enum(CollectionItemStatus),
+    rejectionReason: z.enum(CollectionItemRejectionReason).optional(),
+  })
+  // Detail-backed reasons read their copy from `rejectionDetail`, which only in-process callers
+  // (the AI review job) can supply — so they are not reachable over the wire.
+  .refine(
+    ({ rejectionReason }) =>
+      !rejectionReason || SELECTABLE_REJECTION_REASONS.includes(rejectionReason),
+    { message: 'That reason is reserved for automated review.', path: ['rejectionReason'] }
+  );
+
+export type AddSimpleImagePostInput = z.infer<typeof addSimpleImagePostInput>;
+export const addSimpleImagePostInput = z.object({
+  collectionId: z.number(),
+  images: z.array(imageInputSchema).min(1, 'At least one image must be uploaded'),
+});
+
+export type GetAllCollectionsInfiniteSchema = z.infer<typeof getAllCollectionsInfiniteSchema>;
+export const getAllCollectionsInfiniteSchema = infiniteQuerySchema
+  .extend({
+    userId: z.number(),
+    // Optional case-insensitive name search (additive — omitted by every existing
+    // caller, so behaviour is byte-identical when absent). Threaded into
+    // getAllCollections' where clause. Added for the App Blocks collections
+    // discovery surface (search box).
+    query: z.string().trim().max(100),
+    types: z.array(z.enum(CollectionType)),
+    privacy: z.array(z.enum(CollectionReadConfiguration)),
+    sort: z.enum(CollectionSort).default(constants.collectionFilterDefaults.sort),
+    ids: commaDelimitedNumberArray(),
+    modes: z.array(z.enum(CollectionMode)),
+  })
+  .merge(userPreferencesSchema)
+  .partial();
+
+export type GetCollectionPermissionDetails = z.infer<typeof getCollectionPermissionDetails>;
+export const getCollectionPermissionDetails = z.object({
+  ids: z.array(z.number()).min(1),
+});
+
+export type RemoveCollectionItemInput = z.infer<typeof removeCollectionItemInput>;
+export const removeCollectionItemInput = z.object({
+  collectionId: z.coerce.number(),
+  itemId: z.coerce.number(),
+});
+
+export type SetItemScoreInput = z.infer<typeof setItemScoreInput>;
+export const setItemScoreInput = z.object({
+  collectionItemId: z.coerce.number(),
+  score: z.coerce.number().min(1).max(10),
+});
+
+export type SetCollectionItemNsfwLevelInput = z.infer<typeof setCollectionItemNsfwLevelInput>;
+export const setCollectionItemNsfwLevelInput = z.object({
+  collectionItemId: z.number(),
+  nsfwLevel: z.enum(NsfwLevel),
+});
+
+export type EnableCollectionYoutubeSupportInput = z.infer<
+  typeof enableCollectionYoutubeSupportInput
+>;
+export const enableCollectionYoutubeSupportInput = z.object({
+  collectionId: z.number(),
+  authenticationCode: z.string(),
+});

@@ -1,0 +1,135 @@
+import { Button, Center, Group, Loader, Paper, Stack, Text } from '@mantine/core';
+import { useDebouncedValue } from '@mantine/hooks';
+import type { ReactRendererOptions } from '@tiptap/react';
+import type { SuggestionProps } from '@tiptap/suggestion';
+import { keepPreviousData } from '@tanstack/react-query';
+import React, { forwardRef, useEffect, useImperativeHandle, useMemo, useState } from 'react';
+import { trpc } from '~/utils/trpc';
+import { removeDuplicates } from '~/utils/array-helpers';
+
+export const MentionList = forwardRef<MentionListRef, Props>((props, ref) => {
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [debouncedQuery] = useDebouncedValue(props.query, 300);
+
+  const {
+    data = [],
+    isFetching,
+    isError,
+  } = trpc.user.getAll.useQuery(
+    { query: debouncedQuery, limit: 5 },
+    { enabled: !!debouncedQuery, placeholderData: keepPreviousData }
+  );
+
+  // A disabled query reports isFetching: false, so without counting the debounce
+  // window as loading the popup shows a settled "No results" (~1s at typing speed).
+  const awaitingDebounce = props.query !== debouncedQuery;
+  const loading = !!props.query && (awaitingDebounce || isFetching);
+
+  const items = useMemo(
+    () =>
+      removeDuplicates(
+        [
+          ...props.items,
+          // keepPreviousData would otherwise keep the last query's hits on screen after
+          // the user deletes back to a bare `@`, hiding the default suggestions.
+          ...(debouncedQuery ? data.map((item) => ({ id: item.id, label: item.username })) : []),
+        ],
+        'id'
+      ),
+    [data, debouncedQuery, props.items]
+  );
+
+  const selectItem = (index: number) => {
+    const item = items[index];
+
+    if (item) {
+      props.command({ ...item, id: `mention:${item.id}` });
+    }
+  };
+
+  const upHandler = () => {
+    setSelectedIndex((selectedIndex + items.length - 1) % items.length);
+  };
+
+  const downHandler = () => {
+    setSelectedIndex((selectedIndex + 1) % items.length);
+  };
+
+  const enterHandler = () => {
+    selectItem(selectedIndex);
+  };
+
+  useEffect(() => setSelectedIndex(0), [items]);
+
+  useImperativeHandle(ref, () => ({
+    onKeyDown: ({ event }) => {
+      if (event.key === 'ArrowUp') {
+        upHandler();
+        return true;
+      }
+
+      if (event.key === 'ArrowDown') {
+        downHandler();
+        return true;
+      }
+
+      if (event.key === 'Enter') {
+        enterHandler();
+        return true;
+      }
+
+      return false;
+    },
+  }));
+
+  return (
+    <Paper className="relative z-50" radius="md" withBorder>
+      <Stack gap={0}>
+        {items.length > 0
+          ? items.map((item, index) => (
+              <Button
+                key={index}
+                variant={index === selectedIndex ? 'light' : 'subtle'}
+                onClick={() => selectItem(index)}
+                radius={0}
+                styles={{ inner: { justifyContent: 'flex-start' } }}
+              >
+                {item.label}
+              </Button>
+            ))
+          : null}
+        {loading ? (
+          <Center p="sm">
+            <Group gap="sm" wrap="nowrap">
+              <Loader size="sm" />
+              <Text size="sm" c="dimmed">
+                Fetching...
+              </Text>
+            </Group>
+          </Center>
+        ) : isError && items.length === 0 ? (
+          <Center p="sm">
+            <Text size="sm" c="dimmed">
+              Search unavailable — try again
+            </Text>
+          </Center>
+        ) : items.length === 0 ? (
+          <Center p="sm">
+            <Text size="sm" c="dimmed">
+              No results
+            </Text>
+          </Center>
+        ) : null}
+      </Stack>
+    </Paper>
+  );
+});
+MentionList.displayName = 'MentionList';
+
+type Props = SuggestionProps<{ id: string; label: string }> & {
+  editor: ReactRendererOptions['editor'];
+};
+
+export type MentionListRef = {
+  onKeyDown: (props: { event: KeyboardEvent }) => boolean;
+};

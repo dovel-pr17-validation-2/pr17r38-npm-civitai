@@ -1,0 +1,476 @@
+/**
+ * Coverage for orchestrator-token-cache. Specifically validates the two
+ * properties this module exists to provide:
+ *
+ *   1. Cache hit: a second call for the same userId within the TTL window
+ *      does not invoke the mint function.
+ *
+ *   2. In-flight coalescing: N concurrent first-time calls for the same
+ *      userId invoke the mint function exactly once. This is the
+ *      thundering-herd protection during a sysRedis failover; without
+ *      coalescing the LRU alone would leave a race window wide enough
+ *      to fire N DB INSERTs.
+ *
+ * Mocks `~/server/prom/client` to avoid pulling the global prom registry
+ * (which would error on duplicate registration across vitest workers).
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('~/server/prom/client', () => ({
+  cacheHitCounter: { inc: vi.fn() },
+  cacheMissCounter: { inc: vi.fn() },
+}));
+// Hoisted so the suite can ASSERT on it. An inline `vi.fn()` in the factory below would leave the
+// `lru` half of the mismatch alarm unassertable — and that label exists to answer "shared store or
+// per-pod?", the question the incident could not answer.
+const { mockObserveMismatch } = vi.hoisted(() => ({ mockObserveMismatch: vi.fn() }));
+// Mocked as a whole rather than widening the prom mock above: this module registers
+// its own counters at import time, and the point of the prom mock is to keep the
+// global registry out of this suite entirely.
+vi.mock('~/server/orchestrator/orchestrator-identity-metrics', () => ({
+  observeTokenIdentityMismatch: mockObserveMismatch,
+}));
+
+import { __testing, getOrMintCachedToken } from '../orchestrator-token-cache';
+
+describe('orchestrator-token-cache', () => {
+  beforeEach(() => {
+    __testing.clear();
+    mockObserveMismatch.mockClear();
+  });
+
+  afterEach(() => {
+    __testing.clear();
+  });
+
+  it('coalesces N concurrent same-user requests into a single mint call', async () => {
+    let mintCalls = 0;
+    const mint = vi.fn(async () => {
+      mintCalls += 1;
+      // Simulate DB latency so all 10 callers enter inflight before resolve.
+      await new Promise((r) => setTimeout(r, 10));
+      return `token-${mintCalls}`;
+    });
+
+    const userId = 42;
+    const N = 10;
+    const results = await Promise.all(
+      Array.from({ length: N }, () => getOrMintCachedToken(userId, mint))
+    );
+
+    expect(mintCalls).toBe(1);
+    expect(mint).toHaveBeenCalledTimes(1);
+    // All callers got the same token (the one mint-result was shared).
+    expect(new Set(results).size).toBe(1);
+    expect(results[0]).toBe('token-1');
+  });
+
+  it('serves repeat calls from cache without re-minting', async () => {
+    const mint = vi.fn(async () => 'cached-token');
+    const userId = 7;
+
+    const first = await getOrMintCachedToken(userId, mint);
+    const second = await getOrMintCachedToken(userId, mint);
+    const third = await getOrMintCachedToken(userId, mint);
+
+    expect(mint).toHaveBeenCalledTimes(1);
+    expect(first).toBe('cached-token');
+    expect(second).toBe('cached-token');
+    expect(third).toBe('cached-token');
+  });
+
+  it('mints independently for different userIds (no cross-user collision)', async () => {
+    let counter = 0;
+    const mint = vi.fn(async () => `token-${++counter}`);
+
+    const [a, b, c] = await Promise.all([
+      getOrMintCachedToken(1, mint),
+      getOrMintCachedToken(2, mint),
+      getOrMintCachedToken(3, mint),
+    ]);
+
+    expect(mint).toHaveBeenCalledTimes(3);
+    expect(new Set([a, b, c]).size).toBe(3);
+  });
+
+  it('__testing.destroy() drops cache + inflight and leaves the module re-usable', async () => {
+    // Round-4 audit fix: `destroy()` is the HMR-safety / test-isolation
+    // hook that drops every entry in the LRUCache (and cancels the
+    // per-entry ttlAutopurge setTimeouts that anchor the cache instance
+    // reachable past intent). Verify it (a) clears cache size, (b)
+    // clears inflight, and (c) leaves the module usable for subsequent
+    // calls (it is NOT a destructive teardown — production code must
+    // never call this, but if it did the module must not be broken).
+    const mintA = vi.fn(async () => 'token-a');
+    await getOrMintCachedToken(1, mintA);
+    expect(__testing.size()).toEqual({ cache: 1, inflight: 0 });
+
+    __testing.destroy();
+    expect(__testing.size()).toEqual({ cache: 0, inflight: 0 });
+
+    // Module remains usable after destroy: a fresh call mints + caches
+    // again. This is the property that makes destroy() safe to call from
+    // both HMR-cleanup and the afterEach hook in the env-driven block
+    // below — neither path wants a one-shot teardown.
+    const mintB = vi.fn(async () => 'token-b');
+    const result = await getOrMintCachedToken(2, mintB);
+    expect(result).toBe('token-b');
+    expect(mintB).toHaveBeenCalledTimes(1);
+    expect(__testing.size()).toEqual({ cache: 1, inflight: 0 });
+  });
+
+  it('clears the in-flight slot on rejection so future calls can retry', async () => {
+    let attempt = 0;
+    const mint = vi.fn(async () => {
+      attempt += 1;
+      if (attempt === 1) throw new Error('transient db blip');
+      return 'recovered-token';
+    });
+
+    const userId = 99;
+    await expect(getOrMintCachedToken(userId, mint)).rejects.toThrow('transient db blip');
+    // Second call must NOT be wedged behind the rejected promise.
+    const recovered = await getOrMintCachedToken(userId, mint);
+    expect(recovered).toBe('recovered-token');
+    expect(mint).toHaveBeenCalledTimes(2);
+  });
+
+  // A hit is VERIFIED, not trusted: entries carry the userId they were minted for.
+  // Reverting that check makes these return the wrong user's bearer, which is a silent
+  // cross-account Buzz charge in production.
+  it('REFUSES an entry bound to another user, alarms, and mints instead', async () => {
+    const mint = vi.fn(async () => 'freshly-minted');
+
+    __testing.poison(42, '999.someone-elses-token');
+    // Negative control: without this, an empty cache produces the same "did not serve it"
+    // result and the test passes even if the staging step did nothing.
+    expect(__testing.size().cache).toBe(1);
+
+    const token = await getOrMintCachedToken(42, mint);
+
+    expect(token).toBe('freshly-minted');
+    expect(token).not.toContain('someone-elses-token');
+    expect(mint).toHaveBeenCalledTimes(1);
+    expect(mockObserveMismatch).toHaveBeenCalledWith('lru');
+  });
+
+  it('treats an unprefixed entry as a miss rather than serving it, without alarming', async () => {
+    const mint = vi.fn(async () => 'freshly-minted');
+
+    __testing.poison(42, 'bare-token-from-an-untaught-writer');
+    expect(__testing.size().cache).toBe(1);
+
+    expect(await getOrMintCachedToken(42, mint)).toBe('freshly-minted');
+    expect(mockObserveMismatch).not.toHaveBeenCalled();
+  });
+
+  it('serves a correctly owned entry without minting', async () => {
+    const mint = vi.fn(async () => 'should-not-be-called');
+
+    __testing.poison(42, '42.owned-token');
+
+    expect(await getOrMintCachedToken(42, mint)).toBe('owned-token');
+    expect(mint).not.toHaveBeenCalled();
+    expect(mockObserveMismatch).not.toHaveBeenCalled();
+  });
+
+  it('verifies the COALESCED result too, not just the cached one', async () => {
+    // The in-flight map is the one structure here that hands one user's mint result to a
+    // different caller. Reverting its check returns the shared value unverified.
+    let resolveMint: (t: string) => void = () => undefined;
+    const mint = vi.fn(
+      () =>
+        new Promise<string>((r) => {
+          resolveMint = r;
+        })
+    );
+
+    const first = getOrMintCachedToken(42, mint);
+    const coalesced = getOrMintCachedToken(42, mint);
+    resolveMint('shared-token');
+
+    expect(await first).toBe('shared-token');
+    expect(await coalesced).toBe('shared-token');
+    // One mint for two callers — the coalescing is still doing its job.
+    expect(mint).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The TTL expiry + kill-switch tests need a different module instance with
+// different env at module-load time (TTL is read once, CACHE_DISABLED is
+// frozen at module load). vi.resetModules() + dynamic import gives us a
+// fresh module per test without polluting the suite above.
+describe('orchestrator-token-cache — env-driven module init', () => {
+  const ORIGINAL_ENV = { ...process.env };
+
+  afterEach(async () => {
+    // Drop the prior module instance's LRUCache + inflight before the
+    // next dynamic-import test. Without this, each `vi.resetModules()`
+    // leaves a ttlAutopurge-timer-anchored LRUCache reachable until its
+    // TTL drains — the round-4 audit measured ~6 leaked instances across
+    // this describe block. This became MORE load-bearing when the
+    // cache-hit test moved to a 5-minute TTL: `destroy()` is what cancels
+    // those long autopurge timers (they are `unref()`ed by lru-cache, so
+    // they cannot hold the event loop open, but they do anchor the
+    // instance).
+    try {
+      const mod = await import('../orchestrator-token-cache');
+      mod.__testing.destroy();
+    } catch {
+      /* ignore — the module may not have loaded for this test */
+    }
+    // Restore env so subsequent tests/suites see a clean slate.
+    process.env = { ...ORIGINAL_ENV };
+    vi.resetModules();
+    vi.useRealTimers();
+  });
+
+  // ---------------------------------------------------------------------
+  // The TTL contract is asserted in TWO tests, split BY DIRECTION, because
+  // the two directions have OPPOSITE sensitivity to a scheduler stall and
+  // no single TTL value is safe for both.
+  //
+  // The cache measures elapsed time in REAL time (see the fake-timer note
+  // below), so the wall-clock gap between two adjacent `await`s is not
+  // bounded by anything the test controls — a GC pause or CI contention
+  // can insert an arbitrary delay there.
+  //
+  //   - EXPIRY ("after the TTL, re-mint") is stall-SAFE. The sleep is a
+  //     LOWER bound on elapsed time; a longer stall only makes the entry
+  //     MORE expired. It can use a short TTL and stay deterministic.
+  //
+  //   - CACHE HIT ("within the TTL, do NOT re-mint") is stall-VULNERABLE.
+  //     It needs elapsed time to stay UNDER the TTL, and the test cannot
+  //     stop the clock. These two statements used to share one test with
+  //     `TTL_MS = 50`, so any stall >50ms between the first and second
+  //     call expired the entry, re-minted, and failed with
+  //     `expected 'token-2' to be 'token-1'` — observed intermittently in
+  //     CI's `preview / unit-tests`. No amount of tuning makes a 50ms
+  //     real-time budget safe; the fix is to give the cache-hit direction
+  //     a TTL a plausible stall cannot cross.
+  //
+  // Why not fake timers? lru-cache v11 reads elapsed time through its
+  // `defaultPerf` time source (`performance.now()`, captured at module
+  // load — verified in lru-cache 11.2.2, `this.#perf.now()`), which is
+  // not reliably intercepted by `vi.useFakeTimers({ toFake: [...] })`,
+  // and pinning it would risk silently regressing on an lru-cache
+  // upgrade. Both tests below therefore run on REAL time.
+  // ---------------------------------------------------------------------
+
+  it('serves a second call from cache within the configured TTL (no re-mint)', async () => {
+    // 5 minutes. This test never sleeps — the two calls below are adjacent
+    // awaits — so a long TTL costs zero wall-clock time, and the value is
+    // chosen to make the flake STRUCTURALLY unreachable rather than merely
+    // unlikely: it is 5x the unit project's 60s `testTimeout`
+    // (vitest.config.mts), so any stall long enough to expire this entry
+    // would have already blown the per-test timeout and been reported as a
+    // hang. The wrong-token failure mode this assertion can produce is
+    // therefore bounded by the harness's own hang detector, not by tuning.
+    process.env.ORCHESTRATOR_TOKEN_CACHE_TTL_MS = '300000';
+    vi.resetModules();
+    const mod = await import('../orchestrator-token-cache');
+
+    let mintCalls = 0;
+    const mint = vi.fn(async () => `token-${++mintCalls}`);
+
+    const userId = 1;
+    const first = await mod.getOrMintCachedToken(userId, mint);
+    expect(first).toBe('token-1');
+    expect(mint).toHaveBeenCalledTimes(1);
+
+    // Within TTL: cache hit, no new mint.
+    const second = await mod.getOrMintCachedToken(userId, mint);
+    expect(second).toBe('token-1');
+    expect(mint).toHaveBeenCalledTimes(1);
+
+    // And it stays a hit — repeat reads must not re-mint either.
+    const third = await mod.getOrMintCachedToken(userId, mint);
+    expect(third).toBe('token-1');
+    expect(mint).toHaveBeenCalledTimes(1);
+
+    mod.__testing.clear();
+  });
+
+  it('expires cached entries after the configured TTL (re-mints on next call)', async () => {
+    // Short real TTL: this direction is stall-safe (see the block comment
+    // above), so 50ms is deterministic here — the 75ms sleep is a LOWER
+    // bound on elapsed time and a stall only widens the margin. Short
+    // enough to keep the suite snappy.
+    process.env.ORCHESTRATOR_TOKEN_CACHE_TTL_MS = '50';
+    vi.resetModules();
+    const mod = await import('../orchestrator-token-cache');
+
+    let mintCalls = 0;
+    const mint = vi.fn(async () => `token-${++mintCalls}`);
+
+    const userId = 1;
+    const first = await mod.getOrMintCachedToken(userId, mint);
+    expect(first).toBe('token-1');
+    expect(mint).toHaveBeenCalledTimes(1);
+
+    // Wait past the TTL boundary.
+    await new Promise((r) => setTimeout(r, 75));
+
+    // After TTL: cache miss, mint runs again.
+    const second = await mod.getOrMintCachedToken(userId, mint);
+    expect(second).toBe('token-2');
+    expect(mint).toHaveBeenCalledTimes(2);
+
+    mod.__testing.clear();
+  });
+
+  it('rejects with timeout error when mint never settles (default behaviour with short MINT_TIMEOUT_MS)', async () => {
+    // 50ms timeout: tight enough to keep the test fast, long enough to
+    // be deterministic on CI even under jitter. We deliberately don't
+    // use vi.useFakeTimers() — the TTL block comment above documents
+    // that fake timers don't intercept lru-cache's perf source, and
+    // mixing real + fake timers makes the race semantics nondeterministic.
+    process.env.ORCHESTRATOR_TOKEN_CACHE_MINT_TIMEOUT_MS = '50';
+    vi.resetModules();
+    const mod = await import('../orchestrator-token-cache');
+
+    // A mint that NEVER resolves — simulates a stuck Postgres failover
+    // or PgBouncer reserve_pool exhaustion. Without the timeout, the
+    // inflight slot would be held forever and same-user callers would
+    // attach to a dead promise.
+    const neverResolves = vi.fn(() => new Promise<string>(() => undefined));
+
+    const userId = 1;
+    await expect(mod.getOrMintCachedToken(userId, neverResolves)).rejects.toThrow(
+      /mint timed out after 50ms for user 1/
+    );
+
+    // The inflight slot MUST be empty after the timeout fired — the
+    // .finally() should have run regardless of which arm of the race won.
+    expect(mod.__testing.size()).toEqual({ cache: 0, inflight: 0 });
+
+    mod.__testing.clear();
+  });
+
+  it('clears the in-flight slot after a timeout so the next caller gets a fresh mint', async () => {
+    process.env.ORCHESTRATOR_TOKEN_CACHE_MINT_TIMEOUT_MS = '50';
+    vi.resetModules();
+    const mod = await import('../orchestrator-token-cache');
+
+    const neverResolves = vi.fn(() => new Promise<string>(() => undefined));
+    const mintFast = vi.fn(async () => 'fresh-token');
+
+    const userId = 2;
+    // First call times out.
+    await expect(mod.getOrMintCachedToken(userId, neverResolves)).rejects.toThrow(
+      /mint timed out after 50ms/
+    );
+    // Second call must NOT be attached to the (still-pending) neverResolves
+    // promise — it must enter a fresh inflight with the fast mint.
+    const recovered = await mod.getOrMintCachedToken(userId, mintFast);
+    expect(recovered).toBe('fresh-token');
+    expect(mintFast).toHaveBeenCalledTimes(1);
+
+    mod.__testing.clear();
+  });
+
+  it('awaits a slow mint with no timeout when ORCHESTRATOR_TOKEN_CACHE_MINT_TIMEOUT_MS=0', async () => {
+    // 0 = timeout disabled (pre-this-PR behaviour). Even a mint slower
+    // than the default 5s timeout must be awaited to completion.
+    process.env.ORCHESTRATOR_TOKEN_CACHE_MINT_TIMEOUT_MS = '0';
+    vi.resetModules();
+    const mod = await import('../orchestrator-token-cache');
+
+    // Mint takes 100ms — far longer than the 50ms used in the timeout
+    // tests above. If the default-5s timeout were still active this
+    // would still pass; the load-bearing assertion is that 0 truly
+    // disables the wrapping (no Promise.race overhead, no setTimeout).
+    const mintSlow = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+      return 'slow-token';
+    });
+
+    const userId = 3;
+    const result = await mod.getOrMintCachedToken(userId, mintSlow);
+
+    expect(result).toBe('slow-token');
+    expect(mintSlow).toHaveBeenCalledTimes(1);
+
+    mod.__testing.clear();
+  });
+
+  it('rejects all coalesced concurrent callers on timeout, then accepts a fresh inflight', async () => {
+    process.env.ORCHESTRATOR_TOKEN_CACHE_MINT_TIMEOUT_MS = '50';
+    vi.resetModules();
+    const mod = await import('../orchestrator-token-cache');
+
+    // Single neverResolves mint shared across 10 coalesced callers. Only
+    // the first caller actually invokes mint(); the other 9 attach to the
+    // inflight promise. When the timeout fires, ALL 10 must reject (they
+    // share the same rejected race-promise), and the inflight slot must
+    // be cleared so a subsequent caller mints fresh.
+    const neverResolves = vi.fn(() => new Promise<string>(() => undefined));
+
+    const userId = 4;
+    const N = 10;
+    const results = await Promise.allSettled(
+      Array.from({ length: N }, () => mod.getOrMintCachedToken(userId, neverResolves))
+    );
+
+    // All 10 rejected with the timeout error.
+    expect(results.every((r) => r.status === 'rejected')).toBe(true);
+    for (const r of results) {
+      if (r.status === 'rejected')
+        expect(String(r.reason)).toMatch(/mint timed out after 50ms for user 4/);
+    }
+    // mint() was only invoked once thanks to coalescing.
+    expect(neverResolves).toHaveBeenCalledTimes(1);
+    // Inflight slot is clean.
+    expect(mod.__testing.size()).toEqual({ cache: 0, inflight: 0 });
+
+    // Subsequent caller hits a brand-new inflight with a healthy mint.
+    const mintFast = vi.fn(async () => 'after-timeout-token');
+    const recovered = await mod.getOrMintCachedToken(userId, mintFast);
+    expect(recovered).toBe('after-timeout-token');
+    expect(mintFast).toHaveBeenCalledTimes(1);
+
+    mod.__testing.clear();
+  });
+
+  it('disables cache + coalescing when ORCHESTRATOR_TOKEN_CACHE_MAX=0', async () => {
+    process.env.ORCHESTRATOR_TOKEN_CACHE_MAX = '0';
+    vi.resetModules();
+    const mod = await import('../orchestrator-token-cache');
+
+    expect(mod.__testing.isDisabled()).toBe(true);
+
+    let mintCalls = 0;
+    // Hold mint slow enough that, if coalescing were active, all 5 callers
+    // would share one inflight promise. Disabled mode must NOT coalesce.
+    // Capture the per-call ordinal *before* awaiting so the returned token
+    // is unique per invocation (otherwise all concurrent callers race past
+    // the increment and stamp the final value).
+    const mint = vi.fn(async () => {
+      mintCalls += 1;
+      const id = mintCalls;
+      await new Promise((r) => setTimeout(r, 10));
+      return `token-${id}`;
+    });
+
+    const userId = 5;
+    const N = 5;
+    const results = await Promise.all(
+      Array.from({ length: N }, () => mod.getOrMintCachedToken(userId, mint))
+    );
+
+    // Each concurrent caller hit `mint` independently — no coalescing.
+    expect(mint).toHaveBeenCalledTimes(N);
+    expect(mintCalls).toBe(N);
+    // Each got its own freshly-minted token.
+    expect(new Set(results).size).toBe(N);
+
+    // And there is no cache state retained between calls.
+    expect(mod.__testing.size()).toEqual({ cache: 0, inflight: 0 });
+
+    // A subsequent call also re-mints (no cache lookup).
+    const after = await mod.getOrMintCachedToken(userId, mint);
+    expect(after).toBe(`token-${N + 1}`);
+    expect(mint).toHaveBeenCalledTimes(N + 1);
+  });
+});

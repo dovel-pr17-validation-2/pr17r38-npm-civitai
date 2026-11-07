@@ -1,0 +1,274 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { TRPCError } from '@trpc/server';
+
+/**
+ * H2 — `enforceAppBlocksFlag` middleware threads the request user's context
+ * into the App Blocks flag gate.
+ *
+ * `isAppBlocksEnabled` is mocked with a FAITHFUL per-user implementation
+ * (mirrors the live `moderators`-segmented flag: ON only when the supplied
+ * user is a moderator). The test then drives the real blocks router so the
+ * middleware's `{ user: ctx.user }` wiring is what decides the outcome:
+ *   - moderator → query proceeds (registry consulted), mutation allowed;
+ *   - non-mod   → query returns [] (disabled), mutation UNAUTHORIZED;
+ *   - anon      → query returns [] (disabled), mutation UNAUTHORIZED.
+ *
+ * This is the no-widening invariant proven through the actual router path.
+ *
+ * The mock set mirrors `blocks.router.workflow.test.ts` — the heavy services
+ * (orchestrator, buzz, redis, registry, user.service) are stubbed so importing
+ * the router doesn't drag in the generated Prisma client / selectors (stale in
+ * a PR worktree).
+ */
+
+const {
+  mockIsAppBlocksEnabled,
+  mockListForModel,
+  mockListAvailable,
+  mockInstallOnModel,
+  mockVerifyBlockToken,
+  mockParseSubjectUserId,
+  mockGetUserById,
+  mockGetUserBuzzAccounts,
+} = vi.hoisted(() => ({
+  mockIsAppBlocksEnabled: vi.fn(),
+  mockListForModel: vi.fn(),
+  mockListAvailable: vi.fn(),
+  mockInstallOnModel: vi.fn(),
+  mockVerifyBlockToken: vi.fn(),
+  mockParseSubjectUserId: vi.fn(),
+  mockGetUserById: vi.fn(),
+  mockGetUserBuzzAccounts: vi.fn(),
+}));
+
+vi.mock('~/server/services/app-blocks-flag', () => ({
+  isAppBlocksEnabled: mockIsAppBlocksEnabled,
+}));
+vi.mock('~/server/middleware/block-scope.middleware', () => ({
+  verifyBlockToken: mockVerifyBlockToken,
+  parseSubjectUserId: (...a: unknown[]) => mockParseSubjectUserId(...a),
+}));
+vi.mock('~/server/orchestrator/get-orchestrator-token', () => ({
+  getOrchestratorToken: vi.fn(),
+}));
+vi.mock('~/server/services/orchestrator/orchestration-new.service', () => ({
+  buildGenerationContext: vi.fn(),
+  createWorkflowStepsFromGraphInput: vi.fn(),
+}));
+vi.mock('~/server/services/orchestrator/workflows', () => ({
+  submitWorkflow: vi.fn(),
+  getWorkflow: vi.fn(),
+  cancelWorkflow: vi.fn(),
+}));
+vi.mock('~/server/services/orchestrator/promptAuditing', () => ({
+  auditPromptServer: vi.fn(),
+}));
+vi.mock('~/server/services/user.service', () => ({
+  getUserById: (...a: unknown[]) => mockGetUserById(...a),
+}));
+vi.mock('~/server/rewards/active/dailyBoost.reward', () => ({
+  dailyBoostReward: { apply: vi.fn(), getUserRewardDetails: vi.fn() },
+}));
+vi.mock('~/server/services/buzz.service', () => ({
+  getUserBuzzAccounts: (...a: unknown[]) => mockGetUserBuzzAccounts(...a),
+}));
+vi.mock('~/server/services/block-registry.service', () => ({
+  BlockRegistry: {
+    listForModel: (...a: unknown[]) => mockListForModel(...a),
+    listAvailable: (...a: unknown[]) => mockListAvailable(...a),
+    installOnModel: (...a: unknown[]) => mockInstallOnModel(...a),
+    updateSettings: vi.fn(),
+    toggleEnabled: vi.fn(),
+    uninstallFromModel: vi.fn(),
+    resolveBlockInstance: vi.fn(),
+  },
+}));
+// rateLimit pulls in redis + heavy deps; the gate under test is the flag
+// middleware, so stub rateLimit to a pass-through middleware. (The real
+// rate-limit middleware is exercised end-to-end by the live stack, not here.)
+vi.mock('~/server/middleware.trpc', async () => {
+  const { middleware } = await import('~/server/trpc');
+  return { rateLimit: () => middleware(async ({ next }) => next()) };
+});
+
+import { blocksRouter } from '../blocks.router';
+import { TokenScope } from '~/shared/constants/token-scope.constants';
+import { dbMock } from '~/__tests__/mocks/db.mock';
+import { redisMock } from '~/__tests__/mocks/redis.mock';
+import { loggingMock } from '~/__tests__/mocks/logging.mock';
+const mockDbRead = dbMock.dbRead;
+const mockRedis = redisMock.redis;
+const mockSysRedis = redisMock.sysRedis;
+const mockLogToAxiom = loggingMock.logToAxiom;
+
+// Faithful mod-segmented flag: ON iff the supplied user is a moderator. No user
+// (anon machine path) → false. Mirrors the live `app-blocks-enabled` rule.
+function fakePerUserFlag(opts?: { user?: { isModerator?: boolean } }) {
+  return Promise.resolve(!!opts?.user?.isModerator);
+}
+
+function fakeCtx(user: unknown) {
+  return {
+    acceptableOrigin: true,
+    user,
+    apiKeyId: null,
+    tokenScope: TokenScope.Full,
+    req: { headers: {} } as never,
+    res: { setHeader: () => undefined } as never,
+    cache: { edgeTTL: 0 },
+    // ctx.features.appBlocks mirrors the client gate. For the listForModel
+    // happy path we set it true for the mod so the registry is reached; the
+    // middleware gate is the unit under test.
+    features: { appBlocks: !!(user as { isModerator?: boolean })?.isModerator } as never,
+    track: undefined,
+  };
+}
+
+const modUser = { id: 1, isModerator: true, tier: 'free', username: 'mod' };
+const normalUser = { id: 2, isModerator: false, tier: 'free', username: 'user' };
+
+beforeEach(() => {
+  mockIsAppBlocksEnabled.mockReset();
+  mockIsAppBlocksEnabled.mockImplementation(fakePerUserFlag);
+  mockListForModel.mockReset();
+  mockListForModel.mockResolvedValue([{ id: 'blk_1' }]);
+  mockListAvailable.mockReset();
+  mockListAvailable.mockResolvedValue({ items: [{ id: 'ab_1' }], nextCursor: undefined });
+  mockInstallOnModel.mockReset();
+  mockInstallOnModel.mockResolvedValue({ id: 'install_1' });
+});
+
+const listInput = { modelId: 7, slotId: 'model.sidebar_top' as const };
+
+describe('enforceAppBlocksFlag — query (listForModel)', () => {
+  it('moderator: gate passes, registry is consulted', async () => {
+    const caller = blocksRouter.createCaller(fakeCtx(modUser) as never);
+    const result = await caller.listForModel(listInput);
+    expect(result).toEqual([{ id: 'blk_1' }]);
+    expect(mockListForModel).toHaveBeenCalledTimes(1);
+    // Threaded the session user into the gate.
+    expect(mockIsAppBlocksEnabled).toHaveBeenCalledWith({ user: modUser });
+  });
+
+  it("🔴 threads the viewer's OWN browsing level so R/X blocks follow it", async () => {
+    // PG|R|X = 13: equal to no browsing-level constant, so a hardcoded flag cannot pass.
+    const viewer = { ...modUser, showNsfw: true, browsingLevel: 13 };
+    const ctx = fakeCtx(viewer);
+    const caller = blocksRouter.createCaller({
+      ...ctx,
+      features: { ...(ctx.features as object), canViewNsfw: true },
+    } as never);
+    await caller.listForModel(listInput);
+    expect(mockListForModel.mock.calls[0][0]).toMatchObject({ viewerBrowsingLevel: 13 });
+  });
+
+  it('non-moderator: gate disables → [] (no-widening), registry NOT consulted', async () => {
+    const caller = blocksRouter.createCaller(fakeCtx(normalUser) as never);
+    const result = await caller.listForModel(listInput);
+    expect(result).toEqual([]);
+    expect(mockListForModel).not.toHaveBeenCalled();
+    expect(mockIsAppBlocksEnabled).toHaveBeenCalledWith({ user: normalUser });
+  });
+
+  it('anonymous: gate disables → [] (no-widening), registry NOT consulted', async () => {
+    const caller = blocksRouter.createCaller(fakeCtx(undefined) as never);
+    const result = await caller.listForModel(listInput);
+    expect(result).toEqual([]);
+    expect(mockListForModel).not.toHaveBeenCalled();
+    expect(mockIsAppBlocksEnabled).toHaveBeenCalledWith({ user: undefined });
+  });
+});
+
+describe('listAvailable — legacy read: flag gate, then moderator-only (F-E E1)', () => {
+  it('anonymous WITHOUT the flag: gate disables → empty (dark today), registry NOT consulted', async () => {
+    // Real anon today: the mod-segmented flag can never match without a mod
+    // context, so the middleware sets _appBlocksDisabled → empty. This is the
+    // "dark" invariant — removing the old hardcoded isModerator gate did NOT
+    // widen access; the flag gate is the real control.
+    const caller = blocksRouter.createCaller(fakeCtx(undefined) as never);
+    const result = await caller.listAvailable({ limit: 20 });
+    expect(result).toEqual({ items: [], nextCursor: undefined });
+    expect(mockListAvailable).not.toHaveBeenCalled();
+    expect(mockIsAppBlocksEnabled).toHaveBeenCalledWith({ user: undefined });
+  });
+
+  it('non-mod WITHOUT the flag: gate disables → empty, registry NOT consulted', async () => {
+    const caller = blocksRouter.createCaller(fakeCtx(normalUser) as never);
+    const result = await caller.listAvailable({ limit: 20 });
+    expect(result).toEqual({ items: [], nextCursor: undefined });
+    expect(mockListAvailable).not.toHaveBeenCalled();
+  });
+
+  // 🔴 MODERATOR-ONLY, INDEPENDENT OF THE FLAG. The service SQL reads `app_blocks` with no
+  // join to `app_listings`, so it never applies per-listing visibility. Once
+  // civitai/flipt-state#263 widens `app-blocks-enabled` to every user, a flag-only gate would
+  // let any caller enumerate testers-only and private apps. Nothing in the product calls
+  // this procedure for a non-moderator any more (the store reads `appListings.listAvailable`),
+  // so it is closed to everyone but moderators rather than taught visibility.
+  const LEAKY_ROWS = {
+    items: [
+      { id: 'ab_testers', visibility: 'testers' },
+      { id: 'ab_private', visibility: 'private' },
+    ],
+    nextCursor: undefined,
+  };
+
+  it('🔴 anonymous WITH the flag on for everyone (post-#263): empty, registry NOT consulted', async () => {
+    mockIsAppBlocksEnabled.mockResolvedValue(true);
+    mockListAvailable.mockResolvedValue(LEAKY_ROWS);
+    const caller = blocksRouter.createCaller(fakeCtx(undefined) as never);
+    const result = await caller.listAvailable({ limit: 20 });
+    expect(result).toEqual({ items: [], nextCursor: undefined });
+    expect(mockListAvailable).not.toHaveBeenCalled();
+  });
+
+  it('🔴 non-mod WITH the flag on for everyone (post-#263): empty, registry NOT consulted', async () => {
+    mockIsAppBlocksEnabled.mockResolvedValue(true);
+    mockListAvailable.mockResolvedValue(LEAKY_ROWS);
+    const caller = blocksRouter.createCaller(fakeCtx(normalUser) as never);
+    const result = await caller.listAvailable({ limit: 20 });
+    expect(result).toEqual({ items: [], nextCursor: undefined });
+    expect(mockListAvailable).not.toHaveBeenCalled();
+  });
+
+  it('moderator: gate passes, registry IS consulted (mods-only is the live state)', async () => {
+    const caller = blocksRouter.createCaller(fakeCtx(modUser) as never);
+    const result = await caller.listAvailable({ limit: 20 });
+    expect(result).toEqual({ items: [{ id: 'ab_1' }], nextCursor: undefined });
+    expect(mockListAvailable).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('enforceAppBlocksFlag — mutation (installOnModel)', () => {
+  const installInput = { modelId: 7, appBlockId: 'app_1', slotId: 'model.sidebar_top' as const };
+
+  it('non-moderator: rejected before the mutation runs (no-widening)', async () => {
+    // moderatorProcedure also gates on isModerator; either gate refusing is
+    // acceptable — the invariant is that a non-mod cannot reach the mutation.
+    const caller = blocksRouter.createCaller(fakeCtx(normalUser) as never);
+    await expect(caller.installOnModel(installInput)).rejects.toBeInstanceOf(TRPCError);
+    expect(mockInstallOnModel).not.toHaveBeenCalled();
+  });
+
+  it('anonymous: rejected', async () => {
+    const caller = blocksRouter.createCaller(fakeCtx(undefined) as never);
+    await expect(caller.installOnModel(installInput)).rejects.toBeInstanceOf(TRPCError);
+    expect(mockInstallOnModel).not.toHaveBeenCalled();
+  });
+});
+
+describe('enforceAppBlocksFlag — mod query (getPublishRequestScreenshots, E5 Low-2)', () => {
+  // The new mod-review screenshot query is moderatorProcedure + enforceAppBlocksFlag;
+  // a non-mod / anon caller must be rejected before the query body reaches (mod-only).
+  const input = { publishRequestId: 'pr_1' };
+
+  it('non-moderator: rejected', async () => {
+    const caller = blocksRouter.createCaller(fakeCtx(normalUser) as never);
+    await expect(caller.getPublishRequestScreenshots(input)).rejects.toBeInstanceOf(TRPCError);
+  });
+
+  it('anonymous: rejected', async () => {
+    const caller = blocksRouter.createCaller(fakeCtx(undefined) as never);
+    await expect(caller.getPublishRequestScreenshots(input)).rejects.toBeInstanceOf(TRPCError);
+  });
+});

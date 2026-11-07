@@ -1,0 +1,318 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * W13 POST-APPROVAL MOD MANAGEMENT (P2) — the moderator ALL-STATUS listings read
+ * (`listAllListingsForModeration`). We do NOT hit a DB — `dbRead.appListing.findMany`
+ * is mocked so we can assert the WHERE (status/kind/search + shadow exclusion), the
+ * keyset (orderBy id DESC, take limit+1, cursor skip), the pagination contract
+ * (nextCursor only on page+1), the limit clamp (≤50), and the projected row shape
+ * (owner chip, metric counts default 0, the latest pending-request projection).
+ */
+
+const { mockDbRead } = vi.hoisted(() => ({
+  mockDbRead: {
+    $queryRaw: vi.fn(async (..._a: unknown[]): Promise<unknown[]> => []),
+    appListing: {
+      findMany: vi.fn(async (..._a: unknown[]): Promise<unknown[]> => []),
+      findFirst: vi.fn(async (..._a: unknown[]): Promise<unknown> => null),
+    },
+    // The slug-keyed ON-SITE "is this draft under review?" lookup. It has no FK to include,
+    // so it is a second batched query rather than a relation — and until this mock existed
+    // the branch was unreachable in tests: every fixture was off-site, so `onsiteSlugs` was
+    // empty and the call short-circuited before touching an undefined mock.
+    appBlockPublishRequest: {
+      findMany: vi.fn(async (..._a: unknown[]): Promise<unknown[]> => []),
+    },
+  },
+}));
+
+vi.mock('~/server/db/client', () => ({ dbRead: mockDbRead, dbWrite: mockDbRead }));
+vi.mock('~/client-utils/edge-url', () => ({ getEdgeUrl: (src: string) => src }));
+vi.mock('~/env/server', () => ({ env: { APPS_DOMAIN: 'civit.ai' } }));
+vi.mock('~/server/common/constants', () => ({ CacheTTL: { hour: 3600, sm: 180 } }));
+vi.mock('~/server/utils/cache-helpers', () => ({
+  // 🔴 BOTH EXPORTS. `app-listing.service` now imports `bustCacheTag` as well as
+  // `queryCache` (it owns `bustAppListingCatalogCache`), and a one-key factory makes the
+  // WHOLE FILE fail to import with `No "bustCacheTag" export is defined on the … mock`.
+  queryCache:
+    () =>
+    async (sql: unknown): Promise<unknown[]> =>
+      mockDbRead.$queryRaw(sql),
+  bustCacheTag: vi.fn(async () => undefined),
+}));
+
+import { listAllListingsForModeration, projectModerationListing } from '../app-listing.service';
+
+/** A hydrated moderation row as `moderationListingSelect` returns it. */
+function modRow(over: Record<string, unknown> = {}) {
+  return {
+    id: 'apl_9',
+    slug: 'cool-app',
+    name: 'Cool App',
+    kind: 'offsite',
+    status: 'approved',
+    category: 'utility',
+    contentRating: 'pg',
+    externalUrl: 'https://ext.example/app',
+    appBlockId: null,
+    user: { id: 7, username: 'dev', image: 'avatar-key' },
+    metric: { installCount: 5, thumbsUpCount: 9, thumbsDownCount: 1 },
+    publishRequests: [],
+    ...over,
+  };
+}
+
+/** The last findMany call's args. */
+function lastFindMany() {
+  return mockDbRead.appListing.findMany.mock.calls.at(-1)?.[0] as {
+    where?: Record<string, unknown>;
+    orderBy?: unknown;
+    take?: number;
+    cursor?: unknown;
+    skip?: number;
+  };
+}
+
+describe('projectModerationListing', () => {
+  it('projects the row DTO (owner chip, counts, no pending request)', () => {
+    const dto = projectModerationListing(modRow() as never);
+    expect(dto).toMatchObject({
+      id: 'apl_9',
+      slug: 'cool-app',
+      name: 'Cool App',
+      kind: 'offsite',
+      status: 'approved',
+      category: 'utility',
+      contentRating: 'pg',
+      externalUrl: 'https://ext.example/app',
+      appBlockId: null,
+      owner: { id: 7, username: 'dev', image: 'avatar-key' },
+      installCount: 5,
+      thumbsUpCount: 9,
+      thumbsDownCount: 1,
+      pendingRequest: null,
+    });
+  });
+
+  it('defaults metric counts to 0 when there is no metric row', () => {
+    const dto = projectModerationListing(modRow({ metric: null }) as never);
+    expect(dto.installCount).toBe(0);
+    expect(dto.thumbsUpCount).toBe(0);
+    expect(dto.thumbsDownCount).toBe(0);
+  });
+
+  it('projects the LATEST pending publish request when present', () => {
+    const dto = projectModerationListing(
+      modRow({
+        status: 'pending',
+        publishRequests: [
+          {
+            id: 'alpr_1',
+            submittedAt: new Date('2026-01-02T00:00:00Z'),
+            changelog: 'first version',
+            submittedBy: { id: 42, username: 'author', deletedAt: null, image: null },
+          },
+        ],
+      }) as never
+    );
+    // 🔴 `deletedAt` SURVIVES THE PROJECTION, and that is the point of this assertion.
+    //
+    // This row is handed to the REUSED off-site review modal — the same modal the review
+    // queue opens — so it is a review surface and the chip must match every other review
+    // read. ⚠️ That modal renders the submitter as PLAIN TEXT today, so the `deletedAt`
+    // branch is not yet exercised there; the select carries the field so it is available the
+    // moment the cell adopts `UserAvatar`, which the on-site half of the same list already
+    // did. The select was widened to the
+    // shared `reviewUserChipSelect` and the projection now passes the chip through WHOLE
+    // rather than re-projecting it through `creatorChip`, which spells `{ id, username,
+    // image }` explicitly and would drop it with no type error. An explicit re-projection is
+    // exactly how this defect travels one layer at a time.
+    //
+    // ⚠️ The sibling `owner` chip is deliberately NOT widened — it is the listings table's
+    // own plain-text creator cell, a different screen, and still reads `ModerationUserChip`.
+    //
+    // 🔴 AND THIS ASSERTION PINS THE PROJECTION, NOT THE SELECT. Narrowing
+    // `moderationListingSelect` back leaves this case green; what catches that is
+    // `ModerationListingRow`'s `ReviewSubmitterChip` annotation, which fails `pnpm typecheck`
+    // with one error naming this field. Said here because a reader looking for the red test
+    // that guards the select will not find one.
+    expect(dto.pendingRequest).toEqual({
+      id: 'alpr_1',
+      submittedAt: new Date('2026-01-02T00:00:00Z'),
+      changelog: 'first version',
+      submittedBy: { id: 42, username: 'author', deletedAt: null, image: null },
+    });
+  });
+
+  it('a vanished owner yields a null owner chip', () => {
+    expect(projectModerationListing(modRow({ user: null }) as never).owner).toBeNull();
+  });
+});
+
+describe('listAllListingsForModeration — filters, keyset + pagination', () => {
+  beforeEach(() => {
+    mockDbRead.appListing.findMany.mockReset();
+    mockDbRead.appListing.findMany.mockResolvedValue([]);
+  });
+
+  it('excludes shadow revision drafts (revisionOfId: null) and applies no filter by default', async () => {
+    await listAllListingsForModeration({ limit: 25 });
+    const { where, orderBy, take } = lastFindMany();
+    // Status + search clauses (each possibly an `OR`) are composed under `AND` so
+    // neither overwrites the other's `OR` key; with no filters the AND is empty.
+    expect(where).toEqual({ revisionOfId: null, AND: [] });
+    expect(orderBy).toEqual({ id: 'desc' });
+    expect(take).toBe(26); // limit + 1
+  });
+
+  it('binds the status filter when provided', async () => {
+    await listAllListingsForModeration({ status: 'removed', limit: 25 });
+    // A concrete status is bound as an AND member (a plain `{ status }` clause).
+    expect(lastFindMany().where).toMatchObject({
+      revisionOfId: null,
+      AND: [{ status: 'removed' }],
+    });
+  });
+
+  it('binds the kind filter when provided', async () => {
+    await listAllListingsForModeration({ kind: 'onsite', limit: 25 });
+    expect(lastFindMany().where).toMatchObject({ kind: 'onsite' });
+  });
+
+  it('builds a case-insensitive name/slug OR for search (trimmed)', async () => {
+    await listAllListingsForModeration({ search: '  Cool  ', limit: 25 });
+    // The search OR is an AND member (so it can't collide with a status OR).
+    expect(lastFindMany().where).toMatchObject({
+      AND: [
+        {
+          OR: [
+            { name: { contains: 'Cool', mode: 'insensitive' } },
+            { slug: { contains: 'Cool', mode: 'insensitive' } },
+          ],
+        },
+      ],
+    });
+  });
+
+  it('omits the search OR when the trimmed query is empty', async () => {
+    await listAllListingsForModeration({ search: '   ', limit: 25 });
+    expect(lastFindMany().where).not.toHaveProperty('OR');
+  });
+
+  it('clamps the page size to 50 (take = 51)', async () => {
+    // The zod schema caps at 50, but the service double-clamps (it is exported).
+    await listAllListingsForModeration({ limit: 999 as never });
+    expect(lastFindMany().take).toBe(51);
+  });
+
+  it('passes the cursor as a keyset (cursor:{id}, skip:1)', async () => {
+    await listAllListingsForModeration({ cursor: 'apl_5', limit: 25 });
+    const call = lastFindMany();
+    expect(call.cursor).toEqual({ id: 'apl_5' });
+    expect(call.skip).toBe(1);
+  });
+
+  it('no cursor/skip on the first page', async () => {
+    await listAllListingsForModeration({ limit: 25 });
+    const call = lastFindMany();
+    expect(call.cursor).toBeUndefined();
+    expect(call.skip).toBeUndefined();
+  });
+
+  it('emits nextCursor = the last row id only when a full page+1 is returned', async () => {
+    mockDbRead.appListing.findMany.mockResolvedValueOnce([
+      modRow({ id: 'apl_3' }),
+      modRow({ id: 'apl_2' }),
+      modRow({ id: 'apl_1' }), // the +1 (dropped)
+    ]);
+    const { items, nextCursor } = await listAllListingsForModeration({ limit: 2 });
+    expect(items.map((i) => i.id)).toEqual(['apl_3', 'apl_2']);
+    expect(nextCursor).toBe('apl_2');
+  });
+
+  it('no nextCursor when the result fits in one page', async () => {
+    mockDbRead.appListing.findMany.mockResolvedValueOnce([modRow({ id: 'apl_1' })]);
+    const { items, nextCursor } = await listAllListingsForModeration({ limit: 25 });
+    expect(items).toHaveLength(1);
+    expect(nextCursor).toBeNull();
+  });
+});
+
+/**
+ * 🔴 `hasPendingBlockRequest` — the ON-SITE "is this draft under review?" signal, and the ONE
+ * thing standing between the mod table and offering a destructive Purge on a live submission.
+ *
+ * It cannot come from a relation: an on-site pre-approval draft's request is an
+ * `AppBlockPublishRequest` joined to the listing by the shared `@unique` SLUG with no foreign
+ * key (`AppListingPublishRequest.appListingId` is "On-site: NULL until approve"). So it is a
+ * second, batched, slug-keyed query — and that is precisely why it needs its own tests: an
+ * `include` would have been type-checked, a hand-rolled second query is not.
+ *
+ * 🔴 THESE EXIST BECAUSE THE SIGNAL SHIPPED WITH ZERO COVERAGE. Hardwiring the projection to
+ * `false` AND breaking the query's status filter left 315 files / 7209 tests green, because
+ * every fixture in this file was off-site, so `onsiteSlugs` was empty and the branch
+ * short-circuited before the (then missing) mock was touched. A fixture that never reaches the
+ * code proves nothing about it.
+ */
+describe('listAllListingsForModeration — the on-site pending-block-request signal', () => {
+  beforeEach(() => {
+    mockDbRead.appListing.findMany.mockReset();
+    mockDbRead.appListing.findMany.mockResolvedValue([]);
+    mockDbRead.appBlockPublishRequest.findMany.mockReset();
+    mockDbRead.appBlockPublishRequest.findMany.mockResolvedValue([]);
+  });
+
+  it('flags the on-site row whose slug HAS a pending block request, and only that row', async () => {
+    mockDbRead.appListing.findMany.mockResolvedValueOnce([
+      modRow({ id: 'apl_live', slug: 'under-review', kind: 'onsite', status: 'draft' }),
+      modRow({ id: 'apl_dead', slug: 'abandoned', kind: 'onsite', status: 'draft' }),
+    ]);
+    // Only one of the two slugs comes back — so a mutant that ignores the result and returns a
+    // constant cannot satisfy both rows.
+    mockDbRead.appBlockPublishRequest.findMany.mockResolvedValueOnce([{ slug: 'under-review' }]);
+
+    const { items } = await listAllListingsForModeration({ limit: 25 });
+    expect(items.map((i) => [i.slug, i.hasPendingBlockRequest])).toEqual([
+      ['under-review', true],
+      ['abandoned', false],
+    ]);
+  });
+
+  it('queries the RIGHT table with the page’s on-site slugs and the pending status', async () => {
+    mockDbRead.appListing.findMany.mockResolvedValueOnce([
+      modRow({ id: 'apl_a', slug: 'onsite-a', kind: 'onsite', status: 'draft' }),
+      modRow({ id: 'apl_b', slug: 'offsite-b', kind: 'offsite' }),
+    ]);
+    await listAllListingsForModeration({ limit: 25 });
+
+    // Literal, not built from the implementation. Pins the table, the key and the status — the
+    // three things that were wrong the first time this guard was written.
+    expect(mockDbRead.appBlockPublishRequest.findMany).toHaveBeenCalledWith({
+      where: { slug: { in: ['onsite-a'] }, status: 'pending' },
+      select: { slug: true },
+    });
+  });
+
+  it('issues NO second query when the page has no on-site rows', async () => {
+    mockDbRead.appListing.findMany.mockResolvedValueOnce([modRow({ kind: 'offsite' })]);
+    const { items } = await listAllListingsForModeration({ limit: 25 });
+    expect(mockDbRead.appBlockPublishRequest.findMany).not.toHaveBeenCalled();
+    expect(items[0].hasPendingBlockRequest).toBe(false);
+  });
+
+  it('never flags an OFF-SITE row, even when its slug collides with a pending block request', async () => {
+    mockDbRead.appListing.findMany.mockResolvedValueOnce([
+      modRow({ id: 'apl_off', slug: 'shared-slug', kind: 'offsite' }),
+      modRow({ id: 'apl_on', slug: 'onsite-x', kind: 'onsite', status: 'draft' }),
+    ]);
+    mockDbRead.appBlockPublishRequest.findMany.mockResolvedValueOnce([
+      { slug: 'shared-slug' },
+      { slug: 'onsite-x' },
+    ]);
+    const { items } = await listAllListingsForModeration({ limit: 25 });
+    expect(items.map((i) => [i.id, i.hasPendingBlockRequest])).toEqual([
+      ['apl_off', false],
+      ['apl_on', true],
+    ]);
+  });
+});

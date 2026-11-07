@@ -1,0 +1,367 @@
+import { keepPreviousData } from '@tanstack/react-query';
+import { useEffect, useMemo, useState } from 'react';
+import { withPlaceholderData } from '~/hooks/trpcHelpers';
+import { trpc } from '~/utils/trpc';
+import type { RouterOutput } from '~/types/router';
+import type {
+  GetCommunityCosmeticsInput,
+  GetPublicShopItemsInput,
+  GetReviewQueueInput,
+  ReviewQueueSort,
+} from '~/server/schema/creator-shop.schema';
+import type { CosmeticShopItemStatus } from '~/shared/utils/prisma/enums';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
+import { numberWithCommas } from '~/utils/number-helpers';
+
+// Matches getEarlyAccessPricesSchema.modelVersionIds.max(200).
+const EARLY_ACCESS_PRICE_BATCH = 200;
+
+export type CreatorShopData = RouterOutput['creatorShop']['getShop'];
+export type CreatorShopItem = CreatorShopData['cosmetics'][number];
+export type CreatorShopManageItem = RouterOutput['creatorShop']['getManageItems'][number];
+
+export const useQueryCreatorShop = (userId?: number, preview = false) => {
+  const { data, ...rest } = trpc.creatorShop.getShop.useQuery(
+    { userId: userId as number, preview },
+    { enabled: !!userId }
+  );
+  return { shop: data, ...rest };
+};
+
+// `userId` is only honored for moderators (enforced server-side); owners omit it.
+export const useQueryCreatorShopManage = (enabled = true, userId?: number) => {
+  const { data = [], ...rest } = trpc.creatorShop.getManageItems.useQuery({ userId }, { enabled });
+  return { items: data, ...rest };
+};
+
+// Cross-creator resale counts for the manage stat cards, both directions.
+// `userId` is only honored for moderators (enforced server-side); owners omit it.
+export type CreatorShopResaleStats = RouterOutput['creatorShop']['getResaleStats'];
+export const useQueryCreatorShopResaleStats = (enabled = true, userId?: number) => {
+  const { data, ...rest } = trpc.creatorShop.getResaleStats.useQuery({ userId }, { enabled });
+  return { resaleStats: data, ...rest };
+};
+
+// `userId` is only honored for moderators (enforced server-side); owners omit it.
+export const useQueryCreatorShopSettings = (enabled = true, userId?: number) => {
+  const { data, ...rest } = trpc.creatorShop.getSettings.useQuery({ userId }, { enabled });
+  return { settings: data, ...rest };
+};
+
+// Other creators' shop items available to resell (cross-creator selling).
+export type CreatorShopPublicShopItem =
+  RouterOutput['creatorShop']['getPublicShopItems']['items'][number];
+export const useQueryPublicShopItems = (filters: Partial<GetPublicShopItemsInput> = {}) => {
+  const { data, ...rest } = trpc.creatorShop.getPublicShopItems.useInfiniteQuery(filters, {
+    getNextPageParam: (lastPage) => lastPage.nextCursor,
+  });
+  const items = useMemo(() => data?.pages.flatMap((page) => page.items) ?? [], [data]);
+  return { items, ...rest };
+};
+
+// Site-wide community cosmetics hub (/shop marketplace section). Paged rather
+// than infinite: a few hundred animated cosmetics mounted at once make the page
+// crawl.
+export type CommunityCosmeticItem =
+  RouterOutput['creatorShop']['getCommunityCosmetics']['items'][number];
+export const useQueryCommunityCosmetics = (filters: Partial<GetCommunityCosmeticsInput> = {}) => {
+  const { data, ...rest } = trpc.creatorShop.getCommunityCosmetics.useQuery(
+    filters,
+    // Keeps the current page rendered while the next one loads, so paging
+    // doesn't collapse the grid to a spinner and jump the scroll position.
+    withPlaceholderData({ keepPreviousData: true })
+  );
+  return { items: data?.items ?? [], totalPages: data?.totalPages ?? 0, ...rest };
+};
+
+// The creator's own resell listings in saved order (for the manage/reorder UI).
+export type CreatorShopManageResoldItem = RouterOutput['creatorShop']['getResoldItems'][number];
+export const useQueryManageResoldItems = (enabled = true) => {
+  const { data = [], ...rest } = trpc.creatorShop.getResoldItems.useQuery(undefined, { enabled });
+  return { items: data, ...rest };
+};
+
+// Early Access download prices for the Models section, keyed by model version id.
+// As the infinite feed grows we only request ids we haven't resolved yet (in
+// batches), instead of re-fetching the whole growing set on every page.
+export const useQueryEarlyAccessPrices = (modelVersionIds: number[]) => {
+  const [prices, setPrices] = useState<Record<number, number>>({});
+  // Every id we've already asked the server about (priced or not) so we never
+  // re-request it — the response omits unpriced ids, so a price map alone can't
+  // distinguish "no price" from "not yet fetched".
+  const [resolved, setResolved] = useState<Set<number>>(() => new Set());
+
+  const requestedIds = useMemo(
+    () => modelVersionIds.filter((id) => !resolved.has(id)).slice(0, EARLY_ACCESS_PRICE_BATCH),
+    [modelVersionIds, resolved]
+  );
+
+  const { data, dataUpdatedAt } = trpc.creatorShop.getEarlyAccessPrices.useQuery(
+    { modelVersionIds: requestedIds },
+    { enabled: requestedIds.length > 0 }
+  );
+
+  useEffect(() => {
+    if (!data) return;
+    setPrices((prev) => ({ ...prev, ...data }));
+    // `dataUpdatedAt` only advances on a completed fetch, whose query key is the
+    // current `requestedIds`, so this closure always matches the response.
+    setResolved((prev) => {
+      const next = new Set(prev);
+      for (const id of requestedIds) next.add(id);
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataUpdatedAt]);
+
+  return prices;
+};
+
+const REVIEW_QUEUE_PAGE_SIZE = 20;
+
+export const useQueryCreatorShopReviewQueue = ({
+  status,
+  username,
+  userId,
+  cosmeticTypes,
+  sort = 'oldest',
+  page = 1,
+  enabled = true,
+}: {
+  status?: CosmeticShopItemStatus | undefined;
+  username?: string;
+  userId?: number;
+  cosmeticTypes?: GetReviewQueueInput['cosmeticTypes'];
+  sort?: ReviewQueueSort;
+  page?: number;
+  enabled?: boolean;
+} = {}) =>
+  trpc.creatorShop.getReviewQueue.useQuery(
+    {
+      limit: REVIEW_QUEUE_PAGE_SIZE,
+      page,
+      sort,
+      status,
+      username: username?.trim() || undefined,
+      userId,
+      cosmeticTypes: cosmeticTypes?.length ? cosmeticTypes : undefined,
+    },
+    // Without this the list unmounts on every page step, which also clears the
+    // selection the moderator is reviewing.
+    { enabled, placeholderData: keepPreviousData }
+  );
+
+// Everyone who has ever submitted a shop item — the option list for the review
+// queue's creator filter.
+export const useQueryCreatorShopReviewQueueCreators = (enabled = true) => {
+  const { data = [], ...rest } = trpc.creatorShop.getReviewQueueCreators.useQuery(undefined, {
+    enabled,
+  });
+  return { creators: data, ...rest };
+};
+
+export const useMutateCreatorShop = () => {
+  const queryUtils = trpc.useUtils();
+
+  const onError = (title: string) => (error: { message: string }) =>
+    showErrorNotification({ title, error: new Error(error.message) });
+
+  // A submit can be rejected because the quoted fee no longer matches, and the error
+  // tells the creator to reopen the form. That only recovers if the next mount refetches.
+  const onSubmitError = (title: string) => async (error: { message: string }) => {
+    await queryUtils.creatorShop.getFees.invalidate();
+    onError(title)(error);
+  };
+
+  const submitItem = trpc.creatorShop.submitItem.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getManageItems.invalidate();
+      showSuccessNotification({ message: 'Item submitted for review' });
+    },
+    onError: onSubmitError('Failed to submit item'),
+  });
+
+  const updateItem = trpc.creatorShop.updateItem.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getManageItems.invalidate();
+      // Price and resale terms both change what the resale picker offers other
+      // creators, and the storefront reads the item's price too.
+      await queryUtils.creatorShop.getPublicShopItems.invalidate();
+      await queryUtils.creatorShop.getShop.invalidate();
+      showSuccessNotification({ message: 'Item updated' });
+    },
+    onError: onError('Failed to update item'),
+  });
+
+  const submitPack = trpc.creatorShop.submitPack.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getManageItems.invalidate();
+      showSuccessNotification({ message: 'Pack submitted for review' });
+    },
+    onError: onSubmitError('Failed to submit pack'),
+  });
+
+  const updatePack = trpc.creatorShop.updatePack.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getManageItems.invalidate();
+      await queryUtils.creatorShop.getPack.invalidate();
+      // The moderator cosmetic-store list edits packs through this same
+      // mutation, and both storefronts render a pack's title and price — a
+      // price or contents edit also drops it to PendingReview, so all three
+      // are showing a listing that is no longer on sale.
+      await queryUtils.cosmeticShop.getShopItemsPaged.invalidate();
+      await queryUtils.creatorShop.getShop.invalidate();
+      await queryUtils.creatorShop.getCommunityCosmetics.invalidate();
+      showSuccessNotification({ message: 'Pack updated' });
+    },
+    onError: onError('Failed to update pack'),
+  });
+
+  const archiveItem = trpc.creatorShop.archiveItem.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getManageItems.invalidate();
+    },
+    onError: onError('Failed to archive item'),
+  });
+
+  const setItemListed = trpc.creatorShop.setItemListed.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getManageItems.invalidate();
+      await queryUtils.creatorShop.getShop.invalidate();
+      // Delisting can strip a featured slot server-side, and both of these
+      // filter on `listed`.
+      await queryUtils.creatorShop.getSettings.invalidate();
+      await queryUtils.creatorShop.getCommunityCosmetics.invalidate();
+      await queryUtils.creatorShop.getPublicShopItems.invalidate();
+    },
+    onError: onError('Failed to update listing'),
+  });
+
+  const unarchiveItem = trpc.creatorShop.unarchiveItem.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getManageItems.invalidate();
+    },
+    onError: onError('Failed to restore item'),
+  });
+
+  const deleteItem = trpc.creatorShop.deleteItem.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getManageItems.invalidate();
+      await queryUtils.creatorShop.getReviewQueue.invalidate();
+      // Deleting can also free a featured slot server-side.
+      await queryUtils.creatorShop.getSettings.invalidate();
+      await queryUtils.creatorShop.getShop.invalidate();
+    },
+    onError: onError('Failed to delete item'),
+  });
+
+  const addResoldItem = trpc.creatorShop.addResoldItem.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getSettings.invalidate();
+      await queryUtils.creatorShop.getShop.invalidate();
+      await queryUtils.creatorShop.getResoldItems.invalidate();
+      await queryUtils.creatorShop.getPublicShopItems.invalidate();
+      await queryUtils.creatorShop.getResaleStats.invalidate();
+      showSuccessNotification({ message: 'Added to your shop' });
+    },
+    onError: onError('Failed to add item'),
+  });
+
+  const removeResoldItem = trpc.creatorShop.removeResoldItem.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getSettings.invalidate();
+      await queryUtils.creatorShop.getShop.invalidate();
+      await queryUtils.creatorShop.getResoldItems.invalidate();
+      await queryUtils.creatorShop.getPublicShopItems.invalidate();
+      await queryUtils.creatorShop.getResaleStats.invalidate();
+    },
+    onError: onError('Failed to remove item'),
+  });
+
+  const updateSettings = trpc.creatorShop.updateSettings.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getSettings.invalidate();
+      // The storefront reads settings (enabled, sections, resold) via getShop too.
+      await queryUtils.creatorShop.getShop.invalidate();
+      await queryUtils.creatorShop.getResoldItems.invalidate();
+      showSuccessNotification({ message: 'Shop settings saved' });
+    },
+    onError: onError('Failed to save settings'),
+  });
+
+  // Quiet — reordering fires on every drop.
+  const reorderResoldItems = trpc.creatorShop.reorderResoldItems.useMutation({
+    async onSuccess() {
+      await queryUtils.creatorShop.getShop.invalidate();
+      await queryUtils.creatorShop.getResoldItems.invalidate();
+    },
+    onError: onError('Failed to save order'),
+  });
+
+  const reviewItem = trpc.creatorShop.reviewItem.useMutation({
+    // Settled, not success: a verdict refused because the item changed needs the new version shown.
+    async onSettled() {
+      await queryUtils.creatorShop.getReviewQueue.invalidate();
+    },
+    onError: onError('Failed to review item'),
+  });
+
+  const takedownItem = trpc.creatorShop.takedownItem.useMutation({
+    async onSuccess(result) {
+      await queryUtils.creatorShop.getReviewQueue.invalidate();
+      await queryUtils.creatorShop.getManageItems.invalidate();
+      await queryUtils.creatorShop.getShop.invalidate();
+      await queryUtils.creatorShop.getSettings.invalidate();
+      await queryUtils.creatorShop.getCommunityCosmetics.invalidate();
+      await queryUtils.creatorShop.getPublicShopItems.invalidate();
+      const failed = result.failures.filter((f) => f.stage !== 'cdn').length;
+      const artworkFailed = result.failures.length - failed;
+      showSuccessNotification({
+        title: 'Cosmetic taken down',
+        message: `Refunded ${result.refunded} of ${result.purchases} sale${
+          result.purchases === 1 ? '' : 's'
+        }, took back ${numberWithCommas(result.clawedBack)} Buzz (${
+          result.clawedBackPct
+        }% of those sales) from the seller and removed it from ${result.revokedFrom} account${
+          result.revokedFrom === 1 ? '' : 's'
+        }.${
+          result.boxesPulled || result.boxOpeningsRefunded
+            ? ` Pulled from ${result.boxesPulled} mystery box${
+                result.boxesPulled === 1 ? '' : 'es'
+              } and refunded ${result.boxOpeningsRefunded} box opener${
+                result.boxOpeningsRefunded === 1 ? '' : 's'
+              }.`
+            : ''
+        }${
+          failed
+            ? ` ${failed} refund or box step${failed === 1 ? '' : 's'} failed — finish by hand.`
+            : ''
+        }${
+          artworkFailed
+            ? ' Recording its artwork for removal failed — take it down again to retry.'
+            : result.artworkLeftServing
+            ? ' Its artwork was not removed from the CDN and needs a manual check.'
+            : ''
+        }`,
+      });
+    },
+    onError: onError('Failed to take down item'),
+  });
+
+  return {
+    submitItem,
+    updateItem,
+    submitPack,
+    updatePack,
+    archiveItem,
+    setItemListed,
+    unarchiveItem,
+    deleteItem,
+    addResoldItem,
+    removeResoldItem,
+    updateSettings,
+    reorderResoldItems,
+    reviewItem,
+    takedownItem,
+  };
+};

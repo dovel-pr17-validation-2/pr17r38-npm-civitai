@@ -1,0 +1,127 @@
+import { CloseButton } from '@headlessui/react';
+import type { ButtonProps } from '@mantine/core';
+import { Button, Card, Divider, Group } from '@mantine/core';
+import { IconBrush, IconCheck, IconCopy } from '@tabler/icons-react';
+import React from 'react';
+import { ImageMeta } from '~/components/Image/DetailV2/ImageMeta';
+import { useMetadataCopy } from '~/hooks/useMetadataCopy';
+import { generationGraphPanel } from '~/store/generation-graph.store';
+import { useTrackEvent } from '~/components/TrackView/track.utils';
+import { trpc } from '~/utils/trpc';
+
+// export default function ImageMetaPopoverLazy({ imageId }: ImageMetaPopoverProps) {
+//   const isClient = useIsClient();
+//   if (!isClient) return children;
+
+//   return (
+//     <Popover className="relative flex items-center">
+//       <PopoverButton className="flex cursor-pointer items-center justify-center border-none bg-transparent">
+//         {children}
+//       </PopoverButton>
+//       <PopoverPanel
+//         className="z-[500]"
+//         anchor="top end"
+//         onClick={(e) => {
+//           e.preventDefault();
+//           e.stopPropagation();
+//         }}
+//       >
+//         <Card withBorder className="flex w-96 max-w-full flex-col gap-3 rounded-xl">
+//           <ImageMetaPopoverInner imageId={imageId} />
+//         </Card>
+//       </PopoverPanel>
+//     </Popover>
+//   );
+// }
+
+const sharedButtonProps: ButtonProps = {
+  size: 'xs',
+  variant: 'light',
+  classNames: { inner: 'flex gap-1' },
+};
+
+export default function ImageMetaPopoverLazy({ imageId }: { imageId: number }) {
+  const { data, isLoading } = trpc.image.getGenerationData.useQuery({ id: imageId });
+  const { meta, canRemix, type = 'image' } = data ?? {};
+  const { copy, copied } = useMetadataCopy(meta);
+  const { trackAction } = useTrackEvent();
+
+  return (
+    <Card withBorder className="flex w-96 max-w-full flex-col gap-3 rounded-xl">
+      {isLoading ? (
+        <div className="flex animate-pulse flex-col gap-3">
+          {Array(2)
+            .fill(0)
+            .map((_, index) =>
+              index + (1 % 2) === 0 ? (
+                <Divider key={index} />
+              ) : (
+                <React.Fragment key={index}>
+                  <div className="h-3 w-32 rounded-full bg-gray-200 dark:bg-gray-700"></div>
+                  <div className="flex flex-col gap-2">
+                    {Array(3)
+                      .fill(0)
+                      .map((_, i) => (
+                        <div
+                          key={i}
+                          className="h-2.5 rounded-full bg-gray-200 dark:bg-gray-700"
+                        ></div>
+                      ))}
+                    <div className="h-2.5 w-56 rounded-full bg-gray-200 dark:bg-gray-700"></div>
+                  </div>
+                </React.Fragment>
+              )
+            )}
+        </div>
+      ) : (
+        <>
+          <ImageMeta imageId={imageId} />
+          <Button.Group>
+            {canRemix && (
+              <Button
+                as={CloseButton}
+                {...sharedButtonProps}
+                data-activity="remix:image-meta"
+                // @ts-ignore eslint-disable-next-line
+                onClick={() => {
+                  // Only act when we actually have an imageId — `imageId ?? 0`
+                  // would pollute the funnel with imageId=0 events AND fail
+                  // server-side at getGenerationData. Both calls share the
+                  // same guard so a falsy imageId is a complete no-op.
+                  if (!imageId) return;
+                  trackAction({
+                    type: 'Image_Remix_Click',
+                    details: {
+                      imageId,
+                      imageType: type,
+                      source: 'remix:image-meta',
+                    },
+                  }).catch(() => undefined);
+                  generationGraphPanel.open({ type, id: imageId });
+                }}
+                className="flex-1"
+              >
+                <Group gap={4} align="center">
+                  <IconBrush size={16} />
+                  Remix
+                </Group>
+              </Button>
+            )}
+            {meta && (
+              <Button
+                {...sharedButtonProps}
+                className="-ml-px"
+                onClick={copy}
+                color={copied ? 'teal' : undefined}
+                data-activity="copy:image-meta"
+              >
+                {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+                {!canRemix && (!copied ? 'Copy Generation Data' : 'Copied')}
+              </Button>
+            )}
+          </Button.Group>
+        </>
+      )}
+    </Card>
+  );
+}

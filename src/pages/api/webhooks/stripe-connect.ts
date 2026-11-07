@@ -1,0 +1,81 @@
+import type { NextApiRequest, NextApiResponse } from 'next';
+import { instrumentApiResponse } from '~/server/prom/http-errors';
+import { getServerStripe } from '~/server/utils/get-server-stripe';
+import { env } from '~/env/server';
+import type Stripe from 'stripe';
+import type { Readable } from 'node:stream';
+import { trackWebhookEvent } from '~/server/clickhouse/client';
+import { updateByStripeConnectAccount } from '../../../server/services/user-payment-configuration.service';
+
+// Stripe requires the raw body to construct the event.
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
+async function buffer(readable: Readable) {
+  const chunks = [];
+  for await (const chunk of readable) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+const relevantEvents = new Set(['account.updated', 'transfer.created']);
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  // Count any 5xx this webhook emits into civitai_app_http_errors_total — these
+  // handlers bypass the endpoint wrappers, so their 500s were counter-blind.
+  // Listener-only (res.once('finish')); no behavior/response change.
+  instrumentApiResponse(req, res);
+  if (req.method === 'POST') {
+    const stripe = await getServerStripe();
+    if (!stripe) {
+      return;
+    }
+
+    const buf = await buffer(req);
+    const rawPayload = buf.toString('utf8');
+    const sig = req.headers['stripe-signature'];
+    const webhookSecret = env.STRIPE_CONNECT_WEBHOOK_SECRET;
+    let event: Stripe.Event;
+
+    // Track to ClickHouse (fire and forget, never throws)
+    trackWebhookEvent('stripe-connect', rawPayload).catch(() => null);
+
+    try {
+      if (!sig || !webhookSecret) return; // only way this is false is if we forgot to include our secret or stripe decides to suddenly not include their signature
+      event = stripe.webhooks.constructEvent(buf, sig, webhookSecret);
+    } catch (error: any) {
+      console.log(`❌ Error message: ${error.message}`);
+      return res.status(400).send('Webhook Error');
+    }
+
+    if (relevantEvents.has(event.type)) {
+      try {
+        switch (event.type) {
+          case 'account.updated':
+            const data = event.data.object as Stripe.Account;
+            await updateByStripeConnectAccount({ stripeAccount: data });
+            break;
+          case 'transfer.created':
+            // TODO: Close transfer request.
+            console.log('transfer created');
+            break;
+          default:
+            throw new Error('Unhandled relevant event!');
+        }
+      } catch (error: any) {
+        return res.status(400).send({
+          error: 'Webhook handler failed',
+        });
+      }
+    }
+
+    res.json({ received: true });
+  } else {
+    res.setHeader('Allow', 'POST');
+    res.status(405).end('Method Not Allowed');
+  }
+}

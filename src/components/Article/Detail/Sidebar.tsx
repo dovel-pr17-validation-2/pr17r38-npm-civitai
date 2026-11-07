@@ -1,0 +1,109 @@
+import {
+  Accordion,
+  SimpleGrid,
+  Stack,
+  useComputedColorScheme,
+  useMantineTheme,
+} from '@mantine/core';
+import { useLocalStorage } from '@mantine/hooks';
+import { IconList, IconPaperclip } from '@tabler/icons-react';
+import type { ReactNode } from 'react';
+
+import { AttachmentCard } from '~/components/Article/Detail/AttachmentCard';
+import { TableOfContent } from '~/components/Article/Detail/TableOfContent';
+import { SmartCreatorCard } from '~/components/CreatorCard/CreatorCard';
+import { useHeadingsData } from '~/hooks/useHeadingsData';
+import { useIsMobile } from '~/hooks/useIsMobile';
+import type { ArticleGetById } from '~/server/services/article.service';
+import utilClasses from '~/libs/helpers.module.scss';
+
+export function Sidebar({ articleId, attachments, creator, hiddenNotice }: Props) {
+  const { nestedHeadings } = useHeadingsData();
+  const theme = useMantineTheme();
+  const colorScheme = useComputedColorScheme('dark');
+
+  // A new key: the old one holds the 'toc' default it wrote for every reader, not their choice.
+  const [storedAccordion, setActiveAccordion] = useLocalStorage<string>({
+    key: 'article-active-accordion-v2',
+    defaultValue: '',
+  });
+  // The contents are `hideMobile`, so on a phone they can't be the open item.
+  const tocHidden = useIsMobile({ breakpoint: 'xs', type: 'media' });
+
+  const hasAttachments = !!attachments.length;
+  const hasHeadings = !!nestedHeadings.length;
+  const shown = [hasHeadings && !tocHidden && 'toc', hasAttachments && 'attachments'].filter(
+    (item): item is string => !!item
+  );
+  const activeAccordion = shown.includes(storedAccordion)
+    ? storedAccordion
+    : hasAttachments
+    ? 'attachments'
+    : shown[0] ?? null;
+
+  return (
+    <aside
+      style={{
+        position: 'sticky',
+        top: 'calc(var(--header-height) + var(--mantine-spacing-md))',
+      }}
+    >
+      <Stack>
+        {hiddenNotice}
+        {(hasAttachments || hasHeadings) && (
+          <Accordion
+            variant="separated"
+            value={activeAccordion}
+            onChange={(value) => (value ? setActiveAccordion(value) : undefined)}
+            styles={{
+              content: { padding: 0 },
+              item: {
+                overflow: 'hidden',
+                borderColor: colorScheme === 'dark' ? theme.colors.dark[4] : theme.colors.gray[3],
+                boxShadow: theme.shadows.sm,
+              },
+              control: {
+                padding: theme.spacing.sm,
+              },
+            }}
+          >
+            <Stack>
+              {!!nestedHeadings.length && (
+                <Accordion.Item value="toc" className={utilClasses.hideMobile}>
+                  <Accordion.Control icon={<IconList size={20} />}>
+                    Table of Contents
+                  </Accordion.Control>
+                  <Accordion.Panel>
+                    <TableOfContent headings={nestedHeadings} />
+                  </Accordion.Panel>
+                </Accordion.Item>
+              )}
+              {hasAttachments && (
+                <Accordion.Item className="mt-0" value="attachments">
+                  <Accordion.Control icon={<IconPaperclip size={20} />}>
+                    Attachments
+                  </Accordion.Control>
+                  <Accordion.Panel>
+                    <SimpleGrid cols={1} spacing={2}>
+                      {attachments.map((attachment) => (
+                        <AttachmentCard key={attachment.id} {...attachment} />
+                      ))}
+                    </SimpleGrid>
+                  </Accordion.Panel>
+                </Accordion.Item>
+              )}
+            </Stack>
+          </Accordion>
+        )}
+        <SmartCreatorCard user={creator} tipBuzzEntityId={articleId} tipBuzzEntityType="Article" />
+      </Stack>
+    </aside>
+  );
+}
+
+type Props = {
+  articleId: number;
+  attachments: ArticleGetById['attachments'];
+  creator: ArticleGetById['user'];
+  hiddenNotice?: ReactNode;
+};

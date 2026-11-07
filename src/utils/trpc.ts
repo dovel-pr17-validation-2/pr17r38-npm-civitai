@@ -1,0 +1,677 @@
+// src/utils/trpc.ts
+import {
+  QueryClient,
+  type DefaultError,
+  type DefaultedQueryObserverOptions,
+  type QueryClientConfig,
+  type QueryKey,
+  type QueryObserverOptions,
+} from '@tanstack/react-query';
+import type { CreateTRPCClient, OperationLink, TRPCLink } from '@trpc/client';
+import { observable, type Unsubscribable } from '@trpc/server/observable';
+import {
+  createTRPCClient,
+  TRPCClientError,
+  httpBatchStreamLink,
+  httpLink,
+  loggerLink,
+  splitLink,
+} from '@trpc/client';
+import type { CreateTRPCNext } from '@trpc/next';
+import { createTRPCNext } from '@trpc/next';
+import type { NextPageContext } from 'next';
+import superjson from 'superjson';
+import type { AppRouter } from '~/server/routers';
+import { clientTransformer } from '~/shared/utils/trpc-union-transformer';
+import { isDev } from '~/env/other';
+import { pageRouteHeaders } from '~/utils/page-route-header';
+import { env } from '~/env/client';
+import { showErrorNotification } from '~/utils/notifications';
+import { removeEmpty } from '~/utils/object-helpers';
+import { TRPC_MAX_BATCH_SIZE } from '~/shared/constants/trpc.constants';
+import { BLOCK_TOKEN_QUERY_PROCEDURES } from '~/shared/constants/block-token-transport.constants';
+import {
+  deferToBatchWindow,
+  getTrpcUnifiedBatchWindowEnabled,
+  registerBatchingApplies,
+} from '~/utils/trpc-batch-window';
+
+type RequestHeaders = {
+  'x-client-date': string;
+  'x-client': string;
+  'x-client-version'?: string;
+};
+
+const url = '/api/trpc';
+
+/**
+ * ── Two size gates for two different URL limits ─────────────────────────────────────────
+ * A tRPC query can leave the browser two ways, each with a DIFFERENT URL ceiling:
+ *   1. Batched (`httpBatchStreamLink`) — the batch link hard-caps the whole per-request URL
+ *      at `maxURLLength: 2083` and throws "Input is too big for a single dispatch" if ONE op
+ *      alone exceeds it. → gated by `isTooLargeToBatch` (tight, ENCODED-precise) below.
+ *   2. Non-batched single GET (`httpLinkWithLargeQuerySupport`) — no 2083 cap; the only limit
+ *      is HTTP 431 / proxy URL limits (~4000+ chars). → gated by `isLargeQuery` (coarse RAW).
+ * Keeping these SEPARATE matters: `isLargeQuery` governs the GET→POST decision on the path
+ * EVERY query takes while the `trpcBatching` flag is off, so it must NOT inherit the tight
+ * batch budget — doing so would needlessly flip mid-size cacheable GETs to (uncacheable) POST
+ * for 100% of live traffic. The tight budget applies ONLY to the batch link.
+ */
+
+/**
+ * Encoded-URL budget (percent-encoded chars) for a single query's input on the BATCH link.
+ * Measured against the ACTUAL wire cost — `encodeURIComponent(JSON.stringify(
+ * superjson.serialize(input)))`, the same transform tRPC applies when building the GET URL —
+ * NOT a raw-char heuristic. It MUST use the same serializer the client actually writes with
+ * (the CLIENT stays superjson-write in Phase 2 — the per-pool devalue flip is SERVER-only,
+ * so the browser bundle keeps writing superjson via `input.serialize`); sizing with a
+ * different serializer would let the GET/POST batching decision drift from the real wire
+ * length. Sits ~280 under the batch link's
+ * `maxURLLength: 2083` to absorb the path (`/api/trpc/<proc>`) + `?batch=1&input={"0":…}`
+ * wrapper overhead, so a single op can never overflow the batched GET regardless of how
+ * punctuation-dense its JSON is.
+ *
+ * Why encoded, not raw: JSON near the limit is structurally dense (`{}",:[]`, each → %XX), so
+ * the encoded URL runs ~1.75–1.9× the raw JSON — not the ~1.4× a fixed factor assumes. A raw
+ * threshold that looks safe (e.g. 1400) still lets a ~12–14-resource whatIf payload stay
+ * batched yet overflow 2083 (the exact #2962 crash). Measuring the encoded length removes the
+ * guess and can't drift with payload composition.
+ */
+const URL_INPUT_BUDGET = 1800;
+
+/**
+ * Whether a query's input is too large to safely ride the BATCH link (whose single-op URL is
+ * hard-capped at `maxURLLength: 2083`). Excludes such a query from batching (see `shouldBatch`)
+ * so it can never trip the "Input is too big for a single dispatch" throw.
+ *
+ * Measures the ACTUAL encoded wire cost — the exact `encodeURIComponent(JSON.stringify(
+ * superjson.serialize(input)))` tRPC builds the GET URL from — against `URL_INPUT_BUDGET`. Uses
+ * the SAME serializer the client links write with (the client stays superjson-write in Phase 2),
+ * so the sizer can't drift from the real URL. No length-based short-circuit: a byte/char-count proxy underestimates the
+ * encoded length in the unsafe direction (a small-count input can encode large — the serializer
+ * expands special types, and `encodeURIComponent` expands one non-ASCII UTF-16 unit to up to 9
+ * chars, e.g. `中` → `%E4%B8%AD`), which twice let an overflowing op stay batched. `serialize`
+ * already runs unconditionally on the write path, so the encode walk is a marginal added cost,
+ * not worth the hole.
+ */
+export function isTooLargeToBatch(op: { type: string; input: unknown }) {
+  if (op.type !== 'query' || op.input == null) return false;
+  try {
+    return (
+      encodeURIComponent(JSON.stringify(superjson.serialize(op.input))).length > URL_INPUT_BUDGET
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Raw-input threshold for the NON-BATCHED single GET. That path has no 2083 batch cap — the
+ * only ceiling is the server/proxy URL limit (HTTP 431; Node ~16KB, nginx/Traefik default 8KB),
+ * which is far looser than the batch cap, so a coarse raw-char heuristic is sufficient here.
+ * NOTE this bounds RAW input, not the encoded URL: a punctuation-dense raw-2500 input can encode
+ * to a multi-KB GET URL — still well under those limits, but do NOT read 2500 as "≈4KB URL".
+ * Held at the long-standing 2500 so this path's GET→POST (and therefore edge-cacheability)
+ * behaviour is UNCHANGED from before batching shipped: the tight encoded batch budget governs
+ * the batch link ONLY, never 100% of live GET traffic.
+ */
+const MAX_GET_INPUT_LENGTH = 2500;
+
+/**
+ * Whether a query's input is large enough that carrying it in a NON-BATCHED GET URL would risk
+ * HTTP 431 / proxy URL limits. Such queries are routed through tRPC's native
+ * `methodOverride: 'POST'`, which moves the input into the request body. Requires
+ * `allowMethodOverride: true` on the server adapter — see `src/pages/api/trpc/[trpc].ts`.
+ */
+export function isLargeQuery(op: { type: string; input: unknown }) {
+  if (op.type !== 'query' || op.input == null) return false;
+  try {
+    return JSON.stringify(op.input).length > MAX_GET_INPUT_LENGTH;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether a query must leave the browser as POST: either its input is too large for a GET URL
+ * (`isLargeQuery`), or its procedure is in `BLOCK_TOKEN_QUERY_PROCEDURES` — its input carries a
+ * block token, a bearer credential, and a GET would put it in the request URL. Those also never
+ * batch (see `shouldBatch`). Same set the server keys its `no-store` header on.
+ */
+export function shouldSendQueryAsPost(op: { type: string; path: string; input: unknown }) {
+  if (op.type !== 'query') return false;
+  return BLOCK_TOKEN_QUERY_PROCEDURES.has(op.path) || isLargeQuery(op);
+}
+
+/**
+ * Terminating link: large queries and `BLOCK_TOKEN_QUERY_PROCEDURES` go out as POST
+ * (body-carried input, not edge-cacheable), everything else stays a normal GET so the
+ * `responseMeta` Cache-Control headers in `[trpc].ts` can still edge-cache them.
+ */
+function httpLinkWithLargeQuerySupport({
+  url,
+  headers,
+}: {
+  url: string;
+  headers: ReturnType<typeof getHeaders>;
+}): TRPCLink<AppRouter> {
+  return splitLink({
+    condition: shouldSendQueryAsPost,
+    true: httpLink({ transformer: clientTransformer, url, methodOverride: 'POST', headers }),
+    false: httpLink({ transformer: clientTransformer, url, headers }),
+  });
+}
+
+/**
+ * Module-scoped, flag-driven batch toggle. Default OFF so batching is dark until the
+ * `trpcBatching` feature flag ramps. Set from `FeatureFlagsProvider`, never on the server:
+ * in its mount/update effect, and — when `trpcBatchingFirstCommit` is on — also while it
+ * renders in the browser, so before any query in that commit is sent. Kept as a
+ * mutable module flag (not React state) because the tRPC terminating link is built once at
+ * module init and cannot read a hook; the `splitLink` condition re-reads this per operation,
+ * so a later flip takes effect on subsequent queries without rebuilding the client.
+ */
+let trpcBatchingEnabled = false;
+export function setTrpcBatchingEnabled(enabled: boolean) {
+  trpcBatchingEnabled = enabled;
+}
+/**
+ * Whether tRPC request batching is active for THIS client (the `trpcBatching` flag
+ * resolved on for this user). Read by both `shouldBatch` (link routing) and the
+ * `QueryClient` `retry` policy, so retry behavior stays coupled to the batch cohort.
+ */
+export function getTrpcBatchingEnabled() {
+  return trpcBatchingEnabled;
+}
+// Back-compat alias used by existing unit tests.
+export const __getTrpcBatchingEnabled = getTrpcBatchingEnabled;
+
+/**
+ * True ONLY when we are definitively in an authenticated browser session.
+ * `window.isAuthed` is set by `CivitaiSessionProvider` while it renders, so before any query
+ * in that commit is sent. On the server, and while the session is not yet known, this is
+ * `false` — the SAFE direction: anonymous + unknown ⇒ do NOT batch, so anonymous
+ * edge-cacheable tRPC GETs stay unbatched (no `?batch` param) and remain CF-cacheable.
+ */
+export function isAuthedBrowser() {
+  return typeof window !== 'undefined' && window.isAuthed === true;
+}
+
+/**
+ * tRPC procedure paths (`<routerKey>.<procedure>`) that are EDGE-CACHEABLE for
+ * AUTHENTICATED sessions and therefore must NEVER be batched — batching appends
+ * `?batch=1`, which `edgeCacheIt` (`src/server/middleware.trpc.ts`) refuses to cache, so
+ * batching one of these would trade an authed CF edge-hit for extra api-pool load (the
+ * opposite of the goal).
+ *
+ * IMPORTANT — this is the FULL set of procedures that apply `edgeCacheIt` and do NOT opt
+ * back out for authed sessions. Three spellings count as opting out:
+ * `noEdgeCache({ authedOnly: true })`, a blanket `noEdgeCache()`, and a `ctx.cache.skip`
+ * set from `ctx.user` in a middleware applied UPSTREAM of `edgeCacheIt` (see
+ * `model.router.ts`'s `skipEdgeCache` — `edgeCacheIt` reads `skip` before the resolver
+ * runs, so only an upstream position works).
+ *
+ * NB: `createContext` seeds `edgeTTL: 0` for logged-in users, but `edgeCacheIt` OVERWRITES
+ * it with a positive TTL (it only honors the `?batch` bail, `ctx.cache.skip` and
+ * `ctx.cache.canCache`), so the origin marks these responses cacheable for authed users too;
+ * whether the CDN stores them is its own configuration.
+ *
+ * 🔴 One exception to that last sentence, and it is subtle: `edgeCacheIt` MUTATES
+ * `ctx.cache`, while `responseMeta` reads the ROOT context and tRPC's `next({ ctx })`
+ * builds a new object. A procedure whose upstream middleware REPLACES `ctx.cache`
+ * (`cache: { ...ctx.cache }`) therefore hands `edgeCacheIt` a copy, and its TTLs never
+ * reach the header at all. `model.getAll` is the only such procedure today. Do not rely
+ * on that for safety — it is incidental, and one refactor from disappearing.
+ *
+ * 🔴 `noEdgeCache()` is ALSO inert when combined with `edgeCacheIt`, in either order:
+ * `noEdgeCache` writes before `next()` and `edgeCacheIt` writes after it, so `edgeCacheIt`
+ * wins. No procedure combines them today, so the clause above has never been exercised —
+ * if you reach for it on an `edgeCacheIt` procedure, it will not work. Use the upstream
+ * `skip` pattern instead.
+ *
+ * 🔴 Keep this in sync with the routers. `trpc-batching.test.ts` re-derives this set by
+ * parsing every `*.router.ts` and FAILS if it drifts — so adding a new `edgeCacheIt`
+ * procedure without listing it here (or without an authed `noEdgeCache`) breaks CI rather
+ * than silently starting to batch (and de-cache) it.
+ */
+export const CACHEABLE_PROCEDURES: ReadonlySet<string> = new Set([
+  'article.getCivitaiNews',
+  'article.getOfficialTag',
+  'bug.getLatest',
+  'changelog.getLatest',
+  'cosmetic.getEventDecorationsForSearch',
+  'event.getCosmeticScores',
+  'event.getDonors',
+  'event.getHatCatalog',
+  'event.getPartners',
+  'event.getRewards',
+  'event.getStandings',
+  'event.getTeamRoster',
+  'event.getTeamScoreHistory',
+  'event.getTeamScores',
+  'event.getWornHat',
+  'generation.checkResourcesCoverage',
+  'hatTurf.getStickersForImages',
+  'generation.getStatus',
+  'homeBlock.getHomeBlock',
+  'image.get404Images',
+  'image.getResources',
+
+  'modelFile.getOptions',
+  'nowPayments.getBuzzConversionRate',
+  'nowPayments.getMinAmount',
+  'nowPayments.getSupportedCurrencies',
+  'siteAlerts.getActive',
+  'system.getBenignPhrases',
+  'system.getCreationBlockedTags',
+  'system.getDbKV',
+  'system.getLiveNow',
+  'system.getUserMenuDefaultPins',
+  'tag.getFeedTagBar',
+  'tag.getHomeExcluded',
+  'technique.getAll',
+  'tool.getAll',
+  'training.getPublicStatus',
+  'training.getStatus',
+  'user.getCreator',
+]);
+
+/**
+ * Procedures excluded from batching for reasons INDEPENDENT of edge-caching — i.e. ones the
+ * router-parsing guard above can never derive.
+ *
+ * Why this set exists at all: `CACHEABLE_PROCEDURES` is re-derived from the routers by
+ * `trpc-batching.test.ts`, so anything in it must be derivable. A procedure we want unbatched
+ * for a different reason has nowhere to live in that set without corrupting the derivation —
+ * and, worse, would sit there looking derived. Two sets, two mechanisms: neither can silently
+ * disable the other.
+ *
+ * HEAVY FEED procedures — `image.getInfinite`, `image.getImagesAsPostsInfinite`,
+ * `model.getAll`, `user.getAll` — depend on being sent as their own request, under their own
+ * procedure path. A batched request names several procedures in one path, so they must not
+ * be batched.
+ *
+ * `event.getData` and `image.getGenerationData` are PENDING-CACHEABLE: their `edgeCacheIt` is
+ * commented out in the router with the intent of restoring it. They must stay unbatched
+ * anyway, because batching appends `?batch=1` and `edgeCacheIt` refuses to cache a batched
+ * request. If they started batching now, restoring the commented-out middleware would
+ * silently deliver zero edge-cache benefit — a one-line uncomment whose effect is cancelled
+ * somewhere else entirely, with nothing to point at.
+ *
+ * `image.getGenerationData` — `src/server/routers/image.router.ts` ("TODO: Add edgeCacheIt back
+ * after fixing the cache invalidation"). Also fired at feed/lightbox width, one call per image,
+ * which is precisely the fan-out shape the batch cap exists to bound.
+ *
+ * `event.getData` — `src/server/routers/event.router.ts`, `// .use(edgeCacheIt({ ttl:
+ * CacheTTL.lg }))`.
+ *
+ * 🔴 Neither of those two was ever DELIBERATELY excluded: both were on the never-batch list
+ * only because the drift guard's substring test also matched their commented-out code.
+ * Making that guard comment-aware is what surfaced them, and it would otherwise have silently
+ * started batching both. Listing them here keeps today's behaviour unchanged and gives it an
+ * actual reason — changing it is a separate decision, on evidence, not a side effect of a bug
+ * fix.
+ */
+export const NEVER_BATCH_PROCEDURES: ReadonlySet<string> = new Set([
+  'event.getData',
+  'image.getGenerationData',
+  // Heavy feed procedures — see above.
+  'image.getImagesAsPostsInfinite',
+  'image.getInfinite',
+  'model.getAll',
+  'user.getAll',
+]);
+
+/**
+ * Route an operation to the streaming batch link only when ALL hold:
+ *  - it's a `query` (mutations stay standalone — matches the historical link, and keeps
+ *    the large-mutation POST path intact),
+ *  - the `trpcBatching` flag is on for this user,
+ *  - we're in an authenticated browser (see `isAuthedBrowser` — anon stays cacheable),
+ *  - the procedure is NOT edge-cacheable for authed sessions (see `CACHEABLE_PROCEDURES`),
+ *  - the procedure is NOT excluded for a non-caching reason (see `NEVER_BATCH_PROCEDURES`),
+ *  - the procedure is NOT a block-token query (see `BLOCK_TOKEN_QUERY_PROCEDURES` — the batch link sends
+ *    queries as GET, which would put a block token in the URL),
+ *  - the caller didn't opt out via `context.skipBatch === true`,
+ *  - its encoded input fits the batch link's URL cap (`isTooLargeToBatch` — otherwise it
+ *    would trip "Input is too big for a single dispatch"; excluded ops fall to the
+ *    non-batched link, which sends them as GET or POST per `isLargeQuery`).
+ */
+export function shouldBatch(op: {
+  type: string;
+  path: string;
+  input: unknown;
+  context: Record<string, unknown>;
+}) {
+  return (
+    op.type === 'query' &&
+    trpcBatchingEnabled &&
+    isAuthedBrowser() &&
+    !CACHEABLE_PROCEDURES.has(op.path) &&
+    !NEVER_BATCH_PROCEDURES.has(op.path) &&
+    !BLOCK_TOKEN_QUERY_PROCEDURES.has(op.path) &&
+    op.context.skipBatch !== true &&
+    !isTooLargeToBatch(op)
+  );
+}
+
+/**
+ * Shared terminating link. Authenticated-browser queries (flag-gated) go out batched via
+ * `httpBatchStreamLink` (results stream as they resolve, so the fastest query in a batch
+ * isn't blocked by the slowest); everything else — anonymous traffic, mutations, large
+ * queries, and `skipBatch` opt-outs — falls through to the unbatched large-query-aware
+ * path, preserving CF edge-cache for anon GETs and the `methodOverride: 'POST'` route.
+ */
+function terminatingLink({
+  url,
+  headers,
+}: {
+  url: string;
+  headers: ReturnType<typeof getHeaders>;
+}): TRPCLink<AppRouter> {
+  return splitLink({
+    condition: shouldBatch,
+    true: splitLink({
+      // `trpcUnifiedBatchWindow`: both browser clients send through ONE batch link, so the React
+      // client's queries and the vanilla client's (the hand-rolled batchers) released by the same
+      // window share a request. Off: each client keeps its own batch link, as before.
+      condition: () => typeof window !== 'undefined' && getTrpcUnifiedBatchWindowEnabled(),
+      true: sharedBrowserBatchLink,
+      false: batchStreamLink({ url, headers }),
+    }),
+    false: httpLinkWithLargeQuerySupport({ url, headers }),
+  });
+}
+
+/**
+ * Holds batchable queries until the shared window closes (`~/utils/trpc-batch-window`), so queries
+ * started a few ms apart leave together. Everything else, and everything while the flag is off,
+ * passes straight through. Must sit after `authedCacheBypassLink`, so `shouldBatch` reads the input
+ * the terminating link will.
+ */
+export const batchWindowLink: TRPCLink<AppRouter> = () => {
+  return ({ next, op }) => {
+    if (!getTrpcUnifiedBatchWindowEnabled() || !shouldBatch(op)) return next(op);
+    return observable((observer) => {
+      let subscription: Unsubscribable | undefined;
+      let unsubscribed = false;
+      deferToBatchWindow(() => {
+        if (unsubscribed) return;
+        // A synchronous throw here would otherwise be caught by the window's own guard and the
+        // query would never settle; hand it to the caller as this operation's error instead.
+        try {
+          subscription = next(op).subscribe(observer);
+        } catch (error) {
+          observer.error(TRPCClientError.from(error as Error));
+        }
+      });
+      return () => {
+        unsubscribed = true;
+        subscription?.unsubscribe();
+      };
+    });
+  };
+};
+
+registerBatchingApplies(() => trpcBatchingEnabled && isAuthedBrowser());
+
+/**
+ * The batch link, built once for the browser on first use and shared by `trpcVanilla` and the React
+ * client. Lazy: SSR never reaches it (the split above checks `window`).
+ */
+let sharedBrowserBatchOperationLink: OperationLink<AppRouter> | undefined;
+const sharedBrowserBatchLink: TRPCLink<AppRouter> = (runtime) => {
+  return (opts) => {
+    sharedBrowserBatchOperationLink ??= batchStreamLink({ url, headers: getHeaders() })(runtime);
+    return sharedBrowserBatchOperationLink(opts);
+  };
+};
+
+function batchStreamLink({
+  url,
+  headers,
+}: {
+  url: string;
+  headers: ReturnType<typeof getHeaders>;
+}): TRPCLink<AppRouter> {
+  return httpBatchStreamLink({
+    transformer: clientTransformer,
+    url,
+    headers,
+    maxURLLength: 2083,
+    // Mirror the server's `maxBatchSize` default (`src/pages/api/trpc/[trpc].ts`) from the
+    // SAME constant. tRPC requires the client limit be <= the server's: without this the
+    // browser could coalesce more operations than the server accepts and 400 itself, failing
+    // every query in the batch. With it, the link's dataloader SPLITS an over-wide fan-out
+    // into several <=cap requests instead — `groupItems` starts a new group whenever
+    // `validate` rejects, and only ever rejects a lone operation, which can't happen here
+    // (one op is always <= the cap).
+    //
+    // ⚠️ DEFENCE IN DEPTH, not the primary bound. `maxURLLength: 2083` above already binds
+    // the fan-out shapes this app actually emits — the two `useQueries` sites reach the URL
+    // cap at 22–29 operations, i.e. BELOW `maxItems`, so today the URL budget is what splits
+    // them and this line never fires. It becomes load-bearing for short-path, no-input
+    // procedures (≈147 ops fit under the URL cap) and after the `trpcBatching` flag ramps
+    // past its current mod-only audience.
+    //
+    // 🔴 The server cap is env-overridable and this one is not (a browser bundle cannot read
+    // server env), so the two can diverge. Raising the server's is safe; lowering it below
+    // this constant means an already-loaded bundle can build a batch the server rejects.
+    maxItems: TRPC_MAX_BATCH_SIZE,
+  });
+}
+const headers: RequestHeaders = {
+  'x-client-version': process.env.version,
+  'x-client-date': Date.now().toString(),
+  'x-client': 'web',
+};
+
+/**
+ * Shared QueryClient config. Used by both the per-request server `QueryClient`
+ * (created by `@trpc/next` via `queryClientConfig` below) and the singleton
+ * browser `QueryClient` returned by `getQueryClient()` for callsites that
+ * import `queryClient` directly.
+ */
+/**
+ * Query retry policy.
+ *
+ * Dark path (batching flag OFF): `failureCount < 1` == exactly one retry — byte-for-byte
+ * the prior `retry: 1` behavior for every non-batched user.
+ *
+ * Batch cohort (flag ON): 0 retries. A batch transport failure (e.g. a 5xx on the single
+ * coalesced HTTP request) fails ALL N queries in that batch at once; with `retry: 1` that
+ * would fire N simultaneous retries — a thundering herd on the event-loop-bound api pool
+ * during the exact incident the retry was meant to smooth. Suppressing retries for the
+ * batch cohort keeps a batch failure to a single in-flight request. Reverts with the flag.
+ *
+ * Scope: `defaultOptions.queries` only — mutations (which never batch) keep React Query's
+ * own default (0 query-retries), so this does not change mutation behavior.
+ */
+export function queryRetry(failureCount: number, _error: unknown): boolean {
+  if (getTrpcBatchingEnabled()) return false;
+  return failureCount < 1;
+}
+
+const queryClientConfig: QueryClientConfig = {
+  defaultOptions: {
+    queries: {
+      refetchOnWindowFocus: false,
+      retry: queryRetry,
+      staleTime: Infinity,
+    },
+  },
+};
+
+/**
+ * Per-request QueryClient for SSR: every query on it gets `gcTime: Infinity`, overriding any
+ * per-query value.
+ *
+ * Why: query-core skips the GC timer for a server query only when it falls back to its DEFAULT
+ * gcTime (Infinity on the server). An explicit per-query `gcTime` (e.g. `ModelTensorMetadata`'s
+ * 30 min) wins over that default, and the `Query` constructor calls `scheduleGc()` even for a
+ * disabled query. The timer's closure holds the Query, which holds this client and its whole
+ * cache — so one render of such a component pinned the render's entire QueryCache for the
+ * gcTime. A production SSR heap snapshot held ~700 such caches (~100 MB) on one pod.
+ *
+ * With `gcTime: Infinity` no timer is ever scheduled, so the client is collectable as soon as the
+ * render that created it is done. Nothing is lost: a server-side client lives for one render and
+ * is never reused. Server-only — the browser keeps plain `QueryClient`, where per-query gcTime is
+ * the real cache-eviction policy.
+ *
+ * All query building (`useQuery`, `fetchQuery`, `ensureQueryData`, `hydrate`) passes through
+ * `QueryCache.build` → `client.defaultQueryOptions`, so this one override covers every path.
+ */
+class ServerQueryClient extends QueryClient {
+  override defaultQueryOptions<
+    TQueryFnData = unknown,
+    TError = DefaultError,
+    TData = TQueryFnData,
+    TQueryData = TQueryFnData,
+    TQueryKey extends QueryKey = QueryKey,
+    TPageParam = never
+  >(
+    options:
+      | QueryObserverOptions<TQueryFnData, TError, TData, TQueryData, TQueryKey, TPageParam>
+      | DefaultedQueryObserverOptions<TQueryFnData, TError, TData, TQueryData, TQueryKey>
+  ): DefaultedQueryObserverOptions<TQueryFnData, TError, TData, TQueryData, TQueryKey> {
+    const defaulted = super.defaultQueryOptions(options);
+    return defaulted.gcTime === Infinity ? defaulted : { ...defaulted, gcTime: Infinity };
+  }
+}
+
+/**
+ * Browser-only QueryClient singleton.
+ *
+ * IMPORTANT: never construct this at module scope. Doing so on the server
+ * means every SSR request shares one `QueryCache`, which only ever grows.
+ * A heap snapshot from civitai-dp-prod on 2026-05-14 found 11,962 retained
+ * `Query` objects on a single pod traceable to a module-scope `QueryClient`.
+ *
+ * Callsites that import { queryClient } from this module run only in the
+ * browser (mutation `onSuccess` callbacks, event handlers, `useEffect`).
+ * Touching this on the server will throw to prevent the leak from coming back.
+ */
+let browserQueryClient: QueryClient | undefined;
+function getBrowserQueryClient(): QueryClient {
+  if (typeof window === 'undefined') {
+    throw new Error(
+      '[trpc] queryClient was accessed on the server. Use `useQueryClient()` ' +
+        'inside a component — on the server tRPC builds a fresh per-request ' +
+        'QueryClient (see `ServerQueryClient`).'
+    );
+  }
+  if (!browserQueryClient) browserQueryClient = new QueryClient(queryClientConfig);
+  return browserQueryClient;
+}
+
+/**
+ * Proxy preserves the existing `import { queryClient } from '~/utils/trpc'`
+ * call sites without forcing them to call a function. Property access is
+ * lazy, so the singleton is only created when first touched in the browser.
+ */
+export const queryClient: QueryClient = new Proxy({} as QueryClient, {
+  get(_target, prop, receiver) {
+    const client = getBrowserQueryClient();
+    const value = Reflect.get(client, prop, receiver);
+    return typeof value === 'function' ? value.bind(client) : value;
+  },
+});
+
+export const authedCacheBypassLink: TRPCLink<AppRouter> = () => {
+  return ({ next, op }) => {
+    const isAuthed = typeof window !== 'undefined' ? window.isAuthed : false;
+    const authed = removeEmpty({ authed: isAuthed || undefined });
+    // Spreading into an ARRAY input would turn `[x]` into `{ 0: x, authed: true }`
+    // and corrupt it (e.g. a mutation typed `z.array(...)`), so array inputs pass
+    // through untouched — they just don't get the authed cache-key (fine:
+    // mutations aren't cached). Object/undefined inputs keep the existing merge.
+    const input = Array.isArray(op.input) ? op.input : { ...(op.input as any), ...authed };
+
+    return next({ ...op, input });
+  };
+};
+
+/**
+ * Get headers for each request
+ * @see https://trpc.io/docs/v10/client/headers
+ */
+function getHeaders(ctx?: NextPageContext) {
+  return function () {
+    return { ...ctx?.req?.headers, ...headers, ...pageRouteHeaders() };
+  };
+}
+
+export const trpcVanilla: CreateTRPCClient<AppRouter> = createTRPCClient<AppRouter>({
+  links: [
+    authedCacheBypassLink,
+    loggerLink({
+      enabled: (opts) =>
+        (isDev && env.NEXT_PUBLIC_LOG_TRPC) ||
+        (opts.direction === 'down' && opts.result instanceof Error),
+    }),
+    batchWindowLink,
+    terminatingLink({ url, headers: getHeaders() }),
+  ],
+});
+
+export const trpc: CreateTRPCNext<AppRouter, NextPageContext> = createTRPCNext<AppRouter>({
+  config(opts) {
+    const { ctx } = opts;
+    const isClient = typeof window !== 'undefined';
+
+    return {
+      // On the browser, reuse the same singleton `QueryClient` that direct
+      // `import { queryClient }` callsites read/write — otherwise their
+      // `setQueriesData`/`cancelQueries` would target a different cache than
+      // the one `useQuery` hooks subscribe to.
+      //
+      // On the server, build a FRESH client per call: `withTRPC` calls `config()` once per
+      // render (in a `useState` initializer), so this is one client per request — the prior
+      // module-scope singleton accumulated 11,962 `Query` objects per pod (heap snapshot,
+      // civitai-dp-prod, 2026-05-14). It is a `ServerQueryClient` so no query on it can
+      // schedule a GC timer that keeps the request's cache alive after the render.
+      ...(isClient
+        ? { queryClient: getBrowserQueryClient() }
+        : { queryClient: new ServerQueryClient(queryClientConfig) }),
+      links: [
+        authedCacheBypassLink,
+        loggerLink({
+          enabled: (opts) =>
+            (isDev && env.NEXT_PUBLIC_LOG_TRPC) ||
+            (opts.direction === 'down' && opts.result instanceof Error),
+        }),
+        batchWindowLink,
+        terminatingLink({
+          url: isClient ? url : `${env.NEXT_PUBLIC_BASE_URL as string}${url}`,
+          headers: getHeaders(ctx),
+        }),
+      ],
+    };
+  },
+  // v11: `createTRPCNext` requires the transformer at the top level of its options
+  // (WithTRPCOptions intersects TransformerOptions). The link carries it too for the
+  // actual wire (de)serialization. Phase 2 CLIENT: union READ, superjson WRITE (the
+  // per-pool devalue write flip is SERVER-only — see trpc-union-transformer.ts).
+  transformer: clientTransformer,
+  ssr: false,
+});
+
+export const handleTRPCError = (
+  error: any,
+  message = 'There was an error while performing your request'
+) => {
+  try {
+    // If failed in the FE - TRPC error is a JSON string that contains an array of errors.
+    const parsedError = JSON.parse(error.message);
+    showErrorNotification({
+      title: message,
+      error: parsedError,
+    });
+  } catch (e) {
+    // Report old error as is:
+    showErrorNotification({
+      title: message,
+      error: new Error(error.message),
+    });
+  }
+};

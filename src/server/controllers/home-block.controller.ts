@@ -1,0 +1,392 @@
+import type { Context, ProtectedContext } from '~/server/createContext';
+import { coverageAudience } from '~/server/services/generation/coverage-source';
+import {
+  throwAuthorizationError,
+  throwDbError,
+  throwNotFoundError,
+} from '~/server/utils/errorHandling';
+import type { HomeBlockWithData } from '~/server/services/home-block.service';
+import {
+  acknowledgeFeaturedCollection,
+  addCollectionToFeaturedPool,
+  deleteHomeBlockById,
+  getFeaturedCollectionsPool,
+  getHomeBlockById,
+  getHomeBlockData,
+  getHomeBlocks,
+  getSystemHomeBlocks,
+  removeCollectionFromFeaturedPool,
+  setHomeBlocksOrder,
+  upsertHomeBlock,
+} from '~/server/services/home-block.service';
+import { filterViewableHomeBlocks, isHomeBlockGated } from '~/server/services/home-block-access';
+import { homeBlockCacheBust } from '~/server/services/home-block-cache.service';
+import { getFeaturedCollectionsState } from '~/server/jobs/refresh-featured-collections-eligibility';
+import { dbRead } from '~/server/db/client';
+import {
+  getCollectionById,
+  getUserCollectionPermissionsById,
+} from '~/server/services/collection.service';
+import type {
+  CreateCollectionHomeBlockInputSchema,
+  GetHomeBlockByIdInputSchema,
+  GetHomeBlocksInputSchema,
+  GetSystemHomeBlocksInputSchema,
+  HomeBlockMetaSchema,
+  SetHomeBlocksOrderInputSchema,
+  ToggleFeaturedCollectionInputSchema,
+} from '~/server/schema/home-block.schema';
+import { HomeBlockType } from '~/shared/utils/prisma/enums';
+import type { GetByIdInput, UserPreferencesInput } from '~/server/schema/base.schema';
+import { TRPCError } from '@trpc/server';
+import { isDefined } from '~/utils/type-guards';
+
+export const getHomeBlocksHandler = async ({
+  ctx,
+  input,
+}: {
+  ctx: Context;
+  input: GetHomeBlocksInputSchema;
+}): Promise<HomeBlockWithData[]> => {
+  const { ownedOnly, excludedSystemHomeBlockIds = [], systemHomeBlockIds } = input;
+
+  try {
+    const _homeBlocks = await getHomeBlocks({
+      userId: ctx.user?.id,
+      ownedOnly,
+      includeSource: true,
+      viewer: ctx.user,
+    });
+
+    let homeBlocks = _homeBlocks.filter((homeBlock) => {
+      if ((excludedSystemHomeBlockIds ?? []).includes(homeBlock.id)) {
+        return false;
+      }
+
+      if ((systemHomeBlockIds ?? []).length === 0) {
+        return true; // Always allow.
+      }
+
+      // Now check if it's a system home block and the domain allows to show it:
+      if (homeBlock.userId === -1 || ('source' in homeBlock && homeBlock.source?.userId === -1)) {
+        return (systemHomeBlockIds ?? []).includes(homeBlock.id);
+      }
+
+      return true;
+    });
+
+    // User might be on a diff. domain that doesn't allow their blocks and we should be able to figure this one out on our end:
+    if (homeBlocks.length === 0 && systemHomeBlockIds) {
+      homeBlocks = await getHomeBlocks({
+        ids: systemHomeBlockIds,
+        includeSource: true,
+        viewer: ctx.user,
+      });
+    }
+
+    if (input.withCoreData) {
+      const coverage = await coverageAudience(ctx.user ?? undefined);
+      // Get the core data for each home block:
+      const homeBlocksWithData = await Promise.all(
+        homeBlocks.map((homeBlock) => {
+          return getHomeBlockData({ homeBlock, user: ctx.user, input, coverage });
+        })
+      );
+
+      return homeBlocksWithData.filter(isDefined);
+    }
+
+    return homeBlocks.map((homeBlock) => ({
+      ...homeBlock,
+      metadata: homeBlock.metadata as HomeBlockMetaSchema,
+    }));
+  } catch (error) {
+    throw throwDbError(error);
+  }
+};
+
+export const getSystemHomeBlocksHandler = async ({
+  input,
+  ctx,
+}: {
+  input: GetSystemHomeBlocksInputSchema;
+  ctx: Context;
+}): Promise<HomeBlockWithData[]> => {
+  try {
+    const { excludedSystemHomeBlockIds, systemHomeBlockIds } = input;
+    const _homeBlocks = await filterViewableHomeBlocks(
+      await getSystemHomeBlocks({ input }),
+      ctx.user
+    );
+
+    const homeBlocks = _homeBlocks.filter((homeBlock) => {
+      if ((excludedSystemHomeBlockIds ?? []).includes(homeBlock.id)) {
+        return false;
+      }
+
+      if ((systemHomeBlockIds ?? []).length === 0) {
+        return true; // Always allow.
+      }
+
+      // Now check if it's a system home block and the domain allows to show it:
+      return (systemHomeBlockIds ?? []).includes(homeBlock.id);
+    });
+    return homeBlocks.map((homeBlock) => ({
+      ...homeBlock,
+      metadata: homeBlock.metadata as HomeBlockMetaSchema,
+    }));
+  } catch (error) {
+    throw throwDbError(error);
+  }
+};
+
+export const getHomeBlocksByIdHandler = async ({
+  ctx,
+  input,
+}: {
+  ctx: Context;
+  input: GetHomeBlockByIdInputSchema & UserPreferencesInput;
+}): Promise<HomeBlockWithData> => {
+  try {
+    const homeBlock = await getHomeBlockById({
+      ...input,
+      viewer: ctx.user,
+    });
+
+    // `&& ctx.cache` because `ctx.cache` really is null on the SSG prefetch path —
+    // `createServerSideHelpers` builds the context with `cache: null as any`
+    // (`~/server/utils/server-side-helpers.ts`), and that `as any` is why `strict: true`
+    // does not flag the unguarded form. Today only `getHomeBlocks` (the list) is
+    // prefetched (`src/pages/index.tsx`), so this line is not reachable from there and
+    // the guard is precautionary; it is here so that reachability stops being the thing
+    // holding it up.
+    //
+    // Sibling writers of `ctx.cache` from inside a resolver are INCONSISTENT about this,
+    // so do not take any single one as the convention: `system.router.getBenignPhrases`
+    // and `model.controller.getModelsPagedSimpleHandler` both guard, while
+    // `model.controller.getModelsInfiniteHandler` does not.
+    if (
+      homeBlock &&
+      (homeBlock.type === HomeBlockType.Announcement || isHomeBlockGated(homeBlock)) &&
+      ctx.cache
+    )
+      ctx.cache.skip = true;
+
+    if (!homeBlock) {
+      throw throwNotFoundError('Home block not found');
+    }
+
+    return homeBlock;
+  } catch (error) {
+    throw throwDbError(error);
+  }
+};
+
+export const createCollectionHomeBlockHandler = async ({
+  ctx,
+  input,
+}: {
+  ctx: ProtectedContext;
+  input: CreateCollectionHomeBlockInputSchema;
+}) => {
+  const collection = await getCollectionById({ input: { id: input.collectionId } });
+
+  if (!collection) {
+    throw throwNotFoundError('Collection not found');
+  }
+
+  const permission = await getUserCollectionPermissionsById({
+    id: collection.id,
+    isModerator: ctx.user.isModerator,
+    userId: ctx.user.id,
+  });
+
+  if (!permission.read) {
+    throw throwAuthorizationError('You do not have permission to view this collection');
+  }
+
+  const metadata: HomeBlockMetaSchema = {
+    collection: {
+      id: collection.id,
+      // Right now this is the standard.
+      limit: 8,
+      rows: 2,
+    },
+  };
+
+  await upsertHomeBlock({
+    input: {
+      type: HomeBlockType.Collection,
+      metadata,
+      userId: ctx.user.id,
+      isModerator: ctx.user.isModerator,
+    },
+  });
+};
+
+export const deleteUserHomeBlockHandler = async ({
+  input,
+  ctx,
+}: {
+  input: GetByIdInput;
+  ctx: ProtectedContext;
+}) => {
+  const { id: userId, isModerator } = ctx.user;
+
+  try {
+    const homeBlock = await getHomeBlockById({ ...input, viewer: ctx.user });
+    if (!homeBlock) throw throwNotFoundError(`No home block with id ${input.id}`);
+
+    if (!isModerator && homeBlock.userId !== userId) throw throwAuthorizationError();
+
+    const deleted = await deleteHomeBlockById({
+      input: { ...input, userId: ctx.user.id, isModerator: ctx.user.isModerator },
+    });
+
+    return deleted;
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const setHomeBlocksOrderHandler = async ({
+  ctx,
+  input,
+}: {
+  ctx: ProtectedContext;
+  input: SetHomeBlocksOrderInputSchema;
+}) => {
+  try {
+    await setHomeBlocksOrder({ input: { ...input, userId: ctx.user.id }, viewer: ctx.user });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const getFeaturedCollectionsPoolHandler = async () => {
+  try {
+    const pool = await getFeaturedCollectionsPool();
+    const state = await getFeaturedCollectionsState();
+    if (pool.collectionIds.length === 0) {
+      return {
+        homeBlockId: pool.homeBlockId,
+        collections: [],
+        stateComputedAt: state?.computedAt ?? null,
+      };
+    }
+    const collections = await dbRead.collection.findMany({
+      where: { id: { in: pool.collectionIds } },
+      select: {
+        id: true,
+        name: true,
+        nsfwLevel: true,
+        type: true,
+        write: true,
+        image: { select: { id: true, url: true, nsfwLevel: true } },
+        user: { select: { id: true, username: true } },
+        _count: { select: { items: true } },
+      },
+    });
+    const nameSnapshots = pool.metadata.featuredCollections?.nameSnapshots ?? {};
+    const writeSnapshots = pool.metadata.featuredCollections?.writeSnapshots ?? {};
+    const byId = new Map(collections.map((c) => [c.id, c]));
+    const ordered = pool.collectionIds.map((id) => {
+      const c = byId.get(id);
+      const entry = state?.perCollection[id];
+      if (!c) {
+        // Ghost entry â€” collection deleted or no longer accessible. Surface it so mods can
+        // remove the dangling id from the pool. `missing: true` is the UI's cue.
+        return {
+          id,
+          name: nameSnapshots[id] ?? `Collection ${id}`,
+          nsfwLevel: 0,
+          type: null,
+          write: null,
+          image: null,
+          user: { id: -1, username: null },
+          _count: { items: 0 },
+          approvedName: nameSnapshots[id] ?? null,
+          approvedWrite: writeSnapshots[id] ?? null,
+          recentCount: 0,
+          lastAcceptedAt: null,
+          nameChanged: false,
+          writeChanged: false,
+          eligible: false,
+          missing: true as const,
+        };
+      }
+      return {
+        ...c,
+        approvedName: nameSnapshots[id] ?? c.name,
+        approvedWrite: writeSnapshots[id] ?? c.write,
+        recentCount: entry?.recentCount ?? 0,
+        lastAcceptedAt: entry?.lastAcceptedAt ?? null,
+        nameChanged: entry?.nameChanged ?? false,
+        writeChanged: entry?.writeChanged ?? false,
+        eligible: entry?.eligible ?? false,
+        missing: false as const,
+      };
+    });
+    return {
+      homeBlockId: pool.homeBlockId,
+      collections: ordered,
+      stateComputedAt: state?.computedAt ?? null,
+    };
+  } catch (error) {
+    throw throwDbError(error);
+  }
+};
+
+async function bustFeaturedCollectionsCache(homeBlockId: number) {
+  await homeBlockCacheBust(HomeBlockType.FeaturedCollections, homeBlockId);
+}
+
+export const addCollectionToFeaturedPoolHandler = async ({
+  input,
+}: {
+  ctx: ProtectedContext;
+  input: ToggleFeaturedCollectionInputSchema;
+}) => {
+  try {
+    const result = await addCollectionToFeaturedPool({ collectionId: input.collectionId });
+    await bustFeaturedCollectionsCache(result.homeBlockId);
+    return result;
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const removeCollectionFromFeaturedPoolHandler = async ({
+  input,
+}: {
+  ctx: ProtectedContext;
+  input: ToggleFeaturedCollectionInputSchema;
+}) => {
+  try {
+    const result = await removeCollectionFromFeaturedPool({ collectionId: input.collectionId });
+    await bustFeaturedCollectionsCache(result.homeBlockId);
+    return result;
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};
+
+export const acknowledgeFeaturedCollectionHandler = async ({
+  input,
+}: {
+  ctx: ProtectedContext;
+  input: ToggleFeaturedCollectionInputSchema;
+}) => {
+  try {
+    const result = await acknowledgeFeaturedCollection({ collectionId: input.collectionId });
+    await bustFeaturedCollectionsCache(result.homeBlockId);
+    return result;
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    else throw throwDbError(error);
+  }
+};

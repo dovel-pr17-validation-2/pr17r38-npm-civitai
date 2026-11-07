@@ -1,0 +1,94 @@
+import type { TagType } from '~/shared/utils/prisma/enums';
+import { useUpdateHiddenPreferences, useHiddenPreferencesData } from '~/hooks/hidden-preferences';
+import type { VotableTagModel } from '~/libs/tags';
+import { trpc } from '~/utils/trpc';
+import produce from 'immer';
+import { useVotableTagStore } from '~/components/VotableTags/VotableTag';
+
+const defaultVotable: Partial<VotableTagModel> = {
+  id: 0,
+  vote: 1,
+  score: 1,
+  upVotes: 1,
+  downVotes: 0,
+};
+
+type TagVoteTarget = {
+  entityId: number;
+  entityType: 'image' | 'model';
+};
+
+type TagVote = {
+  tags: string[];
+  vote: number;
+  tagType?: TagType;
+};
+
+/** Shows tag votes in the client caches without sending them; for votes the server already has. */
+export const useApplyTagVotes = ({ entityId, entityType }: TagVoteTarget) => {
+  const queryUtils = trpc.useUtils();
+  const updateHiddenPreferences = useUpdateHiddenPreferences();
+  const { hiddenTags } = useHiddenPreferencesData();
+  const setVote = useVotableTagStore((state) => state.setVote);
+
+  const handleTagMutation = (changedTags: string[], vote: number, tagType: TagType) => {
+    const preppedTags = changedTags.map(
+      (tag) =>
+        ({
+          ...defaultVotable,
+          name: tag,
+          type: tagType,
+          vote,
+        } as VotableTagModel)
+    );
+
+    queryUtils.tag.getVotableTags.setData(
+      { id: entityId, type: entityType },
+      produce((old: VotableTagModel[] | undefined) => {
+        if (!old) return;
+        for (const tag of preppedTags) {
+          const existingIndex = old.findIndex((x) => x.name === tag.name);
+          if (existingIndex !== -1) {
+            const existing = old[existingIndex];
+            if (existing.id === 0 && vote <= 0) {
+              old.splice(existingIndex, 1);
+            } else {
+              setVote({ entityId, entityType, name: tag.name, vote });
+              existing.vote = vote;
+            }
+          } else {
+            old.push(tag);
+            setVote({ entityId, entityType, name: tag.name, vote });
+          }
+        }
+      })
+    );
+  };
+
+  const applyVote = ({ tags, vote, tagType = 'UserGenerated' }: TagVote) => {
+    handleTagMutation(tags, vote, tagType);
+    if (
+      entityType === 'image' &&
+      hiddenTags.filter((x) => x.hidden).some((x) => tags.includes(x.name))
+    ) {
+      updateHiddenPreferences({ kind: entityType, data: [{ id: entityId }], hidden: vote > 0 });
+    }
+  };
+
+  return applyVote;
+};
+
+export const useVoteForTags = ({ entityId, entityType }: TagVoteTarget) => {
+  const applyVote = useApplyTagVotes({ entityId, entityType });
+  const { mutate: addVotes } = trpc.tag.addTagVotes.useMutation();
+  const { mutate: removeVotes } = trpc.tag.removeTagVotes.useMutation();
+
+  const handleVote = (tagVote: TagVote) => {
+    const { tags, vote } = tagVote;
+    if (vote === 0) removeVotes({ tags, type: entityType, id: entityId });
+    else addVotes({ tags, vote, type: entityType, id: entityId });
+    applyVote(tagVote);
+  };
+
+  return handleVote;
+};

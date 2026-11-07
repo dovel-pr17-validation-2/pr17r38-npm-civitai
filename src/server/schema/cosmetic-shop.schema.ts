@@ -1,0 +1,321 @@
+import { CosmeticSource, CosmeticType } from '~/shared/utils/prisma/enums';
+import * as z from 'zod';
+import { paginationSchema } from '~/server/schema/base.schema';
+import { comfylessImageSchema } from '~/server/schema/image.schema';
+import { getSanitizedStringSchema } from '~/server/schema/utils.schema';
+import { eventTagSchema, eventTagsSchema } from '~/server/schema/event-tag.schema';
+
+export type GetPaginatedCosmeticShopItemInput = z.infer<typeof getPaginatedCosmeticShopItemInput>;
+export const getPaginatedCosmeticShopItemInput = paginationSchema.merge(
+  z.object({
+    limit: z.coerce.number().min(1).max(200).default(60),
+    name: z.string().optional(),
+    types: z.array(z.enum(CosmeticType)).optional(),
+    minPrice: z.number().optional(),
+    maxPrice: z.number().optional(),
+    // Tri-state archived filter: `false` hides archived listings (the
+    // section-items picker — archived cosmetics can't be sold, so they must not
+    // be featurable), `true` shows only archived, `undefined` shows all (the
+    // moderator store management list).
+    archived: z.boolean().optional(),
+    publishedCreatorOnly: z.boolean().optional(),
+    ids: z.array(z.number()).optional(),
+  })
+);
+
+export const shopItemsFeaturedHistoryInput = z.object({
+  ids: z.array(z.number().int().positive()).max(200),
+});
+
+// Shop context for purchases: the official Civitai shop attributes as the
+// system user (-1); creator storefronts attribute as their owner's user id.
+export const CIVITAI_SHOP_ATTRIBUTION = -1;
+
+// One field a creator edit moved. Values are pre-formatted for display (Buzz
+// amounts stay numeric so the UI can group them) and absent when the field was
+// cleared or was never set.
+export type CosmeticShopItemHistoryChange = z.infer<typeof cosmeticShopItemHistoryChange>;
+export const cosmeticShopItemHistoryChange = z.object({
+  field: z.string(),
+  from: z.union([z.string(), z.number()]).nullish(),
+  to: z.union([z.string(), z.number()]).nullish(),
+});
+
+export type CosmeticShopItemHistoryEntry = z.infer<typeof cosmeticShopItemHistoryEntry>;
+export const cosmeticShopItemHistoryEntry = z.object({
+  at: z.string(),
+  userId: z.number(),
+  kind: z.enum(['submitted', 'edited', 'reviewed', 'takedown', 'refunded']),
+  // Status the item landed in after this event.
+  status: z.string().optional(),
+  // Review verdict for `reviewed` entries: approve | reject | request-changes | revert.
+  action: z.string().optional(),
+  note: z.string().optional(),
+  changes: z.array(cosmeticShopItemHistoryChange).optional(),
+});
+
+const withdrawnRefundTerms = z.object({
+  trigger: z.enum(['reject', 'archive', 'manual']),
+  clawback: z.boolean(),
+  userId: z.number(),
+  at: z.string(),
+});
+
+export type CosmeticShopItemMeta = z.infer<typeof cosmeticShopItemMeta>;
+export const cosmeticShopItemMeta = z.object({
+  paidToUserIds: z.array(z.number()).optional(),
+  purchases: z.number().default(0),
+  // Creator Shop: id of the creator who submitted this item (also drives payout),
+  // the Buzz submission-fee transaction, and the last moderator-approved price
+  // used to decide whether a price edit (>±25%) requires re-review.
+  creatorId: z.number().optional(),
+  submissionTxId: z.string().optional(),
+  // Buzz actually charged at submission. Recorded because the fee is operator-tunable,
+  // so today's configured value is not what an older item paid.
+  submissionFee: z.number().optional(),
+  lastApprovedAmount: z.number().optional(),
+  // Whether holders may wear the item while it is not Published: set by every verdict, cleared by a
+  // creator edit to what holders see. Kept here because `history` is capped and loses old verdicts.
+  displayApproved: z.boolean().optional(),
+  // Pre-submit artwork validation + image info, surfaced to moderators in the
+  // Creator Shop review queue.
+  autoChecks: z
+    .array(
+      z.object({
+        key: z.string(),
+        label: z.string(),
+        passed: z.boolean(),
+        detail: z.string().optional(),
+      })
+    )
+    .optional(),
+  imageMeta: z
+    .object({ width: z.number(), height: z.number(), hasTransparency: z.boolean() })
+    .optional(),
+  // sha256 of the submitted artwork bytes — used to block duplicate submissions.
+  imageHash: z.string().optional(),
+  // Packs only. A pack has no Cosmetic of its own, so its cover art and size
+  // live here rather than in `Cosmetic.data`.
+  coverUrl: z.string().optional(),
+  // Artwork of the first few members, for packs with no cover of their own.
+  // Snapshotted rather than joined so a storefront card can render it from meta
+  // alone; re-taken whenever the contents change.
+  coverTiles: z.array(z.string()).optional(),
+  // Authoritative, not a render convenience: the build-time member count a sale
+  // is checked against (`packMembersMissing`). The join rows can't serve, since
+  // deleting a member Cosmetic deletes its row. A pack without it can't be sold.
+  packMemberCount: z.number().optional(),
+  // Cross-creator selling: whether other creators may resell this item, and the %
+  // of price (0-70, out of the creator's 70% pool) the reseller keeps.
+  sellableByOthers: z.boolean().optional(),
+  sellerShare: z.number().optional(),
+  // Creator opt-in: buyers may pay with Blue Buzz (fully or partially). The
+  // creator is paid blue for the blue-paid portion of each sale.
+  acceptsBlueBuzz: z.boolean().optional(),
+  // Creator Shop: who affirmed they hold the rights to sell this artwork, when,
+  // and the exact wording they accepted. Re-recorded whenever the artwork is
+  // replaced, so it always describes the art currently on the item. Absent on
+  // official items and on creator items submitted before this was required.
+  rightsAffirmation: z
+    .object({
+      userId: z.number(),
+      affirmedAt: z.string(),
+      version: z.number(),
+      statement: z.string(),
+    })
+    .optional(),
+  // Set by a moderator takedown (IP/TOS). An item carrying this was pulled and
+  // refunded — it must never be restored to sale by unarchiving.
+  takedown: z
+    .object({
+      reason: z.string(),
+      moderatorId: z.number(),
+      at: z.string(),
+    })
+    .optional(),
+  // Set when a moderator rejects the item or it is archived while withheld: purchases made up to
+  // `at` that are still unrefunded get refunded and the creator's payouts reversed. Both writers
+  // set `clawback: true`; a manual refund stamps the same terms on the purchase row only, with
+  // `clawback` chosen by the moderator. The terms stay explicit because they are copied onto
+  // purchase rows and finished as stored. The withdrawn-refund job retries from it; approval and
+  // restore clear it.
+  withdrawnRefund: withdrawnRefundTerms.optional(),
+  // Append-only (capped) log of submissions, creator edits, review verdicts and
+  // takedowns, so a re-review can see what changed and what was decided before.
+  // Absent on items that predate it — the UI shows an empty state rather than
+  // implying nothing ever happened.
+  history: z.array(cosmeticShopItemHistoryEntry).optional(),
+});
+
+// Recorded on UserCosmeticShopPurchases.meta at purchase time. The 70% pool can
+// be split with a reseller (or kept by the platform) depending on the storefront
+// the sale came through, and that context is gone by the time a takedown runs —
+// so a takedown reverses these exact payouts instead of guessing. NULL on rows
+// written before the column existed.
+export type CosmeticPurchaseMeta = z.infer<typeof cosmeticPurchaseMeta>;
+export const cosmeticPurchaseMeta = z.object({
+  payouts: z
+    .array(
+      z.object({
+        userId: z.number(),
+        amount: z.number(),
+        color: z.string(),
+        // The Buzz transaction that paid it, so a takedown refunds that payout
+        // instead of charging the recipient a separate reversal.
+        transactionId: z.string().optional(),
+      })
+    )
+    .optional(),
+  // Kept by the platform (no recipient), so nothing to claw back — recorded for
+  // the takedown summary and for reconciliation.
+  platformCut: z.number().optional(),
+  // Stamped before a withdrawn-item refund moves any money for this purchase: the terms it is
+  // finished on, even if the item's own marker is cleared before it is.
+  withdrawnRefund: withdrawnRefundTerms.optional(),
+  // A box purchase whose draw a takedown revoked: flagged refunded when claimed, with the Buzz owed
+  // until `paidAt`. A re-run of that takedown pays any still owed.
+  takedownRefund: z
+    .object({ shopItemId: z.number(), at: z.string(), paidAt: z.string().optional() })
+    .optional(),
+});
+
+export type UpsertCosmeticInput = z.infer<typeof upsertCosmeticInput>;
+export const upsertCosmeticInput = z
+  .object({
+    id: z.number().optional(),
+    videoUrl: z.string().nullish(),
+    // Fields below are required when creating a new cosmetic (no id provided)
+    name: z.string().min(1).optional(),
+    description: getSanitizedStringSchema().nullish(),
+    type: z.enum(CosmeticType).optional(),
+    source: z.enum(CosmeticSource).optional(),
+    permanentUnlock: z.boolean().optional(),
+    // Cosmetic-specific config — for image-based types this carries
+    // { url, animated?, type? }; NamePlate carries text styling. Free-form so
+    // moderators can author types we haven't built UI for yet.
+    data: z.record(z.string(), z.unknown()).optional(),
+  })
+  .refine((value) => value.id != null || (value.name && value.type && value.source), {
+    message: 'name, type, and source are required when creating a new cosmetic',
+    path: ['name'],
+  });
+
+export type UpsertCosmeticShopItemInput = z.infer<typeof upsertCosmeticShopItemInput>;
+export const upsertCosmeticShopItemInput = z.object({
+  id: z.number().optional(),
+  title: z.string().max(255),
+  // Only the SHOP ITEM opts in. `upsertCosmeticInput` and `upsertCosmeticShopSectionInput`
+  // carry a description too, and neither reconciles references — a span stored there would be
+  // frozen text that never updates.
+  description: getSanitizedStringSchema({ allowBlurbs: true }).nullish(),
+  videoUrl: z.string().nullish(),
+  cosmeticId: z.number(),
+  unitAmount: z.number(),
+  availableFrom: z.date().nullish(),
+  availableTo: z.date().nullish(),
+  availableQuantity: z.number().nullish(),
+  archived: z.boolean().optional(),
+  meta: cosmeticShopItemMeta.optional(),
+  addToSectionIds: z.array(z.number()).optional(),
+});
+
+export type GetAllCosmeticShopSections = z.infer<typeof getAllCosmeticShopSections>;
+export const getAllCosmeticShopSections = z.object({
+  title: z.string().optional(),
+  withItems: z.boolean().optional(),
+  archived: z.boolean().optional(),
+});
+
+export type CosmeticShopSectionMeta = z.infer<typeof cosmeticShopSectionMeta>;
+export const cosmeticShopSectionMeta = z.object({
+  hideTitle: z.boolean().optional(),
+  availableItemsMax: z.number().optional(),
+  // Renders the sitewide community-cosmetics feed in place of hand-picked
+  // items, so mods control the hub's placement/banner/copy like any section.
+  communityHub: z.boolean().optional(),
+  // Shop items carrying this event tag join the section on their own, after its hand-picked items,
+  // so an event's approved cosmetics need not be placed one by one. Blank clears it.
+  eventTag: z.union([z.literal('').transform(() => undefined), eventTagSchema]).optional(),
+});
+
+export type UpsertCosmeticShopSectionInput = z.infer<typeof upsertCosmeticShopSectionInput>;
+export const upsertCosmeticShopSectionInput = z.object({
+  id: z.number().optional(),
+  title: z.string().max(255),
+  description: getSanitizedStringSchema().nullish(),
+  placement: z.number().optional(),
+  items: z.array(z.number()).optional(),
+  image: comfylessImageSchema.nullish(),
+  published: z.boolean().optional(),
+  meta: cosmeticShopSectionMeta.optional(),
+});
+
+export type SetShopItemEventTagsInput = z.infer<typeof setShopItemEventTagsInput>;
+export const setShopItemEventTagsInput = z.object({
+  shopItemId: z.number().int().positive(),
+  eventTags: eventTagsSchema,
+});
+
+export type ShopItemSectionInput = z.infer<typeof shopItemSectionInput>;
+export const shopItemSectionInput = z.object({
+  shopItemId: z.number().int().positive(),
+  sectionId: z.number().int().positive(),
+});
+
+export type UpdateCosmeticShopSectionsOrderInput = z.infer<
+  typeof updateCosmeticShopSectionsOrderInput
+>;
+export const updateCosmeticShopSectionsOrderInput = z.object({
+  sortedSectionIds: z.array(z.number()),
+});
+
+export type PurchaseCosmeticShopItemInput = z.infer<typeof purchaseCosmeticShopItemInput>;
+export const purchaseCosmeticShopItemInput = z.object({
+  shopItemId: z.number(),
+  // The creator whose shop this was bought through — used to credit a reseller
+  // (Creator Shop cross-creator selling). Verified server-side.
+  viaShopUserId: z.number().optional(),
+  // Buyer's payment choice for items that accept Blue Buzz: the domain color
+  // only (default), or blue first with the remainder in the domain color.
+  // Rejected server-side if the item doesn't accept blue.
+  payWith: z.enum(['default', 'blue-first']).optional(),
+  // One buying intent, so a retry or a double-click cannot be charged twice.
+  // Only stickers can be bought more than once, which is what makes a second
+  // charge for one intent reachable at all — every other type is still refused
+  // outright by the ownership check.
+  //
+  // The expected price is checked with it: the buyer pressed a button showing a
+  // number, and a listing re-priced since that render must refuse rather than
+  // charge something they never agreed to. For a pack it is the amount due, which
+  // also moves with what the buyer owns.
+  idempotencyKey: z.string().uuid().optional(),
+  expectedUnitAmount: z.number().int().nonnegative().optional(),
+  // A mystery box listing only: the box version whose contents and odds the buyer was shown.
+  // Required there; a box edited since refuses rather than sells contents nobody saw.
+  expectedVersion: z.number().int().positive().optional(),
+});
+
+export type ToggleWishlistShopItemInput = z.infer<typeof toggleWishlistShopItemInput>;
+export const toggleWishlistShopItemInput = z.object({
+  shopItemId: z.number(),
+  // Desired end state rather than a blind flip, so a rapid double-click settles
+  // on what the last click asked for instead of racing to an arbitrary value.
+  // Omitted = flip whatever is currently stored.
+  wishlisted: z.boolean().optional(),
+});
+
+export type GetPreviewImagesInput = z.infer<typeof getPreviewImagesInput>;
+export const getPreviewImagesInput = z.object({
+  browsingLevel: z.number(),
+  limit: z.number().optional(),
+});
+
+export type GetShopInput = z.infer<typeof getShopInput>;
+export const getShopInput = z.object({
+  // 'Pack' rides alongside the cosmetic types: a pack has no type of its own,
+  // but a shopper filtering the shelf thinks of it as one more kind of thing.
+  cosmeticTypes: z.array(z.union([z.enum(CosmeticType), z.literal('Pack')])).optional(),
+  sectionId: z.number().optional(),
+  // Only this event's items (Cosmetic.data.event), for the event's own page.
+  event: z.string().max(64).optional(),
+});

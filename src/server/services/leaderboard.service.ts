@@ -1,0 +1,317 @@
+import { Prisma } from '@prisma/client';
+import type { CosmeticSource, CosmeticType } from '~/shared/utils/prisma/enums';
+import { DomainColor } from '~/shared/utils/prisma/enums';
+import dayjs from '~/shared/utils/dayjs';
+import { dbRead, dbWrite } from '~/server/db/client';
+import type {
+  GetLeaderboardInput,
+  GetLeaderboardPositionsInput,
+  GetLeaderboardsInput,
+  GetLeaderboardsWithResultsInput,
+} from '~/server/schema/leaderboard.schema';
+import { leaderboardPopulatedKey } from '~/server/services/new-creators.service';
+import { getCosmeticsForUsers, getProfilePicturesForUsers } from '~/server/services/user.service';
+
+/**
+ * A board is populated for today when it has rows dated today, or when `prepare-leaderboard` marked it
+ * complete for today. The marker covers a board that legitimately yields no rows, which the rows cannot
+ * show. The job writes the marker with `current_date + addDays` at 23:00, so the 00:01 readers see it as
+ * `current_date`.
+ */
+export async function getUnpopulatedLeaderboards() {
+  const rows = await dbWrite.$queryRaw<
+    { id: string; hasRows: boolean; marker: string | null; today: string }[]
+  >`
+      SELECT
+        l.id,
+        EXISTS (
+          SELECT 1
+          FROM "LeaderboardResult" lr
+          WHERE lr."leaderboardId" = l.id AND lr.date = current_date::date
+        ) AS "hasRows",
+        kv.value #>> '{}' AS "marker",
+        current_date::text AS "today"
+      FROM "Leaderboard" l
+      LEFT JOIN "KeyValue" kv ON kv.key = ${leaderboardPopulatedKey('')}::text || l.id
+      WHERE l.query != '' AND l.active
+    `;
+
+  return rows.filter((x) => !x.hasRows && x.marker !== x.today).map((x) => x.id);
+}
+
+export async function isLeaderboardPopulated() {
+  return (await getUnpopulatedLeaderboards()).length === 0;
+}
+
+// A board is visible on a domain when its `domain` array contains that color or
+// `all`.
+//
+// An unresolved domain falls back to the SFW colors, NOT to `all` alone. Failing
+// closed here means "never surface mature boards on a host we can't identify" — it
+// does not mean "surface nothing". Environments that don't set the server-side
+// `SERVER_DOMAIN_*` vars (PR previews ship only the NEXT_PUBLIC_ ones) resolve
+// undefined for every request, and an `all`-only filter blanks every domain-scoped
+// board there — which is how this was first noticed.
+const SFW_DOMAINS = [DomainColor.all, DomainColor.green, DomainColor.blue];
+
+export function domainVisibilityFilter(domain?: DomainColor) {
+  return { hasSome: domain ? [DomainColor.all, domain] : SFW_DOMAINS };
+}
+
+export async function getLeaderboards(input: GetLeaderboardsInput) {
+  const leaderboards = await dbRead.leaderboard.findMany({
+    where: {
+      public: !input.isModerator ? true : undefined,
+      active: true,
+      domain: domainVisibilityFilter(input.domain),
+      id: input.ids
+        ? {
+            in: input.ids,
+          }
+        : undefined,
+    },
+    select: {
+      id: true,
+      title: true,
+      description: true,
+      scoringDescription: true,
+      // `domain` is deliberately NOT selected. The `where` above is the only place
+      // domain scoping belongs; shipping the column invites a client to re-derive it,
+      // which is the bug this replaced.
+      //
+      // Unconditional: the `where` above already limits non-moderators to public
+      // boards, and UserProfileEditModal filters its showcase options on this
+      // field — selecting it only for moderators would blank that list for
+      // everyone else.
+      public: true,
+    },
+    orderBy: {
+      index: 'asc',
+    },
+  });
+
+  return leaderboards;
+}
+
+type LeaderboardPosition = {
+  leaderboardId: string;
+  position: number;
+  score: number;
+  metrics: Prisma.JsonValue;
+};
+export async function getLeaderboardPositions(input: GetLeaderboardPositionsInput) {
+  const userId = input.userId;
+  if (!userId) return [] as LeaderboardPosition[];
+
+  // strip time from date
+  let date = input.date ?? new Date();
+  date = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
+  const positions = await dbRead.leaderboardResult.findMany({
+    where: {
+      userId,
+      date,
+      leaderboard: {
+        domain: domainVisibilityFilter(input.domain),
+        ...(!input.isModerator ? { public: true } : {}),
+      },
+      position: input.top ? { lte: input.top } : undefined,
+    },
+    select: {
+      leaderboardId: true,
+      position: true,
+      score: true,
+      metrics: true,
+    },
+  });
+
+  return positions as LeaderboardPosition[];
+}
+
+const metricOrder = ['ratingCount', 'heart', 'downloadCount', 'viewCount', 'shots', 'hit', 'miss'];
+type LeaderboardRaw = {
+  userId: number;
+  date: Date;
+  position: number;
+  score: number;
+  metrics: Record<string, number>;
+  username: string;
+  deletedAt: Date | null;
+  image: string | null;
+  cosmetics:
+    | {
+        data: MixedObject | null;
+        cosmetic: {
+          id: number;
+          data: string;
+          type: CosmeticType;
+          source: CosmeticSource;
+          name: string;
+          leaderboardId: string;
+          leaderboardPosition: number;
+        };
+      }[]
+    | null;
+  delta: {
+    position: number;
+    score: number;
+  } | null;
+};
+export async function getLeaderboard(input: GetLeaderboardInput) {
+  const date = dayjs(input.date ?? dayjs().utc()).format('YYYY-MM-DD');
+
+  const leaderboardResultsRaw = await dbRead.$queryRaw<LeaderboardRaw[]>`
+    WITH yesterday AS (
+      SELECT
+        "userId",
+        position,
+        score
+      FROM "LeaderboardResult"
+      WHERE
+        "leaderboardId" = ${input.id}
+        AND "date" = date(${date}) - interval '1 day'
+        AND position < 2000
+    )
+    SELECT
+      lr."userId",
+      lr.date,
+      lr.position,
+      lr.score,
+      lr.metrics,
+      u.username,
+      u."deletedAt",
+      u.image,
+      (
+        SELECT jsonb_build_object(
+          'position', lr.position - lro.position,
+          'score', lr.score - lro.score
+        )
+        FROM yesterday lro
+        WHERE lro."userId" = lr."userId"
+      ) delta
+    FROM "LeaderboardResult" lr
+    JOIN "Leaderboard" l ON l.id = lr."leaderboardId"
+    JOIN "User" u ON u.id = lr."userId"
+    WHERE lr.date = date(${date})
+      AND lr."leaderboardId" = ${input.id}
+      AND lr.position < ${input.maxPosition ?? 1000}
+      AND l.domain && ${domainVisibilityFilter(input.domain).hasSome}::"DomainColor"[]
+      ${Prisma.raw(!input.isModerator ? 'AND l.public = true' : '')}
+    ORDER BY lr.position
+  `;
+
+  return await formatLeaderboardResults(leaderboardResultsRaw, metricOrder);
+}
+
+export type LeaderboardWithResults = Awaited<ReturnType<typeof getLeaderboardsWithResults>>[number];
+
+export async function getLeaderboardsWithResults(input: GetLeaderboardsWithResultsInput) {
+  const { isModerator } = input;
+  const leaderboards = await getLeaderboards(input);
+
+  const leaderboardsWithResults = await Promise.all(
+    leaderboards.map(async (leaderboard) => {
+      const results = await getLeaderboard({
+        id: leaderboard.id,
+        isModerator,
+        domain: input.domain,
+        date: input.date,
+        maxPosition: 5,
+      });
+
+      const cosmetics = await dbRead.cosmetic.findMany({
+        select: {
+          id: true,
+          name: true,
+          data: true,
+          description: true,
+          source: true,
+          type: true,
+          leaderboardPosition: true,
+        },
+        where: {
+          leaderboardId: leaderboard.id,
+        },
+        orderBy: {
+          leaderboardPosition: 'asc',
+        },
+      });
+
+      return {
+        ...leaderboard,
+        cosmetics,
+        results,
+      };
+    })
+  );
+
+  return leaderboardsWithResults;
+}
+
+const legendsMetricOrder = ['diamond', 'gold', 'silver', 'bronze'];
+export async function getLeaderboardLegends(input: GetLeaderboardInput) {
+  const leaderboardResultsRaw = await dbRead.$queryRaw<LeaderboardRaw[]>`
+    WITH scores AS (
+      SELECT
+        lbr."userId",
+        lbr.score,
+        lbr.metrics,
+        lbr.position
+      FROM "LegendsBoardResult" lbr
+      JOIN "Leaderboard" l ON l.id = lbr."leaderboardId"
+      WHERE lbr."leaderboardId" = ${input.id}
+        AND l.domain && ${domainVisibilityFilter(input.domain).hasSome}::"DomainColor"[]
+    )
+    SELECT
+      s."userId",
+      current_date date,
+      s.position,
+      s.score,
+      s.metrics,
+      u.username,
+      u."deletedAt",
+      u.image,
+      null delta
+    FROM scores s
+    JOIN "User" u ON u.id = s."userId"
+    ORDER BY s.score DESC
+  `;
+
+  return await formatLeaderboardResults(leaderboardResultsRaw, legendsMetricOrder);
+}
+
+async function formatLeaderboardResults(results: LeaderboardRaw[], metricSortOrder = metricOrder) {
+  const userIds = results.map((r) => r.userId);
+  const [profilePictures, cosmetics] = await Promise.all([
+    getProfilePicturesForUsers(userIds),
+    getCosmeticsForUsers(userIds),
+  ]);
+
+  return results.map(({ metrics: metricsRaw, userId, username, deletedAt, image, ...results }) => {
+    const metrics = Object.entries(metricsRaw)
+      .map(([type, value]) => ({
+        type,
+        value,
+      }))
+      .sort((a, b) => {
+        const aIndex = metricSortOrder.indexOf(a.type);
+        const bIndex = metricSortOrder.indexOf(b.type);
+        if (aIndex === -1) return 1;
+        if (bIndex === -1) return -1;
+        return aIndex - bIndex;
+      });
+
+    return {
+      ...results,
+      user: {
+        id: userId,
+        username,
+        deletedAt,
+        image,
+        cosmetics: cosmetics[userId] ?? [],
+        profilePicture: profilePictures[userId] ?? null,
+      },
+      metrics,
+    };
+  });
+}

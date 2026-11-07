@@ -1,0 +1,297 @@
+import { expect, test } from '@playwright/test';
+import { storageStatePath } from './preview-fixtures';
+import { trpcQuery } from './preview-trpc';
+
+/**
+ * Preview-e2e (F-C): App Blocks MARKETPLACE discovery + per-app detail — the
+ * anon-capable PUBLIC read path (`blocks.listAvailable` → `blocks.getAppDetail`)
+ * plus `/apps`, and the retirement of the legacy `/apps/<appBlockId>` route.
+ * Otherwise untested by the preview suite; a PR that broke the marketplace
+ * listing/detail projection or the `features.appBlocks` page gate passes every
+ * other preview spec today.
+ *
+ * Runs as the `mod` fixture (id 2000000001) — the ONLY preview role with
+ * `features.appBlocks` (the Flipt `app-blocks-enabled` flag is moderator-segment
+ * -only) AND exempt from the per-IP marketplace rate limit (listAvailable /
+ * getAppDetail carry a 60/60 rateLimit that the middleware waives for mods).
+ * The non-mod testers do NOT have appBlocks: for them /apps SSR-resolves to a
+ * Next 404 (resolveAppsPageAccess → notFound) and listAvailable returns empty —
+ * so this MUST run as mod to exercise the real read path.
+ *
+ * Data resilience: the dev DB is a weekly prod clone — there are ~3 approved app
+ * blocks today, but a given clone could have zero. So we DISCOVER an appBlockId
+ * at runtime from `listAvailable` (never hardcode one) and `test.skip()` with an
+ * annotation when the clone has no approved blocks, rather than hard-failing.
+ *
+ * NB: these procs are DB-backed (not meili-backed search), so no `retryFlaky`.
+ *
+ * Verified tRPC shapes (against origin/main, paths relative to civitai/src):
+ *  - blocks.listAvailable (blocks.router.ts:952 publicProcedure + enforceApp
+ *    BlocksFlag + 60/60 rateLimit; input listAvailableSchema, all fields
+ *    optional/defaulted so `{}` is valid) RETURNS AN OBJECT, NOT a bare array:
+ *    `{ items: AvailableBlock[]; nextCursor?: string }`
+ *    (BlockRegistry.listAvailable, block-registry.service.ts:2226). Each
+ *    AvailableBlock (subscription.schema.ts:157) = { id, blockId, appId,
+ *    appName, manifest: PublicBlockManifest, installCount, category,
+ *    scopesSummary }. We DISCOVER an id from `items[0].id` (that id is the
+ *    `appBlockId`).
+ *  - blocks.getAppDetail (blocks.router.ts:1001 publicProcedure + flag +
+ *    60/60 rateLimit; input { appBlockId }) returns `PublicAppDetail | null`
+ *    (subscription.schema.ts:371): { id, blockId, appId, appName, manifest:
+ *    { name?, description?, targets? }, scopes: string[], contentRating,
+ *    version, installCount, liveUrl, screenshots }. Returns null for a missing
+ *    / non-approved id (the router then throws NOT_FOUND — our helper would
+ *    surface that as a thrown error). We assert the shape of a discovered,
+ *    known-approved id, so a non-null detail is expected.
+ *  - Legacy detail page (`/apps/[appBlockId]/index.tsx`) is RETIRED: its
+ *    `getServerSideProps` now resolves the app's approved `AppListing` and
+ *    redirects to `/apps/store-preview/<slug>` (or `notFound` when the app has no
+ *    approved listing). It no longer renders, so this spec asserts the REDIRECT
+ *    rather than a heading on it.
+ *  - Marketplace page (`/apps/index.tsx`) renders the apps navigation as a LEFT RAIL of
+ *    links, whose rows come from `appsSections` in `~/components/Apps/apps-sections`.
+ *    The row this spec keys on is `{ id: 'marketplace', path: '', label: 'Marketplace' }`
+ *    — `path` is the URL segment UNDER `/apps`, so the marketplace row's is the empty
+ *    string, not `'/apps'`. It is the only row whose `visible` predicate is unconditional
+ *    for a store-eligible viewer: `(_s, c) => c.canSeeStore`, which is exactly the gate
+ *    the page itself is behind. ⚠️ An earlier revision of this line added "every other
+ *    row is summary-conditional" as the reason — that is wrong for the BUILD row, which
+ *    is `(_s, c) => c.canBuild`, context-conditional and deliberately summary-free. The
+ *    conclusion still holds by a different route: `canBuild` is
+ *    `hasAppsStoreAccess(features) && (isAppDeveloper || appBlocksGetStarted)`, strictly
+ *    NARROWER than `canSeeStore`, so it cannot be visible where the marketplace row is
+ *    not. It is NOT necessarily the first row, so the assertion below selects it BY NAME
+ *    and the order is irrelevant to it.
+ *
+ *    🔴 THE RAIL IS VIEWPORT-GATED, so this spec asserts BOTH nav forms: the drawer
+ *    trigger at this config's default 1280×720 (below `APPS_RAIL_MIN_VIEWPORT`, 1300),
+ *    and the `App sections` landmark plus the `Marketplace` LINK after widening to
+ *    1440. See the block comment on the assertion itself for why both are required.
+ *
+ *    ⚠️ This docblock described an `AppsSubNav` TABS BAR sourced from `SUB_NAV_LINKS`
+ *    until the rail landed. Both are gone — `AppsSubNav.tsx` was DELETED by this PR and
+ *    `SUB_NAV_LINKS` no longer exists — and the stale text is what made the assertion
+ *    below look correct while it queried a `role="tab"` that nothing renders.
+ *
+ *    The page ALSO renders a search control, which this spec does not assert:
+ *    `AppListingsMarketplaceBody.tsx` renders `<TextInput aria-label="Search"
+ *    placeholder="Search by name">` inside the `apps-store-control-row` group. ⚠️ An
+ *    earlier revision of this docblock gave the placeholder as "Search by name or block
+ *    id" (stale — only the placeholder text changed), and a later one deleted the whole
+ *    claim as "removed upstream in #2767". BOTH were wrong: the control exists at
+ *    `origin/main` and at this PR's head, and #2767 does not touch that file. The
+ *    deletion was derived from `git log -S`, which reports commits where an occurrence
+ *    COUNT changed — a rename is indistinguishable from a removal in that output.
+ *
+ *    The page renders no `<Title>Civitai App Blocks</Title>`: the app-blocks nav
+ *    refactor (#2749/#2758) made `AppsPageLayout` DELIBERATELY OMIT the page title on
+ *    the marketplace surface ("omit for a header with just the chrome, e.g. the
+ *    marketplace" — the `title` prop's docstring in `AppsPageLayout.tsx`; the wording
+ *    was "just the tabs" before the rail, and this citation pointed at a line number
+ *    that has since drifted onto unrelated text). The nav is therefore what uniquely
+ *    identifies the rendered apps surface for an appBlocks-enabled viewer; a
+ *    non-appBlocks viewer gets the Next 404 (resolveAppsPageAccess.ts → notFound).
+ */
+
+const ROLE = 'mod' as const;
+
+// Public marketplace listing shape (the fields this spec reads). Mirrors
+// AvailableBlock — typed locally so the tRPC result isn't `unknown`/implicit any.
+type AvailableBlock = {
+  id: string;
+  blockId: string;
+  appId: string;
+  appName: string | null;
+  manifest: { name?: string; description?: string; targets?: Array<{ slotId?: string }> };
+  installCount: number;
+  category: string | null;
+  scopesSummary: string[];
+};
+type ListAvailableResult = { items: AvailableBlock[]; nextCursor?: string };
+
+// Public per-app detail shape (the fields this spec reads). Mirrors
+// PublicAppDetail — getAppDetail returns this or null.
+type PublicAppDetail = {
+  id: string;
+  blockId: string;
+  appId: string;
+  appName: string | null;
+  manifest: { name?: string; description?: string; targets?: Array<{ slotId?: string }> };
+  scopes: string[];
+  contentRating: string | null;
+  version: string | null;
+  installCount: number;
+  liveUrl: string;
+  screenshots: Array<{ index: number; url: string; contentType: string }>;
+};
+
+test.describe('App Blocks marketplace discovery + detail render (mod)', () => {
+  test.use({ storageState: storageStatePath(ROLE) });
+
+  test('listAvailable → getAppDetail round-trip + /apps and /apps/[id] render', async ({
+    page,
+  }) => {
+    // The marketplace index renders for an appBlocks-enabled viewer (the mod) and
+    // 404s for everyone else. Asserting it loads (status < 400) + shows the apps
+    // navigation proves the mod cleared the `features.appBlocks` SSR gate and the page
+    // rendered (NOT the 404 a non-appBlocks user gets). The page renders no "Civitai App
+    // Blocks" heading — the app-blocks nav refactor (#2749/#2758) made AppsPageLayout omit
+    // the title on the marketplace surface — so the nav is what uniquely identifies the
+    // apps surface.
+    //
+    // 🔴 THE NAV IS A LEFT RAIL OF LINKS, NOT A TAB STRIP, AND IT IS VIEWPORT-GATED.
+    // This assertion read `getByRole('tab', { name: 'Marketplace' })` until the rail
+    // landed; there are no `role="tab"` elements on `/apps` any more. Two things had to
+    // change together, and the second is the one that bites:
+    //   • the role is `link` — the rail is a `<nav aria-label="App sections">` of real
+    //     anchors;
+    //   • the rail is `display: none` below `APPS_RAIL_MIN_VIEWPORT` (1300px), where a
+    //     "App sections" drawer trigger stands in for it — and this config's
+    //     `devices['Desktop Chrome']` viewport is **1280×720**, i.e. BELOW that line. So
+    //     the default preview viewport renders the DRAWER form and a bare
+    //     `getByRole('link', …)` would fail on a perfectly healthy page.
+    // Both forms are asserted below rather than one, because both are real surfaces a
+    // user gets and the smoke suite is the only tier that sees this page deployed.
+    // domcontentloaded ONLY — never networkidle.
+    const resp = await page.goto('/apps', { waitUntil: 'domcontentloaded' });
+    expect(resp?.status(), 'GET /apps status for the appBlocks-enabled mod').toBeLessThan(400);
+
+    // (a) THE DEFAULT (1280) FORM — the drawer trigger is the only nav affordance here.
+    await expect(
+      page.getByRole('button', { name: 'App sections' }),
+      '/apps at 1280 should render the "App sections" drawer trigger for an ' +
+        'appBlocks-enabled mod (not a 404). Below 1300px the rail is display:none.'
+    ).toBeVisible();
+
+    // (b) THE RAIL FORM — widen past the threshold and the landmark + entries appear.
+    // This is the half that proves the nav actually has destinations rather than just a
+    // button, and it is the shape the overwhelming majority of desktop viewers get.
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await expect(
+      page.getByRole('navigation', { name: 'App sections' }),
+      '/apps at 1440 should expose the "App sections" navigation landmark'
+    ).toBeVisible();
+    await expect(
+      page.getByRole('link', { name: 'Marketplace' }),
+      '/apps should render the rail\'s "Marketplace" entry for an appBlocks-enabled mod'
+    ).toBeVisible();
+    await page.setViewportSize({ width: 1280, height: 720 });
+
+    // DISCOVER an appBlockId at runtime from the public listing. Never hardcode
+    // one — the weekly dev clone's approved set varies. `{}` input is valid (all
+    // listAvailableSchema fields are optional/defaulted). page.request carries the
+    // mod cookie; the helper stamps Origin/Referer for the CSRF gate.
+    const listing = await trpcQuery<ListAvailableResult>(page.request, 'blocks.listAvailable', {});
+    expect(
+      Array.isArray(listing?.items),
+      'blocks.listAvailable should resolve to { items: AvailableBlock[] }'
+    ).toBe(true);
+
+    const blocks = listing?.items ?? [];
+    test.skip(
+      blocks.length === 0,
+      'No approved app blocks in this dev-DB clone — nothing to discover (the weekly prod clone can have zero). Skipping the detail-render leg rather than hard-failing.'
+    );
+
+    // One representative block — don't crawl the whole list.
+    const first = blocks[0];
+    expect(typeof first.id, 'each listed block should carry a string id (the appBlockId)').toBe(
+      'string'
+    );
+
+    // Per-app DETAIL for that exact block. getAppDetail returns the public
+    // projection for an approved id; a discovered id IS approved (listAvailable
+    // only returns status='approved' rows), so detail must be non-null.
+    const detail = await trpcQuery<PublicAppDetail | null>(page.request, 'blocks.getAppDetail', {
+      appBlockId: first.id,
+    });
+    expect(
+      detail,
+      'getAppDetail should return a non-null detail for a discovered approved id'
+    ).not.toBeNull();
+    expect(detail!.id, 'getAppDetail.id should echo the requested appBlockId').toBe(first.id);
+    // A human display name: manifest.name is the public allowlist field; fall back
+    // to blockId (the page does the same: name = manifest.name ?? blockId ?? id).
+    const detailName = detail!.manifest.name ?? detail!.blockId;
+    expect(
+      typeof detailName,
+      'detail should expose a display name (manifest.name or blockId)'
+    ).toBe('string');
+    expect(detailName.length, 'the display name should be non-empty').toBeGreaterThan(0);
+    // The scopes + slots arrays are shape-correct (anon-display allowlist).
+    expect(Array.isArray(detail!.scopes), 'detail.scopes should be an array').toBe(true);
+    expect(
+      Array.isArray(detail!.manifest.targets ?? []),
+      'detail.manifest.targets should be an array (slot badges)'
+    ).toBe(true);
+
+    // The legacy per-app route `/apps/<appBlockId>` is RETIRED: it now redirects to
+    // the unified store detail. This leg used to assert that route rendered the
+    // block's name; that page no longer renders at all, so asserting a heading here
+    // would either test the store detail by accident or race its client-side query.
+    // Assert the RETIREMENT instead — the invariant this route now has.
+    //
+    // Deliberately asserts the destination PATH PREFIX, not `/apps/store-preview/
+    // <blockId>`: the redirect resolves the store slug from the listing row, and
+    // pinning blockId here would re-import the very assumption the redirect avoids.
+    //
+    // 🔴 A 404 here is a real signal, not flake: it means this approved app has no
+    // approved `AppListing` row. Auto-create-on-approve is best-effort (it logs and
+    // continues on failure) and apps approved before it shipped were backfilled by
+    // hand, so the gap is recoverable but does not self-heal. Fix the data (run the
+    // mod-only listing backfill), don't relax this assertion. domcontentloaded ONLY.
+    const detailResp = await page.goto(`/apps/${encodeURIComponent(first.id)}`, {
+      waitUntil: 'domcontentloaded',
+    });
+    expect(
+      detailResp?.status(),
+      `GET /apps/${first.id} should follow the retirement redirect to a served page (a 404 means this approved app has no approved AppListing row)`
+    ).toBeLessThan(400);
+
+    const landedOn = new URL(page.url()).pathname;
+    expect(
+      landedOn,
+      `the retired /apps/${first.id} should land on the unified store detail, not render itself`
+    ).toMatch(/^\/apps\/store-preview\/.+/);
+
+    // 🔴 The two assertions below replace an earlier `.not.toBe('/apps/<id>')`, which
+    // COULD NOT FAIL: given the `toMatch` above has passed, `landedOn` already starts
+    // `/apps/store-preview/`, and `/apps/<appBlockId>` never can — so the inequality
+    // held by construction. It wore the name of a guard while guarding nothing. Both
+    // replacements pin a property the `toMatch` genuinely leaves open.
+
+    // (a) The slug occupies EXACTLY ONE path segment. `/^\/apps\/store-preview\/.+/`
+    //     happily accepts `/apps/store-preview/a/b` — i.e. a destination that climbed
+    //     out of the detail route into some other page. This is the browser-level
+    //     twin of the containment property the unit test pins on the built string.
+    const slugSegment = landedOn.slice('/apps/store-preview/'.length);
+    expect(
+      slugSegment.split('/').filter(Boolean),
+      `the store slug must be one path segment, got "${slugSegment}"`
+    ).toHaveLength(1);
+
+    // (b) The retirement happened at the HTTP layer — a real server redirect out of
+    //     the legacy route — not a client-side bounce rendered by the page. Walk the
+    //     redirect chain of the response we landed on and require the legacy path in
+    //     it. This fails if anyone reimplements the retirement as a `router.replace`
+    //     in the component (which would reintroduce exactly the render-then-race this
+    //     leg was rewritten to avoid), and it fails if a future `/apps/*` middleware
+    //     or rewrite starts serving the store detail directly without the 302.
+    const redirectChain: string[] = [];
+    for (
+      let req = detailResp?.request().redirectedFrom();
+      req && redirectChain.length < 10;
+      req = req.redirectedFrom()
+    ) {
+      redirectChain.push(new URL(req.url()).pathname);
+    }
+    expect(
+      redirectChain.map((p) => decodeURIComponent(p)),
+      `GET /apps/${
+        first.id
+      } must reach the store detail via a SERVER redirect out of the legacy route (chain: ${
+        redirectChain.join(' -> ') || '<none>'
+      })`
+    ).toContain(`/apps/${first.id}`);
+  });
+});

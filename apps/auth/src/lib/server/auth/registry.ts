@@ -1,0 +1,69 @@
+import {
+  SESSION_REGISTRY_KEYS,
+  createSessionRegistry,
+  type SessionRegistry,
+  type SessionRegistryRedis,
+} from '@civitai/auth';
+import { env } from '$env/dynamic/private';
+import { getSysRedis } from '../redis';
+import { logToAxiom } from '../axiom';
+
+// Cross-app session revocation. The redis CLIENT is built from @civitai/redis; the KEY STRINGS
+// come from @civitai/redis's registry — so a logout/ban here is seen by every app on the same
+// redis, with no second definition to collide.
+//
+// Falls back to a no-op registry when REDIS isn't configured, so the hub still runs (login works;
+// tracking/revocation are simply skipped) — the same fail-open spirit as the main app.
+
+const noop: SessionRegistry = {
+  async trackToken() {},
+  async invalidateToken() {},
+  async invalidateFamily() {},
+  async invalidateUserSessions() {},
+  async invalidateAll() {},
+  async markForRefresh() {},
+  async isRevoked() {
+    return false;
+  },
+};
+
+// Built lazily on FIRST USE (a request), never at module-load — so `vite build` (which evaluates
+// modules but calls no methods) doesn't try to read REDIS_* / connect.
+let _registry: SessionRegistry | undefined;
+function registry(): SessionRegistry {
+  if (_registry) return _registry;
+  const sysRedis = getSysRedis(); // the hub's single shared sys client (null when REDIS_SYS_URL is unset)
+  if (!sysRedis) return (_registry = noop);
+  return (_registry = createSessionRegistry({
+    // sysRedis's methods are typed to the known-key union; the registry is namespace-agnostic
+    // (plain string keys), so cast at this boundary — the main app does the same on these calls.
+    redis: sysRedis as unknown as SessionRegistryRedis,
+    keys: SESSION_REGISTRY_KEYS,
+    // Pass the deployment's real rolling-refresh interval so the registry can hold its eviction floor above
+    // it. Without this it falls back to the documented default, and a deployment that lengthened the interval
+    // would silently make live sessions evictable.
+    refreshIntervalSeconds: Number(env.AUTH_SESSION_UPDATE_AGE) || undefined,
+    // An eviction means an account crossed the per-user session ceiling — the signal that used to exist
+    // only as an api-primary event-loop wedge. Log it so the ceiling is observable without one.
+    onEvict: ({ userId, evicted, total }) => {
+      logToAxiom({
+        name: 'session-token-ceiling-evict',
+        type: 'info',
+        userId,
+        evicted,
+        total,
+      }).catch(() => undefined);
+    },
+  }));
+}
+
+// Lazy facade delegating to the real (or no-op) registry on first call.
+export const sessions: SessionRegistry = {
+  trackToken: (tokenId, userId) => registry().trackToken(tokenId, userId),
+  invalidateToken: (tokenId, userId) => registry().invalidateToken(tokenId, userId),
+  invalidateFamily: (familyId) => registry().invalidateFamily(familyId),
+  invalidateUserSessions: (userId) => registry().invalidateUserSessions(userId),
+  invalidateAll: () => registry().invalidateAll(),
+  markForRefresh: (tokenId) => registry().markForRefresh(tokenId),
+  isRevoked: (claims) => registry().isRevoked(claims),
+};

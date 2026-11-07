@@ -1,0 +1,365 @@
+import { clickhouse } from '~/server/clickhouse/client';
+import { logToAxiom } from '~/server/logging/client';
+
+/**
+ * App Blocks — author-facing IMPRESSIONS, read from the `blockRenders`
+ * ClickHouse table.
+ *
+ * WHY THIS EXISTS: every other author metric comes from Postgres, and the
+ * engagement counters specifically come from `block_scope_invocations`, which
+ * is written ONLY on authenticated, scope-gated API calls. Anonymous viewers
+ * and static / no-scope blocks emit nothing there, so a block with no scoped
+ * API surface reports flat engagement no matter how many people saw it.
+ * `blockRenders` is the only signal that covers them — it is written once per
+ * host mount (BLOCK_READY) by two writers (the `/api/track/block-render` REST
+ * beacon and the `track.blockRender` tRPC proc), both via `tracker.blockRender`.
+ *
+ * 🔴 UNIQUE VIEWERS DO NOT DEDUP ON `blockInstanceId`. That id looks per-mount
+ * and is not: it is `page_apb_<ULID>`, effectively one per PLACEMENT. Measured
+ * against prod on 2026-08-04 — 124 rows carried only 28 distinct
+ * `blockInstanceId` across 27 distinct `appBlockId`, i.e. ~1:1 with the app —
+ * so deduping on it would report "1 unique viewer" for an app with hundreds of
+ * impressions. The viewer identity is `userId`, and for signed-out rows
+ * (`isAnon`) `userId` is a literal 0 for EVERYONE, so anon rows must dedup on
+ * `ip` instead or they collapse into a single phantom viewer. Hence the
+ * `uniqExactIf(userId, …) + uniqExactIf(ip, …)` split below.
+ *
+ * 🔴 THIS RAIL EXCLUDES PRIVATE RUNS — CLOSED AT THE WRITERS, NOT HERE. It was ONE OF TWO
+ * open flag-flip preconditions, and ✅ THE OTHER ONE — the attribution rail — IS NOW CLOSED
+ * TOO: the two owner-visible reads of `block_spend_attribution` in `app-analytics.service.ts`
+ * exclude `status = 'voided'`, so a private run's generation row no longer counts into
+ * `runs` / `runs.buzzSpent`. Both analytics rails this file's heading is about are therefore
+ * shut.
+ *
+ * ⚠️ THAT IS NOT "nothing blocks the flag", and this sentence is deliberately not a list.
+ * Other preconditions live on the flag itself and they move; the authoritative, kept-current
+ * enumeration is the precondition block at `APP_BLOCKS_PRIVATE_RUN_FLAG` in
+ * `app-blocks-flag.ts`, which is the file an operator opens before widening. Read them there
+ * rather than inferring the flag's readiness from any count in this docblock — an earlier
+ * revision of this very paragraph named a rail as open that had been closed hours before.
+ *
+ * THE LEAK: a private run of a delisted app — a moderator, the owner, or an accepted
+ * listing collaborator running its already-deployed bundle — MOUNTS THE HOST, so it emitted
+ * a `blockRenders` row like any other view and appeared in the owner's impressions. Worse
+ * than a total: the uniques split above is computed per `userId`, so the reviewer landed as
+ * an identifiable unique viewer on the exact day review happened. The operator decision for
+ * that feature is that such a run is invisible to the app's owner INCLUDING IN ANALYTICS.
+ *
+ * The sibling `block_scope_invocations` rail solves the same problem with a `source` marker
+ * written from the verified token claim (`blocks/scope-activity-predicate.ts`). That could
+ * not be reused: different store, different writer, and NEITHER writer sees a block token —
+ * the row comes from a client beacon (`components/AppBlocks/sendBlockRender.ts` →
+ * `pages/api/track/block-render.ts`) and from `track.router.ts`.
+ *
+ * ── THE TWO SHAPES, AND WHY THIS ONE ─────────────────────────────────────────
+ * (a) SUPPRESS THE INSERT on a private-run mount. (b) Carry a marker through the beacon
+ * schema, both writers and a NEW ClickHouse column, then exclude it at the read. (a) shipped:
+ *
+ *  1. THE ROW WAS NOT THE RECORD, which is the decisive one. The concern with (a) is losing
+ *     the evidence that a review happened; it is not lost. A private run cannot boot without
+ *     a token, and the mint writes `app-blocks.private-run.mint` to Axiom AND stdout, plus
+ *     `app-blocks.private-run.mint-refused` for every refusal EXCEPT `flag-off`. The
+ *     operator decision is that the trail is INTERNAL-AUDIT-ONLY, which is what those lines
+ *     are and what a ClickHouse row the owner can read is not. ⚠️ Reconciling a suppressed
+ *     impression by grepping `private-run.mint` alone MISSES the dev-tunnel case below —
+ *     that mount audits under `app-blocks.dev-tunnel.*`.
+ *  2. (a) MIRRORS AN EXISTING, REVIEWED SUPPRESSION on this exact pair of writers:
+ *     `secondary` already skips the insert in both, symmetrically.
+ *  3. 🔴 (b) COSTS (a)'s WHOLE MECHANISM PLUS TWO MORE PARTS. Neither writer sees a block
+ *     token (above), so (b) cannot derive its marker the way the sibling rail does — it
+ *     would have to call THIS SAME PREDICATE, then write the answer to a new column, then
+ *     filter at the read. That is (a)'s whole mechanism PLUS a hand-applied DDL in every
+ *     environment (`src/server/clickhouse/migrations/` is that channel;
+ *     `2026-08-17-comic-views.sql` widens a tracker-written table) which must land and be
+ *     verified everywhere BEFORE either writer ships or the marker is a silent no-op,
+ *     PLUS a read filter that can over-filter. There is no cheaper or safer version of it.
+ *
+ *     ⚠️ THE ONE THING (b) WOULD BUY: (a) is irreversible at the data layer. A suppressed
+ *     row is never written, so if the decision is ever revised — say "owners see a count
+ *     but not an identity" — there is no history to recover. The mint line is a record of
+ *     the MOUNT, in Axiom/stdout with finite retention, not a per-impression row in a
+ *     durable store. Accepted deliberately; revisit here if the policy softens.
+ *
+ * The gate is ONE predicate — `blocks/private-run-impression.service.ts` — called by BOTH
+ * writers; its docblock carries the derivation, the ordering and the cost. 🔴 The signal is
+ * derived from the SESSION, never from the request body: a client-settable field on a public
+ * beacon would let any viewer suppress their own impressions, which is a larger defect than
+ * the one being fixed.
+ *
+ * ⚠️ OVER-FILTERING is the quieter hazard — excluding too much silently deletes the owner's
+ * real impression counts, and nobody reports numbers they never saw. It is bounded
+ * STRUCTURALLY rather than by care: suppression requires the app to be NON-APPROVED (the
+ * predicate refuses `approved` outright, so nothing publicly mountable can be hidden) AND
+ * the viewer to be that app's owner, an accepted collaborator, or a moderator. A third
+ * party's impression is therefore unreachable from the gate, and every gate in it fails
+ * toward RECORDING the row.
+ *
+ * 🔴 NOTHING IN THIS FILE ENFORCES IT, AND THAT IS THE DESIGN — do not read the heading
+ * above as a claim about the query below. The rows simply never arrive; the read is
+ * unchanged and keeps its existing plan. The structural guarantee that BOTH writers gate
+ * is `blocks/__tests__/block-render-writer.call-site-ledger.test.ts`, and the behavioural
+ * one is `src/tests/api/track/block-render.private-run.test.ts`. A future reader looking
+ * here for a `source <> …` filter will not find one and should not add one.
+ *
+ * ⚠️ TWO RAILS, TWO DIFFERENT QUESTIONS, AND NOTHING ASSERTS THEY AGREE.
+ * `block_scope_invocations` marks a row from the VERIFIED TOKEN CLAIM — a fact about the
+ * REQUEST. This rail asks `resolvePrivateRunAccess` — a fact about the VIEWER AND THE APP,
+ * NOW. They are not two implementations of one predicate, so they can disagree in both
+ * directions:
+ *   · a mount served under a token minted before the flag was turned off for that viewer
+ *     records an owner-visible impression while its invocation rows stay hidden;
+ *   · a DEV-TUNNEL mount by an app's owner is the standing inverse — the impression is
+ *     suppressed (the owner satisfies the predicate) while its invocation rows are
+ *     visible, because a dev-tunnel token carries no private-run claim.
+ * The leaked row in the first case is exactly the owner-visible impression this feature
+ * exists to suppress, so it is not incidental — but it needs a mid-token-lifetime flag
+ * flip, and a third derivation to reconcile the two would be ill-defined rather than
+ * merely expensive: there is no single question for it to answer. Recorded, not guarded,
+ * and 🔴 do not accept a later proposal to unify them.
+ *
+ * 🔴 A LOAD PRECONDITION THIS CLOSURE CREATES. Recorded as a gate on widening in
+ * `app-blocks-flag.ts`'s own PRECONDITION block — the file an operator opens — so only
+ * the shape is here: the gate can reach `resolvePrivateRunAccess` (4–9 statements by
+ * audience, one on the WRITE PRIMARY) on a route with no rate limit, and before this
+ * change the common beacon path did ZERO Postgres queries.
+ *
+ * ACCEPTANCE (the condition this arc closes on): one private run against a delisted app,
+ * then the operator reads that app's analytics panel and confirms `views.count` and
+ * `views.uniqueViewers` did not move.
+ *
+ * 🔴 NEVER interpolate into these queries. The `$query` tagged template on the
+ * ClickHouse client formats strings VERBATIM (`formatSqlType` returns the raw
+ * value — no quoting, no escaping), so `${id}` is a SQL-injection vector. Every
+ * value here rides in `query_params` instead, which the driver binds; that also
+ * matches the repo's other parameterised reads (scanner-review.service.ts).
+ *
+ * NO TIME SERIES, on purpose. An earlier revision also ran a bucketed
+ * `GROUP BY` query, which doubled the ClickHouse load per request for a value
+ * NOTHING rendered — the panel charts only `installs.series` and `runs.series`.
+ * That cost is paid on a fan-out path (see VIEWS_QUERY_TIMEOUT_SECONDS), so a
+ * dead second round-trip is not free. If a views chart is ever added, restore
+ * the query AND note that ClickHouse's `toStartOfWeek` defaults to SUNDAY while
+ * Postgres `date_trunc('week', …)` is MONDAY — mode 1 is required, or the views
+ * line sits a day out of phase with the runs line on the same axis.
+ *
+ * COVERAGE CAVEAT worth knowing before trusting the number: `blockRenders`
+ * counts MOUNT ATTEMPTS, not successful loads. `/api/track/block-render` writes
+ * a row even when the launch FAILS (it is a failed mount's only beacon) and the
+ * table carries no status column, so this reader cannot exclude them. An app
+ * that fails to load for everyone still reports loads.
+ *
+ * ⚠️ TRUST CAVEAT — TREAT THESE NUMBERS AS UNTRUSTED INPUT.
+ *
+ * The rows this reads are produced by an UNAUTHENTICATED write path, and the
+ * app they are attributed to is chosen by the caller. Both counters below are
+ * therefore influenceable from outside — and note that `uniqueViewers` is NOT
+ * the safer of the two: for signed-out viewers it is derived from request
+ * metadata that the origin does not independently verify, so it is at least as
+ * influenceable as the raw count. Do not reason about it as a harder-to-game
+ * number just because it is a distinct-count.
+ *
+ * (Specifics of the write path have been reported to security@civitai.com per
+ * SECURITY.md, and are deliberately not restated here. If you are changing the
+ * ingest path or the IP derivation, ask them for the report first — the
+ * mechanism matters and this comment is not sufficient to design against.)
+ *
+ * This is a pre-existing WRITER-side weakness, deliberately not fixed in the
+ * change that added this reader: an ingest gate that wrongly rejects beacons
+ * would make these counts UNDER-report silently and permanently, because the
+ * beacon is fire-and-forget and this table has no status column — so a wrongly
+ * dropped beacon leaves no trace anywhere. Fixing it well means adding
+ * provenance to the row so the READER can filter, which needs a coordinated
+ * change to the out-of-repo tracker service and the ClickHouse schema (there is
+ * no DDL for this table in this repo).
+ *
+ * Until then: do NOT build payouts, revenue share, ranking, discovery, or
+ * author-visible leaderboards on these figures. Present-day exposure is low in
+ * absolute terms (~3 rows/day platform-wide; both feature flags are mod-only),
+ * but there is no provenance column, so rows written now cannot later be sorted
+ * into trusted and untrusted. If inflation happens first the history is
+ * unrecoverable rather than repairable — which is the real cost of waiting.
+ */
+
+/** Impressions for a set of owned app blocks over a bounded range. */
+export type AppViews = {
+  /** Total impressions (one row per host mount) within the range. */
+  count: number;
+  /**
+   * Distinct viewers: authenticated viewers by `userId`, plus signed-out
+   * viewers by `ip`. See the dedup note above for why neither key alone works.
+   * IP-based counting is an approximation (shared NAT under-counts, mobile
+   * roaming over-counts) — it is a reach indicator, not an identity count.
+   */
+  uniqueViewers: number;
+  /**
+   * Of `count`, how many IMPRESSIONS came from signed-out viewers — an
+   * impression count, NOT a viewer count, and not a subset of `uniqueViewers`.
+   * One anonymous visitor reloading ten times contributes 10 here and 1 to
+   * `uniqueViewers`, so `anonCount` can exceed `uniqueViewers`. Label it as
+   * loads wherever it is rendered next to a viewer figure.
+   */
+  anonCount: number;
+  /**
+   * TRUE when the impression store could not be read — ClickHouse is not
+   * configured for this deployment, or the query failed. The zeros above are
+   * then a PLACEHOLDER, NOT a measurement.
+   *
+   * This is deliberately a PER-SECTION flag rather than a third value on the
+   * payload-level `AppAnalytics['unavailable']`: ClickHouse being down says
+   * nothing about the Postgres-derived installs/runs/revenue counters in the
+   * same response, which are still genuinely measured. Flagging the whole
+   * payload would throw away good data; omitting the flag entirely would
+   * reproduce the fabricated-zero defect that civitai#3557 and civitai#3581
+   * fixed, where a renderer cannot tell "nobody looked" from "we never asked".
+   */
+  unavailable?: boolean;
+};
+
+/** A placeholder zero (we could not ask). Always carries the discriminator. */
+export function unavailableViews(): AppViews {
+  return { count: 0, uniqueViewers: 0, anonCount: 0, unavailable: true };
+}
+
+/** A measured zero (we asked, the answer was none). */
+export function emptyViews(): AppViews {
+  return { count: 0, uniqueViewers: 0, anonCount: 0 };
+}
+
+/**
+ * ClickHouse DateTime parameter format (UTC, second resolution). The `time`
+ * column is a `DateTime`, so sub-second precision is not representable anyway.
+ */
+function chDateTime(d: Date): string {
+  return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
+ * Server-side execution cap, in seconds. The shared client is configured with a
+ * `request_timeout` of FIVE MINUTES and an unbounded `max_open_connections` — so
+ * without a bound a merely SLOW ClickHouse (not a down one) holds the whole
+ * `Promise.all` in getMyAppAnalytics open for minutes.
+ *
+ * That matters more than it looks: `AppAnalyticsInline` issues one
+ * `getMyAppAnalytics` PER APPROVED APP ROW in the submissions list, so a single
+ * page load fans out to N of these. The degrade-don't-throw contract covered
+ * errors only; latency needs its own bound, and the cap must be enforced
+ * SERVER-side (`max_execution_time`) as well as client-side (`abort_signal`),
+ * because aborting the socket alone leaves the query running on the cluster.
+ */
+export const VIEWS_QUERY_TIMEOUT_SECONDS = 10;
+
+type RollupRow = {
+  impressions: number | string;
+  authedViewers: number | string;
+  anonViewers: number | string;
+  anonImpressions: number | string;
+};
+
+/**
+ * VIEWS_WHERE is kept as ONE frozen string, and the tests pin it WHOLE.
+ *
+ * 🔴 This clause is the only thing that applies tenant isolation to the
+ * impression read — ownership is resolved upstream, but this is where the
+ * resolved ids actually constrain the scan. Asserting fragments of it with
+ * substring matches is not enough: an adversarial sweep flipped `AND` to `OR`
+ * (making the id filter a no-op, returning every author's impressions) and `IN`
+ * to `NOT IN` (returning every OTHER author's impressions) and BOTH mutants
+ * survived a fully green suite, because every fragment the tests looked for was
+ * still present. So the test pins this exact normalised text. A cosmetic
+ * reformat will fail that test; that is the intended trade.
+ */
+const VIEWS_WHERE = `WHERE appBlockId IN {appBlockIds:Array(String)} AND createdDate >= toDate({from:DateTime}) AND createdDate <= toDate({to:DateTime}) AND time >= {from:DateTime} AND time <= {to:DateTime}`;
+
+/**
+ * Impressions for `appBlockIds` between `from` and `to`.
+ *
+ * The caller MUST have already resolved `appBlockIds` to ids the requester
+ * owns — this function applies no ownership check of its own, exactly like the
+ * Postgres aggregates it sits beside.
+ *
+ * Never throws: a ClickHouse failure — including a TIMEOUT — degrades to
+ * `unavailable: true` so one slow or flaky store cannot take down an analytics
+ * panel whose other counters are fine.
+ */
+export async function getAppViews({
+  appBlockIds,
+  from,
+  to,
+  ch = clickhouse,
+}: {
+  appBlockIds: string[];
+  from: Date;
+  to: Date;
+  ch?: typeof clickhouse;
+}): Promise<AppViews> {
+  // Defensive: the only production caller (getMyAppAnalytics) already returns
+  // early when the owner has no apps, so this is not reachable from there. It
+  // stays because the function is exported and a future caller must not be able
+  // to turn an empty id list into an unfiltered scan.
+  if (appBlockIds.length === 0) return emptyViews();
+
+  // `clickhouse` is undefined whenever CLICKHOUSE_HOST/USERNAME are unset
+  // (src/server/clickhouse/client.ts) — i.e. most dev and CI environments.
+  if (!ch) return unavailableViews();
+
+  try {
+    // Bounds BOTH `time` (the real predicate) and `createdDate` (the partition
+    // key) so the scan prunes partitions instead of reading the whole table.
+    // `createdDate` is a `Date` (verified against prod: `system.columns` reports
+    // `createdDate Date`, `time DateTime`), so comparing it to `toDate(...)` is
+    // the correct granularity — if it were ever migrated to `DateTime` the
+    // upper bound would silently truncate to midnight and drop the current
+    // day's impressions with no error and no `unavailable` flag.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), VIEWS_QUERY_TIMEOUT_SECONDS * 1000);
+    try {
+      const rollupResp = await ch.query({
+        query: `
+          SELECT
+            count() AS impressions,
+            uniqExactIf(userId, isAnon = 0) AS authedViewers,
+            uniqExactIf(ip, isAnon = 1) AS anonViewers,
+            countIf(isAnon = 1) AS anonImpressions
+          FROM blockRenders
+          ${VIEWS_WHERE}
+        `,
+        query_params: {
+          appBlockIds,
+          from: chDateTime(from),
+          to: chDateTime(to),
+        },
+        format: 'JSONEachRow',
+        abort_signal: controller.signal,
+        clickhouse_settings: { max_execution_time: VIEWS_QUERY_TIMEOUT_SECONDS },
+      });
+
+      const [rollup] = (await rollupResp.json()) as RollupRow[];
+
+      return {
+        count: Number(rollup?.impressions ?? 0),
+        // Authenticated viewers are distinct userIds; signed-out viewers all
+        // share userId 0, so they are counted by distinct ip and added on.
+        uniqueViewers: Number(rollup?.authedViewers ?? 0) + Number(rollup?.anonViewers ?? 0),
+        anonCount: Number(rollup?.anonImpressions ?? 0),
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (error) {
+    // Degrade, don't throw: the rest of the payload is still good data. This
+    // also catches the abort, so a timeout reads as `unavailable` rather than
+    // as zero impressions.
+    logToAxiom(
+      {
+        name: 'app-views-service',
+        type: 'error',
+        message: 'blockRenders read failed',
+        error: (error as Error)?.message,
+      },
+      // Same datastream as every other ClickHouse failure site (tracker.ts), so
+      // this lands next to its siblings rather than in a stream of its own.
+      'clickhouse'
+    ).catch(() => undefined);
+    return unavailableViews();
+  }
+}

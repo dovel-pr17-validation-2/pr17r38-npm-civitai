@@ -1,0 +1,488 @@
+import type { Prisma } from '@prisma/client';
+import { env } from '~/env/server';
+import type { ComponentFileType, ModelFileType } from '~/server/common/constants';
+import { componentFileTypes } from '~/server/common/constants';
+import { EntityAccessPermission } from '~/server/common/enums';
+import type { BaseFileSchema, GetFilesByEntitySchema } from '~/server/schema/file.schema';
+import { getBountyEntryFilteredFiles } from '~/server/services/bountyEntry.service';
+import type { LinkedComponentSettings } from '~/server/schema/model-version.schema';
+import { getPrimaryFile } from '~/server/utils/model-helpers';
+import type { ScanResultCode } from '~/shared/utils/prisma/enums';
+import { ModelUsageControl } from '~/shared/utils/prisma/enums';
+import { hasFailedScan } from '~/server/utils/failed-scan';
+import { logToAxiom, safeError } from '~/server/logging/client';
+import { resolveDownloadUrl } from '~/utils/delivery-worker';
+import type { ResolveAttribution } from '~/utils/resolve-attribution';
+import type { NameableFile, NameableModel, NameableVersion } from '~/utils/model-file-naming';
+import { resolveModelFileName } from '~/utils/model-file-naming';
+import { removeEmpty } from '~/utils/object-helpers';
+import { isDefined } from '~/utils/type-guards';
+import { canViewPoiModel } from '~/server/utils/poi-model-visibility';
+import { throwBadRequestError } from '~/server/utils/errorHandling';
+import { dbRead } from '../db/client';
+import { loadKyselyDb } from '~/server/db/kyselyDb.lazy';
+import { readModelVersionForFileViaKysely } from '~/server/services/hot-reads-5.reads';
+import {
+  downloadFileSelect,
+  readDownloadFilesViaKysely,
+} from '~/server/services/hot-reads-6.reads';
+import type { DownloadFilesWhere } from '@civitai/db-queries/hot-reads-6';
+import { hasEntityAccess } from './common.service';
+import {
+  getVersionEarlyAccess,
+  isModelArchived,
+  isModelDeleted,
+  isVersionPublished,
+} from '~/server/utils/model-version-gates';
+
+export const getFilesByEntity = async ({ id, ids, type }: GetFilesByEntitySchema) => {
+  if (!id && (!ids || ids.length === 0)) {
+    return [];
+  }
+
+  const files = await dbRead.file.findMany({
+    where: { entityId: ids ? { in: ids } : id, entityType: type },
+    select: { id: true, name: true, url: true, sizeKB: true, metadata: true, entityId: true },
+  });
+
+  return files.map(({ metadata, ...file }) => ({
+    ...file,
+    metadata: (metadata as Prisma.JsonObject) ?? {},
+  }));
+};
+
+/** File metadata only the bounty entry file check and its moderator override write. Never taken from a caller. */
+export const SERVER_FILE_METADATA_KEYS = [
+  'sha256Server',
+  'hashCheckedAt',
+  'hashAttemptedAt',
+  'hashFailCount',
+  'hashLastError',
+  'blockedReason',
+  'checkOverride',
+] as const;
+
+function callerMetadata(metadata: unknown) {
+  return Object.fromEntries(
+    Object.entries((metadata ?? {}) as Record<string, unknown>).filter(
+      ([key]) => !(SERVER_FILE_METADATA_KEYS as readonly string[]).includes(key)
+    )
+  );
+}
+
+export const updateEntityFiles = async ({
+  tx,
+  entityId,
+  entityType,
+  files,
+  ownRights,
+}: {
+  tx: Prisma.TransactionClient;
+  entityId: number;
+  entityType: string;
+  files: BaseFileSchema[];
+  ownRights: boolean;
+}) => {
+  const updatedFiles = files.filter((f) => f.id);
+
+  // A file saved again at the same url keeps its check result; a new url is checked afresh. The
+  // result is read inside this UPDATE, from the row as it is written, so a moderator's change to it
+  // is never written back over; read it in an earlier statement and that guarantee is gone. The
+  // server keys must be read from `f`, the row being updated, not a joined or sub-selected copy. In
+  // id order, so two saves of one item take the row locks in the same order.
+  for (const file of [...updatedFiles].sort((a, b) => (a.id as number) - (b.id as number))) {
+    const metadata = { ...callerMetadata(file.metadata), ownRights };
+    const count = await tx.$executeRaw`
+      UPDATE "File" f
+      SET name = ${file.name}, url = ${file.url}, "sizeKB" = ${file.sizeKB},
+        metadata = ${JSON.stringify(metadata)}::jsonb || CASE
+          WHEN f.url = ${file.url} AND jsonb_typeof(f.metadata) = 'object' THEN COALESCE(
+            (SELECT jsonb_object_agg(key, value) FROM jsonb_each(f.metadata)
+              WHERE key = ANY(${[...SERVER_FILE_METADATA_KEYS]}::text[])),
+            '{}'::jsonb
+          )
+          ELSE '{}'::jsonb
+        END
+      WHERE f.id = ${file.id} AND f."entityId" = ${entityId} AND f."entityType" = ${entityType}
+    `;
+    if (count !== 1) throw throwBadRequestError('A file to update is not part of this item.');
+  }
+
+  // Delete any files that were removed.
+  const deletedFileIds = files.map((x) => x.id).filter(isDefined);
+
+  if (deletedFileIds.length >= 0) {
+    await tx.file.deleteMany({
+      where: {
+        entityId,
+        entityType,
+        id: { notIn: deletedFileIds },
+      },
+    });
+  }
+
+  const newFiles = files.filter((x) => !x.id);
+
+  if (newFiles.length > 0) {
+    // Create any new files.
+    await tx.file.createMany({
+      data: newFiles.map((file) => ({
+        ...file,
+        entityId,
+        entityType,
+        metadata: { ...callerMetadata(file.metadata), ownRights },
+      })),
+    });
+  }
+};
+
+export const getFileWithPermission = async ({
+  fileId,
+  userId,
+  isModerator,
+}: {
+  fileId: number;
+  userId?: number;
+  isModerator?: boolean;
+}) => {
+  const file = await dbRead.file.findUnique({
+    where: { id: fileId },
+    select: { url: true, name: true, metadata: true, entityId: true, entityType: true },
+  });
+
+  if (!file) return null;
+
+  switch (file.entityType) {
+    case 'BountyEntry': {
+      const bountyEntryFiles = await getBountyEntryFilteredFiles({
+        id: file.entityId,
+        userId,
+        isModerator,
+      });
+      if (!bountyEntryFiles.some((x) => x.id === fileId && !!x.url)) {
+        return null;
+      }
+
+      return file;
+    }
+    default:
+      return file;
+  }
+};
+
+/** Maps ModelFileType (with spaces) to ModelFileComponentType (camelCase) */
+const fileTypeToComponentTypeMap: Record<string, ModelFileComponentType> = {
+  VAE: 'VAE',
+  'Text Encoder': 'TextEncoder',
+  UNet: 'UNet',
+  'Diffusion Model': 'DiffusionModel',
+  CLIPVision: 'CLIPVision',
+  ControlNet: 'ControlNet',
+  Config: 'Config',
+};
+
+function isComponentFileType(type: string): type is ComponentFileType {
+  return (componentFileTypes as readonly string[]).includes(type);
+}
+
+function fileTypeToComponentType(type: string): ModelFileComponentType | undefined {
+  return fileTypeToComponentTypeMap[type];
+}
+
+export const getFileForModelVersion = async ({
+  modelVersionId,
+  type,
+  format,
+  size,
+  fp,
+  quantType,
+  user,
+  noAuth,
+  fileId,
+  direct,
+  attribution,
+}: {
+  modelVersionId: number;
+  type?: ModelFileType;
+  format?: ModelFileFormat;
+  size?: ModelFileSize;
+  fp?: string;
+  quantType?: string;
+  user?: {
+    isModerator?: boolean | null;
+    id?: number;
+    tier?: string;
+    filePreferences?: UserFilePreferences;
+  };
+  noAuth?: boolean;
+  fileId?: number;
+  /**
+   * Resolve to an origin-direct URL rather than the CDN-fronted one. Affects only
+   * which host serves the bytes — every access decision above is unchanged, and
+   * this flag is read after all of them.
+   */
+  direct?: boolean;
+  /**
+   * Which code path and actor this resolve is for, forwarded to the storage
+   * resolver for attribution only. Required so every caller names itself.
+   */
+  attribution: ResolveAttribution;
+}): Promise<ModelVersionFileResult> => {
+  // The version and its model. The read's inner join drops a version whose model row was
+  // hard-deleted (an orphaned foreign key), so that version is `not-found` (404), not a 500.
+  const { kyselyRead } = await loadKyselyDb();
+  const modelVersion = await readModelVersionForFileViaKysely(kyselyRead, modelVersionId);
+
+  if (!modelVersion) return { status: 'not-found' };
+
+  // disablePoi - Disables downloads for POI resources.
+  if (!canViewPoiModel(modelVersion.model.poi, modelVersion.model.userId, user)) {
+    return { status: 'not-found' };
+  }
+
+  const [versionAccess] = await hasEntityAccess({
+    entityIds: [modelVersion?.id],
+    entityType: 'ModelVersion',
+    userId: user?.id,
+    isModerator: user?.isModerator ?? undefined,
+  });
+
+  // Paid-access gate now sourced from PaidAccess (mirrors the old columns during Phase 1).
+  const { inEarlyAccess, deadline } = await getVersionEarlyAccess(modelVersion.id);
+  const isDownloadable = modelVersion.usageControl === ModelUsageControl.Download;
+
+  if (!noAuth && isModelArchived(modelVersion)) return { status: 'archived' };
+
+  const isMod = user?.isModerator;
+  const userId = user?.id;
+  const isOwner = !!userId && modelVersion.model.userId === userId;
+
+  // A deleted model is downloadable by moderators only — no exceptions. This
+  // gate runs before every other access path (owner, internal noAuth callers,
+  // and the published-state check) so a deleted (incl. DMCA-removed) model can
+  // never be served to its owner or anyone else. Owners are otherwise allowed
+  // to download their own unpublished work, but a deleted model's owner is
+  // frequently the exact party a takedown targets (the uploader).
+  if (isModelDeleted(modelVersion) && !isMod) return { status: 'not-found' };
+
+  const canDownload = noAuth || isMod || isOwner || isVersionPublished(modelVersion);
+
+  if (!canDownload) return { status: 'not-found' };
+
+  if (modelVersion?.usageControl !== ModelUsageControl.Download && !isMod && !isOwner) {
+    return { status: 'downloads-disabled' };
+  }
+
+  const requireAuth = modelVersion.requireAuth || !env.UNAUTHENTICATED_DOWNLOAD;
+  if (requireAuth && !userId) return { status: 'unauthorized' };
+
+  // The paid gate is checked BEFORE the generic access check so a gated version routes the user to
+  // the purchase flow; the other order collapses it into a bare denial and loses the reason.
+  // `permissions` only carries grant bits when there IS a grant — hasEntityAccess reports "no grant"
+  // as -1 (every bit set), so testing the bit alone reads a buyer-less user as already owning the
+  // download and skips the purchase route.
+  const boughtDownload =
+    !!versionAccess?.hasAccess &&
+    (versionAccess.permissions & EntityAccessPermission.EarlyAccessDownload) !== 0;
+  if (inEarlyAccess && !boughtDownload && !isMod && !isOwner) {
+    return { status: 'early-access', details: { deadline, baseModel: modelVersion.baseModel } };
+  }
+
+  // `unauthorized` means "no session" and callers answer it with a login redirect. A signed-in user
+  // who lacks a grant must NOT get that — they bounce off /login straight back to the page they came
+  // from, which reads as the download button doing nothing at all.
+  if (!(versionAccess?.hasAccess ?? true)) {
+    return { status: userId ? 'no-access' : 'unauthorized' };
+  }
+
+  // Get the correct file
+  let file: FileResult | null = null;
+  let versionFiles: FileResult[] = [];
+  const readFiles = (where: DownloadFilesWhere) => readDownloadFilesViaKysely(kyselyRead, where);
+  if (fileId) {
+    // Direct file lookup by ID — bypasses type-based resolution. Fetched as the whole version's
+    // files rather than the one row so the siblings come along; it is the same single query.
+    const found = await readFiles({ modelVersionId, publicOnly: !isOwner && !isMod });
+    versionFiles = found as FileResult[];
+    file = versionFiles.find((candidate) => candidate.id === fileId) ?? null;
+  } else {
+    // Try local files on this model version first. A replaced file is a quarantined component whose
+    // linked replacement is the fallback below, so it must not win here.
+    const files = await readFiles({
+      modelVersionId,
+      notReplaced: true,
+      type,
+      publicOnly: !isOwner && !isMod,
+    });
+    versionFiles = files as FileResult[];
+    const metadata = {
+      ...user?.filePreferences,
+      ...removeEmpty({ format, size, fp, quantType }),
+    } as FileMetadata;
+    const castedFiles = files as Array<Omit<FileResult, 'metadata'> & { metadata: FileMetadata }>;
+    file = getPrimaryFile(castedFiles, { metadata });
+
+    // If no local file found and the requested type is a component type,
+    // fall back to linked components (external files on other model versions)
+    if (!file && type && isComponentFileType(type)) {
+      const componentType = fileTypeToComponentType(type);
+      const linked = await dbRead.recommendedResource.findFirst({
+        where: {
+          sourceId: modelVersionId,
+          settings: { path: ['isLinkedComponent'], equals: true },
+        },
+        select: { resourceId: true, settings: true },
+      });
+      const settings = linked?.settings as LinkedComponentSettings | null;
+      if (linked && settings?.componentType === componentType) {
+        // Fetch the primary 'Model' file from the linked version
+        const linkedFile = await dbRead.modelFile.findFirst({
+          where: { modelVersionId: linked.resourceId, type: 'Model' },
+          select: downloadFileSelect,
+          orderBy: { id: 'asc' },
+        });
+        if (linkedFile) {
+          file = { ...linkedFile, type: type } as FileResult;
+          // Belongs to the linked version, so this version's files are not its siblings.
+          versionFiles = [];
+        }
+      }
+    }
+  }
+  if (!file) return { status: 'not-found' };
+  if (!isMod && hasFailedScan(file)) return { status: 'failed-scan' };
+
+  // Named against every file on the version, not only the files this request could pick from:
+  // otherwise two files sharing an uploaded name both download under it and overwrite each other.
+  const pickedFromAll = !!fileId && (isOwner || !!isMod);
+  if (versionFiles.length && !pickedFromAll) {
+    versionFiles = (await readFiles({ modelVersionId })) as FileResult[];
+  }
+
+  const filename = getDownloadFilename({
+    model: modelVersion.model,
+    modelVersion,
+    file,
+    versionFiles,
+  });
+  try {
+    const { url, urlExpiryDate } = await resolveDownloadUrl(file.id, file.url, filename, {
+      direct,
+      ...attribution,
+    });
+    return {
+      status: 'success',
+      url,
+      // The legacy delivery-worker path hands this back as JSON text, not a Date.
+      urlExpiresAt: new Date(urlExpiryDate),
+      fileId: file.id,
+      sizeKB: file.sizeKB,
+      modelId: modelVersion.model.id,
+      modelVersionId,
+      nsfw: modelVersion.model.nsfw,
+      inEarlyAccess,
+      metadata: file.metadata as FileMetadata,
+      isDownloadable,
+      // The download endpoint excludes unpublished versions from the download metric — a draft is only
+      // reachable by its owner and by internal services, so anything fetching one isn't a download.
+      published: isVersionPublished(modelVersion),
+    };
+  } catch (err) {
+    // Both storage-resolver and delivery-worker fallback rejected this file —
+    // usually an un-registered `file_locations` row on a bucket the
+    // delivery-worker doesn't know, or a stored `file.url` whose delivery URL no
+    // longer resolves. A broken/missing delivery URL is a *not-found* (the file
+    // is not deliverable), NOT a server fault — so the endpoint should answer
+    // 404, not 500. `resolveDownloadUrl` no longer throws `URI malformed` on a
+    // malformed/already-encoded URL (delivery-worker now decodes best-effort),
+    // so reaching this catch means the file genuinely can't be resolved.
+    //
+    // Use a DISTINCT `resolve-failed` status (not the deterministic `not-found`)
+    // so the endpoint can mark this 404 `Cache-Control: no-store`. This catch
+    // fires on TRANSIENT delivery-worker/storage-resolver non-2xx too (a storage
+    // outage, not just a permanently-broken URL); under `PublicEndpoint`'s default
+    // `s-maxage=300` a transient failure would otherwise let the CDN edge-cache
+    // "File not found" for ~5 min for a file that actually exists, even after the
+    // backend recovers. The deterministic by-id `not-found` stays cacheable.
+    //
+    // Still log so the leak is visible in production. safeError includes
+    // `name: 'Error'` which must be spread BEFORE our literal `name` or the
+    // event name gets overwritten.
+    logToAxiom({
+      type: 'error',
+      ...safeError(err),
+      name: 'resolve-download-url-failed',
+      fileId: file.id,
+      modelId: modelVersion.model.id,
+      modelVersionId,
+      fileUrl: file.url,
+      fileType: file.type,
+      userId: user?.id,
+    }).catch(() => undefined);
+    return { status: 'resolve-failed' };
+  }
+};
+
+export function getDownloadFilename({
+  model,
+  modelVersion,
+  file,
+  versionFiles,
+}: {
+  model: NameableModel;
+  modelVersion: NameableVersion;
+  file: NameableFile;
+  versionFiles?: NameableFile[];
+}) {
+  return resolveModelFileName({ model, modelVersion, file, versionFiles });
+}
+
+type ModelVersionFileResult =
+  | {
+      status:
+        | 'not-found'
+        | 'resolve-failed'
+        | 'unauthorized'
+        | 'no-access'
+        | 'archived'
+        | 'downloads-disabled'
+        | 'failed-scan'
+        | 'error';
+    }
+  | {
+      status: 'early-access';
+      details: {
+        deadline?: Date;
+        /** Lets the caller say a non-commercial version can't be bought, instead of offering a purchase. */
+        baseModel: string;
+      };
+    }
+  | {
+      status: 'success';
+      url: string;
+      urlExpiresAt: Date;
+      fileId: number;
+      sizeKB: number;
+      modelId: number;
+      modelVersionId: number;
+      nsfw: boolean;
+      inEarlyAccess: boolean;
+      metadata: FileMetadata;
+      isDownloadable?: boolean;
+      published: boolean;
+    };
+
+type FileResult = {
+  type: string;
+  id: number;
+  name: string;
+  overrideName?: string | null;
+  metadata: Prisma.JsonValue;
+  sizeKB: number;
+  hashes: {
+    hash: string;
+  }[];
+  url: string;
+  pickleScanResult: ScanResultCode;
+  virusScanResult: ScanResultCode;
+};

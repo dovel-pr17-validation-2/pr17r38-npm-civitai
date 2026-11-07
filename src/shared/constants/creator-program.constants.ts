@@ -1,0 +1,96 @@
+import { buzzBankTypes } from '~/shared/constants/buzz.constants';
+import type { UserTier } from '~/server/schema/user.schema';
+import type { CashWithdrawalMethod } from '~/shared/utils/prisma/enums';
+
+export const EXTRACTION_PHASE_DURATION = 3; // days
+
+/**
+ * The ledger description on an extraction fee.
+ *
+ * A constant because the Buzz dashboard renders a `Fee` description only when it
+ * recognises the string, so a reword here has to travel to that allowlist.
+ */
+export const EXTRACTION_FEE_DESCRIPTION = 'Extraction fee';
+
+type ExtractionFee = {
+  min: number;
+  max?: number;
+  fee: number;
+};
+export const EXTRACTION_FEES: ExtractionFee[] = [
+  {
+    min: 0,
+    max: 100000,
+    fee: 0,
+  },
+  {
+    min: 100000,
+    max: 1000000,
+    fee: 0.05,
+  },
+  {
+    min: 1000000,
+    max: 5000000,
+    fee: 0.1,
+  },
+  {
+    min: 5000000,
+    max: undefined,
+    fee: 0.15,
+  },
+];
+
+export type CapDefinition = {
+  tier: UserTier;
+  limit?: number;
+  percentOfPeakEarning?: number;
+  hidden?: boolean;
+};
+export const PEAK_EARNING_WINDOW = 12;
+
+/**
+ * Must be the start of a UTC month: this month's deposits are read from the bank account, so a
+ * mid-month cutover would subtract pre-cutover deposits the snapshot already reflects.
+ */
+export const BANKABLE_CUTOVER = new Date('2026-11-01T00:00:00Z');
+export const MIN_CAP = 100000;
+export const CAP_DEFINITIONS: CapDefinition[] = [
+  { tier: 'founder', limit: MIN_CAP, hidden: true },
+  { tier: 'bronze', limit: MIN_CAP },
+  { tier: 'silver', limit: 1000000, percentOfPeakEarning: 1.25 },
+  { tier: 'gold', percentOfPeakEarning: 1.5 },
+];
+
+export const MIN_BANK_AMOUNT = 10000;
+export {
+  CREATOR_PROGRAM_MIN_CREATOR_SCORE as MIN_CREATOR_SCORE,
+  CREATOR_PROGRAM_MIN_WITHDRAWAL_AMOUNT as MIN_WITHDRAWAL_AMOUNT,
+} from '@civitai/buzz';
+
+type WithdrawalFee = {
+  type: 'fixed' | 'percent';
+  amount: number;
+  enabled?: boolean;
+};
+
+// TODO creators program - Justin: Revise withdrawal fees here. They might make no sense.
+export const WITHDRAWAL_FEES: Record<CashWithdrawalMethod, WithdrawalFee | undefined> = {
+  ACH: { type: 'fixed', amount: 200 },
+  PayPal: { type: 'percent', amount: 0.05 },
+  Check: { type: 'fixed', amount: 400 },
+  Card: undefined,
+  Custom: undefined,
+  eCheck: undefined,
+  Intercash: undefined,
+  Payoneer: undefined,
+  WireTransfer: undefined,
+  HoldMyPayments: undefined,
+  NoPM: undefined,
+  TipaltiInternalValue: undefined,
+};
+
+export const FIRST_CREATOR_PROGRAM_MONTH = new Date('2025-03-01');
+export const CAPPED_BUZZ_VALUE = (1 / 1000) * 100; // $0.001 per Buzz (*100 to convert to cents)
+
+// Order matters, the first one is the default color we'll show.
+export const SUPPORTED_BUZZ = buzzBankTypes;

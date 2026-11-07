@@ -1,0 +1,186 @@
+import cardClasses from '~/components/Cards/Cards.module.css';
+import { FeedCard } from '~/components/Cards/FeedCard';
+import { EdgeMedia2 } from '~/components/EdgeMedia/EdgeMedia';
+import { MediaHash } from '~/components/ImageHash/ImageHash';
+import { DEFAULT_EDGE_IMAGE_WIDTH } from '~/server/common/constants';
+import type { ImageProps } from '~/components/ImageViewer/ImageViewer';
+import { IconCategory, IconPhoto } from '@tabler/icons-react';
+import { ImageGuard2 } from '~/components/ImageGuard/ImageGuard2';
+import { ImageContextMenu } from '~/components/Image/ContextMenu/ImageContextMenu';
+import { getSkipValue } from '~/components/EdgeMedia/EdgeMedia.util';
+import { RoutedDialogLink } from '~/components/Dialog/RoutedDialogLink';
+import { getModelUrl } from '~/utils/string-helpers';
+import type { ImpressionTarget } from '~/components/TrackView/useTrackImpression';
+import { isImpressionEntityType } from '~/server/schema/track.schema';
+import type { EventDecorationEntity } from '~/components/Cosmetics/EventDecoration/WornHatPopover';
+import { CosmeticEntity } from '~/shared/utils/prisma/enums';
+
+const isCosmeticEntity = (value?: string): value is CosmeticEntity =>
+  !!value && (Object.values(CosmeticEntity) as string[]).includes(value);
+
+/**
+ * The content this card's hat is worn on: the entity the card stands for, as getEntityCoverImage
+ * sends that entity's hat, not its cover image's. Anything that cannot wear one falls back to the image.
+ */
+export function getGenericCardWornOn(
+  imageId: number,
+  entityType?: string,
+  entityId?: number
+): EventDecorationEntity {
+  return entityId && isCosmeticEntity(entityType)
+    ? { entityType, entityId }
+    : { entityType: CosmeticEntity.Image, entityId: imageId };
+}
+
+export function GenericImageCard({
+  image,
+  entityType,
+  entityId,
+  disabled,
+  hideEventDecoration,
+}: {
+  image: ImageProps;
+  entityId: number;
+  entityType?: string;
+  disabled?: boolean;
+  hideEventDecoration?: boolean;
+}) {
+  const url = (() => {
+    if (!entityType || !entityId) return undefined;
+
+    switch (entityType) {
+      case 'Model': {
+        return getModelUrl({ modelId: entityId });
+      }
+      case 'Collection': {
+        return `/collections/${entityId}`;
+      }
+      case 'Bounty': {
+        return `/bounties/${entityId}`;
+      }
+      case 'Image': {
+        return `/images/${entityId}`;
+      }
+      default: {
+        return '/';
+      }
+    }
+  })();
+
+  const Icon = (() => {
+    switch (entityType) {
+      case 'Model': {
+        return IconCategory;
+      }
+      case 'Image': {
+        return IconPhoto;
+      }
+      default: {
+        return null;
+      }
+    }
+  })();
+
+  const isImageEntity = entityType === 'Image';
+
+  // This card is polymorphic — it renders a Model, Collection or Bounty behind a
+  // cover image as often as it renders an image. Reporting only the image would
+  // credit the cover and drop the thing the card is actually for. `entityType` is
+  // a loose string here, so it is narrowed against the tracked set rather than
+  // cast; an unrecognised value contributes nothing instead of a bad row.
+  const impressions: ImpressionTarget[] = [{ entityType: 'Image', entityId: image.id }];
+  if (entityId && isImpressionEntityType(entityType)) impressions.push({ entityType, entityId });
+
+  const cardContent = (
+    <FeedCard
+      impressions={impressions}
+      style={{
+        cursor: disabled ? 'initial' : undefined,
+      }}
+      href={disabled ? undefined : url}
+      frameDecoration={image.cosmetic}
+      eventDecoration={hideEventDecoration ? undefined : image.eventDecoration?.data}
+      eventDecorationOn={getGenericCardWornOn(image.id, entityType, entityId)}
+      aspectRatio="portrait"
+      useCSSAspectRatio
+    >
+      <div className={cardClasses.root}>
+        {image && (
+          <ImageGuard2 image={image}>
+            {(safe) => {
+              // Small hack to prevent blurry landscape images
+              const originalAspectRatio =
+                image.width && image.height ? image.width / image.height : 1;
+              return (
+                <>
+                  {!disabled && (
+                    <>
+                      <ImageGuard2.BlurToggle className="absolute left-2 top-2 z-10" />
+                      <ImageContextMenu image={image} className="absolute right-2 top-2 z-10" />
+                    </>
+                  )}
+                  {safe ? (
+                    <div style={{ height: '100%' }}>
+                      <EdgeMedia2
+                        metadata={image.metadata}
+                        src={image.url}
+                        name={image.name ?? image.id.toString()}
+                        alt={image.name ?? undefined}
+                        type={image.type}
+                        imageId={image.id}
+                        width={
+                          originalAspectRatio > 1
+                            ? DEFAULT_EDGE_IMAGE_WIDTH * originalAspectRatio
+                            : DEFAULT_EDGE_IMAGE_WIDTH
+                        }
+                        skip={getSkipValue(image)}
+                        placeholder="empty"
+                        className={cardClasses.image}
+                        wrapperProps={{ style: { height: '100%', width: '100%' } }}
+                        loading="lazy"
+                        contain
+                      />
+                    </div>
+                  ) : (
+                    <MediaHash {...image} />
+                  )}
+
+                  {Icon && (
+                    <Icon
+                      size={20}
+                      style={{
+                        position: 'absolute',
+                        bottom: '10px',
+                        left: '10px',
+                        zIndex: 1,
+                        borderRadius: '50%',
+                        width: '20px',
+                        height: '20px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }}
+                    />
+                  )}
+                </>
+              );
+            }}
+          </ImageGuard2>
+        )}
+      </div>
+    </FeedCard>
+  );
+
+  if (isImageEntity && !disabled)
+    return (
+      <RoutedDialogLink
+        name="imageDetail"
+        state={{ imageId: entityId, filters: { postId: image.postId } }}
+        passHref
+      >
+        {cardContent}
+      </RoutedDialogLink>
+    );
+
+  return cardContent;
+}

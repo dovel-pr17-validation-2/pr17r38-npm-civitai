@@ -1,0 +1,48 @@
+.content {
+  flex: 1;
+  color: theme('colors.white');
+  opacity: 0;
+  transition: opacity 200ms ease;
+  display: flex;
+  height: 100%;
+  position: relative;
+
+  &.inView {
+    opacity: 1;
+  }
+}
+
+.header, .footer {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  padding: theme('padding.2');
+  display: flex;
+  gap: theme('gap.1');
+  pointer-events: none;
+}
+
+.header {
+  top: 0;
+  // Steps the corner chips clear of an event decoration sitting on the corner.
+  padding-left: max(theme('padding.2'), var(--event-decoration-clear-left, 0px));
+}
+
+.footer {
+  bottom: 0;
+
+  &.gradient {
+    background: linear-gradient(transparent, rgba(0,0,0,.6));
+  }
+}
+
+.chip {
+  border-radius: theme('borderRadius.xl');
+  height: 26px;
+  overflow: unset;
+  pointer-events: auto;
+
+  & * {
+    overflow: unset;
+  }
+}

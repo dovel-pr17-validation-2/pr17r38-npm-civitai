@@ -1,0 +1,351 @@
+import { keepPreviousData } from '@tanstack/react-query';
+import {
+  ActionIcon,
+  Button,
+  Card,
+  Center,
+  Checkbox,
+  Group,
+  Loader,
+  Paper,
+  SegmentedControl,
+  Stack,
+  Textarea,
+  Title,
+} from '@mantine/core';
+import { Popover } from '~/components/MantineOverlays';
+import type { TooltipProps } from '@mantine/core';
+import {
+  IconExternalLink,
+  IconPlus,
+  IconSquareCheck,
+  IconSquareOff,
+  IconTrash,
+} from '@tabler/icons-react';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
+import { useCallback, useRef, useState } from 'react';
+import { create } from 'zustand';
+import { immer } from 'zustand/middleware/immer';
+
+import { useMergedRef } from '@mantine/hooks';
+import { ButtonTooltip } from '~/components/CivitaiWrapped/ButtonTooltip';
+import { EdgeMedia } from '~/components/EdgeMedia/EdgeMedia';
+import { MasonryColumns } from '~/components/MasonryColumns/MasonryColumns';
+import { MasonryContainer } from '~/components/MasonryColumns/MasonryContainer';
+import { MasonryProvider } from '~/components/MasonryColumns/MasonryProvider';
+import { MasonryCard } from '~/components/MasonryGrid/MasonryCard';
+import { NoContent } from '~/components/NoContent/NoContent';
+import { PopConfirm } from '~/components/PopConfirm/PopConfirm';
+import { useInView } from '~/hooks/useInView';
+import { NsfwLevel } from '~/server/common/enums';
+import type { SanityImage } from '~/server/routers/research.router';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+import { getImageEntityUrl } from '~/utils/moderators/moderator.util';
+import { trpc } from '~/utils/trpc';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+
+type StoreState = {
+  selected: Record<number, boolean>;
+  getSelected: () => number[];
+  toggleSelected: (value: number) => void;
+  selectMany: (values: number[]) => void;
+  deselectAll: () => void;
+};
+
+const useStore = create<StoreState>()(
+  immer((set, get) => ({
+    selected: {},
+    getSelected: () => {
+      const dict = get().selected;
+      return Object.keys(dict).map(Number);
+    },
+    toggleSelected: (value) => {
+      set((state) => {
+        if (state.selected[value]) delete state.selected[value];
+        else state.selected[value] = true;
+      });
+    },
+    selectMany: (values) => {
+      set((state) => {
+        values.map((value) => {
+          state.selected[value] = true;
+        });
+      });
+    },
+    deselectAll: () => {
+      set((state) => {
+        state.selected = {};
+      });
+    },
+  }))
+);
+
+export const getServerSideProps = createServerSideProps({ requireModerator: true });
+
+export default function RaterSanity() {
+  const { data: images, isLoading } = trpc.research.raterGetSanityImages.useQuery(undefined, {
+    placeholderData: keepPreviousData,
+  });
+  const [nsfwLevel, setNsfwLevel] = useState<NsfwLevel>(NsfwLevel.PG);
+
+  return (
+    <MasonryProvider columnWidth={310} maxColumnCount={7} maxSingleColumnWidth={450}>
+      <MasonryContainer py="xl">
+        <Stack>
+          {images && (
+            <Paper
+              withBorder
+              shadow="lg"
+              p={0}
+              pr="xs"
+              style={{
+                display: 'inline-flex',
+                float: 'right',
+                alignSelf: 'flex-end',
+                marginRight: 6,
+                position: 'sticky',
+                top: 45,
+                marginBottom: -65,
+                zIndex: 10,
+              }}
+            >
+              <SegmentedControl
+                mr="xs"
+                value={nsfwLevel.toString()}
+                onChange={(v) => setNsfwLevel(parseInt(v, 10) as NsfwLevel)}
+                data={[
+                  { value: NsfwLevel.PG.toString(), label: 'PG' },
+                  { value: NsfwLevel.PG13.toString(), label: 'PG13' },
+                  { value: NsfwLevel.R.toString(), label: 'R' },
+                  { value: NsfwLevel.X.toString(), label: 'X' },
+                ]}
+              />
+
+              <Controls images={images} />
+            </Paper>
+          )}
+          <Group align="flex-end">
+            <Title>Rater Sanity Images</Title>
+          </Group>
+
+          {isLoading ? (
+            <Center py="xl">
+              <Loader size="xl" />
+            </Center>
+          ) : images?.length ? (
+            <>
+              <MasonryColumns
+                data={images.filter((image) => image.nsfwLevel === nsfwLevel)}
+                imageDimensions={(data) => {
+                  const width = data?.width ?? 450;
+                  const height = data?.height ?? 450;
+                  return { width, height };
+                }}
+                maxItemHeight={600}
+                render={ImageGridItem}
+                itemId={(data) => data.id}
+              />
+            </>
+          ) : (
+            <NoContent mt="lg" message="There are no sanity images that match that criteria" />
+          )}
+        </Stack>
+      </MasonryContainer>
+    </MasonryProvider>
+  );
+}
+
+function ImageGridItem({ data: image, height }: ImageGridItemProps) {
+  const selected = useStore(useCallback((state) => state.selected[image.id] ?? false, [image.id]));
+  const toggleSelected = useStore((state) => state.toggleSelected);
+
+  const entityUrl = getImageEntityUrl(image);
+
+  const { ref: inViewRef, inView } = useInView();
+  const ref = useRef<HTMLElement>(null);
+  const mergedRef = useMergedRef(inViewRef, ref);
+
+  return (
+    <MasonryCard
+      shadow="sm"
+      withBorder
+      ref={mergedRef as any}
+      style={(theme) => ({
+        minHeight: height,
+        outline: selected
+          ? `3px solid ${
+              theme.colors[theme.primaryColor][
+                typeof theme.primaryShade === 'number'
+                  ? theme.primaryShade
+                  : theme.primaryShade.dark
+              ]
+            }`
+          : undefined,
+      })}
+      onClick={() => toggleSelected(image.id)}
+    >
+      <>
+        <Card.Section style={{ height: `${height}px` }}>
+          {inView && (
+            <>
+              <Checkbox
+                checked={selected}
+                size="lg"
+                className="absolute left-[5px] top-[5px] z-10"
+              />
+              <EdgeMedia
+                src={image.url}
+                name={image.id.toString()}
+                type="image"
+                width={450}
+                placeholder="empty"
+              />
+              {!!entityUrl && (
+                <Link legacyBehavior href={entityUrl} passHref>
+                  <LegacyActionIcon
+                    component="a"
+                    variant="transparent"
+                    style={{ position: 'absolute', bottom: '5px', left: '5px' }}
+                    size="lg"
+                    target="_blank"
+                    onClick={(e: React.MouseEvent<HTMLAnchorElement>) => {
+                      e.stopPropagation();
+                    }}
+                  >
+                    <IconExternalLink
+                      color="white"
+                      filter="drop-shadow(1px 1px 2px rgb(0 0 0 / 50%)) drop-shadow(0px 5px 15px rgb(0 0 0 / 60%))"
+                      opacity={0.8}
+                      strokeWidth={2.5}
+                      size={26}
+                    />
+                  </LegacyActionIcon>
+                </Link>
+              )}
+            </>
+          )}
+        </Card.Section>
+      </>
+    </MasonryCard>
+  );
+}
+
+type ImageGridItemProps = {
+  data: {
+    id: number;
+    url: string;
+    width: number;
+    height: number;
+    nsfwLevel: NsfwLevel;
+  };
+  index: number;
+  width: number;
+  height: number;
+};
+
+function Controls({ images }: { images: SanityImage[] }) {
+  const queryUtils = trpc.useUtils();
+  const selected = useStore((state) => Object.keys(state.selected).map(Number));
+  const selectMany = useStore((state) => state.selectMany);
+  const deselectAll = useStore((state) => state.deselectAll);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const updateSanityImages = trpc.research.raterUpdateSanityImages.useMutation({
+    onSettled: async () => {
+      await queryUtils.research.raterGetSanityImages.invalidate();
+    },
+  });
+
+  const tooltipProps: Omit<TooltipProps, 'label' | 'children'> = {
+    position: 'bottom',
+    withArrow: true,
+    withinPortal: true,
+  };
+
+  const handleDeleteSelected = () => {
+    deselectAll();
+    updateSanityImages.mutate({
+      remove: selected,
+    });
+  };
+
+  const handleSelectAll = () => {
+    selectMany(images.map((x) => x.id));
+  };
+
+  const [addPopoverOpen, setAddPopoverOpen] = useState(false);
+  const handleAdd = () => {
+    if (!textareaRef.current) return;
+    const values = textareaRef.current.value.split('\n').map((x) => x.trim());
+    if (!values) return;
+
+    const ids: number[] = [];
+    for (const value of values) {
+      let idString = value;
+      if (idString.startsWith('http')) {
+        idString = idString.split('/').pop()!;
+      }
+      const id = parseInt(idString, 10);
+      if (!isNaN(id)) ids.push(id);
+    }
+
+    updateSanityImages.mutate({
+      add: ids,
+    });
+
+    textareaRef.current.value = '';
+    setAddPopoverOpen(false);
+  };
+
+  const handleClearAll = () => deselectAll();
+
+  return (
+    <Group wrap="nowrap" gap="xs">
+      <ButtonTooltip label="Select all" {...tooltipProps}>
+        <LegacyActionIcon
+          variant="outline"
+          onClick={handleSelectAll}
+          disabled={selected.length === images.length}
+        >
+          <IconSquareCheck size="1.25rem" />
+        </LegacyActionIcon>
+      </ButtonTooltip>
+      <ButtonTooltip label="Clear selection" {...tooltipProps}>
+        <LegacyActionIcon variant="outline" disabled={!selected.length} onClick={handleClearAll}>
+          <IconSquareOff size="1.25rem" />
+        </LegacyActionIcon>
+      </ButtonTooltip>
+      <PopConfirm
+        message={`Are you sure you want to delete ${selected.length} image(s)?`}
+        position="bottom-end"
+        onConfirm={handleDeleteSelected}
+        withArrow
+      >
+        <ButtonTooltip label="Delete" {...tooltipProps}>
+          <LegacyActionIcon variant="outline" disabled={!selected.length} color="red">
+            <IconTrash size="1.25rem" />
+          </LegacyActionIcon>
+        </ButtonTooltip>
+      </PopConfirm>
+      <Popover position="bottom-end" width={300} opened={addPopoverOpen}>
+        <Popover.Target>
+          <LegacyActionIcon
+            variant="outline"
+            color="green"
+            onClick={() => setAddPopoverOpen((x) => !x)}
+          >
+            <IconPlus size="1.25rem" />
+          </LegacyActionIcon>
+        </Popover.Target>
+        <Popover.Dropdown px="xs">
+          <Stack gap={4}>
+            <Textarea ref={textareaRef} placeholder="Add a link or id per line" autosize />
+            <Button fullWidth onClick={() => handleAdd()}>
+              Add to Sanity Images
+            </Button>
+          </Stack>
+        </Popover.Dropdown>
+      </Popover>
+    </Group>
+  );
+}

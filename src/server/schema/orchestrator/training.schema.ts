@@ -1,0 +1,296 @@
+import type { SessionUser } from '~/types/session';
+import type { FeatureAccess } from '~/server/services/feature-flags.service';
+import type { ColorDomain } from '~/shared/constants/domain.constants';
+import * as z from 'zod';
+import { OrchEngineTypes, OrchPriorityTypes } from '~/server/common/enums';
+import {
+  audioSampleOverrideSchema,
+  trainingDetailsParams,
+  trainingDetailsParamsUnion,
+} from '~/server/schema/model-version.schema';
+import { buzzSpendTypes } from '~/shared/constants/buzz.constants';
+import { aiToolkitLrSchedulerTypes, aiToolkitOptimizerTypes } from '~/utils/training';
+
+const imageTrainingBaseSchema = z.object({
+  model: z.string(),
+  priority: z.enum(OrchPriorityTypes), // technically can be a number
+  engine: z.enum(OrchEngineTypes),
+  trainingDataImagesCount: z.number(),
+});
+
+// AI Toolkit specific parameters - uses discriminated union for proper modelVariant validation
+const aiToolkitMaxEpochs = 50;
+const prodigyOptimizers = ['prodigy', 'prodigy8bit'];
+const maxLrForNonProdigy = 0.1;
+const aiToolkitBaseParams = z.object({
+  engine: z.literal(OrchEngineTypes.AiToolkit),
+  // Steps-based pricing: `steps` is the primary length knob; `epochs` is the saved
+  // checkpoint count. Both optional — `epochs`-only keeps legacy flat pricing.
+  epochs: z.number().int().min(1).max(aiToolkitMaxEpochs).optional(),
+  steps: z.number().int().min(1).optional(),
+  batchSize: z.number().int().min(1).optional(),
+  sampleCfgScale: z.number().optional(),
+  sampleStrength: z.number().optional(),
+  continueFrom: z.string().optional(),
+  resolution: z.number().nullable(),
+  lr: z.number(),
+  textEncoderLr: z.number().nullable(),
+  trainTextEncoder: z.boolean(),
+  lrScheduler: z.enum(aiToolkitLrSchedulerTypes),
+  optimizerType: z.enum(aiToolkitOptimizerTypes),
+  networkDim: z.number().nullable(),
+  networkAlpha: z.number().nullable(),
+  noiseOffset: z.number().nullable(),
+  minSnrGamma: z.number().nullable(),
+  flipAugmentation: z.boolean(),
+  shuffleTokens: z.boolean(),
+  keepTokens: z.number(),
+  numRepeats: z.number().optional(),
+});
+
+// Use discriminated union to enforce modelVariant requirements per ecosystem.
+//
+// Exported (as `aiToolkitTrainingParamsSchema`) for the App Blocks `kind:'training'`
+// wire body, which validates an app-supplied param set against THIS schema rather
+// than a second copy that could drift from what the training form accepts.
+export const aiToolkitTrainingParamsSchema = z
+  .discriminatedUnion('ecosystem', [
+    // SD1, SDXL, Chroma, Qwen, and ZImageTurbo don't need modelVariant
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('sd1'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('sdxl'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('chroma'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('qwen'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('zimageturbo'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('zimagebase'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('ltx2'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('ltx23'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('ltx25'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('minimaxh3'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('ernie'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('anima'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('boogu'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('krea2'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('mageflow'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('ideogram4'),
+      modelVariant: z.undefined().optional(),
+    }),
+    // SD3, Flux1, Flux2Klein, and Wan require modelVariant
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('sd3'),
+      modelVariant: z.enum(['large', 'medium']),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('flux1'),
+      modelVariant: z.enum(['dev', 'schnell']),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('wan'),
+      modelVariant: z.enum(['2.1', '2.2']),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('flux2klein'),
+      modelVariant: z.enum(['4b', '9b']),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('qwen21'),
+      modelVariant: z.undefined().optional(),
+      batchSize: z.literal(1).optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('ming'),
+      modelVariant: z.undefined().optional(),
+      batchSize: z.literal(1).optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('yue2'),
+      modelVariant: z.undefined().optional(),
+      batchSize: z.literal(1).optional(),
+    }),
+    // ACE-Step audio
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('ace_step_15'),
+      modelVariant: z.undefined().optional(),
+    }),
+    aiToolkitBaseParams.extend({
+      ecosystem: z.literal('ace_step_15_xl'),
+      modelVariant: z.enum(['base', 'sft']),
+    }),
+  ])
+  .refine(
+    (data) => {
+      if (prodigyOptimizers.includes(data.optimizerType)) return true;
+      return data.lr < maxLrForNonProdigy;
+    },
+    {
+      message: `Learning rate must be less than ${maxLrForNonProdigy} for non-Prodigy optimizers`,
+      path: ['lr'],
+    }
+  );
+
+export type AiToolkitTrainingParams = z.infer<typeof aiToolkitTrainingParamsSchema>;
+
+const whatIfTrainingDetailsParams = trainingDetailsParams.pick({
+  resolution: true,
+  maxTrainEpochs: true,
+  numRepeats: true,
+  trainBatchSize: true,
+});
+
+// WhatIf schema that accepts either Kohya-style or AI Toolkit parameters
+// Using discriminated union for better type safety based on engine type
+const whatIfKohyaParams = z.object({
+  model: z.string(),
+  priority: z.enum(OrchPriorityTypes),
+  engine: z.enum([
+    OrchEngineTypes.Kohya,
+    OrchEngineTypes.Rapid,
+    OrchEngineTypes.Flux2Dev,
+    OrchEngineTypes.Flux2DevEdit,
+    OrchEngineTypes.Musubi,
+  ]),
+  trainingDataImagesCount: z.number(),
+  resolution: z.number(),
+  maxTrainEpochs: z.number(),
+  numRepeats: z.number(),
+  trainBatchSize: z.number(),
+  // Sample prompts drive the sample-generation jobs that per-resource license
+  // fees attach to; without them the whatif estimate omits the fee that the
+  // real submission incurs. Optional so pre-update clients still validate.
+  samplePrompts: z.array(z.string()).optional(),
+});
+
+const whatIfAiToolkitParams = z.object({
+  model: z.string(),
+  priority: z.enum(OrchPriorityTypes),
+  engine: z.literal(OrchEngineTypes.AiToolkit),
+  trainingDataImagesCount: z.number(),
+  ecosystem: z.string(),
+  modelVariant: z.string().optional(),
+  epochs: z.number().int().min(1).max(aiToolkitMaxEpochs).optional(),
+  steps: z.number().int().min(1).optional(),
+  batchSize: z.number().int().min(1).optional(),
+  sampleCfgScale: z.number().optional(),
+  sampleStrength: z.number().optional(),
+  continueFrom: z.string().optional(),
+  resolution: z.number().nullable(),
+  lr: z.number(),
+  textEncoderLr: z.number().nullable(),
+  trainTextEncoder: z.boolean(),
+  lrScheduler: z.enum(aiToolkitLrSchedulerTypes),
+  optimizerType: z.enum(aiToolkitOptimizerTypes),
+  networkDim: z.number().nullable(),
+  networkAlpha: z.number().nullable(),
+  noiseOffset: z.number().nullable(),
+  minSnrGamma: z.number().nullable(),
+  flipAugmentation: z.boolean(),
+  shuffleTokens: z.boolean(),
+  keepTokens: z.number(),
+  numRepeats: z.number().optional(),
+  maxTrainEpochs: z.number().nullable().optional(),
+  // Sample prompts drive the sample-generation jobs that per-resource license
+  // fees attach to; without them the whatif estimate omits the fee that the
+  // real submission incurs. Optional so pre-update clients still validate.
+  samplePrompts: z.array(z.string()).optional(),
+  samplesOverrides: z.array(audioSampleOverrideSchema).optional(),
+});
+
+export const imageTrainingRouterWhatIfSchema = z
+  .discriminatedUnion('engine', [whatIfKohyaParams, whatIfAiToolkitParams])
+  .refine(
+    (data) => {
+      if (!('optimizerType' in data)) return true; // Kohya params don't have optimizerType
+      if (prodigyOptimizers.includes(data.optimizerType)) return true;
+      return data.lr < maxLrForNonProdigy;
+    },
+    {
+      message: `Learning rate must be less than ${maxLrForNonProdigy} for non-Prodigy optimizers`,
+      path: ['lr'],
+    }
+  );
+export type ImageTrainingRouterWhatIfSchema = z.infer<typeof imageTrainingRouterWhatIfSchema>;
+
+const imageTrainingStepSchema = imageTrainingBaseSchema.extend({
+  trainingData: z.url(),
+  loraName: z.string(),
+  triggerWord: z.string(),
+  samplePrompts: z.array(z.string()),
+  samplesOverrides: z.array(audioSampleOverrideSchema).optional(),
+  negativePrompt: z.string().optional(),
+  params: z.discriminatedUnion('engine', [
+    whatIfTrainingDetailsParams.extend({ engine: z.enum(OrchEngineTypes) }),
+    trainingDetailsParamsUnion,
+  ]),
+  modelFileId: z.number(),
+});
+export type ImageTrainingStepSchema = z.infer<typeof imageTrainingStepSchema>;
+
+export const imageTrainingRouterInputSchema = z.object({
+  modelVersionId: z.number(),
+  buzzType: z.string().optional(),
+});
+
+const imageTrainingWorkflowSchema = imageTrainingRouterInputSchema.extend({
+  token: z.string(),
+  currencies: z.array(z.enum(buzzSpendTypes)).optional(),
+});
+export type ImageTrainingWorkflowSchema = z.infer<typeof imageTrainingWorkflowSchema> & {
+  user: SessionUser;
+  features: FeatureAccess;
+  domain: ColorDomain;
+};
+
+// Can't extend a union, so we need to merge with an intersection
+const imageTraininWhatIfgWorkflowSchema = z.intersection(
+  imageTrainingRouterWhatIfSchema,
+  z.object({
+    token: z.string(),
+    currencies: z.array(z.enum(buzzSpendTypes)).optional(),
+  })
+);
+export type ImageTraininWhatIfWorkflowSchema = z.infer<typeof imageTraininWhatIfgWorkflowSchema>;

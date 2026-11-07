@@ -1,0 +1,509 @@
+import { Anchor, Button, Center, Loader, Modal, Table } from '@mantine/core';
+import { capitalize } from 'lodash-es';
+import { useBankedBuzz } from '~/components/Buzz/CreatorProgramV2/CreatorProgram.util';
+import { CurrencyIcon } from '~/components/Currency/CurrencyIcon';
+import AlertDialog from '~/components/Dialog/Common/AlertDialog';
+import { useDialogContext } from '~/components/Dialog/DialogProvider';
+import { dialogStore } from '~/components/Dialog/dialogStore';
+import {
+  BANKABLE_CUTOVER,
+  CAP_DEFINITIONS,
+  EXTRACTION_FEES,
+  MIN_CAP,
+  PEAK_EARNING_WINDOW,
+  WITHDRAWAL_FEES,
+} from '~/shared/constants/creator-program.constants';
+import { getCapForDefinition, getNextCapDefinition } from '~/shared/utils/creator-program.utils';
+import type { CashWithdrawalMethod } from '~/shared/utils/prisma/enums';
+import { Currency } from '~/shared/utils/prisma/enums';
+import { formatDate } from '~/utils/date-helpers';
+import {
+  abbreviateNumber,
+  formatCurrencyForDisplay,
+  numberWithCommas,
+} from '~/utils/number-helpers';
+import { getDisplayName } from '~/utils/string-helpers';
+
+export const openPhasesModal = () => {
+  dialogStore.trigger({
+    component: AlertDialog,
+    props: {
+      title: 'Creator Program Phases',
+      type: 'info',
+      icon: null,
+      size: 'lg',
+      children: ({ handleClose }) => (
+        <div className="flex flex-col gap-4">
+          <p>Every month, the Creator Program runs in two phases:</p>
+
+          <div className="flex flex-col gap-2">
+            <h3 className="text-xl font-bold">Banking Phase</h3>
+            <ul className="pl-4">
+              <li>
+                During this phase, creators can Bank any Yellow or Green Buzz they&rsquo;ve earned.
+              </li>
+              <li>This phase lasts until 3 days before the end of the month (UTC).</li>
+              <li>
+                As the month progresses, the value of your Banked Buzz{' '}
+                <span className="font-bold underline">decreases</span> because the total amount of
+                Buzz in the Bank increases.
+              </li>
+            </ul>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <h3 className="text-xl font-bold">Extraction Phase</h3>
+            <ul className="pl-4">
+              <li>During this phase, Banking Buzz is disabled.</li>
+              <li>
+                Creators can review their share of the Compensation Pool and decide whether to keep
+                their Buzz Banked or extract it.
+              </li>
+              <li>
+                Extraction is all or nothing, and a fee applies to any amount over 100k Buzz to
+                prevent Bank manipulation.
+              </li>
+              <li>Extracted Buzz can be saved for a future month or used on Civitai.</li>
+              <li>
+                This phase starts 3 days before the end of the month and ends 1 hour before the
+                month ends (UTC).
+              </li>
+              <li>
+                As more creators extract their Buzz, the value of your Banked Buzz{' '}
+                <span className="font-bold underline">increases</span>, making your share of the
+                Pool bigger!
+              </li>
+            </ul>
+          </div>
+          <Button onClick={handleClose}>Close</Button>
+        </div>
+      ),
+    },
+  });
+};
+export const openEarningEstimateModal = () => {
+  dialogStore.trigger({
+    component: AlertDialog,
+    props: {
+      title: 'How does this work?',
+      type: 'info',
+      icon: null,
+      children: ({ handleClose }) => (
+        <div className="flex flex-col gap-4">
+          <p>
+            This is an estimated value based on the assumption that a portion of all Buzz earned by
+            creators will be Banked. The amount you receive depends on the total Buzz Banked by all
+            creators at the end of the month. If you&rsquo;re not happy with your estimated payout,
+            you can withdraw your Buzz during the 3-day Extraction Phase at the end of the month.
+          </p>
+          <Button onClick={handleClose}>Close</Button>
+        </div>
+      ),
+    },
+  });
+};
+
+export const openSettlementModal = () => {
+  dialogStore.trigger({
+    component: AlertDialog,
+    props: {
+      title: 'What is Pending Settlement?',
+      type: 'info',
+      icon: null,
+      children: ({ handleClose }) => (
+        <div className="flex flex-col gap-4">
+          <p>
+            Once you&rsquo;ve received your share of the Compensation Pool, we need 15 days to
+            review the distribution. At 12am UTC on the 15th of the month your Pending Settlement
+            earnings will become Ready to Withdraw.
+          </p>
+          <Button onClick={handleClose}>Close</Button>
+        </div>
+      ),
+    },
+  });
+};
+
+export const openWithdrawalFeeModal = () => {
+  const keys = Object.keys(WITHDRAWAL_FEES) as CashWithdrawalMethod[];
+  dialogStore.trigger({
+    component: AlertDialog,
+    props: {
+      title: 'Withdrawal Fees',
+      type: 'info',
+      icon: null,
+      children: ({ handleClose }) => (
+        <div className="flex flex-col gap-1">
+          <p className="mb-2">
+            Withdrawal fees vary depending on the Withdrawal Method you choose.
+          </p>
+          {keys.map((key) => {
+            const withdrawalFees = WITHDRAWAL_FEES[key];
+            if (!withdrawalFees) {
+              return null;
+            }
+
+            return (
+              <div className="flex gap-4" key={key}>
+                <p className="font-bold">{getDisplayName(key)}</p>
+                <p>
+                  {withdrawalFees.type === 'percent'
+                    ? `${withdrawalFees.amount * 100}%`
+                    : `$${formatCurrencyForDisplay(withdrawalFees.amount, Currency.USD)}`}
+                </p>
+              </div>
+            );
+          })}
+
+          <Button className="mt-2" onClick={handleClose}>
+            Close
+          </Button>
+        </div>
+      ),
+    },
+  });
+};
+
+export const openCompensationPoolModal = () => {
+  dialogStore.trigger({
+    component: AlertDialog,
+    props: {
+      title: 'Compensation Pool',
+      type: 'info',
+      icon: null,
+      children: ({ handleClose }) => (
+        <div className="flex flex-col justify-center gap-4">
+          <p>
+            The Creator Program Compensation Pool is made up of a portion of Civitai&rsquo;s revenue
+            from the previous month. As Civitai grows, so does the pool! The more active Creators
+            there are attracting users who spend Buzz, the larger the pool will be the next month
+          </p>
+          <Button onClick={handleClose}>Close</Button>
+        </div>
+      ),
+    },
+  });
+};
+
+export const openExtractionFeeModal = () => {
+  dialogStore.trigger({
+    component: AlertDialog,
+    props: {
+      title: 'Extraction Fees',
+      type: 'info',
+      icon: null,
+      children: ({ handleClose }) => (
+        <div className="flex flex-col gap-1">
+          <p className="mb-2">
+            Extraction is all or nothing. You can&rsquo;t Extract just a portion of what you have
+            Banked.
+          </p>
+          <p className="mb-2">
+            To prevent manipulation of the total Banked amount by Creators with large amounts of
+            Buzz, we&rsquo;ve implemented the following Extraction Fees:
+          </p>
+          <ul className="py-2 pl-4">
+            {EXTRACTION_FEES.map((fee) => {
+              const feeCopy = fee.fee > 0 ? `${fee.fee * 100}% Fee` : 'No Fee';
+
+              return (
+                <li key={fee.max}>
+                  <span className="font-bold">
+                    {fee.min === 0
+                      ? `<  ${abbreviateNumber(fee.max ?? 0)} Buzz`
+                      : `${abbreviateNumber(fee.min)}${
+                          fee.max ? ` - ${abbreviateNumber(fee.max)}` : '+'
+                        } Buzz`}
+                    :
+                  </span>{' '}
+                  {feeCopy}
+                </li>
+              );
+            })}
+          </ul>
+
+          <p>
+            The fees work on a bracket-based system, meaning that your first 100k Buzz Extracted is
+            free, your next 900k carries a 5% fee and so on.
+          </p>
+          <Button className="mt-2" onClick={handleClose}>
+            Close
+          </Button>
+        </div>
+      ),
+    },
+  });
+};
+
+const BuzzAmount = ({ amount }: { amount: number }) => (
+  <span className="inline-flex items-center">
+    <CurrencyIcon currency={Currency.BUZZ} size={14} />
+    {numberWithCommas(amount)}
+  </span>
+);
+
+type BankableAmount = NonNullable<
+  NonNullable<ReturnType<typeof useBankedBuzz>['banked']>['bankable']
+>;
+
+const BankableBuzzInfo = ({
+  bankable,
+  bankedThisMonth,
+}: {
+  bankable: BankableAmount;
+  bankedThisMonth: number;
+}) => {
+  const cutover = formatDate(BANKABLE_CUTOVER, 'MMMM D, YYYY', true);
+  const paid = bankable.spent ?? 0;
+  const rows = [
+    { label: `Your Yellow and Green Buzz on ${cutover}`, amount: bankable.snapshot, sign: '' },
+    { label: `Bankable Buzz earned since ${cutover}`, amount: bankable.earned, sign: '+' },
+    { label: `Paid to other users since ${cutover}`, amount: paid, sign: '−' },
+    {
+      label: 'Banked in earlier months, less what you extracted',
+      amount: bankable.consumed,
+      sign: '−',
+    },
+    { label: 'Banked this month', amount: bankedThisMonth, sign: '−' },
+  ];
+
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="font-bold">Bankable Buzz</p>
+      <p>
+        Each month you can bank the lower of your Cap and your bankable Buzz. Generation
+        compensation is still paid to you but is not bankable. What you pay other users (tips, Early
+        Access, shop items, bounties and donations) is subtracted from what you earn, then from your
+        unbanked Buzz from {cutover}.
+      </p>
+
+      <Table className="table-auto">
+        <Table.Tbody>
+          {rows.map((row) => (
+            <Table.Tr key={row.label}>
+              <Table.Td>{row.label}</Table.Td>
+              <Table.Td className="text-nowrap text-right tabular-nums">
+                {row.sign} <BuzzAmount amount={row.amount} />
+              </Table.Td>
+            </Table.Tr>
+          ))}
+          <Table.Tr className="font-bold">
+            <Table.Td>Bankable Buzz left</Table.Td>
+            <Table.Td className="text-nowrap text-right tabular-nums">
+              <BuzzAmount amount={bankable.remaining} />
+            </Table.Td>
+          </Table.Tr>
+        </Table.Tbody>
+      </Table>
+      {paid > bankable.earned && (
+        <p className="text-xs">
+          You&apos;ve paid other users <BuzzAmount amount={paid - bankable.earned} /> more than
+          you&apos;ve earned since {cutover}. That comes out of your unbanked Buzz from {cutover},
+          and anything beyond it out of what you earn next.
+        </p>
+      )}
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div>
+          <p className="font-bold">Bankable</p>
+          <ul className="list-disc pl-4">
+            <li>Licensing fees</li>
+            <li>Early Access and paid access</li>
+            <li>Tips from other users</li>
+            <li>Generator tips</li>
+            <li>Donations, shop sales and bounties</li>
+            <li>App author fees</li>
+            <li>Sticker, remix and promotion fees</li>
+          </ul>
+        </div>
+        <div>
+          <p className="font-bold">Not bankable</p>
+          <ul className="list-disc pl-4">
+            <li>Generation compensation</li>
+            <li>Buzz you bought</li>
+            <li>Rewards and credits from Civitai</li>
+            <li>Buzz matched by what you paid other users</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export const CreatorProgramCapsInfo = ({ onUpgrade }: { onUpgrade?: () => void }) => {
+  const { banked, isLoading } = useBankedBuzz();
+
+  if (isLoading) {
+    return (
+      <Center>
+        <Loader />
+      </Center>
+    );
+  }
+
+  const peakEarned = banked?.cap?.peakEarning?.earned ?? 0;
+  const currentCap = banked?.cap?.cap ?? 0;
+
+  const nextCap = banked?.cap
+    ? getNextCapDefinition(banked.cap.definition.tier, currentCap, peakEarned)
+    : undefined;
+
+  const potentialEarnings = nextCap && getCapForDefinition(nextCap, peakEarned);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <p>
+        Every creator in the program has a Cap to the amount of Buzz they can Bank in a month. Caps
+        align with membership tiers as outlined below.
+      </p>
+
+      <Table className="table-auto">
+        <Table.Thead>
+          <Table.Tr className="text-left">
+            <Table.Th>Tier</Table.Th>
+            <Table.Th>Cap</Table.Th>
+          </Table.Tr>
+        </Table.Thead>
+        <Table.Tbody>
+          {CAP_DEFINITIONS.map((cap) => {
+            if (cap.hidden) {
+              return null;
+            }
+
+            return (
+              <Table.Tr key={cap.tier}>
+                <Table.Td className="font-bold">{capitalize(cap.tier)} Member</Table.Td>
+                <Table.Td>
+                  <p className="flex gap-1">
+                    {cap.percentOfPeakEarning
+                      ? `${cap.percentOfPeakEarning * 100}% of your Peak Earning Month with `
+                      : ''}
+
+                    {!cap.limit ? (
+                      'no cap'
+                    ) : cap.percentOfPeakEarning ? (
+                      <span className="inline-flex">
+                        a <CurrencyIcon currency={Currency.BUZZ} className="inline" />
+                        {abbreviateNumber(cap.limit)} cap
+                      </span>
+                    ) : (
+                      <span className="inline-flex">
+                        <CurrencyIcon currency={Currency.BUZZ} className="inline" />
+                        {abbreviateNumber(cap.limit)}
+                      </span>
+                    )}
+                  </p>
+                </Table.Td>
+              </Table.Tr>
+            );
+          })}
+        </Table.Tbody>
+      </Table>
+
+      {banked && banked?.cap && (
+        <>
+          <div className="flex flex-col">
+            <p>
+              <span className="font-bold">Tier:</span> {capitalize(banked.cap.definition.tier)}{' '}
+              Member
+            </p>
+            <p>
+              <span className="font-bold">Peak Earning Month:</span>{' '}
+              {peakEarned > 0 ? (
+                <>
+                  <CurrencyIcon currency={Currency.BUZZ} className="inline" />
+                  {abbreviateNumber(peakEarned)}{' '}
+                  <span className="opacity-50">
+                    ({formatDate(banked.cap.peakEarning.month, 'MMM YYYY')})
+                  </span>
+                </>
+              ) : (
+                // With no qualifying earnings the service falls back to the CURRENT month, which the
+                // copy below says cannot count. Show no month rather than that contradiction.
+                <span className="opacity-50">None yet</span>
+              )}
+            </p>
+            <p>
+              <span className="font-bold">Tier Cap:</span>{' '}
+              <CurrencyIcon currency={Currency.BUZZ} className="inline" />
+              {banked.cap.definition.limit
+                ? numberWithCommas(banked.cap.definition.limit)
+                : 'No Cap'}
+            </p>
+            <p className="font-bold">
+              Your Cap: <CurrencyIcon currency={Currency.BUZZ} className="inline" />{' '}
+              {numberWithCommas(Math.floor(banked.cap.cap))}
+            </p>
+
+            {banked.cap.cap <= MIN_CAP && (
+              <p className="text-sm opacity-50">
+                All members have a minimum cap of{' '}
+                <CurrencyIcon currency={Currency.BUZZ} className="inline" />{' '}
+                {abbreviateNumber(MIN_CAP)}
+              </p>
+            )}
+          </div>
+
+          {nextCap && (
+            <p>
+              You could increase your cap to{' '}
+              <CurrencyIcon currency={Currency.BUZZ} className="inline" />{' '}
+              {numberWithCommas(Math.floor(potentialEarnings as number))} by upgrading to a{' '}
+              {capitalize(nextCap.tier)} Membership.{' '}
+              <Anchor className="text-nowrap" href="/pricing" onClick={onUpgrade}>
+                Upgrade Now
+              </Anchor>
+            </p>
+          )}
+        </>
+      )}
+
+      {banked?.bankable && (
+        <BankableBuzzInfo bankable={banked.bankable} bankedThisMonth={banked.total} />
+      )}
+
+      <div className="flex flex-col gap-2">
+        <p className="font-bold">How your Peak Earning Month is picked</p>
+        <p>
+          We take your best month of licensing fees and Buzz other people spent on your work, in the
+          last {PEAK_EARNING_WINDOW} <span className="font-bold">completed</span> months. From{' '}
+          {formatDate(BANKABLE_CUTOVER, 'MMMM D, YYYY', true)}, generation compensation no longer
+          counts toward your peak, including for earlier months. Tips and rewards do not set your
+          peak.
+        </p>
+        <ul className="list-disc pl-4">
+          <li>
+            <span className="font-bold">The month you are in does not count.</span> Buzz earned
+            today cannot raise today&apos;s Cap, so your Cap holds steady.
+          </li>
+          <li>
+            <span className="font-bold">
+              The last {PEAK_EARNING_WINDOW} completed months are what count.
+            </span>{' '}
+            The Cap follows what you earn now, keeping the Pool shared between active creators.
+          </li>
+        </ul>
+      </div>
+    </div>
+  );
+};
+
+export const CreatorProgramCapsInfoModal = () => {
+  const dialog = useDialogContext();
+
+  return (
+    <Modal
+      {...dialog}
+      size="lg"
+      radius="md"
+      title="Creator Banking Caps"
+      classNames={{
+        title: 'font-bold',
+        header: 'border-b border-gray-3 pb-3 dark:border-dark-4',
+        body: 'pt-4',
+      }}
+    >
+      <CreatorProgramCapsInfo onUpgrade={dialog.onClose} />
+    </Modal>
+  );
+};

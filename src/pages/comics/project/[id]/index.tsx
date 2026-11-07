@@ -1,0 +1,2203 @@
+import {
+  ActionIcon,
+  Alert,
+  Badge,
+  Button,
+  Container,
+  Group,
+  Loader,
+  Modal,
+  ScrollArea,
+  Stack,
+  Text,
+  Title,
+} from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import { useDisclosure } from '@mantine/hooks';
+import { openConfirmModal } from '@mantine/modals';
+import {
+  IconAlertCircle,
+  IconArrowLeft,
+  IconBell,
+  IconBolt,
+  IconBook,
+  IconCalendar,
+  IconCopy,
+  IconDownload,
+  IconEye,
+  IconEyeOff,
+  IconGripVertical,
+  IconInfoCircle,
+  IconLock,
+  IconPhoto,
+  IconPlus,
+  IconSettings,
+  IconSparkles,
+  IconUser,
+  IconUsers,
+  IconWorld,
+} from '@tabler/icons-react';
+import clsx from 'clsx';
+import dynamic from 'next/dynamic';
+import Link from 'next/link';
+import { useRouter } from 'next/router';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { defaultPresetRatio, PRESET_MODEL_SIZES } from '~/shared/generation/preset-sizes';
+import { slugitOr } from '~/utils/string-helpers';
+import { abbreviateNumber } from '~/utils/number-helpers';
+
+import type { DragEndEvent } from '@dnd-kit/core';
+import { closestCenter, DndContext, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
+import { arrayMove, SortableContext } from '@dnd-kit/sortable';
+import { getEdgeUrl } from '~/client-utils/cf-images-utils';
+
+import { ChapterSettingsModal } from '~/components/Comics/ChapterSettingsModal';
+import {
+  COMIC_MODEL_MAX_IMAGES,
+  type BulkPanelItem,
+} from '~/components/Comics/comic-project-constants';
+import { PanelCard, SortablePanel, getNsfwLabel } from '~/components/Comics/PanelCard';
+import { PanelDetailDrawer } from '~/components/Comics/PanelDetailDrawer';
+
+import { PanelModal } from '~/components/Comics/PanelModal';
+import { ProjectSettingsModal } from '~/components/Comics/ProjectSettingsModal';
+import { PublishModal } from '~/components/Comics/PublishModal';
+import { ImportReferencesModal } from '~/components/Comics/ImportReferencesModal';
+import { ReferenceSidebarItem } from '~/components/Comics/ReferenceSidebarItem';
+import { SmartCreateModal } from '~/components/Comics/SmartCreateModal';
+import { SortableChapter } from '~/components/Comics/SortableChapter';
+import { Page } from '~/components/AppLayout/Page';
+import { Meta } from '~/components/Meta/Meta';
+import { useSignalConnection } from '~/components/Signals/SignalsProvider';
+
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { SignalMessages } from '~/server/common/enums';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+import { showErrorNotification, showSuccessNotification } from '~/utils/notifications';
+import { ComicChapterStatus, ComicPanelStatus } from '~/shared/utils/prisma/enums';
+import { trpc } from '~/utils/trpc';
+import styles from './ProjectWorkspace.module.scss';
+
+export const getServerSideProps = createServerSideProps({
+  useSession: true,
+  resolver: async ({ session, features }) => {
+    if (!features?.comicCreator) return { notFound: true };
+    if (!session?.user) {
+      return {
+        redirect: {
+          destination: '/login?returnUrl=/comics',
+          permanent: false,
+        },
+      };
+    }
+  },
+});
+
+function ProjectWorkspace() {
+  const router = useRouter();
+  const currentUser = useCurrentUser();
+  const { id } = router.query;
+  const projectId = Number(id);
+
+  // ── Modal open/close ──
+  const [panelModalOpened, { open: openPanelModal, close: closePanelModal }] = useDisclosure(false);
+  const [settingsOpened, { open: openSettings, close: closeSettings }] = useDisclosure(false);
+  const [publishModalOpened, { open: openPublishModal, close: closePublishModal }] =
+    useDisclosure(false);
+  const [chapterSettingsOpened, { open: openChapterSettings, close: closeChapterSettings }] =
+    useDisclosure(false);
+  const [smartModalOpened, { open: openSmartModal, close: closeSmartModal }] = useDisclosure(false);
+  const [importRefsOpened, { open: openImportRefs, close: closeImportRefs }] = useDisclosure(false);
+
+  // ── Welcome modal (show once per user) ──
+  const [welcomeOpened, setWelcomeOpened] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return !localStorage.getItem('comic-creator-welcome-dismissed');
+  });
+
+  const handleDismissWelcome = useCallback(() => {
+    localStorage.setItem('comic-creator-welcome-dismissed', 'true');
+    setWelcomeOpened(false);
+  }, []);
+
+  // ── Core shared state ──
+  const [prompt, setPrompt] = useState('');
+  const [useContext, setUseContext] = useState(true);
+  const [referencePanelId, setReferencePanelId] = useState<number | null>(null);
+  const [layoutImagePath, setLayoutImagePath] = useState<string | undefined>();
+  const [quantity, setQuantity] = useState(1);
+  const [aspectRatio, setAspectRatioState] = useState(() => {
+    if (typeof window === 'undefined') return '3:4';
+    return localStorage.getItem(`comic-aspect-ratio-${projectId}`) ?? '3:4';
+  });
+  const setAspectRatio = (val: string) => {
+    setAspectRatioState(val);
+    try {
+      localStorage.setItem(`comic-aspect-ratio-${projectId}`, val);
+    } catch {}
+  };
+  const [generationModel, setGenerationModel] = useState<
+    | 'NanoBanana2'
+    | 'NanoBanana'
+    | 'Flux2'
+    | 'Seedream'
+    | 'SeedreamLite'
+    | 'OpenAI'
+    | 'OpenAI2'
+    | 'OpenAI25Flare'
+    | 'OpenAI25Sunburst'
+    | 'Qwen'
+    | 'Grok'
+    | null
+  >(null);
+
+  // Active chapter is driven by the URL path: `/comics/project/{id}/chapter/{position}`.
+  // The browser back-button, deep links, and shares all land on the same
+  // chapter the user last had open, instead of always snapping to the first
+  // one. The bare `/comics/project/{id}` URL falls back to the first chapter
+  // and (once data loads) redirects to the canonical chapter URL so the URL
+  // bar always reflects the selection.
+  const chapterPositionRaw = Array.isArray(router.query.chapterPosition)
+    ? router.query.chapterPosition[0]
+    : router.query.chapterPosition;
+  const urlChapterPosition = (() => {
+    if (typeof chapterPositionRaw !== 'string') return null;
+    const parsed = Number(chapterPositionRaw);
+    return Number.isFinite(parsed) ? parsed : null;
+  })();
+  const goToChapter = useCallback(
+    (position: number | null, options: { history?: 'push' | 'replace' } = {}) => {
+      // `replace` is the default — the silent bare-URL → canonical promotion,
+      // post-mutation redirects, and recovery from deleted chapters all want
+      // to overwrite the URL without leaving a history entry.
+      // `push` is opt-in for explicit user navigation (sidebar clicks) so the
+      // browser back-button cycles through chapters the user actually visited.
+      const navigate = options.history === 'push' ? router.push : router.replace;
+      if (position == null) {
+        void navigate(
+          { pathname: '/comics/project/[id]', query: { id: String(projectId) } },
+          undefined,
+          { shallow: true, scroll: false }
+        );
+        return;
+      }
+      void navigate(
+        {
+          pathname: '/comics/project/[id]/chapter/[chapterPosition]',
+          query: { id: String(projectId), chapterPosition: String(position) },
+        },
+        undefined,
+        { shallow: true, scroll: false }
+      );
+    },
+    [router, projectId]
+  );
+
+  const [regeneratingPanelId, setRegeneratingPanelId] = useState<number | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [insertAtPosition, setInsertAtPosition] = useState<number | null>(null);
+  const [detailPanelId, setDetailPanelId] = useState<number | null>(null);
+  const [selectedImageIds, setSelectedImageIds] = useState<number[] | null>(null);
+  const [enhanceExistingSource, setEnhanceExistingSource] = useState<{
+    url: string;
+    previewUrl: string;
+    width: number;
+    height: number;
+  } | null>(null);
+  const [chapterSettingsTarget, setChapterSettingsTarget] = useState<{
+    position: number;
+    name: string;
+    status: string;
+    earlyAccessConfig: { buzzPrice: number; timeframe: number } | null;
+  } | null>(null);
+
+  // Chapter reorder is opt-in. The previous always-on drag was easy to
+  // trigger by accident (the entire card was the drag handle, and a stray
+  // pointer-down on the wrong axis would commit a reorder to the server
+  // immediately). Toggle this on via the "Reorder" button at the top of
+  // the chapter list; off by default, drag handlers fall back to clicks.
+  const [chapterReorderMode, setChapterReorderMode] = useState(false);
+
+  const panelSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
+  );
+  const chapterSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
+  );
+
+  // ── tRPC queries ──
+  // Shell carries project meta + references + chapter list with derived
+  // counts. The active chapter's full panel data is loaded separately via
+  // `getChapter` so we don't drag every chapter's panels along on every
+  // mount. Mutations route their cache writes to whichever query owns the
+  // affected data; in most cases we just invalidate both.
+  const { data: project, isLoading } = trpc.comics.getProjectShell.useQuery(
+    { id: projectId },
+    { enabled: projectId > 0 }
+  );
+
+  const effectiveModel = generationModel ?? project?.baseModel ?? 'NanoBanana2';
+  const activeAspectRatios = PRESET_MODEL_SIZES[effectiveModel] ?? PRESET_MODEL_SIZES.NanoBanana2;
+  // Reset a stored ratio the model's list lacks (a model change, an old Flux.2 label), but only once
+  // the project has loaded: until then the list is the NanoBanana2 fallback and would clobber a valid one.
+  useEffect(() => {
+    if (!project) return;
+    if (!activeAspectRatios.some((s) => s.label === aspectRatio))
+      setAspectRatio(defaultPresetRatio(activeAspectRatios));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- aspectRatio is read, not a trigger
+  }, [project, activeAspectRatios]);
+
+  const { data: enhanceCostEstimate } = trpc.comics.getPromptEnhanceCostEstimate.useQuery(
+    undefined,
+    { staleTime: 5 * 60 * 1000 }
+  );
+  const enhanceCost = enhanceCostEstimate?.cost ?? null;
+
+  const { data: planCostEstimate } = trpc.comics.getPlanChapterCostEstimate.useQuery(undefined, {
+    staleTime: 5 * 60 * 1000,
+  });
+  const planCost = planCostEstimate?.cost ?? null;
+
+  // ── Active chapter ──
+  // Resolve which chapter is "active":
+  //   1. The chapterPosition path segment if it matches a real chapter.
+  //   2. The first chapter (silent fallback).
+  // If the URL points at a chapter that no longer exists, the effect below
+  // redirects to the first remaining chapter.
+  const activeShellChapter = useMemo(() => {
+    const chapters = project?.chapters ?? [];
+    if (chapters.length === 0) return undefined;
+    if (urlChapterPosition != null) {
+      const match = chapters.find((ch) => ch.position === urlChapterPosition);
+      if (match) return match;
+    }
+    return chapters[0];
+  }, [project?.chapters, urlChapterPosition]);
+
+  const activeChapterPosition = activeShellChapter?.position ?? null;
+
+  const { data: activeChapterData, isLoading: isActiveChapterLoading } =
+    trpc.comics.getChapter.useQuery(
+      {
+        projectId,
+        chapterPosition: activeChapterPosition ?? -1,
+      },
+      {
+        enabled: projectId > 0 && activeChapterPosition != null,
+      }
+    );
+
+  // Combine the shell's chapter metadata with the `getChapter` query's full
+  // panel data. Components that need panels read `.panels`; components that
+  // need chapter metadata read everything else. Until panels load, present
+  // an empty array so renders don't crash — the panel grid shows its own
+  // loader from `isActiveChapterLoading`.
+  const activeChapter = useMemo(() => {
+    if (!activeShellChapter) return undefined;
+    return {
+      ...activeShellChapter,
+      panels: activeChapterData?.panels ?? [],
+    };
+  }, [activeShellChapter, activeChapterData]);
+
+  // Promote the bare `/comics/project/{id}` URL to its canonical chapter URL
+  // once data loads, and recover from a stale URL that points at a deleted
+  // chapter by falling back to the first remaining chapter.
+  useEffect(() => {
+    const chapters = project?.chapters;
+    if (!chapters || chapters.length === 0) return;
+    if (urlChapterPosition == null) {
+      goToChapter(chapters[0].position);
+      return;
+    }
+    const exists = chapters.some((ch) => ch.position === urlChapterPosition);
+    if (!exists) goToChapter(chapters[0].position);
+  }, [urlChapterPosition, project?.chapters, goToChapter]);
+
+  // ── References ──
+  const allReferences = useMemo(() => project?.references ?? [], [project?.references]);
+
+  const referenceImageMap = useMemo(() => {
+    const map = new Map<number, { url: string }>();
+    for (const c of allReferences) {
+      const firstImage = (c as any).images?.[0]?.image;
+      if (firstImage?.url) {
+        map.set(c.id, { url: firstImage.url });
+      }
+    }
+    return map;
+  }, [allReferences]);
+
+  const referenceNameMap = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const c of allReferences) {
+      map.set(c.id, c.name);
+    }
+    return map;
+  }, [allReferences]);
+
+  const activeReferences = useMemo(
+    () => allReferences.filter((c) => c.status === 'Ready'),
+    [allReferences]
+  );
+
+  const maxReferenceImages = COMIC_MODEL_MAX_IMAGES[effectiveModel] ?? 7;
+
+  const mentionedReferences = useMemo(() => {
+    if (!prompt.trim()) return [];
+    const sorted = [...activeReferences].sort((a, b) => b.name.length - a.name.length);
+    const mentioned = new Set<number>();
+    for (const ref of sorted) {
+      const escaped = ref.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = new RegExp(`@${escaped}(?=$|[\\s.,!?;:'")])`, 'gi');
+      if (pattern.test(prompt)) {
+        mentioned.add(ref.id);
+      }
+    }
+    return activeReferences.filter((r) => mentioned.has(r.id));
+  }, [prompt, activeReferences]);
+
+  const mentionedRefImageCount = useMemo(
+    () => mentionedReferences.reduce((sum, c) => sum + (c.images?.length ?? 0), 0),
+    [mentionedReferences]
+  );
+
+  const mentionedIdKey = mentionedReferences.map((r) => r.id).join(',');
+  const prevMentionedIdKeyRef = useRef(mentionedIdKey);
+  useEffect(() => {
+    const prevKey = prevMentionedIdKeyRef.current;
+    prevMentionedIdKeyRef.current = mentionedIdKey;
+
+    // Nothing changed — skip
+    if (prevKey === mentionedIdKey) return;
+
+    const prevIds = new Set(prevKey ? prevKey.split(',').filter(Boolean).map(Number) : []);
+    const currIds = new Set(
+      mentionedIdKey ? mentionedIdKey.split(',').filter(Boolean).map(Number) : []
+    );
+
+    // If no references remain, reset to null
+    if (currIds.size === 0) {
+      setSelectedImageIds(null);
+      return;
+    }
+
+    // If selections were null (all images selected), keep null so new refs auto-include
+    if (selectedImageIds === null) return;
+
+    // Find which references were added vs removed
+    const addedIds = [...currIds].filter((id) => !prevIds.has(id));
+    const removedIds = [...prevIds].filter((id) => !currIds.has(id));
+
+    // Collect image IDs belonging to removed references so we can strip them
+    const removedImageIds = new Set<number>();
+    for (const ref of activeReferences) {
+      if (removedIds.includes(ref.id)) {
+        for (const ri of ref.images ?? []) {
+          if (ri.image?.id) removedImageIds.add(ri.image.id);
+        }
+      }
+    }
+
+    // Collect image IDs belonging to newly added references so we auto-include them
+    const addedImageIds: number[] = [];
+    for (const ref of mentionedReferences) {
+      if (addedIds.includes(ref.id)) {
+        for (const ri of ref.images ?? []) {
+          if (ri.image?.id) addedImageIds.push(ri.image.id);
+        }
+      }
+    }
+
+    // Filter out removed images, add new ones
+    const next = selectedImageIds.filter((id) => !removedImageIds.has(id)).concat(addedImageIds);
+
+    // If result is empty (shouldn't happen normally), reset to null
+    setSelectedImageIds(next.length > 0 ? next : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mentionedIdKey]);
+
+  const reservedSlots = useMemo(
+    () => (referencePanelId ? 1 : 0) + (layoutImagePath ? 1 : 0),
+    [referencePanelId, layoutImagePath]
+  );
+  const refImageBudget = maxReferenceImages - reservedSlots;
+
+  const needsImageSelection =
+    mentionedReferences.length > 0 && mentionedRefImageCount > refImageBudget;
+
+  // Extract reference IDs for cost estimation (images fetched server-side)
+  const mentionedReferenceIds = useMemo(
+    () => (mentionedReferences.length > 0 ? mentionedReferences.map((r) => r.id) : undefined),
+    [mentionedReferences]
+  );
+
+  const {
+    data: costEstimate,
+    isLoading: isCostLoading,
+    error: costError,
+  } = trpc.comics.getGenerationCostEstimate.useQuery(
+    {
+      baseModel: effectiveModel,
+      referenceIds: mentionedReferenceIds,
+      selectedImageIds: selectedImageIds ?? undefined,
+      quantity,
+    },
+    { staleTime: 30_000, retry: 2 }
+  );
+  const panelCost = costEstimate?.cost ?? null;
+
+  const mentionRefs = useMemo(
+    () => activeReferences.map((c) => ({ id: c.id, name: c.name })),
+    [activeReferences]
+  );
+
+  const utils = trpc.useUtils();
+
+  // Most chapter/panel mutations affect both the shell (chapter list,
+  // counts) and the active chapter's panel data. This helper keeps the
+  // mutation success handlers from forgetting to do both — the cost of an
+  // extra invalidate is small compared to the cost of stale data.
+  const invalidateProjectQueries = useCallback(() => {
+    void utils.comics.getProjectShell.invalidate({ id: projectId });
+    if (activeChapterPosition != null) {
+      void utils.comics.getChapter.invalidate({
+        projectId,
+        chapterPosition: activeChapterPosition,
+      });
+    }
+  }, [utils, projectId, activeChapterPosition]);
+
+  // Stable ref for refetch — used by PanelCard callbacks and signal handlers
+  const refetchRef = useRef(invalidateProjectQueries);
+  refetchRef.current = invalidateProjectQueries;
+
+  // Listen for ComicPanelUpdate signals.
+  //   - Ready/Failed in the active chapter: PanelCard's own listener patches its cache.
+  //   - Ready/Failed in a different chapter: PanelCard isn't mounted for non-active
+  //     chapters, so we have to invalidate that chapter's cache here. React Query
+  //     treats `getChapter` invalidation without `chapterPosition` as "any cached
+  //     chapter for this project" — perfect for that case. Shell counts shift too.
+  //   - Non-terminal (Enqueued → Generating): bump the shell+active cache so the
+  //     sidebar's `hasInProgressPanels` flag updates immediately.
+  useSignalConnection(
+    SignalMessages.ComicPanelUpdate,
+    useCallback(
+      (data: { panelId: number; projectId: number; status: string }) => {
+        if (data.projectId !== projectId) return;
+        if (data.status === 'Ready' || data.status === 'Failed') {
+          void utils.comics.getProjectShell.invalidate({ id: projectId });
+          // Without `chapterPosition`, this matches every cached chapter
+          // for the project — covers the not-currently-mounted case.
+          void utils.comics.getChapter.invalidate({ projectId });
+          return;
+        }
+        refetchRef.current();
+      },
+      [projectId, utils]
+    )
+  );
+
+  const processingReferenceIds = useMemo(
+    () => allReferences.filter((c) => c.status === 'Pending').map((c) => c.id),
+    [allReferences]
+  );
+
+  useEffect(() => {
+    if (processingReferenceIds.length === 0) return;
+    const interval = setInterval(async () => {
+      try {
+        const results = await Promise.all(
+          processingReferenceIds.map((cid) =>
+            utils.comics.pollReferenceStatus.fetch({ referenceId: cid })
+          )
+        );
+        if (results.some((r) => r.status === 'Ready' || r.status === 'Failed'))
+          invalidateProjectQueries();
+      } catch {
+        /* ignore */
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [processingReferenceIds.join(','), utils, invalidateProjectQueries]);
+
+  // ── Mutations ──
+  const handleMutationError = (error: any) => {
+    showErrorNotification({ error, title: 'Something went wrong' });
+  };
+
+  const createPanelMutation = trpc.comics.createPanel.useMutation({
+    onSuccess: () => {
+      closePanelModal();
+      setPrompt('');
+      setRegeneratingPanelId(null);
+      setInsertAtPosition(null);
+      invalidateProjectQueries();
+    },
+    onError: handleMutationError,
+  });
+
+  const enhancePanelMutation = trpc.comics.enhancePanel.useMutation({
+    onSuccess: () => {
+      closePanelModal();
+      setPrompt('');
+      setInsertAtPosition(null);
+      invalidateProjectQueries();
+    },
+    onError: handleMutationError,
+  });
+
+  const updatePanelMutation = trpc.comics.updatePanel.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: handleMutationError,
+  });
+
+  const replacePanelImageMutation = trpc.comics.replacePanelImage.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: handleMutationError,
+  });
+
+  const deletePanelMutation = trpc.comics.deletePanel.useMutation({
+    onMutate: async ({ panelId }) => {
+      // We render only the active chapter's panels — every delete originates
+      // there. Drop the panel from the chapter cache, and decrement the
+      // shell's panelCount so the sidebar count stays in sync.
+      if (activeChapterPosition == null) return;
+      await utils.comics.getChapter.cancel({
+        projectId,
+        chapterPosition: activeChapterPosition,
+      });
+      utils.comics.getChapter.setData(
+        { projectId, chapterPosition: activeChapterPosition },
+        (prev) => {
+          if (!prev) return prev;
+          return { ...prev, panels: prev.panels.filter((p) => p.id !== panelId) };
+        }
+      );
+      utils.comics.getProjectShell.setData({ id: projectId }, (prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          chapters: prev.chapters.map((ch) =>
+            ch.position === activeChapterPosition
+              ? { ...ch, panelCount: Math.max(0, ch.panelCount - 1) }
+              : ch
+          ),
+        };
+      });
+    },
+    onSuccess: () => {
+      invalidateProjectQueries();
+      setDetailPanelId(null);
+    },
+    onError: () => invalidateProjectQueries(),
+  });
+
+  const reorderPanelsMutation = trpc.comics.reorderPanels.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: (err) => {
+      handleMutationError(err);
+      invalidateProjectQueries();
+    },
+  });
+
+  const createChapterMutation = trpc.comics.createChapter.useMutation({
+    onMutate: async () => {
+      await utils.comics.getProjectShell.cancel({ id: projectId });
+      utils.comics.getProjectShell.setData({ id: projectId }, (prev) => {
+        if (!prev) return prev;
+        const nextPosition =
+          prev.chapters.length > 0 ? Math.max(...prev.chapters.map((ch) => ch.position)) + 1 : 0;
+        const placeholder = {
+          id: -Date.now(),
+          name: 'New Chapter',
+          position: nextPosition,
+          status: ComicChapterStatus.Draft,
+          panelCount: 0,
+          hasInProgressPanels: false,
+          earlyAccessConfig: null,
+          availability: 'Public',
+          nsfwLevel: 0,
+          earlyAccessEndsAt: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          publishedAt: null,
+          projectId,
+        } as unknown as (typeof prev.chapters)[number];
+        return { ...prev, chapters: [...prev.chapters, placeholder] };
+      });
+    },
+    onSuccess: (data) => {
+      goToChapter(data.position);
+      invalidateProjectQueries();
+    },
+    onError: () => invalidateProjectQueries(),
+  });
+
+  const updateChapterMutation = trpc.comics.updateChapter.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: handleMutationError,
+  });
+
+  const updateChapterEaMutation = trpc.comics.updateChapterEarlyAccess.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: handleMutationError,
+  });
+
+  const deleteChapterMutation = trpc.comics.deleteChapter.useMutation({
+    onMutate: async ({ chapterPosition }) => {
+      await utils.comics.getProjectShell.cancel({ id: projectId });
+      utils.comics.getProjectShell.setData({ id: projectId }, (prev) => {
+        if (!prev) return prev;
+        const filtered = prev.chapters.filter((ch) => ch.position !== chapterPosition);
+        return { ...prev, chapters: filtered };
+      });
+    },
+    onSuccess: () => invalidateProjectQueries(),
+    onError: () => invalidateProjectQueries(),
+  });
+
+  const updateProjectMutation = trpc.comics.updateProject.useMutation({
+    onSuccess: () => {
+      closeSettings();
+      invalidateProjectQueries();
+    },
+    onError: handleMutationError,
+  });
+
+  const deleteReferenceMutation = trpc.comics.deleteReference.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: handleMutationError,
+  });
+
+  const removeReferenceFromProjectMutation = trpc.comics.removeReferenceFromProject.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: handleMutationError,
+  });
+
+  const deleteProjectMutation = trpc.comics.deleteProject.useMutation({
+    onSuccess: () => {
+      const username = currentUser?.username;
+      router.push(username ? `/user/${username}/comics` : '/comics');
+    },
+    onError: handleMutationError,
+  });
+
+  const publishChapterMutation = trpc.comics.publishChapter.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: handleMutationError,
+  });
+
+  const unpublishChapterMutation = trpc.comics.unpublishChapter.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: handleMutationError,
+  });
+
+  const planPanelsMutation = trpc.comics.planChapterPanels.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: handleMutationError,
+  });
+
+  const smartCreateMutation = trpc.comics.smartCreateChapter.useMutation({
+    onSuccess: (data) => {
+      closeSmartModal();
+      goToChapter(data.position);
+      invalidateProjectQueries();
+    },
+    onError: handleMutationError,
+  });
+
+  const bulkCreateMutation = trpc.comics.bulkCreatePanels.useMutation({
+    onSuccess: () => {
+      closePanelModal();
+      setInsertAtPosition(null);
+      invalidateProjectQueries();
+    },
+    onError: handleMutationError,
+  });
+
+  const reorderChaptersMutation = trpc.comics.reorderChapters.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: (err) => {
+      handleMutationError(err);
+      invalidateProjectQueries();
+    },
+  });
+
+  const duplicatePanelMutation = trpc.comics.duplicatePanel.useMutation({
+    onSuccess: () => invalidateProjectQueries(),
+    onError: handleMutationError,
+  });
+
+  const duplicateChapterMutation = trpc.comics.duplicateChapter.useMutation({
+    onSuccess: (data) => {
+      goToChapter(data.position);
+      invalidateProjectQueries();
+    },
+    onError: handleMutationError,
+  });
+
+  // ── Handlers ──
+  const handleModelChange = (value: string | null) =>
+    setGenerationModel(value as typeof generationModel);
+
+  const handlePanelModalClose = () => {
+    closePanelModal();
+    setRegeneratingPanelId(null);
+    setInsertAtPosition(null);
+    setPrompt('');
+    setUseContext(true);
+    setReferencePanelId(null);
+    setQuantity(1);
+    setAspectRatio(defaultPresetRatio(activeAspectRatios));
+    setGenerationModel(null);
+    setSelectedImageIds(null);
+    setEnhanceExistingSource(null);
+  };
+
+  const handleGeneratePanel = async () => {
+    if (!prompt.trim() || !activeChapter || isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      let targetPosition = insertAtPosition;
+      if (regeneratingPanelId && targetPosition == null) {
+        const oldPanel = activeChapter.panels.find((p) => p.id === regeneratingPanelId);
+        if (oldPanel) targetPosition = oldPanel.position;
+      }
+      if (regeneratingPanelId) {
+        // Clear the existing panel image so the UI shows a spinner immediately
+        await updatePanelMutation.mutateAsync({
+          panelId: regeneratingPanelId,
+          status: ComicPanelStatus.Generating,
+          imageUrl: null,
+        });
+        await deletePanelMutation.mutateAsync({ panelId: regeneratingPanelId });
+      }
+      createPanelMutation.mutate({
+        projectId,
+        chapterPosition: activeChapter.position,
+        prompt: prompt.trim(),
+        useContext,
+        ...(referencePanelId ? { referencePanelId } : {}),
+        ...(layoutImagePath ? { layoutImagePath } : {}),
+        quantity,
+        aspectRatio,
+        baseModel: generationModel,
+        ...(targetPosition != null ? { position: targetPosition } : {}),
+        ...(selectedImageIds ? { selectedImageIds } : {}),
+      });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleEnhancePanel = async (sourceImage: {
+    url: string;
+    previewUrl: string;
+    width: number;
+    height: number;
+  }) => {
+    if (!activeChapter || isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      let targetPosition = insertAtPosition;
+      if (regeneratingPanelId && targetPosition == null) {
+        const oldPanel = activeChapter.panels.find((p) => p.id === regeneratingPanelId);
+        if (oldPanel) targetPosition = oldPanel.position;
+      }
+      if (regeneratingPanelId) {
+        // Clear the existing panel image so the UI shows a spinner immediately
+        await updatePanelMutation.mutateAsync({
+          panelId: regeneratingPanelId,
+          status: ComicPanelStatus.Generating,
+          imageUrl: null,
+        });
+        await deletePanelMutation.mutateAsync({ panelId: regeneratingPanelId });
+      }
+      enhancePanelMutation.mutate({
+        projectId,
+        chapterPosition: activeChapter.position,
+        sourceImageUrl: sourceImage.url,
+        sourceImageWidth: sourceImage.width,
+        sourceImageHeight: sourceImage.height,
+        prompt: prompt.trim() || undefined,
+        useContext,
+        ...(referencePanelId ? { referencePanelId } : {}),
+        aspectRatio,
+        baseModel: generationModel,
+        forceGenerate: true,
+        ...(targetPosition != null ? { position: targetPosition } : {}),
+        ...(selectedImageIds ? { selectedImageIds } : {}),
+      });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleBulkCreate = (items: BulkPanelItem[], enhance: boolean) => {
+    if (!activeChapter || items.length === 0 || isSubmitting) return;
+    setIsSubmitting(true);
+    bulkCreateMutation.mutate(
+      {
+        projectId,
+        chapterPosition: activeChapter.position,
+        baseModel: generationModel,
+        panels: items.map((item) => ({
+          prompt: item.prompt?.trim() || undefined,
+          enhance,
+          sourceImageUrl: item.sourceImage?.url,
+          sourceImageWidth: item.sourceImage?.width,
+          sourceImageHeight: item.sourceImage?.height,
+          aspectRatio: item.aspectRatio,
+          // Source-image generation metadata (PNG tags from file uploads or
+          // workflow step meta from generator picks). The server attaches
+          // it to the new Image so resource attribution survives the import.
+          meta: item.meta as any,
+        })),
+      },
+      { onSettled: () => setIsSubmitting(false) }
+    );
+  };
+
+  const handleImportSubmit = (
+    items: {
+      url: string;
+      cfId: string;
+      width: number;
+      height: number;
+      preview: string;
+      meta?: Record<string, unknown>;
+    }[]
+  ) => {
+    if (!activeChapter || items.length === 0 || isSubmitting) return;
+    setIsSubmitting(true);
+    bulkCreateMutation.mutate(
+      {
+        projectId,
+        chapterPosition: activeChapter.position,
+        baseModel: generationModel,
+        panels: items.map((img) => ({
+          sourceImageUrl: img.url,
+          sourceImageWidth: img.width,
+          sourceImageHeight: img.height,
+          aspectRatio: '3:4',
+          meta: img.meta as any,
+        })),
+      },
+      { onSettled: () => setIsSubmitting(false) }
+    );
+  };
+
+  const handlePanelDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id || !activeChapter) return;
+    const panels = activeChapter.panels;
+    const oldIndex = panels.findIndex((p) => p.id === active.id);
+    const newIndex = panels.findIndex((p) => p.id === over.id);
+    if (oldIndex === -1 || newIndex === -1) return;
+    const reordered = arrayMove(panels, oldIndex, newIndex);
+
+    // Optimistic update — only the active chapter's panel order changed,
+    // so we patch the chapter cache directly.
+    utils.comics.getChapter.setData(
+      { projectId, chapterPosition: activeChapter.position },
+      (prev) => {
+        if (!prev) return prev;
+        return { ...prev, panels: reordered.map((p, i) => ({ ...p, position: i })) };
+      }
+    );
+
+    reorderPanelsMutation.mutate({
+      projectId,
+      chapterPosition: activeChapter.position,
+      panelIds: reordered.map((p) => p.id),
+    });
+  };
+
+  const handleChapterDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id || !project) return;
+    const chapters = project.chapters;
+    const oldIndex = chapters.findIndex((ch) => ch.position === active.id);
+    const newIndex = chapters.findIndex((ch) => ch.position === over.id);
+    if (oldIndex === -1 || newIndex === -1) return;
+    const reorderedChapters = arrayMove(chapters, oldIndex, newIndex);
+    const newOrder = reorderedChapters.map((ch) => ch.position);
+
+    // Optimistic update — only chapter positions change, panels untouched.
+    utils.comics.getProjectShell.setData({ id: projectId }, (prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        chapters: reorderedChapters.map((ch, i) => ({ ...ch, position: i })),
+      };
+    });
+
+    reorderChaptersMutation.mutate({ projectId, order: newOrder });
+  };
+
+  const handleOpenChapterSettings = (chapter: NonNullable<typeof project>['chapters'][number]) => {
+    const eaConfig = chapter.earlyAccessConfig as {
+      buzzPrice: number;
+      timeframe: number;
+    } | null;
+    setChapterSettingsTarget({
+      position: chapter.position,
+      name: chapter.name,
+      status: chapter.status,
+      earlyAccessConfig: eaConfig,
+    });
+    openChapterSettings();
+  };
+
+  const handleSaveChapterSettings = (data: {
+    position: number;
+    name: string;
+    eaConfig: { buzzPrice: number; timeframe: number } | null;
+  }) => {
+    if (!project) return;
+    const chapter = project.chapters.find((ch) => ch.position === data.position);
+    if (!chapter) return;
+
+    if (data.name !== chapter.name) {
+      updateChapterMutation.mutate({
+        projectId,
+        chapterPosition: data.position,
+        name: data.name,
+      });
+    }
+
+    if (chapter.status === ComicChapterStatus.Published) {
+      const currentEaConfig = chapter.earlyAccessConfig as {
+        buzzPrice: number;
+        timeframe: number;
+      } | null;
+      if (JSON.stringify(data.eaConfig) !== JSON.stringify(currentEaConfig)) {
+        updateChapterEaMutation.mutate({
+          projectId,
+          chapterPosition: data.position,
+          earlyAccessConfig: data.eaConfig,
+        });
+      }
+    }
+
+    closeChapterSettings();
+  };
+
+  const handleDeleteChapter = (chapterPosition: number, chapterName: string) => {
+    if (!project || project.chapters.length <= 1) return;
+    openConfirmModal({
+      title: 'Delete Chapter',
+      children: (
+        <Text size="sm">
+          Are you sure you want to delete &quot;{chapterName}&quot;? All panels in this chapter will
+          be permanently deleted.
+        </Text>
+      ),
+      labels: { confirm: 'Delete', cancel: 'Cancel' },
+      confirmProps: { color: 'red' },
+      onConfirm: () => {
+        deleteChapterMutation.mutate({ projectId, chapterPosition });
+        if (activeChapterPosition === chapterPosition) {
+          const remaining = project.chapters.filter((ch) => ch.position !== chapterPosition);
+          goToChapter(remaining[0]?.position ?? null);
+        }
+      },
+    });
+  };
+
+  const handleTogglePublish = (chapterPosition: number, currentStatus: string) => {
+    if (
+      currentStatus === ComicChapterStatus.Published ||
+      currentStatus === ComicChapterStatus.Scheduled
+    ) {
+      openConfirmModal({
+        title:
+          currentStatus === ComicChapterStatus.Scheduled ? 'Cancel Schedule' : 'Unpublish Chapter',
+        children: (
+          <Text size="sm">
+            {currentStatus === ComicChapterStatus.Scheduled
+              ? 'This will cancel the scheduled publish and revert the chapter to draft.'
+              : 'This chapter will be reverted to draft and will no longer be visible to readers.'}
+          </Text>
+        ),
+        labels: {
+          confirm: currentStatus === ComicChapterStatus.Scheduled ? 'Cancel Schedule' : 'Unpublish',
+          cancel: 'Keep',
+        },
+        confirmProps: { color: 'yellow' },
+        onConfirm: () => {
+          unpublishChapterMutation.mutate({ projectId, chapterPosition });
+        },
+      });
+    } else {
+      goToChapter(chapterPosition);
+      openPublishModal();
+    }
+  };
+
+  const handleConfirmPublish = (
+    eaConfig: { buzzPrice: number; timeframe: number } | null,
+    scheduledAt?: Date
+  ) => {
+    if (activeChapterPosition == null || !project) return;
+    const isScheduled = scheduledAt && scheduledAt > new Date();
+    const chapterPosition = activeChapterPosition;
+    const chapterName =
+      project.chapters.find((ch) => ch.position === chapterPosition)?.name ??
+      `Chapter ${chapterPosition + 1}`;
+
+    publishChapterMutation.mutate(
+      {
+        projectId,
+        chapterPosition,
+        earlyAccessConfig: eaConfig,
+        scheduledAt,
+      },
+      {
+        onSuccess: () => {
+          closePublishModal();
+          if (isScheduled) {
+            showSuccessNotification({
+              title: 'Chapter scheduled',
+              message: `${chapterName} will publish on ${scheduledAt!.toLocaleString()}.`,
+              autoClose: 5000,
+            });
+            return;
+          }
+
+          // Drop the creator into their published work — basking is mandatory.
+          const publicUrl = `/comics/${projectId}/${slugitOr(project.name, 'comic')}/${
+            chapterPosition + 1
+          }/${slugitOr(chapterName, 'chapter')}`;
+          showSuccessNotification({
+            title: 'Chapter published! 🎉',
+            message: (
+              <Text size="sm">
+                {chapterName} is live.{' '}
+                <Text
+                  component={Link}
+                  href={publicUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  c="blue"
+                  td="underline"
+                >
+                  View it live ↗
+                </Text>
+              </Text>
+            ),
+            autoClose: 6000,
+          });
+          window.open(publicUrl, '_blank', 'noopener,noreferrer');
+        },
+      }
+    );
+  };
+
+  const handleRemoveReferenceFromProject = (referenceId: number, referenceName: string) => {
+    removeReferenceFromProjectMutation.mutate({ projectId, referenceId });
+  };
+
+  const handleDeleteReferencePermanently = (referenceId: number, referenceName: string) => {
+    openConfirmModal({
+      title: 'Delete Reference Permanently',
+      children: (
+        <Text size="sm">
+          This will permanently delete &quot;{referenceName}&quot; from ALL your projects. This
+          cannot be undone. Existing panels will be preserved but unlinked.
+        </Text>
+      ),
+      labels: { confirm: 'Delete Permanently', cancel: 'Cancel' },
+      confirmProps: { color: 'red' },
+      onConfirm: () => {
+        deleteReferenceMutation.mutate({ referenceId });
+      },
+    });
+  };
+
+  const handleRegenerate = (panel: {
+    id: number;
+    prompt: string;
+    metadata: Record<string, any> | null;
+  }) => {
+    const meta = panel.metadata;
+    setRegeneratingPanelId(panel.id);
+    setPrompt(panel.prompt);
+    setUseContext(meta?.useContext ?? true);
+    setReferencePanelId(meta?.referencePanelId ?? null);
+    setQuantity(meta?.quantity ?? 1);
+    setSelectedImageIds(meta?.selectedImageIds ?? null);
+    openPanelModal();
+  };
+
+  const handleDrawerRegenerate = (panel: any) => {
+    setDetailPanelId(null);
+    handleRegenerate(panel);
+  };
+
+  const handleDrawerInsertAfter = (index: number) => {
+    setDetailPanelId(null);
+    setInsertAtPosition(index + 1);
+    openPanelModal();
+  };
+
+  const handleOpenIterativeEditor = (panel: {
+    id: number;
+    position: number;
+    imageUrl: string | null;
+    image?: { width: number; height: number } | null;
+  }) => {
+    const params = new URLSearchParams({
+      chapter: String(activeChapterPosition ?? 0),
+      panelId: String(panel.id),
+      panelPosition: String(panel.position),
+    });
+    if (panel.imageUrl) {
+      params.set('imageUrl', panel.imageUrl);
+      params.set('width', String(panel.image?.width ?? 1024));
+      params.set('height', String(panel.image?.height ?? 1024));
+    }
+    void router.push(`/comics/project/${projectId}/iterate?${params.toString()}`);
+  };
+
+  const handleOpenIterativeEditorNew = () => {
+    if (!activeChapter) return;
+    const params = new URLSearchParams({
+      chapter: String(activeChapterPosition ?? 0),
+      panelPosition: String(activeChapter.panels.length),
+    });
+    void router.push(`/comics/project/${projectId}/iterate?${params.toString()}`);
+  };
+
+  const getStatusDotClass = (status: string, hasRefs: boolean) => {
+    if (status === 'Failed') return styles.failed;
+    if (status === 'Ready' && !hasRefs) return styles.noRefs;
+    if (status === 'Ready') return styles.ready;
+    return styles.pending;
+  };
+
+  const getStatusLabel = (status: string, hasRefs: boolean, isFailed: boolean) => {
+    if (isFailed) return 'Failed';
+    if (status === 'Ready' && !hasRefs) return 'No refs';
+    return status;
+  };
+
+  // ── Loading state ──
+  if (isLoading || !project) {
+    return (
+      <Container size="xl" py="xl">
+        <Stack align="center" gap="md" py={60}>
+          <Loader color="yellow" />
+          <Text size="sm" c="dimmed">
+            Loading project...
+          </Text>
+        </Stack>
+      </Container>
+    );
+  }
+
+  const totalPanelCount = project.chapters.reduce((sum, ch) => sum + ch.panelCount, 0);
+
+  // The shell doesn't carry per-panel status / imageUrl so we can't tell
+  // "has any ready panel with an image" without re-fetching panels. Treat
+  // any panels at all as "worth showing the Read button" — the public read
+  // page already handles the no-renderable-panels case.
+  const hasReadyPanelsWithImages = totalPanelCount > 0;
+
+  // Hero banner (the wide overview-page banner). Surfaced in the workspace
+  // header so the author can see at a glance whether it's set — previously
+  // it was only visible/editable from the Settings modal.
+  const heroImage = (project as any).heroImage as { id: number; url: string } | null | undefined;
+  const heroImagePosition = ((project as any).heroImagePosition as number | undefined) ?? 50;
+
+  // Detail drawer is opened from the active chapter's panel grid, so we
+  // only need to look there. Chapters other than the active one don't have
+  // their panels loaded into the cache.
+  const detailPanel = detailPanelId
+    ? activeChapter?.panels.find((p) => p.id === detailPanelId) ?? null
+    : null;
+  const detailPanelIndex =
+    detailPanel && activeChapter
+      ? activeChapter.panels.findIndex((p) => p.id === detailPanel.id)
+      : -1;
+
+  return (
+    <>
+      {/* ── Welcome modal ─────────────────────────── */}
+      <Modal
+        opened={welcomeOpened}
+        onClose={handleDismissWelcome}
+        title={
+          <Group gap="xs">
+            <IconInfoCircle size={20} />
+            <Text fw={600}>Welcome to Comic Creator (Beta)!</Text>
+          </Group>
+        }
+        centered
+        size="md"
+      >
+        <Stack gap="sm">
+          <Text size="sm">
+            This is an early version with a limited feature set, and you may run into some bumps
+            along the way.
+          </Text>
+          <Text size="sm">
+            We&apos;re already working on a large set of improvements and will be releasing updates
+            rapidly.
+          </Text>
+          <Text size="sm" c="dimmed">
+            As this is an experimental feature, refunds won&apos;t be issued for Beta-related
+            issues.
+          </Text>
+          <Group justify="flex-end" mt="sm">
+            <Button onClick={handleDismissWelcome}>Got it!</Button>
+          </Group>
+        </Stack>
+      </Modal>
+
+      <Meta title={`${project.name} - Civitai Comics`} canonical={`/comics/project/${projectId}`} />
+
+      <Container size="xl" py="xl">
+        <Stack gap="xl">
+          {/* ── Visibility alert ─────────────────────────── */}
+          {/* Surfaced to the OWNER only (this page is owner-protected) so
+              they understand why a published comic isn't reaching the
+              public. The list of affected chapters comes from the same
+              `hiddenReason` the listing route uses to gate visibility, so
+              what we show here matches what readers would see. */}
+          {(() => {
+            const tosChapters = project.chapters.filter((ch) => ch.hiddenReason === 'tosViolation');
+            const reviewChapters = project.chapters.filter(
+              (ch) => ch.hiddenReason === 'reviewPending'
+            );
+            const projectTos = project.hiddenReason === 'tosViolation';
+            if (!projectTos && tosChapters.length === 0 && reviewChapters.length === 0) {
+              return null;
+            }
+            return (
+              <Alert
+                color={projectTos || tosChapters.length > 0 ? 'red' : 'orange'}
+                icon={<IconAlertCircle size={18} />}
+                title={
+                  projectTos
+                    ? 'Comic hidden — TOS violation'
+                    : tosChapters.length > 0
+                    ? 'Some chapters are hidden — TOS violation'
+                    : 'Some chapters are hidden — moderator review pending'
+                }
+              >
+                <Stack gap={4}>
+                  {projectTos && (
+                    <Text size="sm">
+                      This comic has been flagged for a Terms of Service violation and is not
+                      visible to readers. Please review your content or contact support.
+                    </Text>
+                  )}
+                  {!projectTos && tosChapters.length > 0 && (
+                    <Text size="sm">
+                      The following chapters were flagged for a Terms of Service violation and are
+                      hidden from readers: <b>{tosChapters.map((c) => c.name).join(', ')}</b>.
+                    </Text>
+                  )}
+                  {reviewChapters.length > 0 && (
+                    <Text size="sm">
+                      The following chapters have one or more panel images awaiting moderator review
+                      and won't appear publicly until they're cleared:{' '}
+                      <b>{reviewChapters.map((c) => c.name).join(', ')}</b>. They'll publish
+                      automatically once approved.
+                    </Text>
+                  )}
+                </Stack>
+              </Alert>
+            );
+          })()}
+
+          {/* ── Hero banner ─────────────────────────── */}
+          {/* The overview-page banner, shown here so the author can tell at
+              a glance whether it's set. Click anywhere to edit it (and the
+              cover) in Settings. */}
+          <div
+            className={clsx(styles.heroBanner, !heroImage && styles.heroBannerEmpty)}
+            onClick={() => openSettings()}
+            role="button"
+            tabIndex={0}
+          >
+            {heroImage?.url ? (
+              <>
+                <img
+                  src={getEdgeUrl(heroImage.url, { width: 1200, optimized: true })}
+                  alt={`${project.name} hero banner`}
+                  className={styles.heroBannerImg}
+                  style={{ objectPosition: `center ${heroImagePosition}%` }}
+                />
+                <span className={styles.heroBannerEdit}>
+                  <IconSettings size={14} />
+                  Edit in settings
+                </span>
+              </>
+            ) : (
+              <Stack gap={2} align="center" className={styles.heroBannerPlaceholder}>
+                <IconPhoto size={22} style={{ color: '#909296' }} />
+                <Text size="sm" fw={600}>
+                  No hero banner set
+                </Text>
+                <Text size="xs" c="dimmed" ta="center">
+                  Add one in Settings — it headlines your comic&apos;s overview page
+                </Text>
+              </Stack>
+            )}
+          </div>
+
+          {/* ── Header card ─────────────────────────── */}
+          <div className={clsx(styles.headerCard, styles.gradientTopBorder)}>
+            <div className={styles.headerImage} onClick={() => openSettings()}>
+              {project.coverImage?.url ? (
+                <img
+                  src={getEdgeUrl(project.coverImage.url, { width: 160, optimized: true })}
+                  alt={project.name}
+                />
+              ) : (
+                <IconPhoto size={24} style={{ color: '#909296' }} />
+              )}
+            </div>
+
+            <div className={styles.headerContent}>
+              <Group gap="xs" mb={4}>
+                <ActionIcon
+                  variant="subtle"
+                  size="sm"
+                  component={Link}
+                  href={currentUser?.username ? `/user/${currentUser.username}/comics` : '/comics'}
+                  c="dimmed"
+                >
+                  <IconArrowLeft size={16} />
+                </ActionIcon>
+                <Title order={3} fw={700} lineClamp={1}>
+                  {project.name}
+                </Title>
+              </Group>
+
+              {project.description && (
+                <Text size="sm" c="dimmed" lineClamp={2} mb={8}>
+                  {project.description}
+                </Text>
+              )}
+
+              <div className="flex gap-3 items-center flex-wrap">
+                <span className={styles.statPill}>
+                  <span className={styles.statDot} />
+                  {project.chapters.length} {project.chapters.length === 1 ? 'chapter' : 'chapters'}
+                </span>
+                <span className={styles.statPill}>
+                  <span className={styles.statDot} />
+                  {totalPanelCount} {totalPanelCount === 1 ? 'panel' : 'panels'}
+                </span>
+                {/* Public-facing engagement counters (watcher → ClickHouse →
+                    Redis). Shown to the creator on their own workspace so
+                    they can see how their comic is performing without
+                    having to navigate to the public page. Each pill is
+                    only rendered when non-zero so a brand-new comic still
+                    looks clean. */}
+                {project.metrics?.readerCount > 0 && (
+                  <Tooltip label="Unique readers" withArrow>
+                    <span className={styles.statPill}>
+                      <IconUsers size={12} />
+                      {abbreviateNumber(project.metrics.readerCount)}
+                    </span>
+                  </Tooltip>
+                )}
+                {project.metrics?.chapterReadCount > 0 && (
+                  <Tooltip label="Total chapter reads" withArrow>
+                    <span className={styles.statPill}>
+                      <IconEye size={12} />
+                      {abbreviateNumber(project.metrics.chapterReadCount)}
+                    </span>
+                  </Tooltip>
+                )}
+                {project.metrics?.followerCount > 0 && (
+                  <Tooltip label="Followers" withArrow>
+                    <span className={styles.statPill}>
+                      <IconBell size={12} />
+                      {abbreviateNumber(project.metrics.followerCount)}
+                    </span>
+                  </Tooltip>
+                )}
+                {project.metrics?.tippedAmount > 0 && (
+                  <Tooltip
+                    label={`Buzz tipped (${abbreviateNumber(project.metrics.tippedCount)} tip${
+                      project.metrics.tippedCount === 1 ? '' : 's'
+                    })`}
+                    withArrow
+                  >
+                    <span className={styles.statPill}>
+                      <IconBolt size={12} />
+                      {abbreviateNumber(project.metrics.tippedAmount)}
+                    </span>
+                  </Tooltip>
+                )}
+                {project.metrics?.hiddenCount > 0 && (
+                  <Tooltip label="Users who have hidden this comic from their feed" withArrow>
+                    <span className={styles.statPill}>
+                      <IconEyeOff size={12} />
+                      {abbreviateNumber(project.metrics.hiddenCount)}
+                    </span>
+                  </Tooltip>
+                )}
+                {(() => {
+                  const nsfw = getNsfwLabel(project.nsfwLevel);
+                  return nsfw ? (
+                    <Badge size="xs" color={nsfw.color} variant="filled">
+                      {nsfw.label}
+                    </Badge>
+                  ) : null;
+                })()}
+              </div>
+            </div>
+
+            <div className={styles.headerActions}>
+              <ActionIcon variant="subtle" size="lg" onClick={() => openSettings()} c="dimmed">
+                <IconSettings size={20} />
+              </ActionIcon>
+              <button
+                className={styles.gradientBtn}
+                onClick={() =>
+                  router.push(`/comics/${projectId}/${slugitOr(project.name, 'comic')}`)
+                }
+                disabled={!hasReadyPanelsWithImages}
+              >
+                <IconBook size={16} />
+                Read
+              </button>
+            </div>
+          </div>
+
+          {/* ── Main layout ─────────────────────────── */}
+          <div className={styles.workspaceGrid}>
+            {/* ── Sidebar: References ─────────────── */}
+            <div className={styles.sidebarSection}>
+              <div className={styles.sidebarTitle}>
+                <span>References</span>
+                <Group gap={4}>
+                  <Tooltip label="Import from other projects" withArrow>
+                    <ActionIcon variant="subtle" size="sm" onClick={openImportRefs} color="blue">
+                      <IconDownload size={16} />
+                    </ActionIcon>
+                  </Tooltip>
+                  <ActionIcon
+                    variant="subtle"
+                    size="sm"
+                    component={Link}
+                    href={`/comics/project/${projectId}/character`}
+                    color="yellow"
+                  >
+                    <IconPlus size={16} />
+                  </ActionIcon>
+                </Group>
+              </div>
+
+              <ScrollArea.Autosize mah="calc(100vh - 240px)" scrollbarSize={6}>
+                <Stack gap={8}>
+                  {allReferences.length === 0 ? (
+                    <div className="flex flex-col items-center py-8 text-center">
+                      <IconUser size={32} style={{ color: '#605e6e', marginBottom: 12 }} />
+                      <Text size="xs" c="dimmed" mb="md">
+                        References help maintain character consistency across panels. Optional — you
+                        can generate panels without them.
+                      </Text>
+                      <Group gap={8} justify="center">
+                        <button
+                          className={styles.gradientBtn}
+                          onClick={() => router.push(`/comics/project/${projectId}/character`)}
+                        >
+                          <IconPlus size={14} />
+                          Add Reference
+                        </button>
+                        <button className={styles.gradientBtn} onClick={openImportRefs}>
+                          <IconDownload size={14} />
+                          Import
+                        </button>
+                      </Group>
+                    </div>
+                  ) : (
+                    allReferences.map((ref) => (
+                      <ReferenceSidebarItem
+                        key={ref.id}
+                        character={ref}
+                        projectId={projectId}
+                        referenceImageMap={referenceImageMap}
+                        onRemoveFromProject={handleRemoveReferenceFromProject}
+                        onDeletePermanently={handleDeleteReferencePermanently}
+                        getStatusDotClass={getStatusDotClass}
+                        getStatusLabel={getStatusLabel}
+                      />
+                    ))
+                  )}
+                </Stack>
+              </ScrollArea.Autosize>
+
+              <ImportReferencesModal
+                projectId={projectId}
+                opened={importRefsOpened}
+                onClose={closeImportRefs}
+              />
+            </div>
+
+            {/* ── Sidebar: Chapters ───────────────── */}
+            <div id="chapters-sidebar" className={styles.sidebarSection}>
+              <div
+                className={styles.sidebarTitle}
+                style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+              >
+                <span>Chapters</span>
+                {project.chapters.length > 1 && (
+                  <Tooltip
+                    label={
+                      chapterReorderMode ? 'Done — click a chapter to open it' : 'Reorder chapters'
+                    }
+                    withArrow
+                    position="top"
+                  >
+                    <ActionIcon
+                      variant={chapterReorderMode ? 'filled' : 'subtle'}
+                      color={chapterReorderMode ? 'yellow' : 'gray'}
+                      size="sm"
+                      onClick={() => setChapterReorderMode((v) => !v)}
+                      aria-label={chapterReorderMode ? 'Exit reorder mode' : 'Reorder chapters'}
+                    >
+                      <IconGripVertical size={14} />
+                    </ActionIcon>
+                  </Tooltip>
+                )}
+              </div>
+
+              <div className={styles.chapterSidebar}>
+                <DndContext
+                  sensors={chapterSensors}
+                  collisionDetection={closestCenter}
+                  onDragEnd={handleChapterDragEnd}
+                >
+                  <SortableContext items={project.chapters.map((ch) => ch.position)}>
+                    {project.chapters.map((chapter, chapterIdx) => {
+                      const isActive =
+                        (activeChapterPosition ?? project.chapters[0]?.position) ===
+                        chapter.position;
+                      const panelCount = chapter.panelCount;
+                      const hasInProgressPanels = chapter.hasInProgressPanels;
+                      const eaConfig = chapter.earlyAccessConfig as {
+                        buzzPrice: number;
+                        timeframe: number;
+                      } | null;
+                      const isEarlyAccess =
+                        chapter.status === ComicChapterStatus.Published &&
+                        eaConfig != null &&
+                        chapter.earlyAccessEndsAt != null &&
+                        new Date(chapter.earlyAccessEndsAt) > new Date();
+                      const isDeleting =
+                        deleteChapterMutation.isPending &&
+                        deleteChapterMutation.variables?.chapterPosition === chapter.position;
+                      const isUpdating =
+                        (updateChapterMutation.isPending &&
+                          updateChapterMutation.variables?.chapterPosition === chapter.position) ||
+                        (updateChapterEaMutation.isPending &&
+                          updateChapterEaMutation.variables?.chapterPosition === chapter.position);
+                      const isBusy = isDeleting || isUpdating;
+
+                      return (
+                        <SortableChapter
+                          key={`${chapter.projectId}-${chapter.position}`}
+                          id={chapter.position}
+                          disabled={!chapterReorderMode}
+                        >
+                          <div
+                            className={clsx(
+                              styles.chapterItem,
+                              isActive && styles.chapterItemActive
+                            )}
+                            style={
+                              isDeleting
+                                ? { opacity: 0.5, pointerEvents: 'none' }
+                                : chapterReorderMode
+                                ? { cursor: 'grab' }
+                                : undefined
+                            }
+                            onClick={
+                              // In reorder mode, the entire card is the drag
+                              // handle — don't switch chapters on click.
+                              chapterReorderMode
+                                ? undefined
+                                : () => goToChapter(chapter.position, { history: 'push' })
+                            }
+                          >
+                            <span className={styles.chapterItemNumber}>
+                              {isBusy ? (
+                                <Loader size={12} />
+                              ) : chapterReorderMode ? (
+                                <IconGripVertical size={12} />
+                              ) : (
+                                <span style={{ fontSize: 11, fontWeight: 600 }}>
+                                  {chapterIdx + 1}
+                                </span>
+                              )}
+                            </span>
+                            <div className={styles.chapterItemInfo}>
+                              {/* Row 1: chapter name + inline action icons. Putting */}
+                              {/* actions next to the title (not stretched down the */}
+                              {/* whole card) gives the metadata row below full width */}
+                              {/* so panel count + NSFW badge don't get crunched. */}
+                              <div className={styles.chapterItemNameRow}>
+                                <p className={styles.chapterItemName}>
+                                  {chapter.name}
+                                  {isEarlyAccess && (
+                                    <IconLock
+                                      size={11}
+                                      className="inline-block ml-1 opacity-60"
+                                      style={{
+                                        verticalAlign: 'middle',
+                                        color: 'var(--mantine-color-yellow-5)',
+                                      }}
+                                    />
+                                  )}
+                                </p>
+                                <span className={styles.chapterItemActions}>
+                                  <Tooltip
+                                    label={
+                                      hasInProgressPanels
+                                        ? 'Wait for all panels to complete before duplicating'
+                                        : 'Duplicate chapter'
+                                    }
+                                    withArrow
+                                    position="top"
+                                  >
+                                    <ActionIcon
+                                      variant="transparent"
+                                      size="xs"
+                                      c="dimmed"
+                                      disabled={
+                                        hasInProgressPanels ||
+                                        (duplicateChapterMutation.isPending &&
+                                          duplicateChapterMutation.variables?.chapterPosition ===
+                                            chapter.position)
+                                      }
+                                      onClick={(e: React.MouseEvent) => {
+                                        e.stopPropagation();
+                                        openConfirmModal({
+                                          title: 'Duplicate chapter',
+                                          children: `This will create a copy of "${chapter.name}" with all its panels. Continue?`,
+                                          labels: { confirm: 'Duplicate', cancel: 'Cancel' },
+                                          onConfirm: () =>
+                                            duplicateChapterMutation.mutate({
+                                              projectId,
+                                              chapterPosition: chapter.position,
+                                            }),
+                                        });
+                                      }}
+                                    >
+                                      {duplicateChapterMutation.isPending &&
+                                      duplicateChapterMutation.variables?.chapterPosition ===
+                                        chapter.position ? (
+                                        <Loader size={12} />
+                                      ) : (
+                                        <IconCopy size={12} />
+                                      )}
+                                    </ActionIcon>
+                                  </Tooltip>
+                                  <ActionIcon
+                                    variant="transparent"
+                                    size="xs"
+                                    c="dimmed"
+                                    onClick={(e: React.MouseEvent) => {
+                                      e.stopPropagation();
+                                      handleOpenChapterSettings(chapter);
+                                    }}
+                                  >
+                                    <IconSettings size={12} />
+                                  </ActionIcon>
+                                </span>
+                              </div>
+                              {/* Row 2: status dot + panel count + NSFW badge. */}
+                              {/* Full-width now that actions sit on row 1. */}
+                              <div
+                                className={styles.chapterItemCount}
+                                style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+                              >
+                                <Tooltip
+                                  label={
+                                    chapter.status === ComicChapterStatus.Scheduled
+                                      ? `Scheduled · ${
+                                          chapter.publishedAt
+                                            ? new Date(chapter.publishedAt).toLocaleDateString()
+                                            : ''
+                                        }`
+                                      : chapter.status === ComicChapterStatus.Published
+                                      ? isEarlyAccess
+                                        ? `Early Access · ${eaConfig!.buzzPrice} Buzz`
+                                        : 'Published'
+                                      : 'Draft'
+                                  }
+                                  withArrow
+                                  position="right"
+                                >
+                                  <span
+                                    className="inline-block w-1.5 h-1.5 rounded-full"
+                                    style={{
+                                      background:
+                                        chapter.status === ComicChapterStatus.Scheduled
+                                          ? 'var(--mantine-color-blue-5)'
+                                          : isEarlyAccess
+                                          ? 'var(--mantine-color-yellow-5)'
+                                          : chapter.status === ComicChapterStatus.Published
+                                          ? 'var(--mantine-color-green-5)'
+                                          : 'var(--mantine-color-gray-5)',
+                                    }}
+                                  />
+                                </Tooltip>
+                                <span>
+                                  {panelCount} {panelCount === 1 ? 'panel' : 'panels'}
+                                </span>
+                                {(() => {
+                                  const nsfw = getNsfwLabel(chapter.nsfwLevel);
+                                  return nsfw ? (
+                                    <Badge size="xs" color={nsfw.color} variant="filled" ml={2}>
+                                      {nsfw.label}
+                                    </Badge>
+                                  ) : null;
+                                })()}
+                                {chapter.hiddenReason && (
+                                  <Tooltip
+                                    label={
+                                      chapter.hiddenReason === 'tosViolation'
+                                        ? 'Hidden from readers — flagged as a TOS violation. Please remove the offending content or contact support.'
+                                        : 'Hidden from readers — at least one panel image is awaiting moderator review. It will publish automatically once cleared.'
+                                    }
+                                    withArrow
+                                    position="right"
+                                    multiline
+                                    w={260}
+                                  >
+                                    <Badge
+                                      size="xs"
+                                      color={
+                                        chapter.hiddenReason === 'tosViolation' ? 'red' : 'orange'
+                                      }
+                                      variant="filled"
+                                      ml={2}
+                                      leftSection={<IconAlertCircle size={10} />}
+                                    >
+                                      {chapter.hiddenReason === 'tosViolation' ? 'TOS' : 'Review'}
+                                    </Badge>
+                                  </Tooltip>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </SortableChapter>
+                      );
+                    })}
+                  </SortableContext>
+                </DndContext>
+
+                <button
+                  className={styles.chapterAddBtn}
+                  onClick={() => createChapterMutation.mutate({ projectId })}
+                  disabled={createChapterMutation.isPending}
+                >
+                  {createChapterMutation.isPending ? <Loader size={14} /> : <IconPlus size={14} />}
+                  {createChapterMutation.isPending ? 'Adding...' : 'Add Chapter'}
+                </button>
+
+                {activeReferences.length > 0 && (
+                  <button
+                    className={styles.gradientBtn}
+                    style={{ padding: '8px 12px', fontSize: 13, width: '100%' }}
+                    onClick={openSmartModal}
+                  >
+                    <IconSparkles size={14} />
+                    Smart Create
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* ── Main: Panels ───────────────────── */}
+            <div>
+              {/* Active chapter title + publish toggle */}
+              {activeChapter &&
+                (() => {
+                  const activeEaConfig = activeChapter.earlyAccessConfig as {
+                    buzzPrice: number;
+                    timeframe: number;
+                  } | null;
+                  const isActiveEarlyAccess =
+                    activeChapter.status === ComicChapterStatus.Published &&
+                    activeEaConfig != null &&
+                    activeChapter.earlyAccessEndsAt != null &&
+                    new Date(activeChapter.earlyAccessEndsAt) > new Date();
+                  const isPublishing =
+                    (publishChapterMutation.isPending &&
+                      publishChapterMutation.variables?.chapterPosition ===
+                        activeChapter.position) ||
+                    (unpublishChapterMutation.isPending &&
+                      unpublishChapterMutation.variables?.chapterPosition ===
+                        activeChapter.position);
+                  const isDraft = activeChapter.status === ComicChapterStatus.Draft;
+                  const isScheduled = activeChapter.status === ComicChapterStatus.Scheduled;
+
+                  return (
+                    <Group justify="space-between" align="center" mb="md">
+                      <Group gap="sm">
+                        <Title order={4} style={{ fontWeight: 700 }}>
+                          {activeChapter.name}
+                        </Title>
+                        <Badge
+                          size="sm"
+                          variant="light"
+                          color={
+                            isScheduled
+                              ? 'blue'
+                              : isActiveEarlyAccess
+                              ? 'yellow'
+                              : isDraft
+                              ? 'gray'
+                              : 'green'
+                          }
+                          leftSection={
+                            isScheduled ? (
+                              <IconCalendar size={10} />
+                            ) : isActiveEarlyAccess ? (
+                              <IconLock size={10} />
+                            ) : undefined
+                          }
+                          rightSection={
+                            isActiveEarlyAccess ? (
+                              <Tooltip label="Edit Early Access" withArrow>
+                                <ActionIcon
+                                  variant="transparent"
+                                  size="xs"
+                                  c="yellow"
+                                  onClick={() => handleOpenChapterSettings(activeChapter)}
+                                  aria-label="Edit Early Access"
+                                >
+                                  <IconSettings size={12} />
+                                </ActionIcon>
+                              </Tooltip>
+                            ) : undefined
+                          }
+                        >
+                          {isScheduled
+                            ? `Scheduled · ${
+                                activeChapter.publishedAt
+                                  ? new Date(activeChapter.publishedAt).toLocaleDateString()
+                                  : ''
+                              }`
+                            : isActiveEarlyAccess
+                            ? `Early Access · ${activeEaConfig!.buzzPrice} Buzz`
+                            : isDraft
+                            ? 'Draft'
+                            : 'Published'}
+                        </Badge>
+                      </Group>
+                      <Group gap="xs">
+                        {activeChapter.panels.length > 0 && (
+                          <Button
+                            size="xs"
+                            variant="light"
+                            leftSection={<IconEye size={14} />}
+                            component={Link}
+                            href={`/comics/project/${projectId}/read?chapter=${activeChapter.position}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            Preview
+                          </Button>
+                        )}
+                        <Tooltip
+                          label="Add panels before publishing"
+                          disabled={!isDraft || activeChapter.panels.length > 0}
+                        >
+                          <Button
+                            size="xs"
+                            variant={isDraft ? 'filled' : 'light'}
+                            color={isDraft ? 'green' : isScheduled ? 'blue' : 'yellow'}
+                            leftSection={
+                              isDraft ? (
+                                <IconWorld size={14} />
+                              ) : isScheduled ? (
+                                <IconCalendar size={14} />
+                              ) : (
+                                <IconEyeOff size={14} />
+                              )
+                            }
+                            disabled={isDraft && activeChapter.panels.length === 0}
+                            loading={isPublishing}
+                            onClick={() =>
+                              handleTogglePublish(activeChapter.position, activeChapter.status)
+                            }
+                          >
+                            {isDraft ? 'Publish' : isScheduled ? 'Cancel Schedule' : 'Unpublish'}
+                          </Button>
+                        </Tooltip>
+                      </Group>
+                    </Group>
+                  );
+                })()}
+
+              {activeChapter &&
+                activeChapter.panels.length === 0 &&
+                (isActiveChapterLoading ? (
+                  <div className="flex items-center justify-center py-12">
+                    <Loader color="yellow" />
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center py-12 text-center">
+                    <IconPhoto size={48} style={{ color: '#605e6e', marginBottom: 16 }} />
+                    <Text size="sm" c="dimmed" mb="md">
+                      No panels yet. Create your first panel!
+                    </Text>
+                    <Text c="dimmed" size="xs" maw={360}>
+                      Use <b>Generate</b> to create panels from a text prompt, or <b>Enhance</b> to
+                      transform an existing image into a comic panel. Add <b>References</b> to
+                      maintain character consistency across panels.
+                    </Text>
+                  </div>
+                ))}
+
+              {/* Panel grid */}
+              <DndContext
+                sensors={panelSensors}
+                collisionDetection={closestCenter}
+                onDragEnd={handlePanelDragEnd}
+              >
+                <SortableContext items={(activeChapter?.panels ?? []).map((p) => p.id)}>
+                  <div
+                    className="grid gap-4"
+                    style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))' }}
+                  >
+                    {(activeChapter?.panels ?? []).map((panel, index) => (
+                      <SortablePanel key={panel.id} id={panel.id}>
+                        <PanelCard
+                          panel={panel}
+                          projectId={projectId}
+                          chapterPosition={activeChapter?.position ?? 0}
+                          position={index + 1}
+                          referenceNames={
+                            (panel.references ?? [])
+                              .map((r: { referenceId: number }) =>
+                                referenceNameMap.get(r.referenceId)
+                              )
+                              .filter(Boolean) as string[]
+                          }
+                          onDelete={() => deletePanelMutation.mutate({ panelId: panel.id })}
+                          onRegenerate={() => handleRegenerate(panel as any)}
+                          onDuplicate={() =>
+                            openConfirmModal({
+                              title: 'Duplicate panel',
+                              children: 'This will create a copy of this panel. Continue?',
+                              labels: { confirm: 'Duplicate', cancel: 'Cancel' },
+                              onConfirm: () => duplicatePanelMutation.mutate({ panelId: panel.id }),
+                            })
+                          }
+                          isDuplicating={
+                            duplicatePanelMutation.isPending &&
+                            duplicatePanelMutation.variables?.panelId === panel.id
+                          }
+                          onInsertAfter={() => {
+                            setInsertAtPosition(index + 1);
+                            openPanelModal();
+                          }}
+                          onClick={() => setDetailPanelId(panel.id)}
+                          onIterativeEdit={() =>
+                            handleOpenIterativeEditor({ ...panel, position: index } as any)
+                          }
+                          onRatingChange={() => refetchRef.current()}
+                        />
+                      </SortablePanel>
+                    ))}
+
+                    {/* Add panel button */}
+                    {activeChapter && (
+                      <button className={styles.addPanelBtn} onClick={openPanelModal}>
+                        <IconPlus size={28} />
+                      </button>
+                    )}
+                  </div>
+                </SortableContext>
+              </DndContext>
+            </div>
+          </div>
+        </Stack>
+      </Container>
+
+      {/* ── Mobile: floating chapter nav button ──── */}
+      <ActionIcon
+        className={styles.mobileChapterBtn}
+        variant="filled"
+        color="dark"
+        size="xl"
+        radius="xl"
+        onClick={() =>
+          document.getElementById('chapters-sidebar')?.scrollIntoView({ behavior: 'smooth' })
+        }
+      >
+        <IconBook size={18} />
+      </ActionIcon>
+
+      {/* ── Extracted components ──────────────────── */}
+      <PanelDetailDrawer
+        detailPanelId={detailPanelId}
+        setDetailPanelId={setDetailPanelId}
+        projectId={project.id}
+        chapterPosition={activeChapter?.position ?? 0}
+        detailPanel={detailPanel as any}
+        detailPanelIndex={detailPanelIndex}
+        referenceNameMap={referenceNameMap}
+        onRegenerate={handleDrawerRegenerate}
+        onInsertAfter={handleDrawerInsertAfter}
+        onDuplicate={(panelId) =>
+          openConfirmModal({
+            title: 'Duplicate panel',
+            children: 'This will create a copy of this panel. Continue?',
+            labels: { confirm: 'Duplicate', cancel: 'Cancel' },
+            onConfirm: () => duplicatePanelMutation.mutate({ panelId }),
+          })
+        }
+        onDelete={(panelId) => deletePanelMutation.mutate({ panelId })}
+        onIterativeEdit={(panel) => {
+          setDetailPanelId(null);
+          const panelIndex = activeChapter
+            ? activeChapter.panels.findIndex((p) => p.id === panel.id)
+            : -1;
+          handleOpenIterativeEditor({
+            ...panel,
+            position: panelIndex >= 0 ? panelIndex : 0,
+          } as any);
+        }}
+      />
+
+      <PanelModal
+        opened={panelModalOpened}
+        onClose={handlePanelModalClose}
+        prompt={prompt}
+        setPrompt={setPrompt}
+        useContext={useContext}
+        setUseContext={setUseContext}
+        projectId={projectId}
+        chapterPosition={activeChapter?.position ?? 0}
+        referencePanelId={referencePanelId}
+        setReferencePanelId={setReferencePanelId}
+        availablePanels={(activeChapter?.panels ?? [])
+          .map((p, idx) => ({ ...p, idx }))
+          .filter((p) => p.status === 'Ready' && p.imageUrl)
+          .map((p) => ({ id: p.id, imageUrl: p.imageUrl!, position: p.idx }))}
+        layoutImagePath={layoutImagePath}
+        setLayoutImagePath={setLayoutImagePath}
+        quantity={quantity}
+        setQuantity={setQuantity}
+        aspectRatio={aspectRatio}
+        setAspectRatio={setAspectRatio}
+        selectedImageIds={selectedImageIds}
+        setSelectedImageIds={setSelectedImageIds}
+        effectiveModel={effectiveModel}
+        onModelChange={handleModelChange}
+        activeAspectRatios={activeAspectRatios}
+        mentionRefs={mentionRefs}
+        mentionedReferences={mentionedReferences}
+        needsImageSelection={needsImageSelection}
+        refImageBudget={refImageBudget}
+        regeneratingPanelId={regeneratingPanelId}
+        insertAtPosition={insertAtPosition}
+        activeChapterPanelCount={activeChapter?.panels.length ?? 0}
+        panelCost={panelCost}
+        enhanceCost={enhanceCost}
+        isSubmitting={isSubmitting}
+        onGeneratePanel={handleGeneratePanel}
+        onEnhancePanel={handleEnhancePanel}
+        onBulkCreate={handleBulkCreate}
+        onImportSubmit={handleImportSubmit}
+        isCreatePending={createPanelMutation.isPending}
+        isEnhancePending={enhancePanelMutation.isPending}
+        isBulkPending={bulkCreateMutation.isPending}
+        initialEnhanceSource={enhanceExistingSource}
+      />
+
+      <SmartCreateModal
+        opened={smartModalOpened}
+        onClose={closeSmartModal}
+        references={mentionRefs}
+        planCost={planCost}
+        panelCost={panelCost}
+        effectiveModel={effectiveModel}
+        activeAspectRatios={activeAspectRatios}
+        defaultAspectRatio={aspectRatio}
+        onModelChange={handleModelChange}
+        onPlanPanels={(story, panelCount) =>
+          planPanelsMutation.mutate({ projectId, storyDescription: story, panelCount })
+        }
+        isPlanningPanels={planPanelsMutation.isPending}
+        planError={
+          planPanelsMutation.isError
+            ? planPanelsMutation.error?.message ?? 'Failed to plan panels'
+            : null
+        }
+        plannedPanels={planPanelsMutation.data?.panels ?? null}
+        onCreateChapter={(data) =>
+          smartCreateMutation.mutate({
+            projectId,
+            chapterName: data.chapterName,
+            storyDescription: data.storyDescription,
+            panels: data.panels,
+            aspectRatio: data.aspectRatio,
+            baseModel: generationModel,
+          })
+        }
+        isCreating={smartCreateMutation.isPending}
+        createError={
+          smartCreateMutation.isError
+            ? smartCreateMutation.error?.message ?? 'Failed to create chapter'
+            : null
+        }
+      />
+
+      <ChapterSettingsModal
+        opened={chapterSettingsOpened}
+        onClose={closeChapterSettings}
+        chapter={chapterSettingsTarget}
+        canDelete={project.chapters.length > 1}
+        onSave={handleSaveChapterSettings}
+        onDelete={handleDeleteChapter}
+        isSaving={updateChapterMutation.isPending || updateChapterEaMutation.isPending}
+        isDeleting={deleteChapterMutation.isPending}
+      />
+
+      <PublishModal
+        opened={publishModalOpened}
+        onClose={closePublishModal}
+        onPublish={handleConfirmPublish}
+        isLoading={publishChapterMutation.isPending}
+      />
+
+      <ProjectSettingsModal
+        opened={settingsOpened}
+        onClose={closeSettings}
+        project={{
+          name: project.name,
+          description: project.description,
+          genre: (project as any).genre,
+          baseModel: project.baseModel,
+          coverImage: project.coverImage,
+          heroImage: (project as any).heroImage,
+          heroImagePosition: (project as any).heroImagePosition,
+          meta: (project as any).meta,
+        }}
+        onSave={(data) =>
+          updateProjectMutation.mutate({ id: projectId, ...data, baseModel: data.baseModel as any })
+        }
+        onDeleteProject={() => deleteProjectMutation.mutate({ id: projectId })}
+        isSaving={updateProjectMutation.isPending}
+      />
+    </>
+  );
+}
+
+export default Page(ProjectWorkspace);

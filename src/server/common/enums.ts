@@ -1,0 +1,493 @@
+export enum UploadType {
+  Image = 'image',
+  TrainingImages = 'training-images',
+  // A B2 lifecycle rule hides this prefix 7 days after upload; never use it for anything durable.
+  TrainingImagesTemp = 'training-images-temp',
+  Model = 'model',
+  Default = 'default',
+}
+
+export type UploadTypeUnion = `${UploadType}`;
+
+export enum ModelSort {
+  Hot = 'Hot',
+  HighestRated = 'Highest Rated',
+  MostDownloaded = 'Most Downloaded',
+  MostLiked = 'Most Liked',
+  MostDiscussed = 'Most Discussed',
+  MostCollected = 'Most Collected',
+  ImageCount = 'Most Images',
+  Newest = 'Newest',
+  Oldest = 'Oldest',
+  RecentlyAdded = 'Recently Added',
+}
+
+export const ModelSortHidden = {
+  RecentlyAdded: ModelSort.RecentlyAdded,
+};
+
+export enum ReviewSort {
+  Newest = 'newest',
+  Oldest = 'oldest',
+  MostLiked = 'most-liked',
+  MostDisliked = 'most-disliked',
+  MostComments = 'most-comments',
+  Rating = 'rating',
+}
+
+export enum ReviewFilter {
+  NSFW = 'nsfw',
+  IncludesImages = 'includes-images',
+}
+
+export enum ImageSort {
+  MostReactions = 'Most Reactions',
+  MostComments = 'Most Comments',
+  MostCollected = 'Most Collected',
+  Newest = 'Newest',
+  Oldest = 'Oldest',
+  Random = 'Random',
+  RecentlyAdded = 'Recently Added',
+}
+
+export const ImageSortHidden = {
+  Random: ImageSort.Random,
+  RecentlyAdded: ImageSort.RecentlyAdded,
+};
+
+export enum PostSort {
+  MostReactions = 'Most Reactions',
+  MostComments = 'Most Comments',
+  MostCollected = 'Most Collected',
+  Newest = 'Newest',
+  Oldest = 'Oldest',
+  RecentlyAdded = 'Recently Added',
+}
+
+export const PostSortHidden = {
+  RecentlyAdded: PostSort.RecentlyAdded,
+};
+
+export enum ImageType {
+  txt2img = 'txt2img',
+  img2img = 'img2img',
+  inpainting = 'inpainting',
+}
+
+export enum ImageResource {
+  Manual = 'Manual',
+  Automatic = 'Automatic',
+}
+
+export enum TagSort {
+  MostModels = 'Most Models',
+  MostImages = 'Most Images',
+  MostPosts = 'Most Posts',
+  MostArticles = 'Most Articles',
+  MostHidden = 'Most Hidden',
+}
+
+export enum ImageScanType {
+  Moderation = 0,
+  Label = 1,
+  FaceDetection = 2,
+  WD14 = 3,
+  Hash = 4,
+  Hive = 5,
+  MinorDetection = 6,
+  HiveDemographics = 7,
+  Clavata = 8,
+  SpineRating = 9,
+}
+
+// export enum CommentV2Sort {
+//   Newest = 'Newest',
+//   Oldest = 'Oldest',
+// }
+
+export enum ArticleSort {
+  MostBookmarks = 'Most Bookmarks',
+  MostReactions = 'Most Reactions',
+  MostComments = 'Most Comments',
+  MostCollected = 'Most Collected',
+  Newest = 'Newest',
+  RecentlyUpdated = 'Recently Updated',
+  RecentlyAdded = 'Recently Added',
+}
+
+export const ArticleSortHidden = {
+  RecentlyAdded: ArticleSort.RecentlyAdded,
+};
+
+export enum CheckpointType {
+  Trained = 'Trained',
+  Merge = 'Merge',
+}
+
+export enum CollectionSort {
+  MostContributors = 'Most Followers',
+  Newest = 'Newest',
+}
+
+// Order of any cosmetic shop grid — the official /shop sections, a creator's
+// storefront, and the community hub all offer the same list. "Newest" is
+// approval order, not submission order: an item stuck in review for a week
+// would otherwise publish already buried.
+export enum CosmeticShopSort {
+  Newest = 'Newest',
+  Oldest = 'Oldest',
+  PriceLowToHigh = 'Price: Low to High',
+  PriceHighToLow = 'Price: High to Low',
+  MostPopular = 'Most Popular',
+  Name = 'Name (A-Z)',
+}
+
+export enum SignalMessages {
+  BuzzUpdate = 'buzz:update',
+  ImageGenStatusUpdate = 'image-gen:status-update',
+  TrainingUpdate = 'training:update',
+  ImageIngestionStatus = 'image-ingestion:status',
+  ChatNewMessage = 'chat:new-message',
+  ChatNewRoom = 'chat:new-room',
+  ChatTypingStatus = 'chat:typing-status',
+  ChatMessageDeleted = 'chat:message-deleted',
+  ChatMessageUpdated = 'chat:message-updated',
+  ChatRoomUpdated = 'chat:room-updated',
+  ChatMembersUpdated = 'chat:members-updated',
+  OrchestratorUpdate = 'orchestrator-job:status-update',
+  TextToImageUpdate = 'orchestrator:text-to-image-update',
+  WorkflowUpdate = 'orchestrator:workflow-update',
+  /** Also sent for a remix-app workflow's steps, so the remix tray need not watch every generation. */
+  RemixAppUpdate = 'orchestrator:remix-app-update',
+  SchedulerDownload = 'scheduler:download',
+  NotificationNew = 'notification:new',
+  ResourceLoadUpdate = 'resource-load:update',
+  Pong = 'pong',
+  CompensationPoolUpdate = 'creators-program:compensation-pool-update',
+  CashInvalidator = 'creators-program:cash-invalidator',
+  AuctionBidChange = 'auction:bid-change',
+  TopicUpdate = 'topic:connections',
+  NewOrderQueueUpdate = 'new-order:queue-update',
+  NewOrderPlayerUpdate = 'new-order:player-update',
+  MetricUpdate = 'metric:update',
+  SessionRefresh = 'session:refresh',
+  CryptoDepositUpdate = 'crypto-deposit:update',
+  ComicPanelUpdate = 'comic:panel-update',
+  ReferralClick = 'referral:click',
+  ReferralCheckoutViewed = 'referral:checkout-viewed',
+  ReferralPurchasePending = 'referral:purchase-pending',
+  ReferralSettled = 'referral:settled',
+  ReferralMilestone = 'referral:milestone',
+  ReferralTierGranted = 'referral:tier-granted',
+  ReferralClawback = 'referral:clawback',
+  ReferralTokenExpiringSoon = 'referral:token-expiring-soon',
+  ScannerPolicyTestProgress = 'scanner-policy:test-progress',
+  ContestScoreRunUpdate = 'contest-score:run-update',
+  EventPointsHat = 'event-points:hat',
+  EventPointsTeams = 'event-points:teams',
+  EventPointsOwner = 'event-points:owner',
+  EventPointsTurf = 'event-points:turf',
+}
+
+export enum BountySort {
+  EndingSoon = 'Ending Soon',
+  HighestBounty = 'Highest Bounty',
+  MostLiked = 'Most Liked',
+  MostDiscussed = 'Most Discussed',
+  MostContributors = 'Most Contributors',
+  MostTracked = 'Most Tracked',
+  MostEntries = 'Most Entries',
+  Newest = 'Newest',
+}
+
+export enum BountyBenefactorSort {
+  HighestAmount = 'Highest Amount',
+  Newest = 'Newest',
+}
+
+export enum CrucibleSort {
+  PrizePool = 'Prize Pool',
+  EndingSoon = 'Ending Soon',
+  Newest = 'Newest',
+  MostEntries = 'Most Entries',
+}
+
+export enum BountyStatus {
+  Open = 'Open',
+  Expired = 'Expired',
+  Awarded = 'Awarded',
+}
+
+export enum CollectionReviewSort {
+  Newest = 'Newest',
+  Oldest = 'Oldest',
+}
+
+export enum BlockedReason {
+  TOS = 'tos',
+  Moderated = 'moderated',
+  CSAM = 'CSAM',
+  AiNotVerified = 'AiNotVerified',
+}
+
+export enum ViolationType {
+  RealPerson = 'realPerson',
+  RealPersonNsfw = 'realPersonNsfw',
+  RealisticMinor = 'realisticMinor',
+  RealisticMinorNsfw = 'realisticMinorNsfw',
+  AnimatedMinorNsfw = 'animatedMinorNsfw',
+  SchoolNsfw = 'schoolNsfw',
+  MinorViolence = 'minorViolence',
+  Bestiality = 'bestiality',
+  SexualViolence = 'sexualViolence',
+  MindAlteredNsfw = 'mindAlteredNsfw',
+  FecalMatter = 'fecalMatter',
+  Gore = 'gore',
+  Diaper = 'diaper',
+  Anorexia = 'anorexia',
+  BodilyFluids = 'bodilyFluids',
+  Incest = 'incest',
+  Hate = 'hate',
+  NonAi = 'non-ai',
+  Spam = 'spam',
+  Other = 'other',
+}
+
+export enum ThreadSort {
+  Newest = 'Newest',
+  Oldest = 'Oldest',
+  MostReactions = 'Most Reactions',
+}
+
+export enum GenerationReactType {
+  Favorited = 'favorited',
+  Liked = 'liked',
+  Disliked = 'disliked',
+}
+
+export enum GenerationSort {
+  Newest = 'Newest',
+  Oldest = 'Oldest',
+}
+
+export enum NsfwLevel {
+  PG = 1,
+  PG13 = 2,
+  R = 4,
+  X = 8,
+  XXX = 16,
+  Blocked = 32,
+}
+
+export enum OnboardingSteps {
+  TOS = 1,
+  Profile = 2,
+  BrowsingLevels = 4,
+  Buzz = 8,
+  CreatorProgram = 16,
+  BannedCreatorProgram = 32,
+  RedTOS = 64,
+}
+
+export const OnboardingComplete =
+  OnboardingSteps.TOS |
+  OnboardingSteps.Profile |
+  OnboardingSteps.BrowsingLevels |
+  OnboardingSteps.Buzz;
+
+export enum PurchasableRewardViewMode {
+  Available = 'Available',
+  Purchased = 'Purchased',
+}
+
+export enum PurchasableRewardModeratorViewMode {
+  Available = 'Available',
+  History = 'History',
+  Purchased = 'Purchased',
+}
+
+export enum ImageConnectionType {
+  Bounty = 'Bounty',
+  BountyEntry = 'BountyEntry',
+  Article = 'Article',
+}
+
+export enum SearchIndexUpdateQueueAction {
+  Update = 'Update',
+  Delete = 'Delete',
+}
+
+export enum VaultSort {
+  RecentlyAdded = 'Recently Added',
+  RecentlyCreated = 'Recently Created',
+  ModelName = 'Model Name',
+  ModelSize = 'Model Size',
+}
+
+export enum GenerationRequestStatus {
+  Pending = 'Pending',
+  Processing = 'Processing',
+  Cancelled = 'Cancelled',
+  Error = 'Error',
+  Succeeded = 'Succeeded',
+}
+
+export enum EntityAccessPermission {
+  None = 0, // Generally won't be used, but can be used to indicate no access
+  EarlyAccessGeneration = 1,
+  EarlyAccessDownload = 2,
+  All = 1 + 2, // Sum of all prev. permissions.
+}
+
+// The notification category is owned by @civitai/notifications (the app + package own the notification
+// domain now). Re-exported here so the ~90 existing `~/server/common/enums` importers are unchanged and
+// there is ONE definition shared with the package — no enum-vs-union mismatch across the seam.
+// nb: when updating the values, similar updates must be made to the notification DB.
+// Deep path, not the package barrel: the barrel re-exports `./client`, an HTTP client for the
+// internal notifications service, and this module has 56 client-side importers.
+export { NotificationCategory } from '@civitai/notifications/constants';
+
+export enum BanReasonCode {
+  SexualMinor = 'SexualMinor',
+  SexualMinorGenerator = 'SexualMinorGenerator',
+  SexualMinorTraining = 'SexualMinorTraining',
+  SexualPOI = 'SexualPOI',
+  Bestiality = 'Bestiality',
+  Scat = 'Scat',
+  Nudify = 'Nudify',
+  Harassment = 'Harassment',
+  SpamBot = 'SpamBot',
+  BotAccount = 'BotAccount',
+  LeaderboardCheating = 'LeaderboardCheating',
+  BuzzCheating = 'BuzzCheating',
+  RRDViolation = 'RRDViolation',
+  Chargeback = 'Chargeback',
+  Other = 'Other',
+}
+
+export enum StripeConnectStatus {
+  PendingOnboarding = 'PendingOnboarding',
+  PendingVerification = 'PendingVerification',
+  Approved = 'Approved',
+  Rejected = 'Rejected',
+}
+
+// Tipalti's own spelling. These ARE the strings in
+// UserPaymentConfiguration.tipaltiAccountStatus, both for rows written before the webhook
+// validated anything and for the values `Tipalti.payeeStatusSchema` parses incoming ones against —
+// so normalising their casing here silently breaks every comparison. INTERNAL_VALUE is Tipalti's
+// sentinel for a status this API version does not expose.
+export enum TipaltiStatus {
+  PendingOnboarding = 'PendingOnboarding',
+  Active = 'Active',
+  Suspended = 'Suspended',
+  Blocked = 'Blocked',
+  BlockedByProvider = 'BlockedByProvider',
+  InternalValue = 'INTERNAL_VALUE',
+}
+
+const blockedTipaltiStatuses = [TipaltiStatus.Blocked, TipaltiStatus.BlockedByProvider] as const;
+
+export function isBlockedTipaltiStatus(status: string | null | undefined) {
+  return blockedTipaltiStatuses.some((s) => s === status);
+}
+
+export enum OrchPriorityTypes {
+  High = 'high',
+  Normal = 'normal',
+  Low = 'low',
+}
+
+export enum OrchEngineTypes {
+  Kohya = 'kohya',
+  Rapid = 'flux-dev-fast',
+  Flux2Dev = 'flux2-dev',
+  Flux2DevEdit = 'flux2-dev-edit',
+  Musubi = 'musubi',
+  AiToolkit = 'ai-toolkit',
+}
+
+export enum BlocklistType {
+  EmailDomain = 'EmailDomain',
+  // Opt-in per entry: an entry here blocks the domain AND every subdomain of it. Separate from
+  // `EmailDomain` so suffix matching is a decision a moderator makes about one domain, never a
+  // behaviour change applied to the ~8,800 entries the upstream sync maintains.
+  EmailDomainSuffix = 'EmailDomainSuffix',
+  LinkDomain = 'LinkDomain',
+  MessagePattern = 'MessagePattern',
+  UsernameExact = 'UsernameExact',
+  UsernamePartial = 'UsernamePartial',
+  // Whole-word proper nouns / technical phrases that coincidentally contain a
+  // young-word token (e.g. "teen titans", "minor barrel distortion"). Blanked from
+  // the prompt/negative prompt before the minor-review audit runs so they don't
+  // false-flag `needsReview='minor'`. Edited by moderators at /moderator/blocklists.
+  PromptBenignPhrase = 'PromptBenignPhrase',
+  NegativeBenignPhrase = 'NegativeBenignPhrase',
+  // Single words that innocently CONTAIN a profanity token ("spreadsheet" holds
+  // "spread"). Suppresses a substring match from the profanity filter rather than
+  // being blanked from the text — different matcher to the two phrase lists above.
+  ProfanityBenignWord = 'ProfanityBenignWord',
+}
+
+export enum ToolSort {
+  Newest = 'Newest',
+  Oldest = 'Oldest',
+  AZ = 'AZ',
+  ZA = 'ZA',
+}
+
+export enum BuzzWithdrawalRequestSort {
+  Newest = 'Newest',
+  Oldest = 'Oldest',
+  HighestAmount = 'Highest Amount',
+  LowestAmount = 'Lowest Amount',
+}
+
+export enum SignalTopic {
+  CreatorProgram = 'creators-program',
+  Auction = 'auction', // with :auctionId
+  ModelVersion = 'model-version', // with :modelVersionId
+  NewOrderPlayer = 'new-order-player', // with :playerId
+  NewOrderQueue = 'new-order-queue', // with :queueId
+  Metric = 'metrics', // with :entityType:entityId
+  EventPoints = 'event-points', // with :event:hat:topicId, :event:owner:topicId, or :event:teams
+  ContestScore = 'contest-score', // with :collectionId
+}
+
+export enum NewOrderImageRatingStatus {
+  Correct = 'Correct',
+  Pending = 'Pending',
+  Failed = 'Failed',
+  Inconclusive = 'Inconclusive',
+  AcolyteCorrect = 'AcolyteCorrect',
+  AcolyteFailed = 'AcolyteFailed',
+}
+
+export enum NewOrderDamnedReason {
+  InappropriateMinors = 'InappropriateMinors',
+  RealisticMinors = 'RealisticMinors',
+  DepictsRealPerson = 'DepictsRealPerson',
+  Bestiality = 'Bestiality',
+  Other = 'Other',
+}
+
+export enum NewOrderSignalActions {
+  UpdateStats = 'update-stats',
+  RankUp = 'rank-up',
+  Reset = 'reset',
+  AddImage = 'add-image',
+  RemoveImage = 'remove-image',
+}
+
+export enum ExternalModerationType {
+  Clavata = 'Clavata',
+  MessagePattern = 'MessagePattern',
+}
+
+export enum MarketplacePaymentMethod {
+  CashApp = 'CashApp',
+  Revolut = 'Revolut',
+  Venmo = 'Venmo',
+  Wise = 'Wise',
+  Zelle = 'Zelle',
+}

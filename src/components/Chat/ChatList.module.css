@@ -1,0 +1,18 @@
+.selectChat {
+  cursor: pointer;
+  border-radius: var(--mantine-radius-sm);
+  padding: 9px 11px;
+  border-left: 2px solid transparent;
+
+  &:hover {
+    background-color: var(--chat-hover);
+  }
+}
+
+/* A rail is a scan surface: selection reads as an accent marker plus a faint
+   tint. A half-alpha primary block swallows the avatar and the nameplate colour
+   inside it. */
+.selectedChat {
+  background-color: var(--chat-selected) !important;
+  border-left-color: var(--chat-accent);
+}

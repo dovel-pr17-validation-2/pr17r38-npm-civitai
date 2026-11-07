@@ -1,0 +1,767 @@
+import { keepHeldReviewsCte } from '~/server/services/held-review.service';
+import { holdMarkerViewExists } from '~/server/services/legal-hold.service';
+import { Prisma } from '@prisma/client';
+import type { ResourceReview } from '@prisma/client';
+import { countedTopLevelCommentSql } from '~/server/services/comment-count.sql';
+import { CacheTTL } from '~/server/common/constants';
+import { NotificationCategory } from '~/server/common/enums';
+import { dbRead, dbWrite } from '~/server/db/client';
+
+import { getKyselyWithoutLag } from '~/server/db/db-lag-helpers';
+import {
+  readUserResourceReviewsViaKysely,
+  readUserResourceReviewsViaPrisma,
+} from '~/server/services/hot-reads-5.reads';
+import { loadKyselyDb } from '~/server/db/kyselyDb.lazy';
+import { readUserReviewsViaKysely } from '~/server/services/hot-reads-6.reads';
+import { onModelReviewsChanged } from '~/server/events/points/hooks';
+import { logToAxiom } from '~/server/logging/client';
+import type { GetByIdInput } from '~/server/schema/base.schema';
+import type { GetResourceReviewsInput } from '~/server/schema/resourceReview.schema';
+import {
+  resourceReviewSelect,
+  resourceReviewSimpleSelect,
+} from '~/server/selectors/resourceReview.selector';
+import { userWithCosmeticsSelect } from '~/server/selectors/user.selector';
+import { throwOnBlockedUserContent } from '~/server/services/blocklist.service';
+import {
+  getBlockCheckOwnerIds,
+  throwIfBlockedByOwners,
+} from '~/server/services/block-check.service';
+import { createNotification } from '~/server/services/notification.service';
+import {
+  BlockedByUsers,
+  BlockedUsers,
+  HiddenUsers,
+} from '~/server/services/user-preferences.service';
+import { boundExcludedUserIds } from '~/server/utils/excluded-user-ids';
+import {
+  amIBlockedByUser,
+  getBasicDataForUsers,
+  getCosmeticsForUsers,
+  getProfilePicturesForUsers,
+} from '~/server/services/user.service';
+import { queryCache } from '~/server/utils/cache-helpers';
+import {
+  bustRatingTotalsCache,
+  bustRatingTotalsForRows,
+} from '~/server/services/resourceReview.cache';
+import { throwAuthorizationError, throwNotFoundError } from '~/server/utils/errorHandling';
+import { getPagingData } from '~/server/utils/pagination-helpers';
+import type { ResourceReviewCreate } from '~/types/router';
+import type { UpsertResourceReviewInput } from '../schema/resourceReview.schema';
+import type {
+  CreateResourceReviewInput,
+  GetRatingTotalsInput,
+  GetResourceReviewPagedInput,
+  GetResourceReviewsInfiniteInput,
+  GetUserResourceReviewInput,
+  UpdateResourceReviewInput,
+} from './../schema/resourceReview.schema';
+import { queueScamScan } from '~/server/services/text-scan/scam-scan-queue';
+
+export type ResourceReviewDetailModel = AsyncReturnType<typeof getResourceReview>;
+export const getResourceReview = async ({
+  id,
+  userId,
+  isModerator,
+}: GetByIdInput & { userId?: number; isModerator?: boolean }) => {
+  const result = await dbRead.resourceReview.findUnique({
+    where: { id },
+    select: {
+      ...resourceReviewSelect,
+      model: { select: { name: true, id: true, userId: true, status: true } },
+    },
+  });
+  if (!result || result.model.status !== 'Published') throw throwNotFoundError();
+
+  if (userId && !isModerator) {
+    const blocked = await amIBlockedByUser({ userId, targetUserId: result.user.id });
+    if (blocked) throw throwNotFoundError();
+  }
+
+  return result;
+};
+
+export const getUserResourceReview = async ({
+  modelId,
+  modelVersionId,
+  userId,
+  tx,
+}: GetUserResourceReviewInput & { userId: number; tx?: Prisma.TransactionClient }) => {
+  if (!userId) throw throwAuthorizationError();
+  if (!tx)
+    return readUserResourceReviewsViaKysely(await getKyselyWithoutLag('resourceReview', userId), {
+      modelId,
+      modelVersionId,
+      userId,
+    });
+  // Inside a transaction the read stays on that transaction, through Prisma.
+  const results = await readUserResourceReviewsViaPrisma(tx, {
+    modelId,
+    modelVersionId,
+    userId,
+  });
+  if (!results) return null;
+
+  return results;
+};
+
+export const getResourceReviewsByUserId = async ({
+  userId,
+  recommended,
+  modelIds,
+}: {
+  userId: number;
+  recommended?: boolean;
+  // When provided, bound the scan to these models (membership queries). Omitted =
+  // unfiltered = existing behavior for the current whole-history callers.
+  modelIds?: number[];
+}) => {
+  return readUserReviewsViaKysely((await loadKyselyDb()).kyselyRead, {
+    userId,
+    recommended,
+    modelIds,
+  });
+};
+
+export const getResourceReviews = async ({ resourceIds }: GetResourceReviewsInput) => {
+  return await dbRead.resourceReview.findMany({
+    where: { modelVersionId: { in: resourceIds } },
+    select: {
+      id: true,
+      modelVersionId: true,
+      rating: true,
+      recommended: true,
+      details: true,
+    },
+  });
+};
+
+export const getResourceReviewsInfinite = async ({
+  limit,
+  cursor,
+  modelId,
+  modelVersionId,
+  username,
+  include,
+  hasDetails,
+}: GetResourceReviewsInfiniteInput) => {
+  const AND: Prisma.Enumerable<Prisma.ResourceReviewWhereInput> = [];
+  const orderBy: Prisma.Enumerable<Prisma.ResourceReviewOrderByWithRelationInput> = [];
+
+  if (username) {
+    const userFindArgs = { where: { username }, select: { id: true } };
+    const targetUser =
+      (await dbRead.user.findUnique(userFindArgs)) ?? (await dbWrite.user.findUnique(userFindArgs));
+
+    if (!targetUser) throw throwNotFoundError('User not found');
+
+    AND.push({
+      userId: {
+        not: targetUser.id,
+      },
+      model: {
+        userId: targetUser.id,
+      },
+    });
+  }
+  if (modelId) AND.push({ modelId });
+  if (modelVersionId) AND.push({ modelVersionId });
+  if (hasDetails) AND.push({ details: { not: null } });
+
+  if (!username) {
+    AND.push({ details: { not: null } });
+  }
+
+  orderBy.push({ createdAt: 'desc' });
+  const items = await dbRead.resourceReview.findMany({
+    take: limit + 1,
+    cursor: cursor ? { id: cursor } : undefined,
+    where: { AND },
+    orderBy,
+    select: {
+      id: true,
+      modelId: true,
+      modelVersionId: true,
+      details: true,
+      createdAt: true,
+      rating: true,
+      recommended: true,
+      user: { select: userWithCosmeticsSelect },
+      // helper: { select: { imageCount: true } },
+      model: include?.includes('model')
+        ? {
+            select: { id: true, name: true },
+          }
+        : undefined,
+      modelVersion: include?.includes('model')
+        ? {
+            select: {
+              id: true,
+              name: true,
+            },
+          }
+        : undefined,
+    },
+  });
+
+  let nextCursor: number | undefined;
+  if (items.length > limit) {
+    const nextItem = items.pop();
+    nextCursor = nextItem?.id;
+  }
+
+  const commentCounts = await getReviewCommentCounts(items.map((item) => item.id));
+  return {
+    nextCursor,
+    items: items.map((item) => ({
+      ...item,
+      thread: { commentCount: commentCounts.get(item.id) ?? 0 },
+    })),
+  };
+};
+
+/** Not `CommentTopic.commentCount`: that counts replies and tombstones, so the shown number would jump. */
+async function getReviewCommentCounts(reviewIds: number[]) {
+  if (!reviewIds.length) return new Map<number, number>();
+  const rows = await dbRead.$queryRaw<{ reviewId: number; count: number }[]>`
+    SELECT "entityId" AS "reviewId", COUNT(*)::int AS count
+    FROM "CommentV3" v
+    WHERE ${countedTopLevelCommentSql(Prisma.raw('v'), 'review')}
+      AND "entityId" IN (${Prisma.join(reviewIds)})
+    GROUP BY "entityId"
+  `;
+  return new Map(rows.map((row) => [row.reviewId, row.count]));
+}
+
+export type RatingTotalsModel = {
+  '1': number;
+  '2': number;
+  '3': number;
+  '4': number;
+  '5': number;
+  up: number;
+  down: number;
+};
+type GetRatingTotalsRow = { rating: number; recommended: boolean | null; count: number };
+export const getRatingTotals = async ({ modelVersionId, modelId }: GetRatingTotalsInput) => {
+  const AND: Prisma.Sql[] = [];
+  if (modelVersionId) AND.push(Prisma.sql`rr."modelVersionId" = ${modelVersionId}`);
+  else AND.push(Prisma.sql`rr."modelId" = ${modelId}`);
+
+  const query = Prisma.sql`
+    SELECT
+      rr.rating,
+      rr.recommended,
+      COUNT(rr.id)::int count
+    FROM "ResourceReview" rr
+    JOIN "Model" m ON rr."modelId" = m.id AND m."userId" != rr."userId"
+    WHERE ${Prisma.join(AND, ' AND ')} AND NOT rr.exclude
+      AND rr.recommended -- Only expose recommended reviews
+    GROUP BY rr.rating, rr.recommended
+  `;
+
+  const cacheable = queryCache(dbRead, 'getRatingTotals', 'v1');
+  const result = await cacheable<GetRatingTotalsRow[]>(query, {
+    ttl: CacheTTL.hour,
+    tag: modelVersionId ? [`rating:modelVersion:${modelVersionId}`] : [`rating:model:${modelId}`],
+  });
+
+  const transformed = result.reduce(
+    (acc, { rating, recommended, count }) => {
+      const key = rating.toString() as keyof RatingTotalsModel;
+      if (acc[key] !== undefined) acc[key] = count;
+      // Need to check explicitly because of null
+      if (recommended === true) acc.up += count;
+      else if (recommended === false) acc.down += count;
+
+      return acc;
+    },
+    { '1': 0, '2': 0, '3': 0, '4': 0, '5': 0, up: 0, down: 0 }
+  );
+
+  return transformed;
+};
+
+const createResourceReviewNotification = async ({
+  id,
+  modelId,
+  modelVersionId,
+  recommended,
+  userId,
+}: ResourceReviewCreate & { userId: number }) => {
+  // don't send a notification for bad reviews
+  if (!recommended) return;
+
+  // TODO maybe add dedupe query
+
+  const modelVersion = await dbRead.modelVersion.findFirst({
+    where: { id: modelVersionId },
+    select: {
+      model: { select: { name: true, userId: true } },
+      name: true,
+    },
+  });
+
+  // don't send notification to self
+  if (userId === modelVersion?.model.userId || modelVersion?.model.userId === -1) return;
+
+  if (!modelVersion) {
+    logToAxiom(
+      {
+        type: 'warning',
+        name: 'Failed to create notification',
+        details: { key: 'new-review' },
+        message: 'Could not find modelVersion',
+      },
+      'notifications'
+    ).catch();
+    return;
+  }
+
+  const imageCount = await dbRead.imageResourceNew.count({
+    where: { modelVersionId, image: { userId } },
+  });
+
+  // TODO if no content and no images, skip?
+  // if (!imageCount && !content) return;
+
+  const u = await dbRead.user.findFirst({
+    where: { id: userId },
+    select: { username: true },
+  });
+
+  const detailsObj = {
+    version: 2,
+    modelId: modelId,
+    reviewId: id,
+    modelName: modelVersion.model.name,
+    modelVersionName: modelVersion.name,
+    username: u?.username ?? '(unknown)',
+    rating: recommended ? 5 : 1,
+    recommended,
+    imageCount,
+  };
+
+  await createNotification({
+    type: 'new-review',
+    key: `new-review:${modelVersionId}:${userId}`,
+    category: NotificationCategory.Update,
+    userId: modelVersion.model.userId,
+    details: detailsObj,
+  }).catch();
+};
+
+// Read through the writer: on the replica a review created seconds ago resolves no model, the
+// guard finds no owner to refuse against, and the write it guards then succeeds anyway.
+const storedReviewModelId = async (id: number) =>
+  (await dbWrite.resourceReview.findUnique({ where: { id }, select: { modelId: true } }))?.modelId;
+
+/**
+ * A review is content on someone else's model, so the model's owner is the block target. Resolved
+ * through the shared owner map and refused in one call, the way the comment paths do it — a
+ * throw-per-id loop would skip the self-and-duplicate handling that lives in `throwIfBlockedByOwners`.
+ */
+async function throwIfBlockedByModelOwners({
+  userId,
+  isModerator,
+  modelIds,
+}: {
+  userId: number;
+  isModerator?: boolean;
+  modelIds: Array<number | null | undefined>;
+}) {
+  const ids = [...new Set(modelIds.filter((x): x is number => !!x))];
+  const ownerIds = (
+    await Promise.all(
+      ids.map((entityId) => getBlockCheckOwnerIds({ entityType: 'model', entityId }))
+    )
+  ).flat();
+  await throwIfBlockedByOwners({ userId, ownerIds, isModerator });
+}
+
+export const upsertResourceReview = async ({
+  userId,
+  isModerator,
+  ...data
+}: UpsertResourceReviewInput & { userId: number; isModerator?: boolean }) => {
+  await throwOnBlockedUserContent(data.details, { isModerator, surface: 'resourceReview' });
+  // Edits too, not just creates — a review written before a block would otherwise stay editable
+  // into anything afterwards. An edit writes `modelId` through from the request while being scoped
+  // by review id, so the review's stored model is checked alongside the one the request names.
+  const storedModelId = data.id ? await storedReviewModelId(data.id) : undefined;
+  await throwIfBlockedByModelOwners({
+    userId,
+    isModerator,
+    modelIds: [data.modelId, storedModelId],
+  });
+
+  if (!data.id) {
+    const ret = await dbWrite.resourceReview
+      .create({
+        data: { ...data, userId, thread: { create: {} } },
+        select: resourceReviewSelect,
+      })
+      .catch(async (err) => {
+        // Concurrent create race: the (modelVersionId, userId) unique constraint
+        // trips (P2002). The review already exists — resolve idempotently by
+        // returning the existing row instead of bubbling a 500.
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+          return dbWrite.resourceReview.findUniqueOrThrow({
+            where: { modelVersionId_userId: { modelVersionId: data.modelVersionId, userId } },
+            select: resourceReviewSelect,
+          });
+        }
+        throw err;
+      });
+    await createResourceReviewNotification({ ...ret, userId }).catch();
+    await bustRatingTotalsCache({
+      modelId: data.modelId,
+      modelVersionId: data.modelVersionId,
+    }).catch();
+    if (data.details) queueScamScan({ entityType: 'ResourceReview', entityId: ret.id });
+    void onModelReviewsChanged([{ modelId: data.modelId, userId }]);
+    return ret;
+  } else {
+    const ret = await dbWrite.resourceReview.update({
+      where: { id: data.id },
+      data,
+      select: { id: true, modelId: true, modelVersionId: true, userId: true },
+    });
+    // An edit can move the review to another model, so the model it left is re-checked too.
+    void onModelReviewsChanged([
+      ret,
+      ...(storedModelId ? [{ modelId: storedModelId, userId: ret.userId }] : []),
+    ]);
+    await bustRatingTotalsCache({
+      modelId: ret.modelId,
+      modelVersionId: ret.modelVersionId,
+    }).catch();
+    if (data.details) queueScamScan({ entityType: 'ResourceReview', entityId: ret.id });
+    return ret;
+  }
+};
+
+/**
+ * Deletes the reviews `reviews` selects, copying a held author's into "HeldResourceReview" in the
+ * same statement. Returns the deleted rows.
+ */
+async function deleteReviews(reviews: Prisma.Sql) {
+  const markerView = await holdMarkerViewExists();
+  return dbWrite.$queryRaw<ResourceReview[]>`
+    WITH ${keepHeldReviewsCte(reviews, markerView)}
+    DELETE FROM "ResourceReview" WHERE id IN (${reviews})
+    RETURNING id, "modelId", "modelVersionId", rating, recommended, details, "userId", "createdAt",
+      "updatedAt", exclude, nsfw, "tosViolation", metadata`;
+}
+
+export const deleteResourceReview = async ({ id }: GetByIdInput) => {
+  // resourceReview.controller.ts and the client read the deleted row.
+  const [ret] = await deleteReviews(Prisma.sql`SELECT ${id}::int`);
+  if (!ret) throw throwNotFoundError(`No review with id ${id}`);
+  void onModelReviewsChanged([ret]);
+  await bustRatingTotalsCache({
+    modelId: ret.modelId,
+    modelVersionId: ret.modelVersionId,
+  }).catch();
+  return ret;
+};
+
+export async function setExcludeResourceReviews({
+  ids,
+  exclude,
+}: {
+  ids: number[];
+  exclude: boolean;
+}) {
+  if (ids.length === 0) return { count: 0 };
+  // Collect affected model/version ids BEFORE the update so we can bust the
+  // rating-totals cache. setExclude flips the `NOT rr.exclude` filter, so the
+  // totals shift even though rating/recommended don't change.
+  const affected = await dbRead.resourceReview.findMany({
+    where: { id: { in: ids } },
+    select: { modelId: true, modelVersionId: true },
+  });
+  const result = await dbWrite.resourceReview.updateMany({
+    where: { id: { in: ids } },
+    data: { exclude },
+  });
+  await bustRatingTotalsForRows(affected).catch();
+  return { count: result.count };
+}
+
+export async function deleteResourceReviews({ ids }: { ids: number[] }) {
+  if (ids.length === 0) return { count: 0 };
+  const deleted = await deleteReviews(Prisma.sql`SELECT unnest(${ids}::int[])`);
+  void onModelReviewsChanged(deleted);
+  await bustRatingTotalsForRows(deleted).catch();
+  return { count: deleted.length };
+}
+
+export const createResourceReview = async ({
+  isModerator,
+  ...data
+}: CreateResourceReviewInput & { userId: number; isModerator?: boolean }) => {
+  await throwOnBlockedUserContent(data.details, { isModerator, surface: 'resourceReview' });
+
+  await throwIfBlockedByModelOwners({
+    userId: data.userId,
+    isModerator,
+    modelIds: [data.modelId],
+  });
+  const ret = await dbWrite.resourceReview
+    .create({ data, select: resourceReviewSimpleSelect })
+    .catch(async (err) => {
+      // Concurrent create race: the (modelVersionId, userId) unique constraint
+      // trips (P2002). The review already exists — resolve idempotently by
+      // returning the existing row instead of bubbling a 500.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        return dbWrite.resourceReview.findUniqueOrThrow({
+          where: {
+            modelVersionId_userId: { modelVersionId: data.modelVersionId, userId: data.userId },
+          },
+          select: resourceReviewSimpleSelect,
+        });
+      }
+      throw err;
+    });
+  await createResourceReviewNotification({ ...ret, userId: data.userId }).catch();
+  void onModelReviewsChanged([{ modelId: data.modelId, userId: data.userId }]);
+  await bustRatingTotalsCache({
+    modelId: data.modelId,
+    modelVersionId: data.modelVersionId,
+  }).catch();
+  if (data.details) queueScamScan({ entityType: 'ResourceReview', entityId: ret.id });
+  return ret;
+};
+
+export const updateResourceReview = async ({
+  id,
+  userId,
+  isModerator,
+  ...data
+}: UpdateResourceReviewInput & { userId: number; isModerator?: boolean }) => {
+  await throwOnBlockedUserContent(data.details, { isModerator, surface: 'resourceReview' });
+
+  // The request carries no modelId, so the review's stored model is the only target.
+  await throwIfBlockedByModelOwners({
+    userId,
+    isModerator,
+    modelIds: [await storedReviewModelId(id)],
+  });
+  const ret = await dbWrite.resourceReview.update({
+    where: { id },
+    data,
+    select: {
+      id: true,
+      modelId: true,
+      modelVersionId: true,
+      rating: true,
+      recommended: true,
+      nsfw: true,
+      userId: true,
+    },
+  });
+  void onModelReviewsChanged([ret]);
+  await bustRatingTotalsCache({
+    modelId: ret.modelId,
+    modelVersionId: ret.modelVersionId,
+  }).catch();
+  if (data.details) queueScamScan({ entityType: 'ResourceReview', entityId: ret.id });
+  return ret;
+};
+
+type ResourceReviewRow = {
+  id: number;
+  modelVersionId: number;
+  modelId?: number | null;
+  rating: number;
+  recommended: boolean;
+  details: string | null;
+  createdAt: Date;
+  nsfw: boolean;
+  exclude: boolean;
+  metadata: any;
+  userId: number;
+  imageCount: number;
+  commentCount: number;
+};
+// `details` is editor HTML, so an emptied review can be `<p></p>` rather than NULL.
+export const writtenReviewSql = Prisma.sql`(
+  NOT rr.exclude AND NOT rr."tosViolation" AND NOT rr.nsfw
+  AND btrim(regexp_replace(coalesce(rr.details, ''), '<[^>]*>|&nbsp;', '', 'g')) <> ''
+)`;
+
+export const getPagedResourceReviews = async ({
+  input,
+  userId,
+}: {
+  input: GetResourceReviewPagedInput;
+  userId?: number;
+}) => {
+  const { limit, page, modelVersionId, username, writtenOnly } = input;
+  const skip = page && page > 0 ? limit * (page - 1) : 0;
+  const AND = [Prisma.sql`rr."modelVersionId" = ${modelVersionId}`];
+  if (writtenOnly) AND.push(writtenReviewSql);
+  if (username) {
+    const user = await dbRead.user.findFirst({ where: { username }, select: { id: true } });
+    if (user) AND.push(Prisma.sql`rr."userId" = ${user.id}`);
+  }
+
+  const excludedUsers = await Promise.all([
+    HiddenUsers.getCached({ userId }),
+    BlockedByUsers.getCached({ userId }),
+    BlockedUsers.getCached({ userId }),
+  ]);
+  // [hidden, blockedBy, blocked] — bound + dedup so a heavily-blocked viewer's
+  // (unbounded) blockedBy list can't blow past Postgres's 32767 bind-param cap on
+  // the raw NOT IN below (P2029). Same fix + safety-priority order as the comment
+  // surfaces; see boundExcludedUserIds.
+  const [hiddenUsers, blockedByUsers, blockedUsers] = excludedUsers;
+  // If the viewer owns the model these reviews are on, don't hide a blocker's review/thumb
+  // from them (the owner must still see + report engagement on their own content) — drop
+  // blockedByUsers only then; keep the anti-harassment exclusion for every non-owner viewer.
+  // Skip the lookup unless the viewer has a blocked-by list, the only case it changes anything.
+  let isContentOwner = false;
+  if (userId && blockedByUsers.length) {
+    const modelVersion = await dbRead.modelVersion.findUnique({
+      where: { id: modelVersionId },
+      select: { model: { select: { userId: true } } },
+    });
+    isContentOwner = modelVersion?.model?.userId === userId;
+  }
+  const excludedUserIds = boundExcludedUserIds(
+    hiddenUsers.map((u) => u.id),
+    blockedByUsers.map((u) => u.id),
+    blockedUsers.map((u) => u.id),
+    { isContentOwner }
+  );
+  if (excludedUserIds.length) {
+    AND.push(Prisma.sql`rr."userId" != ALL(${excludedUserIds}::int[])`);
+  }
+
+  // writtenOnly's regex would run on every review of the version in an exact COUNT, so that
+  // path pages by hasMore (one extra row) instead.
+  const count = writtenOnly
+    ? undefined
+    : (
+        await dbRead.$queryRaw<{ count: number }[]>`
+          SELECT COUNT(rr.id)::int as count
+          FROM "ResourceReview" rr
+          WHERE ${Prisma.join(AND, ' AND ')}
+        `
+      )[0].count;
+  const rows = await dbRead.$queryRaw<ResourceReviewRow[]>`
+    SELECT
+      rr.id,
+      rr."modelVersionId",
+      rr."modelId",
+      rr.rating,
+      rr.recommended,
+      rr.details,
+      rr."createdAt",
+      rr.nsfw,
+      rr.exclude,
+      rr.metadata,
+      rr."userId",
+      -- TODO: This is a temporary fix until we can figure out a more performant way to get the count
+      -- (
+      --   SELECT "imageCount"::int
+      --   FROM "ResourceReviewHelper" rrh
+      --   WHERE rrh."resourceReviewId" = rr.id
+      -- ) "imageCount",
+      (SELECT COUNT(*)::int FROM "CommentV3" v
+        WHERE ${countedTopLevelCommentSql(
+          Prisma.raw('v'),
+          'review'
+        )} AND v."entityId" = rr.id) as "commentCount"
+    FROM "ResourceReview" rr
+    WHERE ${Prisma.join(AND, ' AND ')}
+    ORDER BY rr."createdAt" DESC
+    LIMIT ${writtenOnly ? limit + 1 : limit}
+    OFFSET ${skip}
+  `;
+  const hasMore = writtenOnly ? rows.length > limit : undefined;
+  const itemsRaw = rows.slice(0, limit);
+
+  const userIds = itemsRaw.map((item) => item.userId);
+  const users = await getBasicDataForUsers(userIds);
+  const userCosmetics = await getCosmeticsForUsers(userIds);
+  const profilePictures = await getProfilePicturesForUsers(userIds);
+  const items = itemsRaw
+    .map(({ userId, imageCount = 0, ...item }) => {
+      let quality = 0;
+      if (item.details && item.details.length > 0) quality++;
+      if (imageCount > 0) quality++;
+      const user = users[userId];
+      return {
+        ...item,
+        imageCount,
+        quality,
+        user: {
+          id: userId,
+          username: user.username,
+          userImage: user.image,
+          deletedAt: user.deletedAt,
+          cosmetics: userCosmetics?.[userId] ?? [],
+          profilePicture: profilePictures?.[userId] ?? null,
+        },
+      };
+    })
+    .sort((a, b) => b.quality - a.quality);
+
+  return getPagingData({ items, count, hasMore }, limit, page);
+};
+
+export const toggleExcludeResourceReview = async ({ id }: GetByIdInput) => {
+  const item = await dbRead.resourceReview.findUnique({ where: { id }, select: { exclude: true } });
+  if (!item) throw throwNotFoundError();
+
+  const ret = await dbWrite.resourceReview.update({
+    where: { id },
+    data: { exclude: !item.exclude },
+    select: {
+      id: true,
+      modelId: true,
+      modelVersionId: true,
+      rating: true,
+      recommended: true,
+      nsfw: true,
+      exclude: true,
+    },
+  });
+  await bustRatingTotalsCache({
+    modelId: ret.modelId,
+    modelVersionId: ret.modelVersionId,
+  }).catch();
+  return ret;
+};
+
+export const getUserRatingTotals = async ({ userId }: { userId: number }) => {
+  const result = await dbRead.$queryRaw<{ rating: number; recommended: boolean; count: number }[]>`
+    SELECT
+      rr.rating,
+      rr.recommended,
+      COUNT(rr.id)::int count
+    FROM "ResourceReview" rr
+    JOIN "Model" m ON rr."modelId" = m.id AND m."userId" = ${userId}
+    WHERE rr."userId" != ${userId} AND NOT rr.exclude
+    GROUP BY rr.rating, rr.recommended
+  `;
+
+  const transformed = result.reduce(
+    (acc, { rating, recommended, count }) => {
+      const key = rating.toString() as keyof RatingTotalsModel;
+      if (acc[key] !== undefined) acc[key] = count;
+      // Need to check explicitly because of null
+      if (recommended === true) acc.up += count;
+      else if (recommended === false) acc.down += count;
+
+      return acc;
+    },
+    { '1': 0, '2': 0, '3': 0, '4': 0, '5': 0, up: 0, down: 0 }
+  );
+
+  return transformed;
+};

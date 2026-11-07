@@ -1,0 +1,99 @@
+# Creator Studio — implementation checklist
+
+**Single source of truth for status.** Everything open — build items, decisions, blockers, bugs, deferred work —
+is tracked here. Detail and rationale live in the reference docs (linked inline); this file is the index of *what's
+left*, not the *why*.
+
+Reference: page specs (`dashboard.md`, `models.md`, `analytics.md`, `earnings.md`, `licensing.md`, `settings.md`,
+`join.md`) · [pre-implementation-decisions.md](pre-implementation-decisions.md) (A/B/C decision log) ·
+[owner-rollup-handoff.md](owner-rollup-handoff.md) + [cdc-koen.md](cdc-koen.md) (A1) ·
+[questions-*.md](questions-justin-product.md) (answered Q&A) · [feedback-justin-round-2.md](feedback-justin-round-2.md)
+(review notes).
+
+Legend: `[x]` done · `[ ]` not started · `[~]` partial · **🚧** blocked on a dep · **🟢** needs a decision ·
+**⏭** deferred / lower-priority · **🐛** flagged bug (upstream, not ours to fix).
+
+---
+
+## Shipped
+
+### Shared / shell
+- [x] App scaffold (SvelteKit spoke), auth gate, nav, layout, favicon
+- [x] Membership resolver (Creator Program gate, **B1**) + moderator test simulator (`cs-test-membership` cookie)
+- [x] Monetization module — `setLicensingFee` / `bulkSetLicensingFee` / apply-default-by-type (kysely); early-access write client → main-app REST endpoint `POST /api/v1/model-versions/early-access`
+- [x] Axiom logging (`handleError` hook)
+- [x] Redis read-through cache — `@civitai/redis` `createRedisCacheBuilder` / `createSysRedisCacheBuilder` → spoke `cache.ts`; range-scaled TTL
+- [x] Charting primitive (**C1**) — Chart.js `Chart` wrapper in `@civitai/ui` (SSR-safe; `chartColor()` theme bridge)
+- [x] `@civitai/buzz` wired (shim + `BUZZ_ENDPOINT`) — authoritative buzz-account reads (cash), not ClickHouse
+- [x] Content/creator analytics reads module (`analytics.ts`, userId-keyed) + earnings/cash reads (`earnings.ts`, `cash.ts`)
+- [x] Empty / unavailable / non-CP state hardening across dashboard, `/earnings`, `/analytics`
+
+### `/models` — Model management ⭐
+- [x] Grouped table (models → versions, drafts included); search / fee filter / sort / pagination (URL-driven)
+- [x] Set / adjust / clear licensing fee — single + inline, fractional (0.01), CP-gated; status Off/Active/Paused
+- [x] Bulk fee editing (`?mode=bulk`) — per-version + select-all, confirm dialog; apply-default-by-type
+- [x] Non-commercial base-model guard; ownership + CP gate re-checked server-side
+- [x] Full early/paid-access config editor (**B12**, full parity) — per-version drawer → main-app endpoint
+- [x] States: empty, filtered-empty, non-member notice, error toasts
+
+### `/` — Dashboard
+- [x] Shell: headline stat cards + section link cards + member badge
+- [x] Content-activity row (30d reactions/followers/images/posts/profile views, `getContentTotals`)
+- [x] Buzz earned (30d) + CP cash cards (ready / pending / withdrawn, authoritative via `@civitai/buzz`); cash cards gated to CP members
+- [x] "Banked this month" card (Buzz in this month's `creatorProgramBank`, `$lib/server/banked.ts`) + a note for a CP member whose membership lapsed: banked Buzz still pays out at month end
+
+### `/earnings` — Earnings by source (A1 Part 1)
+- [x] By-source breakdown (comp / license / tip / access / cosmetic) — reads `buzzTransactions` directly (already owner-keyed); `licenseFee`+`'27'` filter, early-access prefix, cosmetic `sell`
+- [x] Per-currency faithful display (**B8/D1**, no conversion/merge) — currency cards + source×currency table
+- [x] Buzz-only per-currency trend chart (real buzz colors); Redis-cached; 7/30/90d + day/week controls
+- [x] CP cash panel — **authoritative** ready / pending / withdrawn (buzz service + `CashWithdrawal`), USD (cents÷100), matches the Buzz dashboard; Buzz Dashboard link-out (**C6**: one cash home)
+
+### `/analytics` — Basic analytics
+- [x] Content/creator section (**B4b**): reactions/followers/images/posts/profile views over time + top-images; Redis-cached
+- [x] Date-range control — 7/30/90d presets + day/week granularity (URL-driven)
+- [x] Zero-activity + unavailable empty states
+- [x] Audience tab — follower **active reach** (share of followers active in the last 30/60/100 days) +
+      follower **country** doughnut. `getFollowerReach` (`$lib/server/follower-reach.ts`) probes the new
+      `default.user_activity_rollup` (per-user last-seen + last-known country) with the creator's follower
+      ids from Postgres. Refreshed by the `user-activity-rollup` cron (`*/30`,
+      `src/server/jobs/user-activity-rollup.ts`); **DDL + backfill are hand-applied** —
+      `src/server/clickhouse/migrations/2026-09-04-user-activity-rollup.sql`, and they must land *before*
+      the job or the page deploys. Panels are suppressed under 25 followers and countries under 5
+      followers are folded into "Other" (disclosure rule, enforced server-side in `redactReach`); an empty
+      or >12h-stale rollup renders "unavailable" rather than a confident 0%.
+- *(route moved `/earnings/analytics` → `/analytics`)*
+
+### `/settings` — Payout & settings
+- [x] Membership / tier status card; Payout (Tipalti) status card
+- [x] Payout unlock (**#16**) — "Set up payouts" prompt unlocks once settled cash ≥ $50 (`getCreatorCash`)
+- [x] Fee defaults — **read-only info** per **B9** *(becomes a link to the templates list once [pricing-templates.md](monetization/pricing-templates.md) ships)*
+
+### `/join` — Membership upsell
+- [x] CP-framed upsell (**B1**), capability comparison, CTA; CP-member redirect to `/`; reusable `JoinUpsell`; nav aligned to CP membership
+
+---
+
+## Open — needs a product decision (Justin)
+- 🟢 **#23 — Early-access reframing.** **Pre-check answered — the backend already enforces manage-only.** `mergeEarlyAccessConfigUpdate` (`model-version.service.ts:341`) throws *"You cannot add early access on a model after it has been published"*; on a published version with existing EA you can only *loosen* terms (no price↑, no timeframe↑, no donation-goal change). So enabling-on-published is impossible server-side — the studio drawer currently lets you try and eats a 400. Remaining work is UX in `/models` (disable "enable EA" for published-without-config versions; allow manage-only), not a product decision. ([feedback #23](feedback-justin-round-2.md))
+- 🟢 **B13 — Publish / schedule a version in v1?** Recommended default: fast-follow (not v1). ([decisions B13](pre-implementation-decisions.md))
+
+## Blocked — backend / main-app dependency
+- 🚧 **A1 Part 2 — owner-keyed `modelVersionId→ownerUserId` dictionary (Koen / CDC).** Unblocks per-model earnings, `/analytics` model section (generations/downloads/top-models), and the dashboard top-earning-models widget. Ask is written: [cdc-koen.md](cdc-koen.md). **In-spoke fallback is viable now** (Postgres version-ids → `IN()` over pre-aggregated daily MVs; ~820ms for a 349-version creator, capped for mega-creators) — see "Deferred" below.
+- 🚧 **A4 — Sell access indefinitely.** Reuse early-access uncapped; needs the main-app representation (nullable `timeframe`/`indefinite` flag). Write path already exists (the B12 endpoint). ([decisions A4](pre-implementation-decisions.md))
+- 🚧 **Every type above 26 lands as its number (ingest bug, Justin owns).** `licenseFee` is `'27'` and the App Blocks author fee is `'28'`. We filter `type IN ('licenseFee','27')` until the MV fix + backfill lands, then drop `'27'`; whether `'28'` belongs in this page's earnings at all is a separate product decision. ([owner-rollup-handoff §🔴](owner-rollup-handoff.md))
+- 🚧 **B4 — owner-keyed daily SummingMergeTree MVs (perf, not correctness).** The content-analytics 90-day reads scan raw event tables (cached, but heavy). Backend MVs would remove the raw-scan load. Not blocking any feature. ([feedback #10](feedback-justin-round-2.md))
+
+## Flagged bugs — upstream (shape the numbers, not ours to fix)
+- 🐛 **Access sales always credit yellow** — confirmed bug; fix is forward-only, historical rows stay yellow. ([owner-rollup-handoff §D1](owner-rollup-handoff.md))
+- 🐛 **Cosmetic creator payouts are best-effort** — a failed payout leaves no row, so `/earnings` can under-report cosmetic revenue with no signal. ([owner-rollup-handoff §payment-path bugs](owner-rollup-handoff.md))
+- 🐛 **ClickHouse `buzzTransactions` mirror gap** — CH showed a pending-cash balance the buzz service didn't; flag to whoever owns the buzz→CH sync. Doesn't affect the studio (cash reads go to the buzz service).
+
+## Deferred / unblocked builds (buildable when prioritized)
+- 🚧 **Pricing templates** — creator-authored fee + paid-access defaults targeting model type × base model/ecosystem, pre-filling the main-app version form. Plan: [pricing-templates.md](monetization/pricing-templates.md). Resolves **#17**; needs no product decision (see the B9 note there). A per-type localStorage stopgap already ships in the main app and is retired by phase 4 of that plan. **Blocked twice over:** on paid-access unification (templates store a gate, and its shape is changing), and on a **deferred decision about the targeting axis** — Justin proposed creator-named *price tags* instead of model-type × base-model targeting, and that review waits on the `DonationGoal` keep-or-drop question. See [Price tags](monetization/pricing-templates.md#price-tags--a-competing-direction).
+- 🟢 **Paid access: discounts + a free-unlock pledge** — reconcile early access and permanent paid access into one system, with a scheduled discount ladder and an irrevocable free-unlock pledge. Plan: [paid-access-decay.md](monetization/paid-access-decay.md) — structure settled 2026-09-02 (17 questions answered, nothing schema-shaped open), then **reopened 2026-09-03** by a creator thread on early-access-to-paid-access switching — Q18 and Q19 were **superseded 2026-09-03** by [donation-goals.md](monetization/donation-goals.md), which answers the donation-goal half differently: a **met** goal makes a model free to everyone for **30 days**, not permanently, and 30 days is now the only guaranteed free — which invalidates this doc's permanent `PaidAccessGuarantee` and is tracked as **D1**. Q20 is still open. Escrow was explored and **parked**. `DonationGoal` may be **dropped entirely** pending Justin's decision, which would remove three of the four rules. Blocks pricing templates until built.
+- ⏭ **Model analytics via the in-spoke fallback** — Postgres version-ids → `IN()` over `daily_resource_generation_counts` / `daily_downloads` / `buzz_resource_compensation`, capped by version count, Redis-cached. Ships per-model usage/earnings + top-models for small/moderate creators *now*; swap the read to the A1 dictionary when it lands (UI/contract unchanged). *(Scoped + measured; paused by request.)*
+- ⏭ **#24 — Bulk "select all matching" + base-model filter** (`/models`) — highest-value remaining bulk-fee build. ([feedback #24](feedback-justin-round-2.md))
+- [x] **#11 — Synchronized crosshair across charts** — DONE: added a `plugins` prop to the `@civitai/ui` `Chart` wrapper + a `createSyncedCrosshair()` plugin (shared hover index across charts sharing a date axis); wired across the `/analytics` charts.
+- ⏭ **#4 — Dashboard charts** — low priority, no spec (Justin: "low priority, deferred"; `dashboard.md` only floats an *earnings-summary* sparkline, not content). A reactions chart was tried and reverted — wrong metric for an earnings/at-a-glance surface. If revisited, do a buzz-earned sparkline (via `getEarningsSeries`).
+- [x] **Lifetime "total comments received" stat** — DONE: `getAllTimeTotals` surfaces all-time reactions + comments as a context line on `/analytics` (the one place comments appear — no fast period-scoped source). Comments come from Postgres (`Thread.commentCount` over the image's thread and its replies); the `image_metrics_user` rollup it originally read is dead and returned **0** for every creator newer than userId 9.66M. ClickHouse has no correct substitute — see the note on `getAllTimeTotals` before reaching for the `comments` table, whose `entityId` is a comment id, not an image id.
+- ⏭ **Access-config drawer URL-addressable** (`?version=` shallow routing) — `/models` polish.

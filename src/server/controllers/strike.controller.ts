@@ -1,0 +1,149 @@
+import { TRPCError } from '@trpc/server';
+import type { ProtectedContext } from '~/server/createContext';
+import type {
+  CreateStrikeInput,
+  GetStrikesInput,
+  GetMyStrikesInput,
+  GetUserStandingsInput,
+  VoidStrikeInput,
+} from '~/server/schema/strike.schema';
+import {
+  acceptTosAfterMute,
+  createStrike,
+  getStrikeHistoryForMod,
+  getStrikesForMod,
+  getStrikesForUser,
+  getStrikeSummary,
+  getUserStandings,
+  voidStrike,
+} from '~/server/services/strike.service';
+import { userMeta as userMetaSchema } from '~/server/schema/user.schema';
+import { couldAwaitTosReacceptance } from '~/server/common/tos-reacceptance';
+import { shouldOfferTosReacceptance } from '~/server/services/tos-reacceptance.service';
+import { throwDbError } from '~/server/utils/errorHandling';
+
+export const createStrikeHandler = async ({
+  input,
+  ctx,
+}: {
+  input: CreateStrikeInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    return await createStrike({ ...input, issuedBy: ctx.user.id });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    throw throwDbError(error);
+  }
+};
+
+export const voidStrikeHandler = async ({
+  input,
+  ctx,
+}: {
+  input: VoidStrikeInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    return await voidStrike({ ...input, voidedBy: ctx.user.id });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    throw throwDbError(error);
+  }
+};
+
+export const getStrikesHandler = async ({ input }: { input: GetStrikesInput }) => {
+  try {
+    return await getStrikesForMod(input);
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    throw throwDbError(error);
+  }
+};
+
+export const getUserStandingsHandler = async ({ input }: { input: GetUserStandingsInput }) => {
+  try {
+    return await getUserStandings(input);
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    throw throwDbError(error);
+  }
+};
+
+export const getUserStrikeHistoryHandler = async ({ input }: { input: { userId: number } }) => {
+  try {
+    const { user: rawUser, ...strikeData } = await getStrikeHistoryForMod(input.userId);
+
+    const parsed = userMetaSchema.safeParse(rawUser?.meta);
+    const meta = parsed.success ? parsed.data : {};
+
+    return {
+      ...strikeData,
+      user: rawUser
+        ? {
+            id: rawUser.id,
+            username: rawUser.username,
+            createdAt: rawUser.createdAt,
+            muted: rawUser.muted,
+            bannedAt: rawUser.bannedAt,
+            deletedAt: rawUser.deletedAt,
+            scores: meta.scores ?? null,
+            flaggedForReview: meta.strikeFlaggedForReview ?? false,
+          }
+        : null,
+    };
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    throw throwDbError(error);
+  }
+};
+
+export const getMyStrikesHandler = async ({
+  input,
+  ctx,
+}: {
+  input: GetMyStrikesInput;
+  ctx: ProtectedContext;
+}) => {
+  try {
+    return await getStrikesForUser(ctx.user.id, {
+      includeExpired: input.includeExpired,
+      includeInternalNotes: false, // Never expose internal notes to users
+    });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    throw throwDbError(error);
+  }
+};
+
+/**
+ * The user accepting the Terms after a strike mute. Returns whether it actually released them, so the
+ * client can tell "you are unblocked" from "a moderator is reviewing this" without a second call.
+ */
+export const acceptTosAfterMuteHandler = async ({ ctx }: { ctx: ProtectedContext }) => {
+  try {
+    return await acceptTosAfterMute({ userId: ctx.user.id, domain: ctx.domain });
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    throw throwDbError(error);
+  }
+};
+
+export const getMyTosReacceptanceOfferHandler = async ({ ctx }: { ctx: ProtectedContext }) => {
+  try {
+    if (!couldAwaitTosReacceptance(ctx.user)) return { offered: false };
+    return { offered: await shouldOfferTosReacceptance(ctx.user.id) };
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    throw throwDbError(error);
+  }
+};
+
+export const getMyStrikeSummaryHandler = async ({ ctx }: { ctx: ProtectedContext }) => {
+  try {
+    return await getStrikeSummary(ctx.user.id);
+  } catch (error) {
+    if (error instanceof TRPCError) throw error;
+    throw throwDbError(error);
+  }
+};

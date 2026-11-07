@@ -1,0 +1,2396 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Prisma } from '@prisma/client';
+import { asJsonbObject } from '~/server/utils/jsonb-object';
+import { SearchIndexUpdateQueueAction } from '~/server/common/enums';
+
+// The replica/primary distinction is the point of these two: `resolveMinorFlagAppeal` re-reads
+// `model.minor` from the PRIMARY so a revert inside replication lag cannot be missed.
+const mockReplicaModelFindUnique = dbMock.dbRead.model.findUnique;
+const mockPrimaryModelFindUnique = dbMock.dbWrite.model.findUnique;
+
+const {
+  mockSetModelMinor,
+  mockTrackModActivity,
+  mockQueueImageSearchIndexUpdate,
+  mockResolveEntityAppeal,
+  mockGrantModelTextScanPoi,
+  mockStampModelTextScanAppeal,
+  mockReassertModelPoiRestrictions,
+  mockLoadGrantTextHash,
+  mockStampModeratorTextScanRuling,
+  mockSettleFlagAppeals,
+  mockConfirmPoiHashAutoFlag,
+  mockRevertPoiHashAutoFlag,
+} = vi.hoisted(() => ({
+  mockConfirmPoiHashAutoFlag: vi.fn(),
+  mockRevertPoiHashAutoFlag: vi.fn(),
+  mockSetModelMinor: vi.fn(),
+  mockTrackModActivity: vi.fn(),
+  mockQueueImageSearchIndexUpdate: vi.fn(),
+  mockResolveEntityAppeal: vi.fn(),
+  mockGrantModelTextScanPoi: vi.fn(),
+  mockStampModelTextScanAppeal: vi.fn(),
+  mockReassertModelPoiRestrictions: vi.fn(),
+  mockLoadGrantTextHash: vi.fn(),
+  mockStampModeratorTextScanRuling: vi.fn(),
+  mockSettleFlagAppeals: vi.fn(),
+}));
+
+// MINOR_FLAG_SNAPSHOT_KEY is read at module scope by the service's Prisma.sql
+// fragments — omitting it from the mock makes the whole file fail to import
+// (which vitest reports as a passing run with zero tests collected).
+const { mockRestoreOwnerFlagOverride } = vi.hoisted(() => ({
+  mockRestoreOwnerFlagOverride: vi.fn(),
+}));
+vi.mock('~/server/services/model.service', () => ({
+  setModelMinor: mockSetModelMinor,
+  MINOR_FLAG_SNAPSHOT_KEY: 'minorFlagSnapshot',
+  MINOR_LOCKED_PROPERTIES: ['minor', 'nsfw', 'sfwOnly'],
+  restoreOwnerFlagOverride: mockRestoreOwnerFlagOverride,
+}));
+vi.mock('~/server/services/poi-hash.service', () => ({
+  confirmPoiHashAutoFlag: mockConfirmPoiHashAutoFlag,
+  revertPoiHashAutoFlag: mockRevertPoiHashAutoFlag,
+}));
+vi.mock('~/server/services/moderator.service', () => ({ trackModActivity: mockTrackModActivity }));
+
+vi.mock('~/server/services/image.service', () => ({
+  queueImageSearchIndexUpdate: mockQueueImageSearchIndexUpdate,
+}));
+vi.mock('~/server/services/report.service', () => ({
+  resolveEntityAppeal: mockResolveEntityAppeal,
+}));
+// Hand-listed: the real model-poi-minor pulls notification.service, and appeal-text-hash loads
+// every registered profile module.
+vi.mock('~/server/services/text-scan/actions/model-poi-minor', () => ({
+  grantModelTextScanPoi: mockGrantModelTextScanPoi,
+  POI_LOCKED_PROPERTIES: ['poi', 'nsfw', 'sfwOnly'],
+  stampModelTextScanAppeal: mockStampModelTextScanAppeal,
+  reassertModelPoiRestrictions: mockReassertModelPoiRestrictions,
+}));
+vi.mock('~/server/services/text-scan/actions/appeal-text-hash', () => ({
+  loadGrantTextHash: mockLoadGrantTextHash,
+  stampModeratorTextScanRuling: mockStampModeratorTextScanRuling,
+  settleFlagAppealsAfterModeratorLift: mockSettleFlagAppeals,
+}));
+
+import { AppealStatus, EntityType } from '~/shared/utils/prisma/enums';
+import {
+  findMinorHashMatches,
+  applyMinorHashMatch,
+  checkMinorHashOnScan,
+  sweepMinorHashMatches,
+  getMinorHashMatchesForReview,
+  dismissMinorHashMatch,
+  rollbackMinorHashAutoFlags,
+  getAutoFlaggedMinorModels,
+  getAutoFlaggedMinorMatch,
+  getAutoFlaggedMinorDetail,
+  getMinorHashMatchDetail,
+  confirmMinorHashAutoFlag,
+  revertMinorHashAutoFlag,
+  acceptExpiredMinorAutoFlags,
+  getMinorFlagAppealsForReview,
+  resolveMinorFlagAppeal,
+  minorSrcCte,
+  minorHashCandidatesCte,
+  MINOR_HASH_FILE_TYPE,
+  MINOR_HASH_CLEARED_KEY,
+  MINOR_HASH_ACCEPTED_KEY,
+  AUTO_FLAG_REVIEW_WINDOW_DAYS,
+} from '~/server/services/minor-hash.service';
+import { dbMock } from '~/__tests__/mocks/db.mock';
+import { redisMock } from '~/__tests__/mocks/redis.mock';
+import { loggingMock } from '~/__tests__/mocks/logging.mock';
+const mockDbRead = dbMock.dbRead;
+const mockDbWrite = dbMock.dbWrite;
+const mockLogToAxiom = loggingMock.logToAxiom;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // mockRejectedValue in later checkMinorHashOnScan tests otherwise persists past clearAllMocks
+  // (which only clears call history, not implementations) and leaks into sweepMinorHashMatches.
+  mockSetModelMinor.mockReset();
+  mockDbRead.$queryRaw.mockResolvedValue([]);
+  mockDbWrite.$queryRaw.mockResolvedValue([]);
+  mockReplicaModelFindUnique.mockResolvedValue({ minor: true });
+  mockPrimaryModelFindUnique.mockResolvedValue({ minor: true });
+  mockLogToAxiom.mockResolvedValue(undefined);
+  mockLoadGrantTextHash.mockResolvedValue('h-text');
+});
+
+describe('findMinorHashMatches', () => {
+  it('maps rows to { modelId, userId }', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([
+      { id: 10, userId: 1 },
+      { id: 11, userId: 2 },
+    ]);
+
+    const result = await findMinorHashMatches('ABC123');
+
+    expect(result).toEqual([
+      { modelId: 10, userId: 1 },
+      { modelId: 11, userId: 2 },
+    ]);
+  });
+
+  it('returns [] without querying when the hash is empty', async () => {
+    const result = await findMinorHashMatches('');
+
+    expect(result).toEqual([]);
+    expect(mockDbRead.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  it('queries with the SHA256 + minor + lockedProperties gate', async () => {
+    await findMinorHashMatches('ABC123');
+
+    // $queryRaw is called as a tagged template, so the mock receives
+    // (TemplateStringsArray, ...substitutions) — not a single Sql object.
+    const [strings, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    // The minor/lockedProperties gate is interpolated as a shared Prisma.Sql
+    // fragment now, so it lands in values rather than the template strings.
+    const rendered = [
+      text,
+      ...values.map((v) => (v as { strings?: readonly string[] })?.strings?.join('?') ?? ''),
+    ].join('\n');
+    expect(text).toContain(`'SHA256'`);
+    expect(rendered).toContain('m.minor');
+    expect(rendered).toContain(`'minor' = ANY(m."lockedProperties")`);
+    expect(text).toContain('mf.type =');
+    expect(values).toContain(MINOR_HASH_FILE_TYPE);
+    expect(values).toContain('ABC123');
+  });
+
+  // The scan hook had its own copy of the seed predicate; if the two disagree,
+  // a hash the sweep refuses to seed from could still auto-flag at upload time.
+  it('gates on the same seed definition the sweep CTE uses', async () => {
+    await findMinorHashMatches('ABC123');
+
+    const [strings, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const fragments = values.filter((v) => (v as { strings?: readonly string[] })?.strings) as {
+      strings: readonly string[];
+      values: unknown[];
+    }[];
+    const rendered = [
+      Array.from(strings as TemplateStringsArray).join('?'),
+      ...fragments.map((f) => f.strings.join('?')),
+    ].join('\n');
+
+    expect(rendered).toContain(`->>'source' IS DISTINCT FROM 'auto'`);
+    expect(rendered).toContain(`'minor' = ANY(m."lockedProperties")`);
+    // same fragment the CTE embeds, not a hand-rolled copy
+    expect(fragments.some((f) => f.strings.join('?').includes('IS DISTINCT FROM'))).toBe(true);
+  });
+
+  it('uppercases the hash — stored hashes are uppercase hex', async () => {
+    await findMinorHashMatches('abc123');
+
+    const [, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    expect(values).toContain('ABC123');
+    expect(values).not.toContain('abc123');
+  });
+});
+
+// The CTEs are interpolated into $queryRaw as Prisma.Sql VALUES, so their bodies
+// land in `values` and never appear in the `strings` the query-text tests above
+// inspect. Deleting a predicate here would widen the seed set with every other
+// test still green, so assert on the CTE text directly.
+describe('minor-hash CTE predicates', () => {
+  it('restricts the seed set to moderator-locked minor models', () => {
+    expect(minorSrcCte.sql).toContain('m.minor');
+    expect(minorSrcCte.sql).toContain(`'minor' = ANY(m."lockedProperties")`);
+    expect(minorSrcCte.sql).toContain(`mfh.type = 'SHA256'`);
+    expect(minorSrcCte.sql).toContain('mf.type =');
+    expect(minorSrcCte.values).toContain(MINOR_HASH_FILE_TYPE);
+  });
+
+  // Without this the sweep seeds itself: an auto-flagged model contributes every
+  // hash on it, so the seed set grows from machine decisions and the dry run
+  // under-reports what a live run will write (observed 300 predicted / 302
+  // written on a prod-scale clone).
+  it('excludes auto-flagged models from the seed set so it cannot self-amplify', () => {
+    expect(minorSrcCte.sql).toContain(`->>'source' IS DISTINCT FROM 'auto'`);
+    expect(minorSrcCte.values).toContain('minorFlagSnapshot');
+  });
+
+  // An unreviewed LLM verdict seeding the hash auto-flagger would flag other people's uploads
+  // from a decision no human made.
+  it('excludes text-scan flags from the seed set', () => {
+    expect(minorSrcCte.sql).toContain(`->>'source' IS DISTINCT FROM 'auto'`);
+    expect(minorSrcCte.sql).toContain(`->>'source' IS DISTINCT FROM 'text-scan'`);
+  });
+
+  // A moderator's own "Set as Minor" writes source='manual', so it must still
+  // seed — only the machine's own output is excluded.
+  it('keeps manual moderator flags eligible as seeds', () => {
+    expect(minorSrcCte.sql).not.toContain(`IS DISTINCT FROM 'manual'`);
+    expect(minorSrcCte.sql).not.toContain(`? 'minorFlagSnapshot'`);
+  });
+
+  // Rollback deletes the snapshot, so without the clear stamp the model is an
+  // ordinary candidate again and the next sweep re-flags what a human just undid.
+  it('excludes models a rollback cleared, scoped to files that predate the clear', () => {
+    expect(minorHashCandidatesCte.values).toContain(MINOR_HASH_CLEARED_KEY);
+    // time-scoped, not a blanket exclusion: a file uploaded after the clear is a
+    // fresh act by the uploader and must still be catchable
+    expect(minorHashCandidatesCte.sql).toContain(`mf."createdAt" >`);
+  });
+
+  it('restricts candidates to non-minor, non-deleted models of the gated file type', () => {
+    expect(minorHashCandidatesCte.sql).toContain('NOT m.minor');
+    expect(minorHashCandidatesCte.sql).toContain(`m.status <> 'Deleted'`);
+    expect(minorHashCandidatesCte.sql).toContain(`mfh.type = 'SHA256'`);
+    expect(minorHashCandidatesCte.sql).toContain('bool_or(EXISTS (');
+    expect(minorHashCandidatesCte.sql).toContain('mf.type =');
+    expect(minorHashCandidatesCte.values).toContain(MINOR_HASH_FILE_TYPE);
+  });
+});
+
+describe('applyMinorHashMatch', () => {
+  it('flags when a match shares the uploader', async () => {
+    const result = await applyMinorHashMatch({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      matches: [{ modelId: 50, userId: 5 }],
+    });
+
+    expect(result).toBe('flagged');
+    expect(mockSetModelMinor).toHaveBeenCalledWith({
+      id: 100,
+      minor: true,
+      userId: -1,
+      activity: 'setMinorAutoHash',
+    });
+  });
+
+  it('queues without writing when every match is a different uploader', async () => {
+    const result = await applyMinorHashMatch({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      matches: [{ modelId: 50, userId: 9 }],
+    });
+
+    expect(result).toBe('queued');
+    expect(mockSetModelMinor).not.toHaveBeenCalled();
+  });
+
+  it('flags when only one of several matches shares the uploader', async () => {
+    // Guards the `.some` in applyMinorHashMatch: `.every` would silently turn a
+    // real same-uploader hit into an un-actioned queue entry.
+    const result = await applyMinorHashMatch({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      matches: [
+        { modelId: 50, userId: 9 },
+        { modelId: 51, userId: 5 },
+      ],
+    });
+
+    expect(result).toBe('flagged');
+    expect(mockSetModelMinor).toHaveBeenCalledWith({
+      id: 100,
+      minor: true,
+      userId: -1,
+      activity: 'setMinorAutoHash',
+    });
+  });
+
+  it('skips when there are no matches', async () => {
+    const result = await applyMinorHashMatch({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      matches: [],
+    });
+
+    expect(result).toBe('skipped');
+    expect(mockSetModelMinor).not.toHaveBeenCalled();
+  });
+
+  // The scan path can't get this from the candidate CTE — the match query's `m` is
+  // the seed side — so the check lives here, and without it a moderator's revert
+  // survives only until the next scan of the same file.
+  it('skips a same-uploader match on a file a rollback already cleared', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([{ cleared: true }]);
+
+    const result = await applyMinorHashMatch({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      matches: [{ modelId: 50, userId: 5 }],
+    });
+
+    expect(result).toBe('skipped');
+    expect(mockSetModelMinor).not.toHaveBeenCalled();
+  });
+
+  it('still flags when the clear predates the file being scanned', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([{ cleared: false }]);
+
+    const result = await applyMinorHashMatch({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      matches: [{ modelId: 50, userId: 5 }],
+    });
+
+    expect(result).toBe('flagged');
+  });
+
+  // One extra round trip per flag is fine; one per scan is not.
+  it('does not look up the clear stamp on a path that will not write', async () => {
+    await applyMinorHashMatch({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      matches: [{ modelId: 50, userId: 9 }],
+    });
+
+    expect(mockDbRead.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  it('skips when the candidate is itself in the seed set', async () => {
+    const result = await applyMinorHashMatch({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      matches: [
+        { modelId: 100, userId: 5 },
+        { modelId: 50, userId: 5 },
+      ],
+    });
+
+    expect(result).toBe('skipped');
+    expect(mockSetModelMinor).not.toHaveBeenCalled();
+  });
+});
+
+// Pre-state capture now lives inside setModelMinor so manual moderator flags are
+// snapshotted too — covered in set-model-minor.service.test.ts.
+describe('applyMinorHashMatch — flag delegation', () => {
+  it('delegates to setModelMinor with the auto-hash activity', async () => {
+    await applyMinorHashMatch({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      matches: [{ modelId: 50, userId: 5 }],
+    });
+
+    expect(mockSetModelMinor).toHaveBeenCalledWith({
+      id: 100,
+      minor: true,
+      userId: -1,
+      activity: 'setMinorAutoHash',
+    });
+  });
+
+  it('does not flag when the outcome is only queued', async () => {
+    await applyMinorHashMatch({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      matches: [{ modelId: 50, userId: 9 }],
+    });
+
+    expect(mockDbWrite.$executeRaw).not.toHaveBeenCalled();
+    expect(mockSetModelMinor).not.toHaveBeenCalled();
+  });
+});
+
+describe('checkMinorHashOnScan', () => {
+  it('flags a same-uploader match end to end', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([{ id: 50, userId: 5 }]);
+
+    const result = await checkMinorHashOnScan({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      sha256: 'ABC',
+    });
+
+    expect(result).toBe('flagged');
+    expect(mockSetModelMinor).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs auto-flags so they are countable without querying ModActivity', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([{ id: 50, userId: 5 }]);
+
+    await checkMinorHashOnScan({ modelId: 100, userId: 5, fileId: 900, sha256: 'ABC' });
+
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'minor-hash-scan-check', message: 'flagged', modelId: 100 }),
+      'webhooks'
+    );
+  });
+
+  it('does not log when the outcome is only queued', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([{ id: 50, userId: 9 }]);
+
+    const result = await checkMinorHashOnScan({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      sha256: 'ABC',
+    });
+
+    expect(result).toBe('queued');
+    expect(mockLogToAxiom).not.toHaveBeenCalled();
+  });
+
+  it('swallows and logs a lookup failure instead of throwing', async () => {
+    mockDbRead.$queryRaw.mockRejectedValue(new Error('db exploded'));
+
+    const result = await checkMinorHashOnScan({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      sha256: 'ABC',
+    });
+
+    expect(result).toBe('skipped');
+    expect(mockLogToAxiom).toHaveBeenCalled();
+  });
+
+  it('swallows a setModelMinor failure instead of throwing', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([{ id: 50, userId: 5 }]);
+    mockSetModelMinor.mockRejectedValue(new Error('update failed'));
+
+    const result = await checkMinorHashOnScan({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      sha256: 'ABC',
+    });
+
+    expect(result).toBe('skipped');
+    expect(mockLogToAxiom).toHaveBeenCalled();
+  });
+
+  it('swallows a non-Error throw (a rejected string) and logs a readable message', async () => {
+    mockDbRead.$queryRaw.mockRejectedValue('db exploded');
+
+    const result = await checkMinorHashOnScan({
+      modelId: 100,
+      userId: 5,
+      fileId: 900,
+      sha256: 'ABC',
+    });
+
+    expect(result).toBe('skipped');
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'db exploded', modelId: 100, userId: 5, sha256: 'ABC' }),
+      'webhooks'
+    );
+  });
+
+  it('does not throw when the rejection value is null (property access on a non-Error cast)', async () => {
+    mockDbRead.$queryRaw.mockRejectedValue(null);
+
+    await expect(
+      checkMinorHashOnScan({ modelId: 100, userId: 5, fileId: 900, sha256: 'ABC' })
+    ).resolves.toBe('skipped');
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'null', modelId: 100, userId: 5, sha256: 'ABC' }),
+      'webhooks'
+    );
+  });
+});
+
+// The SQL now filters to same-uploader rows, so the limited select only ever
+// returns actionable candidates; the totals come from the separate count query.
+const sweepTotals = [{ candidates: 3, sameUploader: 2 }];
+const sweepRows = [
+  { modelId: 101, userId: 5, sameUploader: true },
+  { modelId: 102, userId: 6, sameUploader: true },
+];
+
+// call 0 = uncapped totals, call 1 = the limited actionable rows
+function mockSweepQueries(totals = sweepTotals, rows = sweepRows) {
+  mockDbRead.$queryRaw.mockResolvedValueOnce(totals).mockResolvedValueOnce(rows);
+}
+
+describe('sweepMinorHashMatches', () => {
+  it('writes nothing on a dry run but reports the split', async () => {
+    mockSweepQueries();
+
+    const report = await sweepMinorHashMatches({ dryRun: true, limit: 100 });
+
+    expect(mockSetModelMinor).not.toHaveBeenCalled();
+    expect(report).toMatchObject({
+      candidates: 3,
+      sameUploader: 2,
+      differentUploader: 1,
+      flagged: 0,
+      failed: 0,
+    });
+    expect(report.sample.length).toBeGreaterThan(0);
+  });
+
+  it('reports the full population, not the limited window', async () => {
+    // A dry run at limit 1 must still describe all 714/301/413-style totals —
+    // the operator sizes the backfill from these numbers.
+    mockSweepQueries([{ candidates: 714, sameUploader: 301 }], [sweepRows[0]]);
+
+    const report = await sweepMinorHashMatches({ dryRun: true, limit: 1 });
+
+    expect(report).toMatchObject({
+      candidates: 714,
+      sameUploader: 301,
+      differentUploader: 413,
+    });
+    expect(report.sample).toHaveLength(1);
+  });
+
+  it('still reports the different-uploader backlog when nothing is actionable', async () => {
+    // Steady state after the backfill: 0 same-uploader rows returned, but the
+    // queue awaiting human review must not read as empty.
+    mockSweepQueries([{ candidates: 413, sameUploader: 0 }], []);
+
+    const report = await sweepMinorHashMatches({ dryRun: true, limit: 500 });
+
+    expect(report).toMatchObject({ candidates: 413, sameUploader: 0, differentUploader: 413 });
+  });
+
+  it('caps the sample at 20 rows', async () => {
+    const many = Array.from({ length: 50 }, (_, i) => ({
+      modelId: i,
+      userId: 1,
+      sameUploader: true,
+    }));
+    mockSweepQueries([{ candidates: 50, sameUploader: 50 }], many);
+
+    const report = await sweepMinorHashMatches({ dryRun: true, limit: 500 });
+
+    expect(report.sample).toHaveLength(20);
+  });
+
+  it('flags every returned candidate when applying', async () => {
+    mockSweepQueries();
+
+    const report = await sweepMinorHashMatches({ dryRun: false, limit: 100 });
+
+    expect(mockSetModelMinor).toHaveBeenCalledTimes(2);
+    expect(mockSetModelMinor).toHaveBeenCalledWith({
+      id: 101,
+      minor: true,
+      userId: -1,
+      activity: 'setMinorAutoHash',
+    });
+    expect(report).toMatchObject({ flagged: 2, failed: 0 });
+  });
+
+  it('reports a per-model failure without aborting the batch', async () => {
+    mockSweepQueries();
+    mockSetModelMinor.mockRejectedValueOnce(new Error('boom'));
+
+    const report = await sweepMinorHashMatches({ dryRun: false, limit: 100 });
+
+    expect(report).toMatchObject({ flagged: 1, failed: 1 });
+    expect(mockLogToAxiom).toHaveBeenCalled();
+  });
+
+  it('does not abort the batch when setModelMinor rejects with a non-Error value', async () => {
+    mockSweepQueries();
+    mockSetModelMinor.mockRejectedValueOnce(null);
+
+    const report = await sweepMinorHashMatches({ dryRun: false, limit: 100 });
+
+    expect(report).toMatchObject({ flagged: 1, failed: 1 });
+    expect(mockLogToAxiom).toHaveBeenCalled();
+  });
+
+  it('logs the report on a real run so a timeout cannot lose it', async () => {
+    mockSweepQueries();
+
+    await sweepMinorHashMatches({ dryRun: false, limit: 100 });
+
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'minor-hash-sweep',
+        candidates: 3,
+        sameUploader: 2,
+        differentUploader: 1,
+        flagged: 2,
+        failed: 0,
+      }),
+      'webhooks'
+    );
+  });
+
+  it('does not log a dry run', async () => {
+    mockSweepQueries();
+
+    await sweepMinorHashMatches({ dryRun: true, limit: 100 });
+
+    expect(mockLogToAxiom).not.toHaveBeenCalled();
+  });
+
+  it('pushes the same-uploader filter into SQL so limit caps writes', async () => {
+    mockSweepQueries([{ candidates: 0, sameUploader: 0 }], []);
+
+    await sweepMinorHashMatches({ dryRun: true, limit: 250 });
+
+    const [strings, ...values] = mockDbRead.$queryRaw.mock.calls[1];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('WHERE c."sameUploader"');
+    expect(text).toContain('LIMIT');
+    expect(values).toContain(250);
+  });
+
+  it('counts the population without a LIMIT', async () => {
+    mockSweepQueries([{ candidates: 0, sameUploader: 0 }], []);
+
+    await sweepMinorHashMatches({ dryRun: true, limit: 250 });
+
+    const [strings, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('count(*)');
+    expect(text).not.toContain('LIMIT');
+    expect(values).not.toContain(250);
+  });
+
+  // Pre-state capture moved into setModelMinor so manual flags get it too; the
+  // sweep no longer snapshots directly.
+  it('flags every candidate row via setModelMinor', async () => {
+    mockSweepQueries();
+
+    await sweepMinorHashMatches({ dryRun: false, limit: 100 });
+
+    expect(mockSetModelMinor).toHaveBeenCalledTimes(sweepRows.length);
+    expect(mockSetModelMinor).toHaveBeenCalledWith(
+      expect.objectContaining({ minor: true, userId: -1, activity: 'setMinorAutoHash' })
+    );
+  });
+
+  it('does not capture pre-state on a dry run', async () => {
+    mockSweepQueries();
+
+    await sweepMinorHashMatches({ dryRun: true, limit: 100 });
+
+    expect(mockDbWrite.$executeRaw).not.toHaveBeenCalled();
+  });
+});
+
+describe('getMinorHashMatchesForReview', () => {
+  it('excludes dismissed models and different-uploader-only, without OFFSET', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getMinorHashMatchesForReview({ limit: 1000 });
+
+    const [strings, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain(`NOT (m.meta ? 'minorHashDismissed')`);
+    expect(text).toContain('WHERE NOT c."sameUploader"');
+    // A targeted rollback of a flag applied from this queue must not put the model
+    // straight back on it. The gate is a nested Prisma.Sql fragment, so its own
+    // values sit one level down from the template's.
+    const nested = values.flatMap((v) => (v as { values?: unknown[] })?.values ?? []);
+    expect(nested).toContain(MINOR_HASH_CLEARED_KEY);
+    expect(text).toContain('bool_or(EXISTS (');
+    expect(text).toContain(`s2."userId" <> c."userId"`);
+    // No server-side window at all: an OFFSET page skips rows as the queue is
+    // actioned, and any window would confine client sorting to a partial set.
+    expect(text).not.toContain('OFFSET');
+    expect(values).toContain(1001); // limit + 1 truncation probe
+  });
+
+  // A model's matched version is often not its default (51 of 411 on prod-scale
+  // data), so the hash and the version must come from the same aggregated row —
+  // otherwise the link points at a version that never carried the hash.
+  it('pairs the reported hash and modelVersionId via a matching ORDER BY', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getMinorHashMatchesForReview({ limit: 25 });
+
+    const [strings] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('(array_agg(mfh.hash ORDER BY mfh.hash, mv.id))[1]');
+    expect(text).toContain('(array_agg(mv.id ORDER BY mfh.hash, mv.id))[1]');
+    // min(hash) would not identify which version carried it
+    expect(text).not.toContain('min(mfh.hash)');
+  });
+
+  it('resolves the flagged model version from the shared hash', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getMinorHashMatchesForReview({ limit: 25 });
+
+    const [strings] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('"minorModelVersionId"');
+    expect(text).toContain('h2.hash = c.hash');
+    expect(text).toContain('mv2."modelId" = s."minorModelId"');
+  });
+
+  it('flags truncation only when the cap is exceeded', async () => {
+    const row = (modelId: number) => ({ modelId, modelName: `m${modelId}` });
+
+    mockDbRead.$queryRaw.mockResolvedValueOnce([row(1), row(2), row(3)]);
+    const over = await getMinorHashMatchesForReview({ limit: 2 });
+    expect(over.items).toHaveLength(2);
+    expect(over.truncated).toBe(true);
+
+    mockDbRead.$queryRaw.mockResolvedValueOnce([row(1)]);
+    const under = await getMinorHashMatchesForReview({ limit: 2 });
+    expect(under.items).toHaveLength(1);
+    expect(under.truncated).toBe(false);
+  });
+});
+
+describe('getAutoFlaggedMinorModels', () => {
+  it('lists only auto-sourced flags a moderator has not signed off yet', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getAutoFlaggedMinorModels({ limit: 1000 });
+
+    const [strings, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain(`->>'source' = 'auto'`);
+    expect(text).toContain('AND NOT ');
+    // the human-confirmation gate is interpolated as a Prisma.Sql fragment
+    const rendered = values
+      .map((v) => (v as { strings?: readonly string[] })?.strings?.join('?') ?? '')
+      .join('\n');
+    expect(rendered).toContain('"ModActivity" ma');
+    expect(rendered).toContain(`ma.activity = 'setMinor'`);
+    expect(values).toContain(1001); // limit + 1 truncation probe
+  });
+
+  it('flags truncation when the cap is exceeded', async () => {
+    const row = (modelId: number) => ({ modelId });
+    mockDbRead.$queryRaw.mockResolvedValueOnce([row(1), row(2), row(3)]);
+
+    const result = await getAutoFlaggedMinorModels({ limit: 2 });
+
+    expect(result.items).toHaveLength(2);
+    expect(result.truncated).toBe(true);
+  });
+
+  // The queue is unbounded otherwise — one dev-clone sweep produced 290 rows.
+  it('limits the queue to the 30-day review window and skips accepted flags', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getAutoFlaggedMinorModels({ limit: 1000 });
+
+    const [strings, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain(`->>'at')::timestamptz >`);
+    expect(text).toContain('AND NOT (m.meta ? ');
+    expect(values).toContain(MINOR_HASH_ACCEPTED_KEY);
+    // The day count must be inlined: bound as a parameter it arrives as int8 and
+    // make_interval only takes int4, so the query fails to resolve the function.
+    const rendered = values
+      .map((v) => (v as { strings?: readonly string[] })?.strings?.join('?') ?? '')
+      .join('\n');
+    expect(rendered).toContain(`make_interval(days => ${AUTO_FLAG_REVIEW_WINDOW_DAYS})`);
+    expect(values).not.toContain(AUTO_FLAG_REVIEW_WINDOW_DAYS);
+  });
+});
+
+// The auto-flag path records no pointer to what it matched — captureMinorFlagSnapshot
+// stores pre-state only — so the seed has to be re-derived from the hash to show a
+// moderator the evidence behind a flag that is already in force.
+describe('getAutoFlaggedMinorMatch', () => {
+  it('re-derives the seed from the shared hash rather than a stored pointer', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getAutoFlaggedMinorMatch({ modelId: 2186217 });
+
+    const [strings, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('smfh.hash = mfh.hash');
+    expect(values).toContain(2186217);
+    // The whole seed set is ~17k models; a per-row panel must not build that CTE.
+    expect(text).not.toContain('minor_src');
+  });
+
+  it('never reports the flagged model as its own match', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getAutoFlaggedMinorMatch({ modelId: 2186217 });
+
+    const [strings] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('m.id <> ');
+  });
+
+  // Same gate as minor_src: without it a model auto-flagged off this one would come
+  // back as its own justification once a second copy landed.
+  it('only accepts human-decided flags as the seed', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getAutoFlaggedMinorMatch({ modelId: 2186217 });
+
+    const [, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const rendered = values
+      .map((v) => (v as { strings?: readonly string[] })?.strings?.join('?') ?? '')
+      .join('\n');
+    expect(rendered).toContain(`->>'source' IS DISTINCT FROM 'auto'`);
+    expect(rendered).toContain(`'minor' = ANY(m."lockedProperties")`);
+  });
+
+  it('returns null when no seed still carries the hash', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await expect(getAutoFlaggedMinorMatch({ modelId: 2186217 })).resolves.toBeNull();
+  });
+
+  it('returns the matched seed when one exists', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([
+      {
+        minorModelId: 2176413,
+        minorModelName: 'FIRE EMBLEM series3',
+        minorModelVersionId: 2451000,
+        minorModelDeletedAt: new Date('2025-12-02'),
+        hash: 'B62D6EFF',
+        modelVersionId: 2461616,
+      },
+    ]);
+
+    await expect(getAutoFlaggedMinorMatch({ modelId: 2186217 })).resolves.toMatchObject({
+      minorModelId: 2176413,
+      hash: 'B62D6EFF',
+    });
+  });
+});
+
+describe('getAutoFlaggedMinorDetail', () => {
+  it('resolves the seed before loading the shared detail for it', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([
+      { minorModelId: 2176413, hash: 'B62D6EFF', modelVersionId: 2461616 },
+    ]);
+    mockDbRead.$queryRaw.mockResolvedValueOnce([{ minorModelStatus: 'Deleted' }]);
+
+    const result = await getAutoFlaggedMinorDetail({ modelId: 2186217 });
+
+    const [, ...detailValues] = mockDbRead.$queryRaw.mock.calls[1];
+    expect(detailValues).toContain(2176413);
+    expect(result.match?.minorModelId).toBe(2176413);
+    expect(result.detail?.minorModelStatus).toBe('Deleted');
+  });
+
+  // No seed is the NORMAL case for a moderator's manual Set-as-Minor, which the
+  // appeals tab exists to review. Short-circuiting left that panel with no cover,
+  // no upload date and "0 models" for the uploader.
+  it("still loads the model's own detail when no seed resolves", async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([]);
+    mockDbRead.$queryRaw.mockResolvedValueOnce([{ uploaderModelCount: 12 }]);
+
+    const result = await getAutoFlaggedMinorDetail({ modelId: 2186217 });
+
+    expect(mockDbRead.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(result.match).toBeNull();
+    expect(result.detail?.uploaderModelCount).toBe(12);
+  });
+
+  // The detail query still has to run, but with nothing to join the seed half
+  // against — a literal 0 would join against model 0.
+  it('passes no seed id to the detail query when none resolves', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([]);
+    mockDbRead.$queryRaw.mockResolvedValueOnce([{}]);
+
+    await getAutoFlaggedMinorDetail({ modelId: 2186217 });
+
+    const [, ...detailValues] = mockDbRead.$queryRaw.mock.calls[1];
+    expect(detailValues).toContain(null);
+    expect(detailValues).not.toContain(0);
+  });
+});
+
+// Same-uploader re-uploads usually follow a delete of the flagged original, so the
+// deletion date is what makes the sequence legible; a bare status badge doesn't
+// show that the copy went up the same day.
+describe('getMinorHashMatchDetail', () => {
+  it('reports when the matched model was deleted', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getMinorHashMatchDetail({ modelId: 2186217, minorModelId: 2176413 });
+
+    const [strings] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('"minorModelDeletedAt"');
+    expect(text).toContain('mm."deletedAt"');
+  });
+});
+
+describe('confirmMinorHashAutoFlag', () => {
+  it("records the moderator's own setMinor so a bulk rollback can no longer revert it", async () => {
+    await confirmMinorHashAutoFlag({ modelId: 100, userId: 4 });
+
+    expect(mockTrackModActivity).toHaveBeenCalledWith(4, {
+      entityType: 'model',
+      entityId: 100,
+      activity: 'setMinor',
+    });
+    // sign-off must not re-run the flag itself
+    expect(mockSetModelMinor).not.toHaveBeenCalled();
+  });
+
+  // The ModActivity row alone took the model out of the queue but left the
+  // snapshot source='auto', which the seed predicate excludes — so an affirmed
+  // minor model's hashes never matched anything afterwards.
+  it("promotes the snapshot to source='manual' so the affirmed model seeds", async () => {
+    await confirmMinorHashAutoFlag({ modelId: 100, userId: 4 });
+
+    expect(mockDbWrite.$executeRaw).toHaveBeenCalledTimes(1);
+    const [strings, ...values] = mockDbWrite.$executeRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('jsonb_set');
+    expect(text).toContain(`'source', 'manual'`);
+    // provenance survives the promotion
+    expect(text).toContain(`'confirmedFrom'`);
+    expect(values).toContain(100);
+    expect(values).toContain(4);
+  });
+
+  // Without the COALESCE the second confirm reads the source it just promoted to
+  // 'manual', so an automated flag stops looking automated to the owner alert.
+  it('keeps the original confirmedFrom so a repeat confirm cannot erase the auto origin', async () => {
+    await confirmMinorHashAutoFlag({ modelId: 100, userId: 4 });
+
+    const [strings] = mockDbWrite.$executeRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toMatch(
+      /'confirmedFrom',\s*COALESCE\(\s*m\.meta->\?->'confirmedFrom',\s*m\.meta->\?->'source'\s*\)/
+    );
+  });
+
+  // Snapshot capture is best-effort, so a model can be flagged without one. The
+  // promotion has to no-op there rather than write a snapshot with no pre-state.
+  it('only promotes a model that actually has a snapshot', async () => {
+    await confirmMinorHashAutoFlag({ modelId: 100, userId: 4 });
+
+    const [strings] = mockDbWrite.$executeRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('WHERE m.id =');
+    expect(text).toContain('AND m.meta ?');
+  });
+});
+
+describe('confirmMinorHashAutoFlag — text-scan ruling', () => {
+  const verdictMeta = { textScanFlags: { minor: { workflowId: 'wf-1', textHash: 'h1' } } };
+
+  it('upholds the text-scan minor flag as a moderator ruling with the reason and note', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({ meta: verdictMeta });
+
+    await confirmMinorHashAutoFlag({
+      modelId: 100,
+      userId: 4,
+      reason: 'Minor depicted',
+      note: 'n',
+    });
+
+    expect(mockStampModelTextScanAppeal).toHaveBeenCalledWith({
+      modelId: 100,
+      userId: 4,
+      decision: 'appealUpheld',
+      labels: ['minor'],
+      via: 'moderator',
+      reason: 'Minor depicted',
+      note: 'n',
+    });
+  });
+
+  it('reports whether a verdict existed and the ruling landed', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({ meta: verdictMeta });
+    await expect(confirmMinorHashAutoFlag({ modelId: 100, userId: 4 })).resolves.toEqual({
+      hadVerdict: true,
+      stamped: true,
+    });
+
+    mockPrimaryModelFindUnique.mockResolvedValue({ meta: { minorFlagSnapshot: {} } });
+    await expect(confirmMinorHashAutoFlag({ modelId: 100, userId: 4 })).resolves.toEqual({
+      hadVerdict: false,
+      stamped: false,
+    });
+  });
+
+  it('records nothing when the flag has no text-scan verdict', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({ meta: { minorFlagSnapshot: {} } });
+    await confirmMinorHashAutoFlag({ modelId: 100, userId: 4 });
+
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      meta: { textScanFlags: { minor: { appealGranted: { by: 1 } } } },
+    });
+    await confirmMinorHashAutoFlag({ modelId: 100, userId: 4 });
+
+    expect(mockStampModelTextScanAppeal).not.toHaveBeenCalled();
+  });
+
+  it('still signs the flag off when the ruling cannot be recorded', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({ meta: verdictMeta });
+    mockStampModelTextScanAppeal.mockRejectedValueOnce(new Error('db down'));
+
+    await expect(confirmMinorHashAutoFlag({ modelId: 100, userId: 4 })).resolves.toEqual({
+      hadVerdict: true,
+      stamped: false,
+    });
+
+    expect(mockTrackModActivity).toHaveBeenCalled();
+    expect(mockLogToAxiom).toHaveBeenCalledWith(expect.objectContaining({ name: 'text-scan' }));
+  });
+
+  it('leaves the verdict alone when the caller records the ruling itself', async () => {
+    await confirmMinorHashAutoFlag({ modelId: 100, userId: 4, recordTextScanRuling: false });
+
+    expect(mockStampModelTextScanAppeal).not.toHaveBeenCalled();
+    expect(mockTrackModActivity).toHaveBeenCalled();
+  });
+});
+
+describe('revertMinorHashAutoFlag', () => {
+  it('rolls back exactly that model and audits the revert', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 77 })]);
+
+    await revertMinorHashAutoFlag({ modelId: 77, userId: 4 });
+
+    expect(mockSetModelMinor).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 77, minor: false, activity: 'rollbackMinorAutoHash' })
+    );
+    expect(mockTrackModActivity).toHaveBeenCalledWith(4, {
+      entityType: 'model',
+      entityId: 77,
+      activity: 'rollbackMinorAutoHash',
+    });
+  });
+
+  it("settles the model's pending appeal after a moderator's revert, once the lift has run", async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 77 })]);
+    mockStampModeratorTextScanRuling.mockResolvedValue(true);
+
+    await revertMinorHashAutoFlag({ modelId: 77, userId: 4, recordTextScanRuling: true });
+
+    expect(mockSettleFlagAppeals).toHaveBeenCalledWith({
+      modelId: 77,
+      userId: 4,
+      liftedLabels: ['minor'],
+      recordRulings: false,
+    });
+    expect(mockSettleFlagAppeals.mock.invocationCallOrder[0]).toBeGreaterThan(
+      mockSetModelMinor.mock.invocationCallOrder[0]
+    );
+  });
+
+  it("passes the moderator's reason and note to the recorded ruling", async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 77 })]);
+    mockStampModeratorTextScanRuling.mockResolvedValue(true);
+
+    await revertMinorHashAutoFlag({
+      modelId: 77,
+      userId: 4,
+      recordTextScanRuling: true,
+      reason: 'Adult',
+      note: 'n',
+    });
+
+    expect(mockStampModeratorTextScanRuling).toHaveBeenCalledWith({
+      modelId: 77,
+      userId: 4,
+      label: 'minor',
+      reason: 'Adult',
+      note: 'n',
+    });
+  });
+
+  it('rules against the hash the moderator saw when one is given', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 77 })]);
+    mockStampModeratorTextScanRuling.mockResolvedValue(true);
+
+    await revertMinorHashAutoFlag({
+      modelId: 77,
+      userId: 4,
+      recordTextScanRuling: true,
+      textHash: 'seen-h',
+    });
+
+    expect(mockStampModeratorTextScanRuling).toHaveBeenCalledWith(
+      expect.objectContaining({ modelId: 77, label: 'minor', textHash: 'seen-h' })
+    );
+  });
+
+  it('leaves appeals alone when the caller is the appeal resolution itself', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 77 })]);
+
+    await revertMinorHashAutoFlag({ modelId: 77, userId: 4 });
+
+    expect(mockSettleFlagAppeals).not.toHaveBeenCalled();
+  });
+});
+
+describe('dismissMinorHashMatch', () => {
+  it('merges the dismissal into Model.meta and records the activity', async () => {
+    await dismissMinorHashMatch({ modelId: 100, userId: 7 });
+
+    expect(mockDbWrite.$executeRaw).toHaveBeenCalledTimes(1);
+    const [strings, ...values] = mockDbWrite.$executeRaw.mock.calls[0];
+    const text = Prisma.sql(strings as TemplateStringsArray, ...values).sql;
+    expect(text.replace(/\s+/g, ' ')).toContain(
+      `meta = ${asJsonbObject('meta')} || jsonb_build_object('minorHashDismissed'`
+    );
+    expect(mockTrackModActivity).toHaveBeenCalledWith(7, {
+      entityType: 'model',
+      entityId: 100,
+      activity: 'dismissMinorHashMatch',
+    });
+  });
+});
+
+function rollbackRow(
+  overrides: Partial<{
+    modelId: number;
+    prevNsfw: boolean;
+    prevSfwOnly: boolean;
+    prevGalleryLevel: number | null;
+    prevLockedProperties: string[];
+    prevMinorImageIds: number[];
+  }> = {}
+) {
+  return {
+    modelId: 200,
+    prevNsfw: false,
+    prevSfwOnly: false,
+    prevGalleryLevel: 31,
+    prevLockedProperties: ['poi'],
+    prevMinorImageIds: [123, 456],
+    ...overrides,
+  };
+}
+
+// rollbackMinorHashAutoFlags issues the confirmed-count query first, then the
+// candidate window.
+function mockRollbackQueries({
+  rows,
+  confirmedTotal = 0,
+  confirmedIds = [],
+}: {
+  rows: ReturnType<typeof rollbackRow>[];
+  confirmedTotal?: number;
+  confirmedIds?: number[];
+}) {
+  mockDbRead.$queryRaw
+    .mockResolvedValueOnce([{ total: confirmedTotal, ids: confirmedIds }])
+    .mockResolvedValueOnce(rows);
+}
+
+describe('rollbackMinorHashAutoFlags', () => {
+  it('unsets minor and restores nsfw, sfwOnly, gallery level, and lockedProperties', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow()]);
+
+    const report = await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    expect(mockSetModelMinor).toHaveBeenCalledWith({
+      id: 200,
+      minor: false,
+      userId: -1,
+      activity: 'rollbackMinorAutoHash',
+    });
+
+    const restoreCall = mockDbWrite.$executeRaw.mock.calls.find((call) =>
+      Array.from(call[0] as TemplateStringsArray)
+        .join('?')
+        .includes('SET nsfw')
+    );
+    expect(restoreCall).toBeDefined();
+    const [strings, ...values] = restoreCall!;
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('"sfwOnly"');
+    expect(text).toContain('"gallerySettings"');
+    expect(text).toContain('"lockedProperties"');
+    expect(text).toContain(`meta = (COALESCE(meta, '{}'::jsonb) - `);
+    expect(values).toContain(31); // prevGalleryLevel
+    // prevLockedProperties, inside the fragment that adds the real-person locks.
+    expect(
+      Prisma.sql(strings as TemplateStringsArray, ...(values as never[])).values
+    ).toContainEqual(['poi']);
+
+    expect(report).toMatchObject({ candidates: 1, rolledBack: 1, skipped: 0, failed: 0 });
+  });
+
+  // The restore moves sfwOnly and the gallery level after setModelMinor's own cache bust, and the
+  // gallery serves a held level while the model is SFW-only.
+  it('drops the cached gallery settings after the restore write', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 200 })]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    const restoreAt = mockDbWrite.$executeRaw.mock.calls.findIndex((call) =>
+      Array.from(call[0] as TemplateStringsArray)
+        .join('?')
+        .includes('SET nsfw')
+    );
+    expect(redisMock.redis.del).toHaveBeenCalledWith(['model:gallery-settings:200']);
+    expect(redisMock.redis.del.mock.invocationCallOrder[0]).toBeGreaterThan(
+      mockDbWrite.$executeRaw.mock.invocationCallOrder[restoreAt]
+    );
+  });
+
+  // An owner's override predates the snapshot, so the ruling it replaced goes back on top.
+  it("puts back the ruling an owner's override replaced after its own restore", async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 200 })]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    const restoreAt = mockDbWrite.$executeRaw.mock.calls.findIndex((call) =>
+      Array.from(call[0] as TemplateStringsArray)
+        .join('?')
+        .includes('SET nsfw')
+    );
+    expect(mockRestoreOwnerFlagOverride).toHaveBeenCalledTimes(1);
+    expect(mockRestoreOwnerFlagOverride).toHaveBeenCalledWith(200, { revertedFlag: 'minor' });
+    expect(mockRestoreOwnerFlagOverride.mock.invocationCallOrder[0]).toBeGreaterThan(
+      mockDbWrite.$executeRaw.mock.invocationCallOrder[restoreAt]
+    );
+  });
+
+  it('drops the system nsfw lock marker in the restore write', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 200 })]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    const restoreCall = mockDbWrite.$executeRaw.mock.calls.find((call) =>
+      Array.from(call[0] as TemplateStringsArray)
+        .join('?')
+        .includes('SET nsfw')
+    );
+    const [strings, ...values] = restoreCall!;
+    expect(Array.from(strings as TemplateStringsArray).join('?')).toContain(
+      `meta = (COALESCE(meta, '{}'::jsonb) - ? - ?::text)`
+    );
+    expect(values).toContain('systemNsfwLock');
+  });
+
+  // Deleting the snapshot is what made a rollback forgettable: the model became an
+  // ordinary candidate again and the next unattended run re-flagged it.
+  it('stamps the model as cleared in the same write that drops the snapshot', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 200 })]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    const restoreCall = mockDbWrite.$executeRaw.mock.calls.find((call) =>
+      Array.from(call[0] as TemplateStringsArray)
+        .join('?')
+        .includes('SET nsfw')
+    );
+    const [strings, ...values] = restoreCall!;
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('|| jsonb_build_object');
+    expect(text).toContain(`jsonb_build_object('at', now())`);
+    expect(values).toContain(MINOR_HASH_CLEARED_KEY);
+  });
+
+  // Minor flagged first, poi second: the snapshot's pre-minor state can be NSFW, and restoring it
+  // must not leave a model that is still poi without its restrictions.
+  it('reasserts the poi restrictions after restoring the pre-minor state', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([
+      rollbackRow({ prevNsfw: true, prevSfwOnly: false, prevLockedProperties: [] }),
+    ]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100, modelIds: [200] });
+
+    expect(mockReassertModelPoiRestrictions).toHaveBeenCalledTimes(1);
+    expect(mockReassertModelPoiRestrictions).toHaveBeenCalledWith(200);
+    const writeOrder = (fragment: string) =>
+      mockDbWrite.$executeRaw.mock.invocationCallOrder[
+        mockDbWrite.$executeRaw.mock.calls.findIndex((call) =>
+          Array.from(call[0] as TemplateStringsArray)
+            .join('?')
+            .includes(fragment)
+        )
+      ];
+    const reassertOrder = mockReassertModelPoiRestrictions.mock.invocationCallOrder[0];
+    expect(writeOrder('SET nsfw'), 'restore write').toBeLessThan(reassertOrder);
+    // The reassert's side effects rewrite every image's minor flag, so the re-mark must follow it.
+    expect(reassertOrder).toBeLessThan(writeOrder('UPDATE "Image"'));
+  });
+
+  it('re-marks prevMinorImageIds back to minor and queues them for search-index update', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ prevMinorImageIds: [123, 456] })]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    const imageCall = mockDbWrite.$executeRaw.mock.calls.find((call) =>
+      Array.from(call[0] as TemplateStringsArray)
+        .join('?')
+        .includes('UPDATE "Image"')
+    );
+    expect(imageCall).toBeDefined();
+    const text = Array.from(imageCall![0] as TemplateStringsArray).join('?');
+    expect(text).toContain('SET minor = true');
+
+    expect(mockQueueImageSearchIndexUpdate).toHaveBeenCalledWith({
+      ids: [123, 456],
+      action: SearchIndexUpdateQueueAction.Update,
+    });
+  });
+
+  it('does not touch images when prevMinorImageIds is empty', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ prevMinorImageIds: [] })]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    const imageCall = mockDbWrite.$executeRaw.mock.calls.find((call) =>
+      Array.from(call[0] as TemplateStringsArray)
+        .join('?')
+        .includes('UPDATE "Image"')
+    );
+    expect(imageCall).toBeUndefined();
+    expect(mockQueueImageSearchIndexUpdate).not.toHaveBeenCalled();
+  });
+
+  it('reports human-confirmed flags as skipped without processing them', async () => {
+    mockRollbackQueries({ rows: [], confirmedTotal: 3, confirmedIds: [201, 202, 203] });
+
+    const report = await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    expect(mockSetModelMinor).not.toHaveBeenCalled();
+    expect(mockDbWrite.$executeRaw).not.toHaveBeenCalled();
+    expect(report).toMatchObject({ candidates: 0, rolledBack: 0, skipped: 3, failed: 0 });
+    expect(report.sample).toEqual([
+      { modelId: 201, outcome: 'skipped' },
+      { modelId: 202, outcome: 'skipped' },
+      { modelId: 203, outcome: 'skipped' },
+    ]);
+  });
+
+  // Regression: confirmed rows keep their meta key forever, so leaving them in the
+  // `ORDER BY id LIMIT n` window let them occupy slots on every call and stall the
+  // drain once as many accumulated as the limit.
+  it('excludes human-confirmed flags from the candidate window so the drain can progress', async () => {
+    mockRollbackQueries({ rows: [], confirmedTotal: 1, confirmedIds: [201] });
+
+    await rollbackMinorHashAutoFlags({ dryRun: true, limit: 100 });
+
+    const [confirmedStrings] = mockDbRead.$queryRaw.mock.calls[0];
+    const confirmedText = Array.from(confirmedStrings as TemplateStringsArray).join('?');
+    expect(confirmedText).toContain('m.meta ? ');
+
+    const [candidateStrings, ...candidateValues] = mockDbRead.$queryRaw.mock.calls[1];
+    const candidateText = Array.from(candidateStrings as TemplateStringsArray).join('?');
+    expect(candidateText).toContain('m.meta ? ');
+    expect(candidateText).toContain('LIMIT ');
+    // The scope is interpolated as a Prisma.Sql fragment, so it lands in values.
+    const scopeText = candidateValues
+      .map((v) => (v as { strings?: readonly string[] })?.strings?.join('?') ?? '')
+      .join('\n');
+    expect(scopeText).toContain('NOT ');
+    expect(scopeText).toContain('"ModActivity" ma');
+  });
+
+  // A bulk rollback undoes the hash backfill. A text-scan flag is a different automation, and a
+  // manual one a moderator's decision; neither may be reverted as its collateral.
+  it('scopes a bulk rollback to auto flags only — never manual, never text-scan', async () => {
+    mockRollbackQueries({ rows: [] });
+
+    await rollbackMinorHashAutoFlags({ dryRun: true, limit: 100 });
+
+    const rendered = mockDbRead.$queryRaw.mock.calls
+      .flatMap((call) => call.slice(1))
+      .map((v) => (v as { strings?: readonly string[] })?.strings?.join('?') ?? '')
+      .join('\n');
+    expect(rendered).toContain(`->>'source' = 'auto'`);
+    expect(rendered).not.toContain(`IS DISTINCT FROM 'manual'`);
+  });
+
+  it('targets exact modelIds regardless of source, bypassing the human-confirmation skip', async () => {
+    mockDbRead.$queryRaw.mockResolvedValueOnce([rollbackRow({ modelId: 77 })]);
+
+    const report = await rollbackMinorHashAutoFlags({
+      dryRun: true,
+      limit: 100,
+      modelIds: [77, 88],
+    });
+
+    // targeted mode issues only the candidate query - no confirmed-count query
+    expect(mockDbRead.$queryRaw).toHaveBeenCalledTimes(1);
+    const [, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const rendered = values
+      .map((v) => (v as { strings?: readonly string[] })?.strings?.join('?') ?? '')
+      .join('\n');
+    expect(rendered).toContain('m.id = ANY(');
+    expect(rendered).not.toContain('IS DISTINCT FROM');
+    expect(rendered).not.toContain('"ModActivity" ma');
+    expect(report).toMatchObject({ candidates: 1, rolledBack: 1, skipped: 0 });
+  });
+
+  it('queries the human-confirmation gate against a later ModActivity setMinor row', async () => {
+    mockRollbackQueries({ rows: [] });
+
+    await rollbackMinorHashAutoFlags({ dryRun: true, limit: 100 });
+
+    // The gate is interpolated as a Prisma.Sql fragment, so it lands in the call's
+    // values rather than its template strings — render both.
+    const renderValue = (value: unknown): string => {
+      const fragment = value as { strings?: readonly string[] } | null;
+      return fragment && Array.isArray(fragment.strings) ? fragment.strings.join('?') : '';
+    };
+    const gateText = mockDbRead.$queryRaw.mock.calls
+      .flatMap((call) => [
+        Array.from(call[0] as TemplateStringsArray).join('?'),
+        ...call.slice(1).map(renderValue),
+      ])
+      .join('\n');
+    expect(gateText).toContain('"ModActivity" ma');
+    expect(gateText).toContain(`ma.activity = 'setMinor'`);
+    expect(gateText).toContain('"createdAt" >');
+    expect(gateText).toContain('m.meta ? ');
+  });
+
+  it('writes nothing on a dry run but reports the anticipated split', async () => {
+    mockRollbackQueries({
+      rows: [rollbackRow({ modelId: 200 })],
+      confirmedTotal: 1,
+      confirmedIds: [201],
+    });
+
+    const report = await rollbackMinorHashAutoFlags({ dryRun: true, limit: 100 });
+
+    expect(mockSetModelMinor).not.toHaveBeenCalled();
+    expect(mockDbWrite.$executeRaw).not.toHaveBeenCalled();
+    expect(mockQueueImageSearchIndexUpdate).not.toHaveBeenCalled();
+    expect(report).toMatchObject({ candidates: 1, rolledBack: 1, skipped: 1, failed: 0 });
+    expect(report.sample).toEqual([
+      { modelId: 200, outcome: 'rolledBack' },
+      { modelId: 201, outcome: 'skipped' },
+    ]);
+  });
+
+  it('reports a per-model failure without aborting the batch', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([
+      rollbackRow({ modelId: 200 }),
+      rollbackRow({ modelId: 201 }),
+    ]);
+    mockSetModelMinor.mockRejectedValueOnce(new Error('boom'));
+
+    const report = await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    expect(report).toMatchObject({ candidates: 2, rolledBack: 1, skipped: 0, failed: 1 });
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'minor-hash-rollback',
+        message: 'boom',
+        modelId: 200,
+      }),
+      'webhooks'
+    );
+  });
+
+  it('does not abort the batch when setModelMinor rejects with a non-Error value', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 200 })]);
+    mockSetModelMinor.mockRejectedValueOnce(null);
+
+    const report = await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    expect(report).toMatchObject({ rolledBack: 0, failed: 1 });
+  });
+
+  it('caps the sample at 20 rows', async () => {
+    const many = Array.from({ length: 30 }, (_, i) => rollbackRow({ modelId: i }));
+    mockDbRead.$queryRaw.mockResolvedValue(many);
+
+    const report = await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    expect(report.sample).toHaveLength(20);
+  });
+
+  it('logs the report on a real run so a timeout cannot lose it', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow()]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: false, limit: 100 });
+
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'minor-hash-rollback',
+        message: 'rollback complete',
+        candidates: 1,
+        rolledBack: 1,
+        skipped: 0,
+        failed: 0,
+      }),
+      'webhooks'
+    );
+  });
+
+  it('does not log a dry run', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow()]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: true, limit: 100 });
+
+    expect(mockLogToAxiom).not.toHaveBeenCalled();
+  });
+
+  // Aging out is a decision that the flag stands. A blanket "undo the backfill"
+  // that silently reverted thousands of them would be indistinguishable from a bug.
+  it('excludes accepted flags from a blanket rollback', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: true, limit: 10 });
+
+    const rendered = mockDbRead.$queryRaw.mock.calls
+      .flatMap(([, ...values]) => values)
+      .map((v) => (v as { strings?: readonly string[] })?.strings?.join('?') ?? '')
+      .join('\n');
+    expect(rendered).toContain(`NOT (m.meta ? `);
+  });
+
+  it('still reverts an accepted flag when it is named explicitly', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: true, limit: 10, modelIds: [77] });
+
+    // `scope` is interpolated as a Prisma.Sql fragment, so its text lands in
+    // values, not in the outer query's own template strings.
+    const [, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const rendered = values
+      .map((v) => (v as { strings?: readonly string[] })?.strings?.join('?') ?? '')
+      .join('\n');
+    expect(rendered).toContain('m.id = ANY(');
+    // The targeted branch must never inherit the untargeted accepted-flag skip —
+    // that skip only exists to protect the blanket path this branch bypasses.
+    expect(rendered).not.toContain('m.meta ? ');
+  });
+
+  // `skipped` must report the complement of what `scope` writes: auto-flagged AND
+  // (confirmed OR accepted). An `AND NOT accepted` here (mirroring `scope` verbatim
+  // instead of complementing it) would silently drop the accepted-but-unconfirmed
+  // population from both candidates and skipped, making a protected row indistinguishable
+  // from a fully-drained queue.
+  it('counts an accepted-but-unconfirmed flag as skipped rather than dropping it from the report', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await rollbackMinorHashAutoFlags({ dryRun: true, limit: 10 });
+
+    const [confirmedStrings] = mockDbRead.$queryRaw.mock.calls[0];
+    const confirmedText = Array.from(confirmedStrings as TemplateStringsArray).join('?');
+    expect(confirmedText).toContain('OR (m.meta ? ');
+    expect(confirmedText).not.toContain('AND NOT (m.meta ? ');
+  });
+});
+
+describe('acceptExpiredMinorAutoFlags', () => {
+  // Which appeals hold a model back is covered against Postgres in
+  // minor-hash-accept-sweep.behavior.test.ts.
+  it('writes nothing on a dry run', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([{ count: 4 }]);
+
+    const result = await acceptExpiredMinorAutoFlags({ dryRun: true, limit: 500 });
+
+    expect(mockDbWrite.$executeRaw).not.toHaveBeenCalled();
+    expect(result.accepted).toBe(4);
+  });
+});
+
+describe('getMinorFlagAppealsForReview', () => {
+  // A text pin: it sees the predicate is written, not that it selects the right rows. The moderator
+  // app's twin of this query has the behavioural case (minor-flag-appeals.pglite.test.ts).
+  it('lists in-app appeals only, never a site-form appeal on the model', async () => {
+    await getMinorFlagAppealsForReview({ limit: 10 });
+    const [strings] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toMatch(/WHERE a\."entityType" = 'Model' AND a\.category IS NULL\n/);
+  });
+
+  it('returns poi and the text-scan verdict so a moderator can read the reason', async () => {
+    await getMinorFlagAppealsForReview({ limit: 10 });
+    const [strings, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('m.poi');
+    expect(text).toContain('AS "textScanFlags"');
+    expect(values).toContain('textScanFlags');
+  });
+
+  it('surfaces appeals against manual flags, not just automated ones', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getMinorFlagAppealsForReview({ limit: 1000 });
+
+    const [strings, ...values] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain('"Appeal"');
+    expect(values).toContain('Pending');
+    // The auto-flagged tab filters source='auto'; repeating that here would hide
+    // every appeal against a moderator's own Set-as-Minor.
+    expect(text).not.toContain(`->>'source' = 'auto'`);
+    // An appeal pulls an aged-out model back into view. Asserted on values, not
+    // text: the key is always a bind parameter, so a text check can never fail.
+    expect(values).not.toContain(MINOR_HASH_ACCEPTED_KEY);
+    expect(text).toContain('ORDER BY a."createdAt"');
+  });
+
+  // A revert taken from the Auto-flagged tab does not resolve the appeal, so
+  // gating on the model still being minor would strand it with nowhere to close it.
+  it('keeps an appeal listed after the flag it contests is gone', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getMinorFlagAppealsForReview({ limit: 1000 });
+
+    const [strings] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).not.toMatch(/AND\s+m\."?minor"?/);
+  });
+
+  // confirmMinorHashAutoFlag promotes an affirmed auto-flag to source='manual',
+  // so source alone reads as "a moderator flagged this directly" for a row that
+  // really did start as a hash match. confirmedFrom is the only surviving record.
+  it('returns the confirmed origin alongside the current flag source', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([]);
+
+    await getMinorFlagAppealsForReview({ limit: 1000 });
+
+    const [strings] = mockDbRead.$queryRaw.mock.calls[0];
+    const text = Array.from(strings as TemplateStringsArray).join('?');
+    expect(text).toContain(`->>'confirmedFrom' AS "flagConfirmedFrom"`);
+  });
+
+  it('reports truncation with the extra row the cap hid', async () => {
+    mockDbRead.$queryRaw.mockResolvedValue([{ modelId: 1 }, { modelId: 2 }]);
+
+    const result = await getMinorFlagAppealsForReview({ limit: 1 });
+
+    expect(result.items).toHaveLength(1);
+    expect(result.truncated).toBe(true);
+  });
+});
+
+describe('resolveMinorFlagAppeal', () => {
+  it("upholds by confirming the flag and rejecting the appeal with the moderator's reason", async () => {
+    await resolveMinorFlagAppeal({
+      modelId: 42,
+      uphold: true,
+      userId: 7,
+      resolvedReason: 'other',
+      internalNotes: 'school uniform tag',
+    });
+
+    expect(mockTrackModActivity).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ entityId: 42, activity: 'setMinor' })
+    );
+    expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ids: [42],
+        entityType: EntityType.Model,
+        status: AppealStatus.Rejected,
+        resolvedReason: 'other',
+        internalNotes: 'school uniform tag',
+        userId: 7,
+      })
+    );
+  });
+
+  // Each stamp records one label-store label; a moderator-kind one would count the appeal outcome
+  // toward consensus.
+  it('records an upheld minor appeal once, as the appeal outcome', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: false,
+      meta: { textScanFlags: { minor: { workflowId: 'wf-1', textHash: 'h-1' } } },
+    });
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: true, userId: 7 });
+
+    expect(mockStampModelTextScanAppeal).toHaveBeenCalledTimes(1);
+    const [stamp] = mockStampModelTextScanAppeal.mock.calls[0] as [{ via?: string }];
+    expect(stamp).toMatchObject({ decision: 'appealUpheld', labels: ['minor'] });
+    expect(stamp.via ?? 'appeal').toBe('appeal');
+    expect(mockTrackModActivity).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ entityId: 42, activity: 'setMinor' })
+    );
+  });
+
+  it('overturns by reverting the flag and approving the appeal', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: false,
+      meta: { minorFlagSnapshot: { at: 'x', source: 'auto' } },
+    });
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+    expect(mockTrackModActivity).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ entityId: 42, activity: 'rollbackMinorAutoHash' })
+    );
+    expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ids: [42],
+        entityType: EntityType.Model,
+        status: AppealStatus.Approved,
+        userId: 7,
+      })
+    );
+  });
+
+  // The owner asked and a moderator agreed: a minor flag from before the automation goes too.
+  it.each([
+    ['unsets minor after a revert that kept it', { prevMinor: true }, true],
+    ['does not unset again after a revert that cleared it', { prevMinor: false }, false],
+  ])('an overturn %s', async (_, snapshot, unsetByModerator) => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: false,
+      meta: { minorFlagSnapshot: { at: 'x', source: 'auto' } },
+    });
+    mockDbRead.$queryRaw.mockResolvedValueOnce([
+      { ...rollbackRow(), ownerDeclaredMinor: false, ...snapshot },
+    ]);
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+    const moderatorUnset = mockSetModelMinor.mock.calls.some(
+      ([input]) => input.userId === 7 && input.minor === false
+    );
+    expect(moderatorUnset).toBe(unsetByModerator);
+    expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+      expect.objectContaining({ status: AppealStatus.Approved })
+    );
+  });
+
+  it('logs a rollback that failed partway, and still unsets minor for the moderator', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: false,
+      meta: { minorFlagSnapshot: { at: 'x', source: 'auto' } },
+    });
+    mockDbRead.$queryRaw.mockResolvedValueOnce([
+      { ...rollbackRow(), prevMinor: false, ownerDeclaredMinor: false },
+    ]);
+    mockSetModelMinor.mockRejectedValueOnce(new Error('boom'));
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'minor-hash-rollback', modelId: 42, type: 'error' })
+    );
+    expect(mockSetModelMinor).toHaveBeenLastCalledWith({ id: 42, minor: false, userId: 7 });
+  });
+
+  // Resolving last leaves a half-applied decision visible: the appeal stays open
+  // rather than closing against a model nothing happened to.
+  it('leaves the appeal open when the confirm write fails', async () => {
+    mockDbWrite.$executeRaw.mockRejectedValueOnce(new Error('boom'));
+
+    await expect(resolveMinorFlagAppeal({ modelId: 42, uphold: true, userId: 7 })).rejects.toThrow(
+      'boom'
+    );
+
+    expect(mockResolveEntityAppeal).not.toHaveBeenCalled();
+  });
+
+  it('leaves the appeal open when the revert fails', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: false,
+      meta: { minorFlagSnapshot: { at: 'x', source: 'auto' } },
+    });
+    mockDbRead.$queryRaw.mockRejectedValueOnce(new Error('boom'));
+
+    await expect(resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 })).rejects.toThrow(
+      'boom'
+    );
+
+    expect(mockResolveEntityAppeal).not.toHaveBeenCalled();
+  });
+
+  // Upholding a reverted flag writes nothing — confirmMinorHashAutoFlag's UPDATE
+  // no-ops — but still closes the appeal Rejected and tells the owner their
+  // request was denied on a model that is not flagged. The table row can be stale
+  // and the procedure is callable directly, so the UI's disabled button is UX only.
+  it('refuses to uphold a flag that is no longer in force', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({ minor: false });
+
+    await expect(
+      resolveMinorFlagAppeal({ modelId: 42, uphold: true, userId: 7 })
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+
+    expect(mockDbWrite.$executeRaw).not.toHaveBeenCalled();
+    expect(mockResolveEntityAppeal).not.toHaveBeenCalled();
+  });
+
+  it('refuses to uphold when the model no longer exists', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue(null);
+
+    await expect(
+      resolveMinorFlagAppeal({ modelId: 42, uphold: true, userId: 7 })
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+
+    expect(mockResolveEntityAppeal).not.toHaveBeenCalled();
+  });
+
+  // The window the guard exists for is a revert that has committed but not yet
+  // replicated: a replica read still says "minor", the confirm UPDATE no-ops, and
+  // the owner is told their request was denied on a model that is not flagged.
+  it('refuses to uphold a revert the replica has not caught up to', async () => {
+    mockReplicaModelFindUnique.mockResolvedValue({ minor: true });
+    mockPrimaryModelFindUnique.mockResolvedValue({ minor: false });
+
+    await expect(
+      resolveMinorFlagAppeal({ modelId: 42, uphold: true, userId: 7 })
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+
+    expect(mockDbWrite.$executeRaw).not.toHaveBeenCalled();
+    expect(mockResolveEntityAppeal).not.toHaveBeenCalled();
+  });
+
+  // Unflagging is the only way left to close a request whose flag another
+  // moderator already reverted, so it must not carry the same gate.
+  it('still overturns a request whose flag was already reverted', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({ minor: false });
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+    expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+      expect.objectContaining({ status: AppealStatus.Approved })
+    );
+  });
+
+  const grantStamps = () =>
+    mockStampModelTextScanAppeal.mock.calls
+      .map(([arg]) => arg)
+      .filter((arg) => arg.decision === 'appealGranted');
+
+  const poiEntry = {
+    at: 'x',
+    workflowId: 'wf-1',
+    reason: 'Names a real actor.',
+    textHash: 'h-text',
+  };
+
+  it('overturns a text-scan poi flag without touching the minor-hash rollback', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: false,
+      poi: true,
+      meta: { textScanFlags: { poi: poiEntry } },
+    });
+
+    expect(await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 })).toEqual({
+      rescanQueued: false,
+    });
+
+    expect(mockTrackModActivity).not.toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ activity: 'rollbackMinorAutoHash' })
+    );
+    expect(mockGrantModelTextScanPoi).toHaveBeenCalledWith({
+      modelId: 42,
+      userId: 7,
+      grantHash: 'h-text',
+    });
+    expect(grantStamps()).toEqual([]);
+    expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+      expect.objectContaining({ status: AppealStatus.Approved })
+    );
+  });
+
+  // Review Focus 4.
+  it('overturns minor before poi, and stamps before closing the appeal', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: true,
+      meta: {
+        minorFlagSnapshot: { at: 'x', source: 'text-scan' },
+        textScanFlags: { poi: poiEntry, minor: poiEntry },
+      },
+    });
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+    const rollbackOrder =
+      mockTrackModActivity.mock.invocationCallOrder[
+        mockTrackModActivity.mock.calls.findIndex(([, a]) => a.activity === 'rollbackMinorAutoHash')
+      ];
+    expect(mockGrantModelTextScanPoi).toHaveBeenCalled();
+    expect(rollbackOrder).toBeLessThan(mockGrantModelTextScanPoi.mock.invocationCallOrder[0]);
+    expect(grantStamps()).toEqual([expect.objectContaining({ labels: ['minor'] })]);
+    expect(mockResolveEntityAppeal).toHaveBeenCalled();
+    expect(mockStampModelTextScanAppeal.mock.invocationCallOrder[0]).toBeLessThan(
+      mockResolveEntityAppeal.mock.invocationCallOrder[0]
+    );
+  });
+
+  // A rescan landing between the lift and the stamp would otherwise see no grant and re-flag.
+  it.each([
+    ['an auto minor flag', { source: 'text-scan' }, 'rollback'],
+    ['a moderator minor flag', { source: 'manual' }, 'unset'],
+  ])('stamps the minor grant before lifting %s', async (_label, snapshot, path) => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: true,
+      meta: {
+        minorFlagSnapshot: { at: 'x', ...snapshot },
+        textScanFlags: { poi: poiEntry, minor: poiEntry },
+      },
+    });
+    mockLoadGrantTextHash.mockResolvedValue('h-current');
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+    const stamp = mockStampModelTextScanAppeal.mock.calls.findIndex(
+      ([arg]) => arg.decision === 'appealGranted'
+    );
+    expect(stamp, 'appealGranted stamp').toBeGreaterThanOrEqual(0);
+    const stampOrder = mockStampModelTextScanAppeal.mock.invocationCallOrder[stamp];
+    const liftOrder =
+      path === 'rollback'
+        ? mockDbRead.$queryRaw.mock.invocationCallOrder[0]
+        : mockSetModelMinor.mock.invocationCallOrder[0];
+    expect(liftOrder, 'minor lift').toBeDefined();
+    expect(stampOrder).toBeLessThan(liftOrder);
+    expect(grantStamps()).toEqual([
+      {
+        modelId: 42,
+        userId: 7,
+        decision: 'appealGranted',
+        labels: ['minor'],
+        grantHashes: { minor: 'h-current', poi: 'h-current' },
+      },
+    ]);
+    expect(mockGrantModelTextScanPoi).toHaveBeenCalledWith({
+      modelId: 42,
+      userId: 7,
+      grantHash: 'h-current',
+    });
+  });
+
+  // A recorded grant reads as lifted, so a grant stamped ahead of a lift that then failed would
+  // leave poi on with nothing able to retry it.
+  it('leaves no poi grant behind when the poi lift fails, so a retry lifts it', async () => {
+    const model = {
+      minor: true,
+      poi: true,
+      meta: {
+        minorFlagSnapshot: { at: 'x', source: 'text-scan' },
+        textScanFlags: { poi: poiEntry, minor: poiEntry },
+      },
+    };
+    mockPrimaryModelFindUnique.mockResolvedValue(model);
+    mockGrantModelTextScanPoi.mockRejectedValueOnce(new Error('boom'));
+
+    await expect(resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 })).rejects.toThrow(
+      'boom'
+    );
+    expect(grantStamps().flatMap((arg) => arg.labels)).not.toContain('poi');
+    expect(mockResolveEntityAppeal).not.toHaveBeenCalled();
+
+    mockPrimaryModelFindUnique.mockResolvedValue({ ...model, minor: false });
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+    expect(mockGrantModelTextScanPoi).toHaveBeenCalledTimes(2);
+    expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+      expect.objectContaining({ status: AppealStatus.Approved })
+    );
+  });
+
+  // Review Focus 4.
+  it('rules each label separately', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: true,
+      meta: {
+        minorFlagSnapshot: { at: 'x', source: 'text-scan' },
+        textScanFlags: { poi: poiEntry, minor: poiEntry },
+      },
+    });
+
+    await resolveMinorFlagAppeal({
+      modelId: 42,
+      uphold: false,
+      userId: 7,
+      labels: { minor: 'uphold', poi: 'overturn' },
+    });
+
+    expect(mockTrackModActivity).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ activity: 'setMinor' })
+    );
+    expect(mockTrackModActivity).not.toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ activity: 'rollbackMinorAutoHash' })
+    );
+    expect(mockGrantModelTextScanPoi).toHaveBeenCalledWith({
+      modelId: 42,
+      userId: 7,
+      grantHash: 'h-text',
+    });
+    expect(mockStampModelTextScanAppeal).toHaveBeenCalledWith(
+      expect.objectContaining({ decision: 'appealUpheld', labels: ['minor'] })
+    );
+    expect(grantStamps()).toEqual([]);
+    expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+      expect.objectContaining({ status: AppealStatus.Approved })
+    );
+  });
+
+  describe('a real-person flag the hash match applied', () => {
+    const hashed = { poiFlagSnapshot: { at: 'x', source: 'auto' } };
+
+    it('is overturned by reverting it, without the appeal being settled underneath', async () => {
+      mockPrimaryModelFindUnique.mockResolvedValue({ minor: false, poi: true, meta: hashed });
+
+      await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+      expect(mockRevertPoiHashAutoFlag).toHaveBeenCalledWith({
+        modelId: 42,
+        userId: 7,
+        fromAppeal: true,
+      });
+      expect(mockLoadGrantTextHash).not.toHaveBeenCalled();
+      expect(mockGrantModelTextScanPoi).not.toHaveBeenCalled();
+      expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+        expect.objectContaining({ status: AppealStatus.Approved })
+      );
+    });
+
+    it('is upheld by confirming it', async () => {
+      mockPrimaryModelFindUnique.mockResolvedValue({ minor: false, poi: true, meta: hashed });
+
+      await resolveMinorFlagAppeal({ modelId: 42, uphold: true, userId: 7 });
+
+      expect(mockConfirmPoiHashAutoFlag).toHaveBeenCalledWith({
+        modelId: 42,
+        userId: 7,
+        fromAppeal: true,
+      });
+      expect(mockRevertPoiHashAutoFlag).not.toHaveBeenCalled();
+      expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+        expect.objectContaining({ status: AppealStatus.Rejected })
+      );
+    });
+
+    it('with a text-scan flag too, the grant lifts it rather than the hash revert', async () => {
+      mockPrimaryModelFindUnique.mockResolvedValue({
+        minor: false,
+        poi: true,
+        meta: { ...hashed, textScanFlags: { poi: { workflowId: 'wf-1', textHash: 'h-1' } } },
+      });
+      mockLoadGrantTextHash.mockResolvedValue('h-text');
+
+      await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+      expect(mockGrantModelTextScanPoi).toHaveBeenCalledWith({
+        modelId: 42,
+        userId: 7,
+        grantHash: 'h-text',
+      });
+      expect(mockRevertPoiHashAutoFlag).not.toHaveBeenCalled();
+    });
+  });
+
+  it('refuses a per-label decision on a label that is not flagged', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({ minor: true, poi: false, meta: {} });
+
+    await expect(
+      resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7, labels: { poi: 'overturn' } })
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(mockResolveEntityAppeal).not.toHaveBeenCalled();
+  });
+
+  describe('the ruling reason is checked against the status the ruling writes', () => {
+    type Labels = Parameters<typeof resolveMinorFlagAppeal>[0]['labels'];
+    const rule = (uphold: boolean, labels: Labels, resolvedReason: string) =>
+      resolveMinorFlagAppeal({ modelId: 42, uphold, userId: 7, labels, resolvedReason });
+
+    beforeEach(() =>
+      mockPrimaryModelFindUnique.mockResolvedValue({
+        minor: true,
+        poi: true,
+        meta: {
+          minorFlagSnapshot: { at: 'x', source: 'text-scan' },
+          textScanFlags: { poi: poiEntry, minor: poiEntry },
+        },
+      })
+    );
+
+    it.each([
+      ['an uphold that lifts poi', true, { poi: 'overturn' }, 'not-a-real-person'],
+      ['an overturn that keeps both', false, { minor: 'uphold', poi: 'uphold' }, 'flag-confirmed'],
+      [
+        'an overturn naming only minor, which lifts poi',
+        false,
+        { minor: 'uphold' },
+        'terms-misread',
+      ],
+    ] as const)('records the reason for %s', async (_, uphold, labels, reason) => {
+      await rule(uphold, labels, reason);
+      expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+        expect.objectContaining({ resolvedReason: reason })
+      );
+    });
+
+    it.each([
+      ['an uphold that lifts poi', true, { poi: 'overturn' }, 'flag-confirmed'],
+      [
+        'an overturn that keeps both',
+        false,
+        { minor: 'uphold', poi: 'uphold' },
+        'not-a-real-person',
+      ],
+      [
+        'an overturn naming only minor, which lifts poi',
+        false,
+        { minor: 'uphold' },
+        'flag-confirmed',
+      ],
+      ['a lift of poi alone', false, { minor: 'uphold', poi: 'overturn' }, 'not-a-minor'],
+    ] as const)(
+      'refuses a mismatched reason on %s before any write',
+      async (_, uphold, labels, reason) => {
+        await expect(rule(uphold, labels, reason)).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        expect(mockDbWrite.$executeRaw).not.toHaveBeenCalled();
+        expect(mockStampModelTextScanAppeal).not.toHaveBeenCalled();
+        expect(mockGrantModelTextScanPoi).not.toHaveBeenCalled();
+        expect(mockResolveEntityAppeal).not.toHaveBeenCalled();
+      }
+    );
+  });
+
+  // Review Focus 4: an appeal never rolls a moderator's own flag back to a pre-state.
+  it('takes the plain unset path for a moderator-origin minor flag', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: false,
+      meta: { minorFlagSnapshot: { at: 'x', source: 'manual' } },
+    });
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+    expect(mockSetModelMinor).toHaveBeenCalledWith({ id: 42, minor: false, userId: 7 });
+    expect(mockTrackModActivity).not.toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ activity: 'rollbackMinorAutoHash' })
+    );
+    expect(mockStampModelTextScanAppeal).toHaveBeenCalledWith(
+      expect.objectContaining({ decision: 'appealGranted', labels: ['minor'] })
+    );
+  });
+
+  // The appeal is against the automation, so a moderator's confirmation does not stop the rollback
+  // that the revert button refuses.
+  it('still fully reverts an auto flag a moderator later confirmed', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: false,
+      meta: { minorFlagSnapshot: { at: 'x', source: 'manual', confirmedFrom: 'auto' } },
+    });
+    // What the revert button's refusal would read for this flag.
+    mockDbWrite.$queryRaw.mockResolvedValue([{ source: 'manual', humanSince: true }]);
+    mockDbRead.$queryRaw.mockResolvedValueOnce([
+      { ...rollbackRow(), prevMinor: false, ownerDeclaredMinor: false },
+    ]);
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+    expect(mockTrackModActivity).toHaveBeenCalledWith(
+      7,
+      expect.objectContaining({ activity: 'rollbackMinorAutoHash' })
+    );
+    expect(mockSetModelMinor).not.toHaveBeenCalledWith({ id: 42, minor: false, userId: 7 });
+  });
+
+  // Review Focus 2.
+  it('throws and leaves the appeal open when the text hash is unknown', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: false,
+      poi: true,
+      meta: { textScanFlags: { poi: poiEntry } },
+    });
+    mockLoadGrantTextHash.mockResolvedValue(null);
+
+    await expect(
+      resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 })
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(mockGrantModelTextScanPoi).not.toHaveBeenCalled();
+    expect(mockStampModelTextScanAppeal).not.toHaveBeenCalled();
+    expect(mockResolveEntityAppeal).not.toHaveBeenCalled();
+  });
+
+  // The ruling is stamped against the text the moderator reviewed, so a rescan of it would only
+  // re-apply a verdict the grant already covers.
+  it('grants against the scanned text and reports no rescan, though the text changed', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: true,
+      meta: {
+        minorFlagSnapshot: { at: 'x', source: 'text-scan' },
+        textScanFlags: {
+          poi: { ...poiEntry, textHash: 'h-flagged' },
+          minor: { ...poiEntry, textHash: 'h-flagged' },
+        },
+      },
+    });
+    mockLoadGrantTextHash.mockResolvedValue('h-current');
+
+    expect(await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 })).toEqual({
+      rescanQueued: false,
+    });
+    expect(grantStamps()).toEqual([
+      expect.objectContaining({ grantHashes: { minor: 'h-current', poi: 'h-current' } }),
+    ]);
+    expect(mockGrantModelTextScanPoi).toHaveBeenCalledWith({
+      modelId: 42,
+      userId: 7,
+      grantHash: 'h-current',
+    });
+  });
+
+  // The web-search pass can own a label, so each overturned label asks for its own hash.
+  it('grants each overturned label against the hash of the row that owns it', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: true,
+      meta: {
+        minorFlagSnapshot: { at: 'x', source: 'text-scan' },
+        textScanFlags: { poi: poiEntry, minor: poiEntry },
+      },
+    });
+    mockLoadGrantTextHash.mockImplementation(async (_type, _id, label) =>
+      label === 'minor' ? 'h-search' : 'h-main'
+    );
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+    expect(mockLoadGrantTextHash).toHaveBeenCalledWith('Model', 42, 'minor');
+    expect(mockLoadGrantTextHash).toHaveBeenCalledWith('Model', 42, 'poi');
+    expect(grantStamps()).toEqual([
+      expect.objectContaining({ grantHashes: { minor: 'h-search', poi: 'h-main' } }),
+    ]);
+    expect(mockGrantModelTextScanPoi).toHaveBeenCalledWith(
+      expect.objectContaining({ grantHash: 'h-main' })
+    );
+  });
+
+  it('upholds a text-scan poi flag by stamping it, without a minor confirm', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: false,
+      poi: true,
+      meta: { textScanFlags: { poi: poiEntry } },
+    });
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: true, userId: 7 });
+
+    expect(mockDbWrite.$executeRaw).not.toHaveBeenCalled();
+    expect(mockLoadGrantTextHash).not.toHaveBeenCalled();
+    expect(mockStampModelTextScanAppeal).toHaveBeenCalledWith({
+      modelId: 42,
+      userId: 7,
+      decision: 'appealUpheld',
+      labels: ['poi'],
+    });
+    expect(mockResolveEntityAppeal).toHaveBeenCalledWith(
+      expect.objectContaining({ status: AppealStatus.Rejected })
+    );
+  });
+
+  it('refuses to uphold a poi flag an earlier appeal already lifted', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: false,
+      poi: true,
+      meta: {
+        textScanFlags: { poi: { ...poiEntry, appealGranted: { at: 'x', by: 1, textHash: 'h' } } },
+      },
+    });
+
+    await expect(
+      resolveMinorFlagAppeal({ modelId: 42, uphold: true, userId: 7 })
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(mockResolveEntityAppeal).not.toHaveBeenCalled();
+  });
+
+  // The reassert lives in the minor-lift paths themselves; the appeal must not add its own.
+  it('reasserts the poi restrictions once, inside the minor revert, on a model that stays poi', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: true,
+      meta: {
+        minorFlagSnapshot: { at: 'x', source: 'text-scan', prevNsfw: true },
+        textScanFlags: { poi: poiEntry, minor: poiEntry },
+      },
+    });
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 42, prevNsfw: true })]);
+
+    await resolveMinorFlagAppeal({
+      modelId: 42,
+      uphold: false,
+      userId: 7,
+      labels: { minor: 'overturn', poi: 'uphold' },
+    });
+
+    expect(mockReassertModelPoiRestrictions).toHaveBeenCalledTimes(1);
+    expect(mockReassertModelPoiRestrictions).toHaveBeenCalledWith(42);
+    expect(mockGrantModelTextScanPoi).not.toHaveBeenCalled();
+  });
+
+  it('adds no reassert of its own on the plain unset path', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: true,
+      meta: {
+        minorFlagSnapshot: { at: 'x', source: 'manual' },
+        textScanFlags: { poi: poiEntry },
+      },
+    });
+
+    await resolveMinorFlagAppeal({
+      modelId: 42,
+      uphold: false,
+      userId: 7,
+      labels: { minor: 'overturn', poi: 'uphold' },
+    });
+
+    expect(mockSetModelMinor).toHaveBeenCalledWith({ id: 42, minor: false, userId: 7 });
+    expect(mockReassertModelPoiRestrictions).not.toHaveBeenCalled();
+  });
+
+  it('grants poi after the minor revert when both are lifted, so the grant decides the final state', async () => {
+    mockPrimaryModelFindUnique.mockResolvedValue({
+      minor: true,
+      poi: true,
+      meta: {
+        minorFlagSnapshot: { at: 'x', source: 'text-scan' },
+        textScanFlags: { poi: poiEntry, minor: poiEntry },
+      },
+    });
+    mockDbRead.$queryRaw.mockResolvedValue([rollbackRow({ modelId: 42 })]);
+
+    await resolveMinorFlagAppeal({ modelId: 42, uphold: false, userId: 7 });
+
+    expect(mockReassertModelPoiRestrictions).toHaveBeenCalled();
+    expect(mockGrantModelTextScanPoi).toHaveBeenCalled();
+    expect(mockReassertModelPoiRestrictions.mock.invocationCallOrder[0]).toBeLessThan(
+      mockGrantModelTextScanPoi.mock.invocationCallOrder[0]
+    );
+  });
+});
+
+// Review Focus 7: a moderator's revert of a text-scan minor must hold against a rescan of the
+// same text, like their Unset does.
+describe('revertMinorHashAutoFlag — moderator ruling', () => {
+  it('records the ruling before the revert when asked to', async () => {
+    mockStampModeratorTextScanRuling.mockResolvedValue(true);
+    await revertMinorHashAutoFlag({ modelId: 42, userId: 7, recordTextScanRuling: true });
+    expect(mockStampModeratorTextScanRuling).toHaveBeenCalledWith({
+      modelId: 42,
+      userId: 7,
+      label: 'minor',
+    });
+    expect(mockStampModeratorTextScanRuling.mock.invocationCallOrder[0]).toBeLessThan(
+      mockDbRead.$queryRaw.mock.invocationCallOrder[0]
+    );
+  });
+
+  it('records nothing by default — the appeal path stamps its own grant', async () => {
+    await revertMinorHashAutoFlag({ modelId: 42, userId: 7 });
+    expect(mockStampModeratorTextScanRuling).not.toHaveBeenCalled();
+  });
+
+  it('still reverts when the text cannot be read, and logs the miss', async () => {
+    mockStampModeratorTextScanRuling.mockResolvedValue(false);
+    await revertMinorHashAutoFlag({ modelId: 42, userId: 7, recordTextScanRuling: true });
+    expect(mockDbRead.$queryRaw).toHaveBeenCalled();
+    expect(mockLogToAxiom).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'text-scan', modelId: 42 })
+    );
+  });
+});

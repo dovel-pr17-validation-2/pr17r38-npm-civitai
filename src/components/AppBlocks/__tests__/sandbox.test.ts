@@ -1,0 +1,170 @@
+import { describe, expect, it } from 'vitest';
+import { clampReviewSandbox, effectiveSandboxIsOpaque, intersectSandbox } from '../sandbox';
+
+/**
+ * L-SANDBOX coverage. intersectSandbox derives the iframe `sandbox`
+ * attribute from the manifest's declared tokens. The audit flagged that an
+ * empty/garbage declaration fell open to a bare `allow-scripts` default in a
+ * way that could silently widen; the fix makes the floor an explicit minimal
+ * safe set and guarantees the result is never wider than what was declared.
+ */
+describe('intersectSandbox', () => {
+  it('fails closed to the minimal safe set when no recognized tokens are declared', () => {
+    // empty string, whitespace, undefined, and all-unrecognized declarations
+    // must all collapse to exactly the minimal floor — never a wider set.
+    for (const raw of [undefined, '', '   ', 'allow-top-navigation allow-same-origin']) {
+      expect(intersectSandbox(raw, 'unverified')).toBe('allow-scripts');
+    }
+  });
+
+  it('never grants allow-same-origin to an untrusted tier even if declared', () => {
+    // allow-same-origin is not in the allowlist, so a manifest cannot
+    // self-grant it; an unverified block gets only the minimal floor.
+    expect(intersectSandbox('allow-same-origin', 'unverified')).toBe('allow-scripts');
+  });
+
+  it('adds allow-same-origin only for trusted tiers', () => {
+    expect(intersectSandbox(undefined, 'verified').split(' ')).toContain('allow-same-origin');
+    expect(intersectSandbox(undefined, 'internal').split(' ')).toContain('allow-same-origin');
+    expect(intersectSandbox(undefined, 'unverified').split(' ')).not.toContain('allow-same-origin');
+  });
+
+  it('honors recognized declared tokens (union with the minimal floor)', () => {
+    const out = intersectSandbox('allow-forms allow-popups', 'unverified').split(' ');
+    expect(out).toContain('allow-scripts'); // minimal floor always present
+    expect(out).toContain('allow-forms');
+    expect(out).toContain('allow-popups');
+  });
+
+  it('strips unrecognized tokens but keeps recognized ones', () => {
+    const out = intersectSandbox('allow-forms allow-top-navigation evil', 'unverified').split(' ');
+    expect(out).toContain('allow-forms');
+    expect(out).not.toContain('allow-top-navigation');
+    expect(out).not.toContain('evil');
+  });
+
+  it('NEVER grants allow-popups-to-escape-sandbox, at ANY trust tier (#5209)', () => {
+    // 🔴 PINS A DECISION, not an implementation detail. #5209 asked for
+    // `navigate(path, 'new_tab')` to work; the tempting fix was to add this token
+    // so the BLOCK could open its own tab. It was refused: a popup opened by the
+    // frame inherits the opener's sandbox, so without this token it lands at an
+    // opaque origin (logged out — worse than no link), and WITH it a third-party
+    // block gets a browsing context free of the sandbox it was placed in. That is
+    // a real escalation. The HOST opens the tab instead, from the unsandboxed
+    // parent frame, where the destination is host-validated and the new context
+    // inherits no sandbox at all.
+    //
+    // The pre-existing strip test above uses the fixture `'... allow-top-navigation
+    // evil'`, so it never named THIS token — a future widening of
+    // ALLOWED_SANDBOX_TOKENS would have gone unnoticed by every sandbox test.
+    for (const tier of ['unverified', 'verified', 'internal', 'whatever-future-tier']) {
+      const out = intersectSandbox(
+        'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox',
+        tier
+      ).split(/\s+/);
+      // Positive control in the same assertion: a sibling token from the SAME
+      // declaration IS honoured, so a `toContain`-fails-open reading is excluded
+      // and this is a measurement of the allowlist rather than of a broken input.
+      expect(out, tier).toContain('allow-popups');
+      expect(out, tier).not.toContain('allow-popups-to-escape-sandbox');
+    }
+  });
+
+  it('result is never wider than declared ∪ minimal ∪ (tier same-origin)', () => {
+    // Property check: every output token is either the minimal floor, a
+    // validly-declared token, or the tier-gated allow-same-origin.
+    const declared = 'allow-forms allow-downloads';
+    const out = intersectSandbox(declared, 'verified').split(' ');
+    const allowed = new Set([
+      'allow-scripts',
+      'allow-forms',
+      'allow-downloads',
+      'allow-same-origin',
+    ]);
+    for (const t of out) expect(allowed.has(t)).toBe(true);
+  });
+});
+
+/**
+ * MOD REVIEW SANDBOX (#2831) — clampReviewSandbox drops every mod-reaching
+ * capability even if the pending manifest declares it, so a malicious review block
+ * can't open a popup or trigger a download at the moderator's tab.
+ */
+describe('clampReviewSandbox (mod review render-only clamp)', () => {
+  const MOD_REACHING = [
+    'allow-popups',
+    'allow-downloads',
+    'allow-modals',
+    'allow-pointer-lock',
+    'allow-top-navigation',
+    'allow-top-navigation-by-user-activation',
+    'allow-popups-to-escape-sandbox',
+  ];
+
+  it('strips every mod-reaching token a malicious manifest declares — keeps only allow-scripts + allow-forms', () => {
+    const declared =
+      'allow-scripts allow-forms allow-popups allow-downloads allow-modals ' +
+      'allow-pointer-lock allow-top-navigation allow-popups-to-escape-sandbox allow-same-origin';
+    const out = clampReviewSandbox(declared).split(/\s+/);
+    expect(out).toContain('allow-scripts');
+    expect(out).toContain('allow-forms');
+    for (const t of MOD_REACHING) expect(out).not.toContain(t);
+    // NEVER allow-same-origin (the review host also forces the opaque origin).
+    expect(out).not.toContain('allow-same-origin');
+  });
+
+  it('fails closed to the minimal allow-scripts floor for empty / all-stripped manifests', () => {
+    for (const raw of [undefined, '', '   ', 'allow-popups allow-downloads allow-same-origin']) {
+      expect(clampReviewSandbox(raw)).toBe('allow-scripts');
+    }
+  });
+
+  it('the clamped string, run through intersectSandbox(unverified), stays opaque + render-only', () => {
+    // Mirror the real wiring: ReviewBlockPreviewHost passes clampReviewSandbox()
+    // and PageBlockHost re-runs intersectSandbox(…, 'unverified').
+    const eff = intersectSandbox(
+      clampReviewSandbox('allow-scripts allow-popups allow-downloads'),
+      'unverified'
+    );
+    const tokens = eff.split(/\s+/);
+    expect(tokens).toContain('allow-scripts');
+    expect(tokens).not.toContain('allow-popups');
+    expect(tokens).not.toContain('allow-downloads');
+    expect(tokens).not.toContain('allow-same-origin');
+    expect(effectiveSandboxIsOpaque(eff)).toBe(true); // opaque origin preserved
+  });
+});
+
+/**
+ * L-OPAQUE caller derivation. The host's postMessage transport must run in
+ * opaque mode iff the EFFECTIVE iframe sandbox lacks `allow-same-origin` (i.e.
+ * the frame runs at an opaque 'null' origin). Both callers (PageBlockHost +
+ * IframeHost) derive `opaqueOrigin = effectiveSandboxIsOpaque(effectiveSandbox)`
+ * from the SAME `intersectSandbox(...)` value they hand to the iframe
+ * `sandbox` attribute, so transport mode can never drift from the actual frame
+ * origin.
+ */
+describe('effectiveSandboxIsOpaque (transport-mode derivation)', () => {
+  it('unverified tier → no allow-same-origin → opaque (true)', () => {
+    const eff = intersectSandbox('allow-forms', 'unverified');
+    expect(eff.split(/\s+/)).not.toContain('allow-same-origin');
+    expect(effectiveSandboxIsOpaque(eff)).toBe(true);
+  });
+
+  it('internal tier → has allow-same-origin → NOT opaque (false, pinned path preserved)', () => {
+    const eff = intersectSandbox('allow-forms', 'internal');
+    expect(eff.split(/\s+/)).toContain('allow-same-origin');
+    expect(effectiveSandboxIsOpaque(eff)).toBe(false);
+  });
+
+  it('verified tier → has allow-same-origin → NOT opaque (false)', () => {
+    expect(effectiveSandboxIsOpaque(intersectSandbox(undefined, 'verified'))).toBe(false);
+  });
+
+  it('direct token checks', () => {
+    expect(effectiveSandboxIsOpaque('allow-scripts')).toBe(true);
+    expect(effectiveSandboxIsOpaque('allow-scripts allow-same-origin')).toBe(false);
+    // word-boundary safe: a token that merely contains the substring is not a match
+    expect(effectiveSandboxIsOpaque('allow-same-origin-ish')).toBe(true);
+  });
+});

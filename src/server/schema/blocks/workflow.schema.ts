@@ -1,0 +1,1547 @@
+import * as z from 'zod';
+import { buzzSpendTypes } from '~/shared/constants/buzz.constants';
+import type { BuzzSpendType } from '~/shared/constants/buzz.constants';
+import { REGISTERED_RECIPE_IDS } from '~/server/services/blocks/recipes';
+import { REGISTERED_STEP_IDS } from '~/server/services/blocks/steps';
+import type { BlockStepToolCall } from '~/server/services/blocks/steps';
+import type {
+  TrainingQuoteErrorCode,
+  StepQuoteErrorCode,
+  WorkflowQuoteErrorCode,
+} from '~/server/services/blocks/pass-through-quote-failure';
+import type { CONFIRMED_STEP_DAILY_LIMIT_ERROR_CODE } from '~/shared/constants/block-scope.constants';
+import type { BlockWorkflowErrorCode } from '~/server/services/blocks/workflow-graph';
+import type { InlineComfyRefusedCode } from '~/server/services/blocks/inline-comfy.service';
+import { detectGraphFormat } from '~/components/AppBlocks/resourceFileParse';
+import {
+  civitaiHostedImageUrlSchema,
+  SOURCE_IMAGE_URL_MAX,
+} from '~/server/schema/blocks/civitai-image-url';
+import type { ModelSubstitutionReason } from '~/shared/generation/model-substitution';
+import { BLOCK_ESTIMATE_BATCH_MAX_CELLS } from '~/shared/constants/block-estimate-batch.constants';
+import { aiToolkitTrainingParamsSchema } from '~/server/schema/orchestrator/training.schema';
+import {
+  findInlineMediaPath,
+  INLINE_MEDIA_MAX_VISITS,
+  INLINE_MEDIA_OVER_BYTE_LIMIT,
+  INLINE_MEDIA_TOO_MANY_VALUES,
+  inlineMediaMessage,
+} from '~/server/schema/blocks/inline-media';
+import type { InlineMediaPath } from '~/server/schema/blocks/inline-media';
+import { jsonLengthWithin, measureJsonLength } from '~/server/schema/blocks/json-length';
+import { blockTrainingDatasetItemsSchema } from '~/server/schema/blocks/training-dataset.schema';
+
+// The spendable buzz account types a viewer may pick for a (money) page block.
+// Reuse the authoritative `buzzSpendTypes` (blue/green/yellow — `red` is
+// disabled and filtered out) rather than a fresh literal so this stays in sync
+// with the buzz-constants source of truth. The domain-maturity policy still
+// CLAMPS which of these is actually spendable per-request in blocks.router
+// (SFW → blue/green, mature → blue/yellow) — this enum only bounds the wire
+// surface; it never widens the allowed set.
+const blockAccountTypeSchema = z.enum(buzzSpendTypes as [BuzzSpendType, ...BuzzSpendType[]]);
+
+// `textToImage` is the block-supported kind. It now covers the whole IMAGE
+// workflow class (App Blocks IMAGE bridge): a bare body maps to a `txt2img`
+// graph workflow, and a body carrying a bounded `sourceImage` maps to an img2img
+// workflow whose variant is chosen from the checkpoint's ecosystem — `img2img`
+// (SD-family) or `img2img:edit` (edit-capable: OpenAI/Qwen/Flux Kontext/…). See
+// buildImageWorkflowInput / BLOCK_IMAGE_WORKFLOW_TYPES in
+// workflow.service. A later phase adds a NON-image media class (video/audio/3D)
+// as a NEW discriminated-union `kind` here, which must also (a) extend the
+// discriminator in blocks.router workflow procedures, (b) be exposed by
+// @civitai/app-sdk's useBuzzWorkflow contract.
+//
+// `customComfy` is the second `kind` (App Blocks customComfy bridge, v1). Unlike
+// `textToImage` (which maps a bounded body onto a generation GRAPH the server
+// builds), a `customComfy` body carries only a server-side `recipe` id + opaque
+// `params` — the server owns the ComfyUI graph in full (a fixed, code-reviewed
+// recipe from `~/server/services/blocks/recipes`). The wire schema does only the
+// COARSE fail-closed gate here: `recipe` MUST be a registered id
+// (REGISTERED_RECIPE_IDS, derived from the recipe registry keys) and `params` is
+// an opaque record; the per-recipe `.strict()` param schema is applied in the
+// TRANSLATOR (workflow.service `buildCustomComfyWorkflowInput`), not here, so the
+// wire surface stays recipe-agnostic. Mirrors `@civitai/app-sdk`'s
+// `WorkflowBodyCustomComfy` (civitai-app-starters PR #171) — keep the two in
+// lockstep.
+//
+// LIVE: blocks.router now branches on `kind==='customComfy'` in BOTH
+// `estimateWorkflow` and `submitWorkflow` (see `estimateCustomComfyWorkflow` /
+// `submitCustomComfyWorkflow`), backed by the post-paid budget belt
+// (`settleCustomComfySpend`) and the `buildCustomComfyWorkflowInput` translator.
+// The earlier "INERT/DARK — router handles ONLY textToImage" note is obsolete;
+// both members of this union are wired end-to-end.
+//
+// Caps are intentionally tighter than the platform-wide generateImageSchema —
+// blocks run in untrusted iframes and the token issuer caps per-call buzz at
+// BUZZ_BUDGET_CAP, so wide-open quantity/dimensions wouldn't be honored
+// anyway. Trim the surface area at the boundary instead of relying on
+// downstream gates.
+
+const PROMPT_MAX = 1500;
+const NEG_PROMPT_MAX = 1500;
+// Exported so the client-side generationSource upload modal
+// (BlockGenerationSourceUploadModal) can downscale a chosen image to fit the
+// SAME bounds the sourceImage schema enforces BEFORE upload — a single source of
+// truth, so the client resize target can never drift from the server clamp.
+export const DIM_MIN = 64;
+export const DIM_MAX = 2048;
+const STEPS_MAX = 50;
+const QUANTITY_MAX = 4;
+const CLIP_SKIP_MAX = 12;
+// Bound for the opaque published-content-author key (`sharedContentKey`).
+// Matches the shared-storage key shape (apps-shared.router `sharedKeyInput`
+// is ≤64) so a server-ULID row key or an app counter key both fit.
+const SHARED_CONTENT_KEY_MAX = 64;
+
+// Page-LoRA caps (App Blocks Page-LoRA, Increment 1). Intentionally tighter
+// than the platform per-tier resource cap — these come from an untrusted
+// iframe, so bound the resource fan-out + strength at the boundary rather than
+// relying on the downstream orchestrator belt. A page block sends the
+// additional resources (LoRA version ids) it obtained out-of-band (author-
+// curated or user-pasted); the server re-derives type/baseModel/entitlement
+// from each version id (no per-LoRA modelId binding — pages have no JWT model
+// binding). `epochNumber` is intentionally OMITTED in v1: epochs imply
+// Private/subscription resources and add a subscription dimension we defer.
+export const MAX_ADDITIONAL_RESOURCES = 5;
+export const LORA_STRENGTH_MIN = -1;
+export const LORA_STRENGTH_MAX = 2;
+
+const blockAdditionalResourceSchema = z.object({
+  modelVersionId: z.number().int().positive(),
+  // Strict (non-coerced) parity with modelVersionId. Block bodies are JSON, so
+  // strength arrives as a real number; z.coerce would let `""`/`[]`/`true`/null
+  // slip through to 0/1 instead of being rejected.
+  strength: z.number().min(LORA_STRENGTH_MIN).max(LORA_STRENGTH_MAX).default(1),
+});
+
+// ── img2img source image (App Blocks IMAGE bridge, Phase-2a) ─────────────────
+// The block body is UNTRUSTED iframe input, so an init/source image MUST NOT be
+// an arbitrary remote URL the generator would fetch (SSRF / arbitrary-fetch).
+// It is bounded to a Civitai-controlled host by `civitaiHostedImageUrlSchema`.
+//
+// 🔴 That predicate MOVED — unchanged — to `~/server/schema/blocks/civitai-image-url`,
+// which is where its full reasoning now lives (hostname-not-substring, the two
+// WHATWG parser-differential classes it closes, and the canonicalize-what-you-
+// validate rule). It moved because the `kind: 'step'` registry needs the SAME
+// bound for every step type that takes an image URL (`convert-image` today) and
+// cannot import this module — this module imports the registry to derive its
+// wire enums, so it would be a cycle. One rule, one place.
+//
+// Re-exported here because `SOURCE_IMAGE_URL_MAX` was part of this module's
+// public surface before the move.
+export { SOURCE_IMAGE_URL_MAX };
+
+const blockSourceImageSchema = z.object({
+  url: civitaiHostedImageUrlSchema,
+  // Dimension hints for the graph's denoise/aspect derivation. Bounded to the
+  // same block caps as params so an iframe can't send absurd dimensions.
+  width: z.coerce.number().int().min(DIM_MIN).max(DIM_MAX),
+  height: z.coerce.number().int().min(DIM_MIN).max(DIM_MAX),
+});
+
+export type BlockSourceImage = z.infer<typeof blockSourceImageSchema>;
+
+// ── Multi-image conditioning (App Blocks IMAGE bridge) ───────────────────────
+// ABSOLUTE wire bound on `sourceImages`, NOT the real cap. The real cap is
+// PER-ECOSYSTEM and derived from the graph's own `imagesDef` config at build
+// time (`getImagesLimit`, ranging 1–10). This constant only stops an untrusted
+// iframe from posting an
+// unbounded array before the body is even parsed — it is set ABOVE the largest
+// per-ecosystem cap on purpose so a future ecosystem raising its own limit is
+// not silently clamped here. Every element is validated individually against
+// `blockSourceImageSchema` (Civitai-host + dimension bounds), never just [0].
+export const BLOCK_SOURCE_IMAGES_WIRE_MAX = 10;
+
+const blockTextToImageBodySchema = z.object({
+  kind: z.literal('textToImage'),
+  modelId: z.number().int().positive(),
+  modelVersionId: z.number().int().positive(),
+  // Optional LoRA stack (Increment 1, LoRA-only v1). Each entry resolves to a
+  // LoRA-type model version that the server entitlement-gates per-resource and
+  // base-model-family-matches against the checkpoint before any spend. Capped
+  // at MAX_ADDITIONAL_RESOURCES for the iframe posture above.
+  additionalResources: z
+    .array(blockAdditionalResourceSchema)
+    .max(MAX_ADDITIONAL_RESOURCES)
+    .optional(),
+  // Optional img2img init/source image (App Blocks IMAGE bridge).
+  // When present, the block bridge emits an img2img graph workflow whose VARIANT
+  // is chosen from the checkpoint's ecosystem (buildImageWorkflowInput /
+  // resolveBlockImageWorkflowType): SD-family ecosystems → `img2img` ("Image
+  // Variations"); edit-capable ecosystems (OpenAI/Qwen/Flux Kontext/… —
+  // EDIT_IMG_IDS) → `img2img:edit`; when absent, behavior is byte-identical to
+  // before (txt2img). Bounded to a Civitai-hosted image (see
+  // blockSourceImageSchema) — never an arbitrary remote URL.
+  //
+  // Two scope limits are enforced downstream (NOT at the wire schema, which only
+  // bounds shape): (1) blocks.router rejects `sourceImage` on a MODEL-bound token
+  // — img2img is PAGE-only, mirroring `additionalResources`; (2)
+  // buildImageWorkflowInput rejects fail-closed a checkpoint whose ecosystem
+  // supports NEITHER img2img variant (deterministically via `isWorkflowAvailable`,
+  // never relying on the graph's safeParse auto-correction).
+  //
+  // 🔴 DEPRECATED ALIAS — kept working indefinitely. The published developer
+  // docs and `@civitai/app-sdk` both ship `sourceImage` today, so removing it
+  // would break every deployed block. `sourceImages` (below) is the current
+  // field; the server normalizes the singular into a 1-element array
+  // (`normalizeBlockSourceImages`) and everything downstream sees only arrays.
+  sourceImage: blockSourceImageSchema.optional(),
+  // Multi-image conditioning. The graph layer has always supported N images
+  // (`imagesDef({ min, max, slots })`); the block bridge could only ever
+  // express one. Each element is validated INDIVIDUALLY (Civitai-hosted https
+  // host check + DIM_MIN/DIM_MAX bounds) — the array form has exactly the same
+  // per-image posture as the singular one, with no "first element only" gap.
+  //
+  // Bounds: `.min(1)` — an EMPTY array is REJECTED rather than silently treated
+  // as "no source image". A caller that sends `sourceImages: []` computed an
+  // empty list and meant to send images; quietly downgrading that to a txt2img
+  // generation would bill them for something they did not ask for, which is the
+  // silent-wrong-answer failure mode this bridge has already been bitten by.
+  // Omit the field entirely for txt2img. `.max()` is the absolute wire bound —
+  // the REAL cap is per-ecosystem and enforced in buildImageWorkflowInput.
+  //
+  // Supplying BOTH `sourceImage` and `sourceImages` is rejected as ambiguous
+  // (see the union-level check below) rather than picking a winner.
+  sourceImages: z
+    .array(blockSourceImageSchema)
+    .min(1, 'sourceImages must not be empty — omit the field for text-to-image')
+    .max(BLOCK_SOURCE_IMAGES_WIRE_MAX)
+    .optional(),
+  // Optional viewer-picked buzz account to spend (money page blocks). Absent →
+  // unchanged Auto behavior (domain-allowed currencies drained blue-first). When
+  // present, blocks.router moves it to the FRONT of the domain-allowed currency
+  // order (preferred-first, then fall back) and REJECTS it if it's outside the
+  // domain-allowed set — the maturity policy is never widened here. See
+  // `resolveBlockCurrenciesForAccount`.
+  accountType: blockAccountTypeSchema.optional(),
+  // Optional GENERIC published-content-author attribution basis. The opaque
+  // shared-storage `key` of the cross-user published content this generation
+  // is running on behalf of — the app supplies it out-of-band from its own
+  // shared data (a document in one of its shared document-store collections, or a
+  // legacy `app_<slug>.shared_kv` row). When present, the server resolves
+  // it (SERVER-SIDE, off the submit critical path) to the content's AUTHOR and
+  // records that user as the payout basis on the spend-attribution row. Purely
+  // opaque + advisory here: this is NEVER trusted as an author (the author is
+  // re-derived from the key server-side), so a forged key can at worst point at
+  // a non-existent row (→ no attribution). Bounded to the same key shape as the
+  // shared-storage surface (≤64). Omit when N/A — behavior is unchanged.
+  // FULLY GENERIC: any app that publishes cross-user content can send it — not
+  // tied to any one app kind.
+  sharedContentKey: z.string().min(1).max(SHARED_CONTENT_KEY_MAX).optional(),
+  params: z.object({
+    prompt: z.string().max(PROMPT_MAX).default(''),
+    negativePrompt: z.string().max(NEG_PROMPT_MAX).optional(),
+    cfgScale: z.coerce.number().min(1).max(30).optional(),
+    sampler: z.string().min(1).max(64).optional(),
+    steps: z.coerce.number().int().min(1).max(STEPS_MAX).optional(),
+    seed: z.coerce.number().int().nullish(),
+    width: z.coerce.number().int().min(DIM_MIN).max(DIM_MAX).optional(),
+    height: z.coerce.number().int().min(DIM_MIN).max(DIM_MAX).optional(),
+    // SD/SDXL per-resource convention. Flux ignores it. Cap at 12 (the
+    // platform-wide constant in generation.constants.ts).
+    clipSkip: z.coerce.number().int().min(0).max(CLIP_SKIP_MAX).optional(),
+    quantity: z.coerce.number().int().min(1).max(QUANTITY_MAX).default(1),
+  }),
+});
+
+// Supplying BOTH the deprecated `sourceImage` and the current `sourceImages` is
+// AMBIGUOUS — we refuse rather than pick a winner. Silently preferring one is
+// exactly how a caller ends up conditioning on an image it thought it had
+// replaced. Enforced at the WIRE schema so both `estimateWorkflow` and
+// `submitWorkflow` inherit it from the single parse, with no way to reach the
+// translator holding both.
+const blockTextToImageBodySchemaChecked = blockTextToImageBodySchema.refine(
+  (body) => !(body.sourceImage && body.sourceImages),
+  {
+    path: ['sourceImages'],
+    message:
+      'send either `sourceImage` (deprecated) or `sourceImages`, not both — they are ambiguous together',
+  }
+);
+
+// ── customComfy: ARM-AWARE REJECTION MESSAGES ────────────────────────────────
+//
+// 🔴 MESSAGE QUALITY ONLY. Nothing below widens or narrows what parses — both
+// arms keep `.strict()` and every field bound is untouched. These helpers only
+// replace the TEXT of two issue kinds the union itself raises.
+//
+// WHY. `customComfy` is a nested discriminated union whose two arms are the
+// whole feature, and until now a body that landed on the wrong arm was told
+// only the name of the key that offended it:
+//
+//   { kind:'customComfy', recipe:'…', graph:{…}, params:{…} }
+//   → `Unrecognized key: "graph"`
+//
+// That answer is CORRECT — keeping `recipe` pins the recipe arm and `.strict()`
+// refuses `graph` — and it is also how a blind-dogfooding developer concluded
+// the inline arm did not exist on the wire at all, and built a workaround. The
+// union knows BOTH of its arms at rejection time; every other rejection on this
+// platform enumerates what IS valid (an unregistered recipe id lists the
+// registered recipes, an unregistered step id lists the registered steps, a
+// malformed AIR prints the AIR grammar), and this was the one place that did
+// not.
+//
+// 🔴 THE ENUMERATION IS DERIVED FROM THE ARM'S OWN SHAPE, NEVER HAND-WRITTEN.
+// That is a SAFETY property, not just DRY. The orchestrator's `CustomComfyInput`
+// carries fields an app must never set (see the `.strict()` note on the inline
+// arm below); those fields are by construction ABSENT from both shapes, so a
+// list derived from `Object.keys(shape)` cannot name one. A hand-written list
+// could — and would turn a helpful error into a map of the internal payload.
+// It also cannot rot: adding a public field to an arm updates the message.
+//
+// COST: these run only on a REJECTED body. Nothing extra happens on the happy
+// path — no second parse, no round-trip.
+const customComfyRecipeShape = {
+  kind: z.literal('customComfy'),
+  mode: z.literal('recipe').optional(),
+  recipe: z.enum(REGISTERED_RECIPE_IDS),
+  params: z.record(z.string(), z.unknown()),
+};
+
+/**
+ * The public wire keys of one `customComfy` arm, in declaration order.
+ *
+ * Declared as a hoisted function, not a const, because `inlineComfyShape` is
+ * defined further down the file — the body only ever runs while formatting a
+ * rejection, long after module init, so the forward reference is safe.
+ */
+function customComfyArmKeys(arm: 'recipe' | 'inline'): string {
+  const shape = arm === 'recipe' ? customComfyRecipeShape : inlineComfyShape;
+  return Object.keys(shape).join(', ');
+}
+
+/** One-line description of an arm, used in both directions of the cross-reference. */
+function customComfyArmHelp(arm: 'recipe' | 'inline'): string {
+  return arm === 'recipe'
+    ? `mode:"recipe" (the default when \`mode\` is omitted) runs a server-registered recipe by id and accepts only: ${customComfyArmKeys(
+        'recipe'
+      )}`
+    : `mode:"inline" carries the ComfyUI graph itself — the graph goes under \`workflow\` — and accepts only: ${customComfyArmKeys(
+        'inline'
+      )}`;
+}
+
+/**
+ * Error map for ONE arm's `.strict()` rejection: name the arm the body landed
+ * on, list that arm's keys, and point at the other arm.
+ *
+ * Returns `undefined` for every other issue code so zod falls through to its own
+ * message — a bad `maxBuzz` still reports `Too big: …` at `path:['maxBuzz']`,
+ * unchanged.
+ */
+function customComfyArmErrorMap(arm: 'recipe' | 'inline') {
+  const other = arm === 'recipe' ? 'inline' : 'recipe';
+  return (iss: { code?: string; keys?: unknown }): string | undefined => {
+    if (iss.code !== 'unrecognized_keys') return undefined;
+    const keys = Array.isArray(iss.keys) ? iss.keys : [];
+    const named = keys.map((k) => `"${String(k)}"`).join(', ');
+    return (
+      `Unrecognized key${keys.length === 1 ? '' : 's'} on a \`customComfy\` ${arm} body: ${named}` +
+      ` — a \`customComfy\` body has two forms. ${customComfyArmHelp(arm)}.` +
+      ` ${customComfyArmHelp(other)}.`
+    );
+  };
+}
+
+// App Blocks customComfy bridge (v1). Coarse fail-closed wire gate only:
+//  - `recipe` MUST be a REGISTERED recipe id (derived from the recipe registry
+//    keys) — an unregistered id is rejected at the union, before any translator
+//    or orchestrator call.
+//  - `params` is an opaque `Record<string, unknown>` here; the per-recipe
+//    `.strict()` param schema (prompt/seed/engine/accountType bounds) is applied
+//    in the translator (`buildCustomComfyWorkflowInput`), which is the single
+//    place a recipe's real param contract lives.
+//  - `.strict()` rejects any extra top-level field on the body.
+//  - `mode` is the ARM discriminator, and on this arm it is an OPTIONAL literal
+//    so an existing body that omits it (every deployed app, every published
+//    `@civitai/app-sdk` body) still lands here. See the union at the bottom of
+//    this file for why `.optional()` and not `.default()` — the difference is
+//    load-bearing and was measured, not assumed.
+export const blockCustomComfyBodySchema = z
+  .object(customComfyRecipeShape, { error: customComfyArmErrorMap('recipe') })
+  .strict();
+
+// ── App Blocks customComfy INLINE-GRAPH arm (`kind:'customComfy'`, `mode:'inline'`) ──
+//
+// The SECOND arm of the `customComfy` member. Where the recipe arm names one of
+// two server-authored graphs, this one carries the ComfyUI graph ITSELF, so an
+// app can ship a workflow the registry does not contain. The recipe arm above is
+// UNCHANGED and stays the default: a body with no `mode` is a recipe body and
+// parses byte-identically to before.
+//
+// 🔴 WHAT THE RECIPE ARM PROVIDED THAT THIS ONE MUST REPLACE. A recipe is a
+// CODE-REVIEWED in-repo artifact, and that review was the trust root for three
+// separate things. An inline graph has no review, so each is replaced by a
+// mechanical gate — see `services/blocks/inline-comfy.service`:
+//   1. `resourceAllowlist` (only fully-public pinned versions) → a real
+//      entitlement belt over the app-supplied `resources` array, which folds
+//      early-access `hasAccess` and Private-subscription.
+//   2. `paramSchema.prompt` (the field `auditPromptServer` reads) → a sweep of
+//      every string leaf in the graph, audited alongside the declared prompt. An
+//      inline graph carries its prompts inside `CLIPTextEncode` nodes, so
+//      auditing a declared field ALONE would make moderation a silent no-op.
+//   3. `budgetFor()` (the `maxBuzz === ceil(stepTimeoutSeconds)` ceiling) → the
+//      app declares `maxBuzz` and the server derives
+//      `stepTimeoutSeconds = maxBuzz`. The invariant then holds BY CONSTRUCTION
+//      — there is only one number — and the whole post-paid spend belt (static
+//      gate, both reservations, settle-to-actual) is reused untouched.
+//
+// 🔴 `.strict()` IS LOAD-BEARING HERE, NOT HYGIENE. The orchestrator's
+// `CustomComfyInput` carries fields an app must NEVER set — `sessionOwnerApiToken`
+// (a Civitai API token forwarded to the claiming worker), `comfyImage` (an OCI
+// image AIR, i.e. an arbitrary container), `minVramGb` (changes the worker tier
+// and therefore the Buzz/second rate the whole ceiling argument rests on),
+// `sessionId`, `useSageAttention`, `minimumDurationSeconds`. The step input is
+// CONSTRUCTED SERVER-SIDE from an allowlisted set of fields; the app's body is
+// never spread into it. `.strict()` is the second belt: an app that sends one of
+// those names is rejected at the wire rather than silently ignored.
+
+/**
+ * Hard per-job Buzz ceiling an inline body may declare.
+ *
+ * 🔴 IT IS THE BINDING BOUND, NOT A REDUNDANT ONE — and this docblock asserted
+ * the opposite until this comment replaced it. It read: "DERIVED, not invented.
+ * This surface is developer-only (`assertViewerIsAppDeveloper` gates every
+ * customComfy submit), and the developer path's own per-call budget ceiling is
+ * `DEV_BUZZ_BUDGET_CAP` (250) … — a declared `maxBuzz` above that is unreachable
+ * through a dev token anyway". Both halves are false, and `PASS_THROUGH_MAX_BUZZ`
+ * below has recorded them as false for as long as it has existed — it even names
+ * THIS docblock as still carrying the claim. NEITHER `customComfy` arm runs
+ * `assertViewerIsAppDeveloper`; the gates the two arms share are page-token-only,
+ * the `ai:write:budgeted` scope, a resolvable token subject, the per-user Apps
+ * kill-switch and a positive `claims.buzzBudget`. And an ordinary install token's
+ * per-call budget clamps at `BUZZ_BUDGET_CAP` (see
+ * `shared/constants/block-scope.constants`) — many times this number. So this constant
+ * is the only thing stopping an inline body declaring a ceiling between this number and
+ * that cap, and RAISING IT CHANGES WHAT ONE JOB CAN COST AN ORDINARY VIEWER. The
+ * false version read as "raising this changes nothing".
+ *
+ * Its VALUE is a policy choice about what one inline job may cost a viewer, set
+ * comfortably above the largest shipped recipe ceiling (180, the `qwen-image`
+ * engine of `seamless-pano-360`) so an inline graph is not more constrained than a
+ * recipe. It must stay at or below `DEV_BUZZ_BUDGET_CAP` in
+ * `services/blocks/dev-scoped-mint.service`, so a pre-approval token can afford any
+ * inline job and an app can be developed and reviewed at the price it will charge.
+ *
+ * Deliberately a LITERAL here rather than an import: this module is imported by
+ * the wire layer and must stay import-light, while `dev-scoped-mint.service`
+ * pulls in the block-token service.
+ * `src/server/schema/blocks/__tests__/workflow.schema.inline-comfy.test.ts`
+ * imports both and pins `INLINE_MAX_BUZZ <= DEV_BUZZ_BUDGET_CAP`.
+ * (That sentence used to name `inline-comfy-budget.test.ts`, a file that does not
+ * exist anywhere in this repo — the guard is real, the filename was not.)
+ */
+export const INLINE_MAX_BUZZ = 250;
+
+/** Max AIR URNs an inline body may declare. Bounds the entitlement fan-out. */
+export const INLINE_RESOURCES_MAX = 24;
+/** Max characters in a single declared AIR URN. */
+const INLINE_AIR_MAX_LEN = 512;
+/** Max nodes in an inline graph. */
+export const INLINE_GRAPH_NODES_MAX = 300;
+/**
+ * Max serialized bytes of an inline graph.
+ *
+ * Two jobs. (1) Payload DoS: `workflow` is an unbounded `Record<string, unknown>`
+ * on a submit path, so without this a single request can be arbitrarily large.
+ * (2) It is what BOUNDS THE MODERATION SWEEP — the prompt audit walks every
+ * string leaf in the graph, so an unbounded graph would be an unbounded audit
+ * payload. Real ComfyUI graphs are single-digit to low-tens of KB; 256 KB is
+ * generous for a graph and still a hard bound.
+ */
+export const INLINE_GRAPH_BYTES_MAX = 256 * 1024;
+
+/** A ComfyUI `/prompt` graph node on the wire: `class_type` + `inputs`. */
+const inlineComfyNodeSchema = z
+  .object({
+    class_type: z.string().min(1).max(128),
+    inputs: z.record(z.string(), z.unknown()),
+  })
+  .strict();
+
+/** A ComfyUI API-format (`/prompt`) graph: node id → node. */
+export const inlineComfyApiGraphSchema = z.record(z.string(), inlineComfyNodeSchema);
+
+/**
+ * The inline arm's `workflow`: any JSON object, held to the strict API-node schema
+ * only when it is API-shaped (`detectGraphFormat` says `api`: every value carries
+ * `class_type` and `inputs`).
+ *
+ * 🔴 A GRAPH THAT IS NOT API-SHAPED PASSES HERE ON PURPOSE, AND IS REFUSED ONE
+ * STEP LATER. A UI (editor) graph used to fail this field with a schema error,
+ * which is thrown at the tRPC boundary and cannot carry the `errorCode` a block
+ * branches on. Letting it through means `checkInlineComfyGraph`
+ * (`services/blocks/inline-comfy.service`) refuses it in the estimate and the
+ * submit with `errorCode: 'not-api-format'`, before anything is quoted, reserved
+ * or submitted. That check is not optional for a caller: it is the only source of
+ * the typed `ComfyGraph` the submit's gates and step builder take.
+ *
+ * An API-shaped graph gets exactly the validation it had before, with the same
+ * issues at the same paths.
+ */
+const inlineComfyWorkflowSchema = z.record(z.string(), z.unknown()).superRefine((graph, ctx) => {
+  if (detectGraphFormat(graph) !== 'api') return;
+  const parsed = inlineComfyApiGraphSchema.safeParse(graph);
+  if (parsed.success) return;
+  for (const issue of parsed.error.issues) ctx.addIssue({ ...issue });
+});
+
+// 🔴 EXTRACTED AS A NAMED SHAPE, not inlined into `z.object({…})`, so
+// `customComfyArmKeys('inline')` can enumerate this arm's PUBLIC keys in a
+// rejection message without a hand-written list that could drift — or name one
+// of the fields `.strict()` exists to refuse. See the ARM-AWARE REJECTION
+// MESSAGES block above the recipe arm.
+const inlineComfyShape = {
+  kind: z.literal('customComfy'),
+  // The arm discriminator. A LITERAL rather than "has a `workflow` key" so the
+  // two arms can never both match, the rejection names the arm, and a future
+  // field addition to either arm cannot silently change which one a body hits.
+  mode: z.literal('inline'),
+  workflow: inlineComfyWorkflowSchema,
+  // The orchestrator's DECLARED DOWNLOAD MANIFEST. The graph itself is opaque
+  // to the orchestrator ("Forwarded opaquely to the worker; the orchestrator
+  // does not inspect or validate node contents" — `CustomComfyInput.workflow`),
+  // so this flat array is the entire untrusted entitlement surface. Gated by
+  // `assertViewerEntitledToInlineResources`; ALSO cross-checked for containment
+  // against AIRs appearing in the graph, so the "opaque" claim is not
+  // load-bearing.
+  resources: z.array(z.string().min(1).max(INLINE_AIR_MAX_LEN)).max(INLINE_RESOURCES_MAX),
+  // Declared so an app can surface what it asked for. NOT trusted as the
+  // complete moderation surface — the graph is swept too (see above).
+  prompt: z.string().max(PROMPT_MAX).default(''),
+  negativePrompt: z.string().max(NEG_PROMPT_MAX).default(''),
+  // The ONLY spend knob. The server derives `stepTimeoutSeconds = maxBuzz` and
+  // stamps it as the step timeout, which is the PHYSICAL cap.
+  maxBuzz: z.number().int().min(1).max(INLINE_MAX_BUZZ),
+};
+
+export const blockInlineComfyBodySchema = z
+  .object(inlineComfyShape, { error: customComfyArmErrorMap('inline') })
+  .strict()
+  .refine((b) => Object.keys(b.workflow).length > 0, {
+    path: ['workflow'],
+    message: 'inline workflow must contain at least one node',
+  })
+  .refine((b) => Object.keys(b.workflow).length <= INLINE_GRAPH_NODES_MAX, {
+    path: ['workflow'],
+    message: `inline workflow may contain at most ${INLINE_GRAPH_NODES_MAX} nodes`,
+  })
+  .refine((b) => jsonLengthWithin([b.workflow], INLINE_GRAPH_BYTES_MAX), {
+    path: ['workflow'],
+    message: `inline workflow exceeds the ${INLINE_GRAPH_BYTES_MAX}-byte limit`,
+  });
+
+// ── App Blocks STEP-TYPE bridge (`kind: 'step'`) — RFC #3515 migration step 1 ──
+//
+// The THIRD union member, added ALONGSIDE the existing two. `textToImage` and
+// `customComfy` are untouched: this member only ADDS a discriminant, so every
+// deployed block and every published `@civitai/app-sdk` body keeps parsing and
+// behaving exactly as before.
+//
+// Where the other two members each hand-wrote a capability, this one is
+// REGISTRY-BACKED: `step` must be a registered id (`REGISTERED_STEP_IDS`,
+// derived from the step-registry keys), and everything about the capability —
+// its bounded params, its billing mode, its moderation posture, its builder —
+// lives in that entry. Adding a capability is a registry entry, not a new union
+// member and not a router branch. That is the point: sibling union members are
+// what make consolidation a breaking change for every published app once the
+// wire contract is public.
+//
+// The wire gate here is deliberately COARSE, exactly mirroring `customComfy`:
+//  - `step` MUST be a REGISTERED id — an unregistered id is rejected AT THE
+//    UNION, before any translator, any spend reservation, or any orchestrator
+//    call. Fail-closed at the schema.
+//  - `params` is an opaque `Record<string, unknown>` here; the per-step
+//    `.strict()` param schema is applied by the handler, which is the single
+//    place a step's real param contract lives. That keeps the wire surface
+//    step-agnostic, so registering a step never edits this file.
+//  - `.strict()` rejects any extra top-level field on the body.
+//
+// 🔴 `customComfy` is NOT migrated behind the registry here. That is the RFC's
+// migration step 3 (with `kind: 'customComfy'` retained as a deprecated alias)
+// and is deliberately out of scope — step 1 is "land the registry alongside the
+// existing members; nothing breaks".
+//
+// Built through a FACTORY rather than inline so the "enum is derived from the
+// registry, not hardcoded" property is directly testable: a test can build the
+// same schema over a widened id list and assert the enum grew.
+export function makeBlockStepBodySchema(stepIds: [string, ...string[]]) {
+  return z
+    .object({
+      kind: z.literal('step'),
+      step: z.enum(stepIds),
+      params: z.record(z.string(), z.unknown()),
+    })
+    .strict();
+}
+
+export const blockStepBodySchema = makeBlockStepBodySchema(REGISTERED_STEP_IDS);
+
+// ── App Blocks PASS-THROUGH arm (`kind:'step'` with no `step` id) ─────────────
+//
+// The SECOND arm of the `kind: 'step'` member, and the one that makes this
+// bridge a denylist-only proxy. The registry arm above names a server-registered
+// capability by id and the server translates; this arm names an ORCHESTRATOR
+// `$type` directly and forwards `input` unmodified. Only
+// `PLATFORM_INTERNAL_STEP_TYPES` stands between the two (`assertStepTypeAllowed`,
+// called on the submitted `$type` in blocks.router before any spend reservation
+// or orchestrator call).
+//
+// 🔴 WHAT THE REGISTRY ARM PROVIDED THAT THIS ONE DOES NOT REPLACE. Four of the
+// registry's controls are deliberately absent here, by operator decision, and a
+// reader is meant to see that rather than assume an oversight:
+//   1. the per-step `.strict()` param schema → `input` is opaque. The
+//      orchestrator's own per-`$type` validation is the only shape gate.
+//   2. `moderationPosture` / the prompt audit → nothing audits this input.
+//      Moderation moved to the PUBLISH boundary; nothing a block generates is
+//      public until published, and that path is moderated.
+//   3. `resourcePolicy` / the `urn:air:` scan → AIR resources are ALLOWED here.
+//      Spend, not entitlement, is the binding control.
+//   4. `billingMode` + the load-time `estimateBuzz === priceForVariant`
+//      invariant → replaced by the inline-comfy mechanism below.
+//
+// 🔴 CONSEQUENCE OF (3) WORTH NAMING, because the denylist does not cover it:
+// `$type: 'customComfy'` is not platform-internal, so an app may reach it
+// through this arm with an `input` the `mode:'inline'` arm's `.strict()` exists
+// to refuse — `comfyImage` (an arbitrary OCI container AIR the worker pulls and
+// runs) and `minVramGb` (which selects a higher worker tier, and therefore a
+// different Buzz/second rate than the `stepTimeoutSeconds = maxBuzz` ceiling
+// assumes). Recorded here so it is a decision someone can revisit, not a
+// surprise. See the PR that added this arm.
+//
+// `maxBuzz` is the ONLY spend knob an app sets and it works exactly as the
+// inline-comfy arm's does: the server derives `stepTimeoutSeconds = maxBuzz` and
+// stamps it as the step timeout, so `maxBuzz === ceil(stepTimeoutSeconds)` cannot be
+// violated — there is only one number.
+//
+// The one exception is a CONFIRMED job (`quoteId`): a fixed orchestrator price above
+// the token's per-call budget that the viewer confirmed in host chrome. That job is
+// charged the confirmed price, not `maxBuzz` — see `submitConfirmedPassThroughStepWorkflow`
+// in blocks.router and `blockConfirmedStepCeiling` in block-scope.middleware.
+
+/**
+ * Hard per-job Buzz ceiling a pass-through body may declare. The same number as
+ * `INLINE_MAX_BUZZ` because two ceilings meant to be equal drift.
+ *
+ * 🔴 IT IS THE BINDING BOUND, NOT A REDUNDANT ONE. A draft of this comment said
+ * both arms were developer-only and therefore already clamped by
+ * `DEV_BUZZ_BUDGET_CAP`; both halves are false — neither arm runs
+ * `assertViewerIsAppDeveloper`, and an ordinary install token's per-call budget
+ * clamps at `BUZZ_BUDGET_CAP` (see `shared/constants/block-scope.constants`).
+ * Recorded because the false version read as "raising this changes nothing".
+ * (`INLINE_MAX_BUZZ`'s own docblock above CARRIED THE SAME CLAIM and has now been
+ * corrected in the same terms. The published `@civitai/app-sdk` doc comments and
+ * the `civitai/cli` page-money scaffold carried it too, and are corrected in
+ * their own repos — the generated `/apps/` reference on developer.civitai.com is
+ * built from the published SDK, so it stays wrong until that publishes and the
+ * docs repo bumps its pin.)
+ */
+export const PASS_THROUGH_MAX_BUZZ = INLINE_MAX_BUZZ;
+
+/**
+ * Max characters of a pass-through `$type`.
+ *
+ * 🔴 EXPORTED so the SEAM can be pinned, not for reuse. The submitted `$type`
+ * becomes the SUBTYPE of the recorded generation type (`step:<$type>`), and
+ * `generation-type.ts` carries its own literal copy of this cap because it must
+ * stay import-light on the fire-and-forget spend path. `generation-type.test.ts`
+ * imports both and asserts them equal, plus equal to a LITERAL — the pair that
+ * catches growth, shrinkage and joint drift: a wire cap raised past that copy
+ * would silently degrade every long `$type` to a bare `step`, a depth loss in an
+ * unbackfillable column that nothing else reports.
+ */
+export const PASS_THROUGH_TYPE_MAX_CHARS = 64;
+
+/**
+ * Max serialized bytes of a pass-through `input`.
+ *
+ * Payload DoS only — `input` is an unbounded `Record<string, unknown>` on a
+ * submit path, so without this a single request can be arbitrarily large. NOT a
+ * moderation bound (there is no sweep on this arm) and not a shape gate. Same
+ * number as the inline graph bound for the same reason `PASS_THROUGH_MAX_BUZZ`
+ * is: one value, not two that are meant to agree.
+ */
+export const PASS_THROUGH_INPUT_BYTES_MAX = INLINE_GRAPH_BYTES_MAX;
+
+/**
+ * Opaque handle to a server-stored confirmed-STEP quote (`blocks.estimateWorkflow` on
+ * a pass-through body priced above the token's per-call budget). Disjoint from the
+ * training `tq_` shape, so neither kind's id can name the other's record.
+ */
+export const BLOCK_STEP_QUOTE_ID_REGEX = /^sq_[a-f0-9]{32}$/;
+
+const blockPassThroughStepShape = {
+  kind: z.literal('step'),
+  // The ARM discriminator. `z.undefined()` — NOT an absent key. See the
+  // `blockStepMemberSchema` note below: an arm that simply omits `step` builds
+  // fine and then throws on the first parse, measured.
+  step: z.undefined(),
+  $type: z.string().min(1).max(PASS_THROUGH_TYPE_MAX_CHARS),
+  // 🔴 ORCHESTRATOR-NATIVE AND FORWARDED UNMODIFIED. The server may refuse it,
+  // but never rewrites, merges or defaults any field in here — that is the
+  // whole point of the arm, and the submitted step's `input` is BYTE-IDENTICAL
+  // to this value.
+  // (Not the SAME object: `z.record` rebuilds the top level, so the caller's own
+  // object never reaches the orchestrator whatever the router does. An earlier
+  // draft claimed identity here and in `blocks.router`; measured false.)
+  input: z.record(z.string(), z.unknown()),
+  maxBuzz: z.number().int().min(1).max(PASS_THROUGH_MAX_BUZZ),
+  // Present on a CONFIRMED submit only — the viewer-confirmed fixed-price quote
+  // (`stepQuote.quoteId` on the estimate reply) this job is charged against in place
+  // of the per-call budget. Excluded from the body hash that binds a quote to its
+  // body. Absent, the arm is exactly the unconfirmed one described above.
+  quoteId: z.string().regex(BLOCK_STEP_QUOTE_ID_REGEX).optional(),
+};
+
+/**
+ * Refuses at the first inline-media path under `fields`, or at `overflow` once the body's
+ * shared value budget runs out. `continue: false` suppresses the byte-cap issue, which an
+ * inline photo usually also trips; only this message names the fix.
+ *
+ * `byteLimit` is the byte cap checked after this, over the same `fields`. Once the strings
+ * already searched put the body over it, no further string is read and this adds no issue
+ * for that reason; the remaining fields are still walked for the value budget, and the cap
+ * refuses the body.
+ */
+function refuseInlineMedia<T extends Record<string, unknown>>(
+  fields: (body: T) => [InlineMediaPath, unknown][],
+  overflow: { path: InlineMediaPath; message: string },
+  byteLimit: number
+) {
+  return (body: T, ctx: z.RefinementCtx) => {
+    const budget = { visits: 0 };
+    for (const [prefix, value] of fields(body)) {
+      const hit = findInlineMediaPath(value, budget, byteLimit);
+      if (!hit || hit === INLINE_MEDIA_OVER_BYTE_LIMIT) continue;
+      const issue =
+        hit === INLINE_MEDIA_TOO_MANY_VALUES
+          ? overflow
+          : { path: [...prefix, ...hit], message: inlineMediaMessage([...prefix, ...hit]) };
+      ctx.addIssue({ code: 'custom', ...issue, continue: false });
+      return;
+    }
+  };
+}
+
+/** The value(s) of `fields` the byte cap measures; the inline-media search walks the same. */
+const fieldValues = (fields: [InlineMediaPath, unknown][]) => fields.map(([, value]) => value);
+
+const passThroughInputFields = (b: { input: unknown }): [InlineMediaPath, unknown][] => [
+  [['input'], b.input],
+];
+
+export const blockPassThroughStepBodySchema = z
+  .object(blockPassThroughStepShape)
+  .strict()
+  .superRefine(
+    refuseInlineMedia(
+      passThroughInputFields,
+      {
+        path: ['input'],
+        message: `step input holds more than ${INLINE_MEDIA_MAX_VISITS} values`,
+      },
+      PASS_THROUGH_INPUT_BYTES_MAX
+    )
+  )
+  .refine(
+    (b) => jsonLengthWithin(fieldValues(passThroughInputFields(b)), PASS_THROUGH_INPUT_BYTES_MAX),
+    {
+      path: ['input'],
+      message: `step input exceeds the ${PASS_THROUGH_INPUT_BYTES_MAX}-byte limit`,
+    }
+  );
+
+export type PassThroughStepBody = z.infer<typeof blockPassThroughStepBodySchema>;
+
+// ── App Blocks MULTI-STEP kind (`kind:'workflow'`) ────────────────────────────
+//
+// 1..N pass-through steps submitted as ONE workflow. A step input may hold the
+// orchestrator's reference object (`{ "$ref", "path", "default"?, "format"? }`)
+// naming `$arguments` or an earlier step.
+//
+// 🔴 THERE IS NO `maxBuzz`. The ceiling is the token's per-generation budget
+// times the number of steps, computed by the server; the app declares nothing.
+//
+// 🔴 THIS SCHEMA CHECKS SHAPE, SIZE AND INLINE MEDIA ONLY. The step count, the
+// step-name rules and the reference graph are checked by `resolveBlockWorkflowGraph`, and the
+// step-type denylist by the router — both on the estimate and the submit, before
+// any orchestrator call. They are NOT here because a schema rejection is thrown
+// at the tRPC boundary, where it cannot carry the `errorCode` a block branches
+// on; those refusals are returned as a failed snapshot instead.
+
+/**
+ * Max serialized bytes of every step `input` plus `arguments`, summed. The same
+ * payload bound a single pass-through `input` gets, applied to the whole body.
+ */
+export const WORKFLOW_INPUT_BYTES_MAX = PASS_THROUGH_INPUT_BYTES_MAX;
+
+/** Max characters of a step `name` on the wire; the name rules are tighter. */
+const WORKFLOW_STEP_NAME_WIRE_MAX = 64;
+
+/** Every step `input`, then `arguments` (absent counts nothing). */
+const workflowInputFields = (b: {
+  steps: { input: unknown }[];
+  arguments?: unknown;
+}): [InlineMediaPath, unknown][] => [
+  ...b.steps.map((step, i): [InlineMediaPath, unknown] => [['steps', i, 'input'], step.input]),
+  [['arguments'], b.arguments],
+];
+
+const blockMultiStepWorkflowStepSchema = z
+  .object({
+    name: z.string().min(1).max(WORKFLOW_STEP_NAME_WIRE_MAX).optional(),
+    $type: z.string().min(1).max(PASS_THROUGH_TYPE_MAX_CHARS),
+    // Orchestrator-native and forwarded unmodified, like the pass-through arm's.
+    input: z.record(z.string(), z.unknown()),
+    suppressOutput: z.boolean().optional(),
+  })
+  .strict();
+
+export const blockMultiStepWorkflowBodySchema = z
+  .object({
+    kind: z.literal('workflow'),
+    steps: z.array(blockMultiStepWorkflowStepSchema).min(1),
+    arguments: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict()
+  // `arguments` too: a step input can `$ref` it, so it reaches the orchestrator the same way.
+  .superRefine(
+    refuseInlineMedia(
+      workflowInputFields,
+      {
+        path: ['steps'],
+        message: `step inputs and arguments hold more than ${INLINE_MEDIA_MAX_VISITS} values in total`,
+      },
+      WORKFLOW_INPUT_BYTES_MAX
+    )
+  )
+  .refine((b) => jsonLengthWithin(fieldValues(workflowInputFields(b)), WORKFLOW_INPUT_BYTES_MAX), {
+    path: ['steps'],
+    message: `workflow step inputs and arguments exceed the ${WORKFLOW_INPUT_BYTES_MAX}-byte limit`,
+  });
+
+export type BlockMultiStepWorkflowBody = z.infer<typeof blockMultiStepWorkflowBodySchema>;
+
+// ── App Blocks TRAINING kind (`kind:'training'`) ───────────────────────────────
+//
+// Trains a LoRA with the ai-toolkit engine on consumer blobs the page host uploaded
+// for the viewer (`OPEN_IMAGE_UPLOAD { purpose: 'trainingData' }`) — the same upload
+// path and `{ air, caption }` items as the Training Studio.
+//
+// 🔴 THERE IS NO `maxBuzz` AND NO TIMEOUT KNOB, ON PURPOSE. The price is the
+// orchestrator's own quote for exactly this step, taken by the estimate and stored
+// server-side; the submit names that quote (`quoteId`), runs only once the viewer
+// has confirmed it from a signed-in session, and re-quotes before charging. An
+// app-supplied number is never the ceiling and never a step timeout.
+//
+// `.strict()` everywhere a key could be smuggled: an unknown top-level key is
+// rejected. `params` is the training form's own ai-toolkit schema
+// (`aiToolkitTrainingParamsSchema`), so the two cannot drift.
+
+/** Opaque handle to a server-stored training quote. */
+export const BLOCK_TRAINING_QUOTE_ID_REGEX = /^tq_[a-f0-9]{32}$/;
+/**
+ * Input of the shared consent pair (`blocks.previewQuoteGrant` /
+ * `blocks.consentQuoteGrant`). The caller states the KIND it is confirming and the
+ * quote id must be of that kind — a discriminated union, so a training id sent as a
+ * step (or the reverse) is refused at the input rather than dispatched by its prefix.
+ */
+export const blockQuoteGrantConsentInputSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('training'),
+    blockToken: z.string().min(1),
+    quoteId: z.string().regex(BLOCK_TRAINING_QUOTE_ID_REGEX),
+  }),
+  z.object({
+    kind: z.literal('step'),
+    blockToken: z.string().min(1),
+    quoteId: z.string().regex(BLOCK_STEP_QUOTE_ID_REGEX),
+  }),
+]);
+/** Max sample prompts on a training run. */
+export const BLOCK_TRAINING_SAMPLE_PROMPTS_MAX = 6;
+/** Max characters of one sample prompt. */
+export const BLOCK_TRAINING_SAMPLE_PROMPT_MAX_CHARS = 1000;
+/** Max characters of the trigger word. */
+export const BLOCK_TRAINING_TRIGGER_WORD_MAX_CHARS = 64;
+/** Max characters of a base-model key (`trainingModelInfo` key). */
+export const BLOCK_TRAINING_MODEL_KEY_MAX_CHARS = 64;
+// The dataset item schema lives in its own dependency-free module so the page host
+// can read it without pulling this file (and the step/recipe registries it imports)
+// into the client bundle.
+export {
+  BLOCK_TRAINING_CAPTION_MAX_CHARS,
+  BLOCK_TRAINING_DATASET_MAX_ITEMS,
+  blockTrainingDatasetItemsSchema,
+} from '~/server/schema/blocks/training-dataset.schema';
+
+export const blockTrainingBodySchema = z
+  .object({
+    kind: z.literal('training'),
+    items: blockTrainingDatasetItemsSchema,
+    engine: z.literal('ai-toolkit'),
+    // A base-model key from the training form's catalog (`trainingModelInfo`);
+    // resolved and gated server-side. Custom AIRs are not accepted in v1.
+    model: z.string().min(1).max(BLOCK_TRAINING_MODEL_KEY_MAX_CHARS),
+    params: aiToolkitTrainingParamsSchema,
+    triggerWord: z.string().max(BLOCK_TRAINING_TRIGGER_WORD_MAX_CHARS),
+    samplePrompts: z
+      .array(z.string().max(BLOCK_TRAINING_SAMPLE_PROMPT_MAX_CHARS))
+      .max(BLOCK_TRAINING_SAMPLE_PROMPTS_MAX),
+    // Present on SUBMIT only — the confirmed quote this run is charged against.
+    // Excluded from the body hash that binds a quote to its body.
+    quoteId: z.string().regex(BLOCK_TRAINING_QUOTE_ID_REGEX).optional(),
+  })
+  .strict();
+
+export type BlockTrainingBody = z.infer<typeof blockTrainingBodySchema>;
+
+export type BlockWorkflowBody = z.infer<typeof blockWorkflowBodySchema>;
+
+// 🔴 THE `customComfy` MEMBER IS A NESTED DISCRIMINATED UNION ON `mode`, AND THE
+// RECIPE ARM'S `mode` IS `.optional()` — NOT `.default('recipe')`. That
+// distinction is the whole reason this comment exists. MEASURED against zod
+// 4.0.17; each of the three obvious spellings was run, not reasoned about:
+//
+//   1. `blockInlineComfyBodySchema` as a FOURTH option of the outer union throws
+//      at parse time: `Duplicate discriminator value "customComfy"`. zod's
+//      discriminated union is a value→schema MAP, so two members cannot share a
+//      `kind`.
+//   2. Nesting on `mode` with the recipe arm declaring
+//      `mode: z.literal('recipe').default('recipe')` CONSTRUCTS fine — and then
+//      REJECTS EVERY DEPLOYED RECIPE BODY with `No matching discriminator`. zod
+//      reads the discriminator value off the SCHEMA and does not see it through
+//      a `.default()`, so `{kind:'customComfy', recipe, params}` (no `mode` key
+//      — what every shipped app and every published `@civitai/app-sdk` sends)
+//      fails. 🔴 THIS IS THE DANGEROUS ONE: it type-checks, it builds, its own
+//      tests pass, and it breaks production.
+//   3. Wrapping the whole thing in a plain `z.union([discriminatedUnion, inlineArm])`
+//      parses every body correctly, but DEGRADES THE ERROR SHAPE: a rejected body
+//      reports a single top-level `invalid_union` issue with `path: []` instead of
+//      the precise `path: ['step']` / `path: ['recipe']` the discriminated union
+//      produces. That is the diagnostic an app author gets for a bounced submit,
+//      and `workflow.schema.step.test.ts` already pins it.
+//
+// `.optional()` works where `.default()` does not: zod treats `undefined` as a
+// legitimate discriminator value for the arm, so a body with no `mode` key lands
+// on the recipe arm, and the outer union stays a real discriminated union with
+// its per-field error paths intact.
+//
+// Both arms are `.strict()`, so a body naming BOTH `recipe` and `workflow` is
+// rejected by both and there is no ambiguity to resolve.
+//
+// Pinned by `workflow.schema.inline-comfy.test.ts` (recipe / textToImage / step
+// bodies parse unchanged, output byte-identical) and by the existing
+// `workflow.schema.step.test.ts` error-path assertion. Failure mode 2 above is
+// covered by a mutation in the sweep: swapping `.optional()` for `.default()`
+// turns the back-compat test red.
+//
+// The third rejection this member owns is an UNKNOWN `mode` (neither absent,
+// `'recipe'` nor `'inline'`), which zod reports as a bare `Invalid input` at
+// `path:['mode']` — the discriminator's own value is the one thing that error
+// does not name. Same treatment as the two `.strict()` maps: enumerate the arms.
+/** The longest non-string `mode` value, in JSON characters, the error echoes. */
+const ECHOED_MODE_MAX_CHARS = 200;
+
+/**
+ * A non-string `mode` as JSON, measured before it is serialized so only a short one is built;
+ * a longer one is described instead. An unserializable value is left to JSON.stringify.
+ */
+function echoedModeValue(raw: unknown): string {
+  return measureJsonLength([raw], ECHOED_MODE_MAX_CHARS) === 'over'
+    ? `a value over ${ECHOED_MODE_MAX_CHARS} characters`
+    : JSON.stringify(raw);
+}
+
+const blockCustomComfyMemberSchema = z.discriminatedUnion(
+  'mode',
+  [blockCustomComfyBodySchema, blockInlineComfyBodySchema],
+  {
+    error: (iss) => {
+      if (iss.code !== 'invalid_union') return undefined;
+      const raw = (iss.input as { mode?: unknown } | null | undefined)?.mode;
+      const named = typeof raw === 'string' ? `"${raw}"` : echoedModeValue(raw ?? null);
+      return (
+        `Invalid \`customComfy\` mode: ${named} — expected "recipe" or "inline".` +
+        ` ${customComfyArmHelp('recipe')}. ${customComfyArmHelp('inline')}.`
+      );
+    },
+  }
+);
+
+// 🔴 THE `kind:'step'` MEMBER IS ALSO A NESTED DISCRIMINATED UNION — ON `step`
+// ITSELF, whose value is the registry id on one arm and `undefined` on the
+// other. Same trap family as `customComfy`/`mode` above, and the three
+// alternatives were again RUN against zod 4.0.17 rather than reasoned about:
+//
+//   1. `blockPassThroughStepBodySchema` as a FOURTH option of the OUTER union
+//      throws `Duplicate discriminator value "step"` — the outer union is a
+//      value→schema map, so two members cannot share a `kind`. (The same
+//      failure `customComfy` documents.)
+//   2. A pass-through arm that simply OMITS `step` CONSTRUCTS fine and then
+//      throws at PARSE time: `Invalid discriminated union option at index "1"`.
+//      zod needs a definite discriminator value per option; an absent key
+//      supplies none. 🔴 THIS IS THE DANGEROUS ONE — it type-checks, it builds,
+//      and it takes down every `kind:'step'` body including the two REGISTERED
+//      ones, on the first request rather than at import.
+//   3. Wrapping the two arms in a plain `z.union([...])` and nesting THAT in the
+//      outer discriminated union throws the SAME parse-time error, for the same
+//      reason: a plain union exposes no discriminator value for `kind` either.
+//      (The `customComfy` note above records `z.union` as merely DEGRADING the
+//      error shape — that was measured about the OUTER union, where the plain
+//      union is the top level. Nested, it does not work at all.)
+//
+// `z.undefined()` supplies the discriminator value zod needs, so
+// `{kind:'step', $type, input, maxBuzz}` (no `step` key) lands on the
+// pass-through arm while `{kind:'step', step, params}` still lands on the
+// registry arm and rejects an unregistered id at `path:['step']` — the error
+// path `workflow.schema.step.test.ts` already pins.
+//
+// Both arms are `.strict()`, so a body naming BOTH `step` and `$type` is
+// rejected by both and there is no ambiguity to resolve.
+const blockStepMemberSchema = z.discriminatedUnion('step', [
+  blockStepBodySchema,
+  blockPassThroughStepBodySchema,
+]);
+
+export const blockWorkflowBodySchema = z.discriminatedUnion('kind', [
+  blockTextToImageBodySchemaChecked,
+  blockCustomComfyMemberSchema,
+  blockStepMemberSchema,
+  blockTrainingBodySchema,
+  blockMultiStepWorkflowBodySchema,
+]);
+
+export { BLOCK_ESTIMATE_BATCH_MAX_CELLS };
+
+/**
+ * Input of `blocks.estimateWorkflowBatch` — the batch twin of `estimateWorkflow`.
+ *
+ * 🔴 `bodies` IS `unknown[]`, NOT `blockWorkflowBodySchema[]`, AND THAT IS THE
+ * PER-CELL INDEPENDENCE RULE RATHER THAN A LOOSENING. tRPC validates `.input()`
+ * for the whole call, so a typed array would fail EVERY cell when one is
+ * malformed. Each element is parsed against `blockWorkflowBodySchema` inside the
+ * procedure instead — the same schema, applied per cell — and a cell that fails it
+ * becomes that cell's error. What this schema still refuses for the whole call is
+ * what is wrong with the LIST: not an array, empty, or longer than the cap.
+ */
+export const blockEstimateBatchInputSchema = z.object({
+  blockToken: z.string().min(1),
+  bodies: z.array(z.unknown()).min(1).max(BLOCK_ESTIMATE_BATCH_MAX_CELLS),
+});
+
+/**
+ * The run total a batch estimate reports beside its per-cell snapshots.
+ *
+ * `total` is the sum of `cost.total` over the cells that PRICED — a non-failed
+ * snapshot carrying a numeric `cost.total`, the same rule the SDK applies to one
+ * estimate. It is a total for the whole list only when `pricedCells` equals
+ * `cellCount`; otherwise it is a partial sum and must be shown as one.
+ *
+ * It is a quote, exactly as each cell is: nothing reserves it and each cell is
+ * priced again when it is submitted.
+ */
+export type BlockEstimateBatchAggregate = {
+  total: number;
+  pricedCells: number;
+  cellCount: number;
+};
+
+/**
+ * Reply of `blocks.estimateWorkflowBatch`. `snapshots[i]` answers `bodies[i]`:
+ * either the snapshot `estimateWorkflow` would have returned for that body, or
+ * the failure-shape snapshot a host builds when that call throws
+ * (`{ workflowId: 'failed', status: 'failed', error }`).
+ */
+export type BlockEstimateBatchResult = {
+  snapshots: BlockWorkflowSnapshot[];
+  aggregate: BlockEstimateBatchAggregate;
+};
+
+// Mirrors BlockWorkflowSnapshot in @civitai/app-sdk's blocks/types.ts.
+// Keep field names in lockstep — this is the wire contract the iframe consumes.
+//
+// `autoClaim` is set when the host opportunistically claimed a Buzz reward
+// on the user's behalf during submit (currently only `dailyBoost`). The block
+// uses this to surface a "+25 daily boost claimed!" notice; it's purely
+// informational, never carries state the block must reconcile.
+export type BlockWorkflowSnapshot = {
+  workflowId: string;
+  status: 'pending' | 'processing' | 'succeeded' | 'failed' | 'expired' | 'canceled';
+  cost?: {
+    /** Whole Buzz. Includes `authorFee` whenever that field is present. */
+    total: number;
+    /**
+     * The part of `total` that is the app author's per-generation fee, in whole
+     * Buzz — the exact amount added into `total` for this reply. Display only.
+     *
+     * A NUMBER wherever `total` was built from a fee quote: the `textToImage`
+     * and registered-`step` estimate replies, and those kinds' submit refusals
+     * by a budget, spend cap or rate limit (they quote the refused price). `0`
+     * means a fee was looked up and none applies.
+     *
+     * ABSENT wherever `total` carries no fee quote — every snapshot of a
+     * submitted workflow (its total is the realized generation cost; the fee is
+     * a separate charge), the registered-`step` submit refusal for a missing
+     * orchestrator price quote (it refuses before any fee is looked up), and the
+     * kinds that price no fee. Absent means "not itemised", which an app must
+     * not read as zero.
+     *
+     * 🔴 THE DISCLOSURE BOUNDARY — this is the one place it is explained. The
+     * cost an app sees is `{ total, authorFee? }` and nothing more: every other
+     * component of `total` — the generation base, other creators' licensing and
+     * lineage fees, the viewer's tips — stays folded into `total` and is NOT
+     * itemised. Showing the author fee is a deliberate product decision: the app
+     * is the fee's beneficiary and the fee formula is already public. It does let
+     * an app (or a viewer) bound the generation base and so roughly infer how much
+     * of `total` went to other parties; that consequence was accepted. Do NOT add
+     * any further breakdown field (base, licensing, lineage, tip) to this wire
+     * shape without a new decision.
+     */
+    authorFee?: number;
+  };
+  imageUrls?: string[];
+  error?: string;
+  /**
+   * A stable, machine-readable companion to `error`, for a block to branch on.
+   * OPTIONAL + additive: set only on the refusals that define a code, absent
+   * everywhere else. Treat an unknown value as opaque — codes may be added.
+   *
+   * `workflow_quote_rejected` / `workflow_quote_unavailable` / `workflow_quote_unpriced`
+   * are ESTIMATE-only: a `kind: 'workflow'` estimate with no price quote is a failed
+   * snapshot with no `cost`. `rejected` means the orchestrator refused the body and a
+   * retry of the same body will not help; `unavailable` is transient; `unpriced` is
+   * an answer without a price. The SUBMIT of the same body defines no such refusal.
+   *
+   * `step_quote_rejected` / `step_quote_unavailable` / `step_quote_unpriced` mean the
+   * same for a registered-step (`kind: 'step'` with `step`) ESTIMATE. Its submit, with
+   * no quote, refuses with a failed snapshot that carries a `cost` and no code.
+   *
+   * `'daily-limit-exceeded'` — a viewer-confirmed job (a confirmed pass-through step or
+   * a `kind:'training'` run) that would exceed what remains of the viewer's own opted-in
+   * daily Buzz limit for this app. Never overridable by the confirm; the viewer raises
+   * the limit themselves. Returned by the submit for an ordinary page token only: a
+   * private run reserves against its own cap and makes no daily-limit check at submit.
+   *
+   * `'not-api-format'` / `'model-filenames'` — an inline `customComfy` graph that cannot
+   * run: not ComfyUI API format, or a loader input holding a model filename instead of
+   * an AIR. The codes are `checkComfyGraph`'s from `@civitai/app-sdk/blocks`. Returned
+   * by the estimate and the submit alike, with no `cost`, before anything is reserved.
+   */
+  errorCode?:
+    | TrainingQuoteErrorCode
+    | WorkflowQuoteErrorCode
+    | StepQuoteErrorCode
+    | BlockWorkflowErrorCode
+    | InlineComfyRefusedCode
+    | typeof CONFIRMED_STEP_DAILY_LIMIT_ERROR_CODE;
+  // The buzz account that primarily funded this generation (the accountType of
+  // the largest realized debit). OPTIONAL + additive: existing consumers that
+  // don't read it are unaffected. Only the account TYPE is surfaced — nothing
+  // beyond what `cost.total` already implies. Absent on estimates, cache-hits,
+  // or any snapshot the orchestrator returned without transactions.
+  spentAccountType?: BuzzSpendType;
+  autoClaim?: {
+    type: 'dailyBoost';
+    amount: number;
+    accountType: 'yellow' | 'blue' | 'red' | 'green';
+  };
+  /**
+   * Checkpoint versions the generation graph SILENTLY replaced (issue #3520).
+   *
+   * On a `modelLocked` ecosystem the graph swaps any version id that is not in
+   * the current workflow's visible list for that workflow's default, returns
+   * success, and bills the user. That is deliberate graceful degradation — it is
+   * what keeps an app pinned to a since-retired version working instead of
+   * hard-failing — but through this bridge the id was DELIBERATE and the
+   * correction was previously undetectable. `requested` is what the block asked
+   * for, `applied` is what actually ran.
+   *
+   * 🔴 BEHAVIOUR IS UNCHANGED: the same model runs as before; this field only
+   * reports it. OPTIONAL + additive, and OMITTED entirely when nothing was
+   * substituted, so every existing snapshot stays byte-identical and a consumer
+   * that does not read it is unaffected.
+   *
+   * WHERE IT APPEARS. 🔴 ON THE `kind: 'textToImage'` PATH ONLY. That is the
+   * only wire body whose handler resolves a checkpoint through the generation
+   * graph (`createBlockTextToImageStep` → `buildGenerationContext`), so it is
+   * the only one that can substitute anything. On that path: the submit reply,
+   * the `estimateWorkflow` reply, EVERY reply from `submitWorkflow` that quotes
+   * a cost without submitting (insufficient per-call budget, the per-user daily
+   * / review Buzz cap, the per-app aggregate spend+velocity cap, the dev-tunnel
+   * session cap), and — because the submit persists it on the orchestrator
+   * workflow's `metadata` — every subsequent `pollWorkflow` / `cancelWorkflow`
+   * read of that workflow. The poll is the one that matters in practice: it is
+   * the snapshot carrying `imageUrls`, i.e. the one a block actually renders
+   * from, so the record is present next to the images it describes rather than
+   * only on a reply the block may have discarded.
+   * The estimate reply is the exception — a whatIf creates no persisted workflow,
+   * so there the record exists only on that reply.
+   *
+   * 🔴 IT DOES **NOT** APPEAR ON `kind: 'customComfy'` OR `kind: 'step'`. Each of
+   * those has its own four cost-quoting exits, and none of the eight carries this
+   * field — correctly, because neither handler builds a generation context: a
+   * customComfy body binds a server-authored recipe and a registry step carries
+   * no model binding at all, so there is nothing to substitute and nothing to
+   * report.
+   *
+   * 🔴 IF YOU ARE EXTENDING A STEP TO RESOLVE A CHECKPOINT THROUGH THE GRAPH,
+   * READ THIS. The paragraph above is a statement about the txt2img handler's
+   * plumbing, NOT a property of the bridge — do not assume the field will flow
+   * on your path because it flows there. The READ half is kind-agnostic (the
+   * poll recovers the record from `workflow.metadata` for any workflow), but the
+   * WRITE half is per-handler: your handler must pass the request's collector to
+   * `snapshotFromWorkflow(..., { modelSubstitutions })` on the reply AND write
+   * `WORKFLOW_METADATA_MODEL_SUBSTITUTIONS_KEY` into the submitted
+   * `body.metadata`, or the substitution stays exactly as unobservable as it was
+   * before #3520 — on the one surface #3520 exists to make observable.
+   * `submitStepWorkflow` does neither today. Pinned by
+   * `generation-surface-wiring.test.ts` (every `buildGenerationContext` call site
+   * enumerated from the tree and pinned to its ENCLOSING FUNCTION, so a new one
+   * inside a step handler fails there) and by the `kind:'step'` absence tests +
+   * their planted-metadata control in `blocks.router.workflow.test.ts`.
+   *
+   * 🔴 WIRE CONTRACT: this is an ADDITIVE field on the type
+   * `@civitai/app-sdk`'s `blocks/types.ts` mirrors. The SDK's inbound validator
+   * does not know it yet, so a block reads it only after the SDK type is widened
+   * in that repo — tracked separately; nothing here edits another repo.
+   */
+  modelSubstitutions?: Array<{
+    requested: number;
+    applied: number;
+    reason: ModelSubstitutionReason;
+  }>;
+  /**
+   * Generated FREE TEXT produced by a registered step whose `moderationPosture`
+   * is `'textOutput'` — and which has PASSED an output moderation scan.
+   *
+   * 🔴 EVERY STRING HERE HAS BEEN SCANNED. That is a property of how the field
+   * is produced, not a promise about who sets it. The single producer is
+   * `attachModeratedStepTextOutputs` (`services/blocks/steps/moderation`), which
+   * runs the scan and strips any incoming value of this field before merging its
+   * own. Do NOT set it anywhere else; doing so would be publishing unscanned
+   * model output, which is the one thing the `'textOutput'` posture exists to
+   * prevent.
+   *
+   * 🔴 BE EXACT ABOUT WHAT ENFORCES THAT — AN EARLIER REVISION OF THIS COMMENT
+   * WAS WRONG, AND IT IS RECORDED RATHER THAN QUIETLY REPLACED BECAUSE THIS IS
+   * THE WIRE-CONTRACT DOC AN ENTRY AUTHOR AND THE `@civitai/app-sdk`
+   * MIRROR-WRITER READ. It said `snapshotFromWorkflow` and `projectAppWorkflow`
+   * "are pure and synchronous and read only `extractOutput`, which returns MEDIA
+   * — neither can put prose in a snapshot at all". `StepOutputMedia.url` is a
+   * bare `string`, never URL-validated, and it reaches `snapshot.imageUrls` /
+   * `AppWorkflow.images[].url` without meeting the scan — so
+   * `extractOutput: () => [{ url: theModelsReply, … }]` on a text entry WOULD
+   * have published unscanned generated text with every gate green. Anyone
+   * trusting the old sentence would conclude a media extractor on a text entry
+   * is structurally harmless and propose relaxing registry clause 8-ii. It is
+   * not harmless; 8-ii is load-bearing.
+   *
+   * WHAT ACTUALLY HOLDS IT (all three off the one `stepOutputShape` predicate,
+   * and spelled out at `attachModeratedStepTextOutputs`): the TYPE
+   * (`TextOutputSurface.extractOutput?: never`), the LOAD-time registry clause
+   * 8-ii, and the READ path (both `workflow.service` extractors call
+   * `extractOutput` only when `postureProducesMedia(...)`). The original
+   * structural point does still stand on its own — a scan is an async network
+   * call and both projections are pure and synchronous, so neither could perform
+   * one — but it bounds only WHO CAN SCAN, never what a media extractor can
+   * smuggle.
+   *
+   * WHERE IT APPEARS: `blocks.pollWorkflow` and `blocks.cancelWorkflow` — the
+   * two procedures wrapped by `attachModeratedStepTextOutputs`, and therefore
+   * the only two that can carry THIS FIELD.
+   *
+   * 🔴 THE EARLIER WORDING CALLED THEM "the two surfaces a block reads a
+   * finished generation from", WHICH IS AN OVERCLAIM — corrected at the poll
+   * itself for the same reason, and recorded here too. Three further procedures
+   * read a finished workflow on a block's behalf, UNWRAPPED:
+   * `blocks.queryAppWorkflows`, `blocks.cancelAppWorkflow` and
+   * `blocks.publishGenerationOutputs` (note these are DIFFERENT procedures from
+   * the similarly-named wrapped pair). What makes those three safe is stated at
+   * each of them — `AppWorkflow` has no text field, and its `images` are
+   * posture-gated — not here.
+   *
+   * NOT on the submit replies, and that is not an oversight: the step submit
+   * passes no `wait`, so the reply is a freshly-queued workflow with no `output`
+   * to publish. It is also not load-bearing — a submit reply is built by
+   * `snapshotFromWorkflow`, which does not produce this field, so an
+   * orchestrator that started answering submits with completed output would
+   * degrade to "the block polls once more", never to "unscanned text ships".
+   *
+   * OMITTED entirely when there is no text, so every existing snapshot stays
+   * byte-identical.
+   *
+   * 🔴 WIRE CONTRACT: additive on the type `@civitai/app-sdk`'s `blocks/types.ts`
+   * mirrors, exactly like `modelSubstitutions` above. The SDK's inbound
+   * validator does not know it yet, so a block reads it only once that type is
+   * widened in the SDK repo — tracked separately; nothing here edits another repo.
+   */
+  textOutputs?: string[];
+  /**
+   * Set when a text-posture step produced nothing the block can be given, with a
+   * user-facing sentence saying why. TWO distinct causes land here:
+   *
+   *   1. WITHHELD — text WAS produced and is being kept back: a content-policy
+   *      hit, or any other fail-CLOSED scan outcome (scanner error or timeout,
+   *      no verdict at all, an over-cap payload, or requested labels that came
+   *      back missing or errored). Every one of those paths returns the SAME
+   *      message, so this cause is one string with several origins.
+   *   2. UNPUBLISHABLE — the step SUCCEEDED and the scan RELEASED, but the
+   *      entry's extractors could publish none of what came back (e.g. a
+   *      provider tool-call `id` outside the published charset). Nothing was
+   *      moderated in this case, and the message says so explicitly.
+   *
+   * 🔴 AN EARLIER VERSION OF THIS DOC DESCRIBED ONLY CAUSE 1 — "generated text
+   * WAS produced but is being withheld" — and both halves of that sentence are
+   * FALSE on cause 2: no text was produced, and no policy or scanner event
+   * occurred. This is the doc the `@civitai/app-sdk` mirror-writer and block
+   * authors read, so a consumer branching on it was being told the wrong thing.
+   * If a third cause is ever added, correct this list in the same change.
+   *
+   * `reason` is deliberately generic: it does not name the labels that
+   * triggered. The triggering labels + scores go to the per-app trigger log
+   * instead, which is where the actionable signal lives (an app whose outputs
+   * trigger constantly is telling you about its system prompt).
+   *
+   * 🔴 THE TWO CAUSES ARE NOT MACHINE-SEPARABLE without matching on the string,
+   * which is NOT a contract. A consumer needing to branch on the difference is
+   * the trigger to add a discriminated reason code — not before.
+   *
+   * 🔴 ONLY CAUSE 2 IS STATUS-GATED, AND THE GATE READS THE STEP'S OWN
+   * `succeeded` STATUS — never the workflow's. CAUSE 1 IS NOT GATED AT ALL: in
+   * `steps/moderation.ts` the `succeeded` test guards the unpublishable branch
+   * only, and the withheld branch is the plain `else` beside it.
+   *
+   * So a CANCELLED generation CAN still set this field. The orchestrator returns
+   * whatever text it had already produced, that text is still scanned, and a hit
+   * still withholds it — `blocks.router.textOutputModeration.test.ts` pins
+   * exactly that, cancelling a workflow whose step succeeded and asserting the
+   * field IS set. A consumer that skips rendering `reason` on cancel would
+   * suppress a real content-policy explanation.
+   *
+   * A block polling a healthy in-flight generation does still see the field
+   * absent — but for a reason worth stating correctly rather than by status: a
+   * step that has produced no text YET can reach neither cause, because
+   * `screenGeneratedText` short-circuits to RELEASED on an empty text set, and
+   * cause 2 additionally needs `succeeded`.
+   *
+   * 🔴 THIS CLAUSE HAS NOW BEEN WRONG TWICE, both times by describing the FIELD
+   * when the code only ever gated ONE OF ITS TWO CAUSES. Before editing it
+   * again, check each cause against `steps/moderation.ts` separately.
+   *
+   * Independent of `textOutputs` rather than mutually exclusive: a workflow with
+   * two text steps can release one and withhold the other, and both fields then
+   * appear. Because of that pairing the `reason` is scoped to "a step in this
+   * response", never to the response as a whole.
+   */
+  textOutputWithheld?: { reason: string };
+  /**
+   * Structured tool calls the model requested on a registered `'textOutput'`
+   * step — and which have PASSED the same output moderation scan `textOutputs`
+   * passes.
+   *
+   * 🔴 SAME SINGLE PRODUCER, SAME STRIPPING, SAME RULE.
+   * `attachModeratedStepTextOutputs` is the only writer; it strips any incoming
+   * value of this field before merging its own, and it attaches tool calls ONLY
+   * onto a released verdict. Do NOT set it anywhere else.
+   *
+   * 🔴 WHY PUBLISHING THESE IS NOT A HOLE IN THE SCAN, since the objects
+   * themselves are never handed to a scanner: the entry's `extractText` returns
+   * every `arguments` string that appears here, so the released verdict was
+   * computed over exactly that prose.
+   *
+   * 🔴 WHAT ENFORCES THAT, STATED AT ITS REAL STRENGTH. For `chat-completion`
+   * the guarantee is STRUCTURAL — both extractors derive from one shared
+   * predicate, so they cannot disagree. Registry clause 8b is a load-time
+   * BACKSTOP against an entry re-splitting them, and it is only as wide as the
+   * shapes its `canonicalOutputFor` sample exercises: a re-split on an axis the
+   * sample does not cover would still pass. An earlier version of this line said
+   * clause 8b "fails the build if an entry ever breaks that containment", which
+   * is wider than the implementation — the same unscoped overclaim corrected in
+   * `steps/moderation.ts` and `steps/chat-completion.step.ts`. Do not restate it.
+   *
+   * The tool NAME is not scanned and does
+   * not need to be — it is pattern-bounded to `[A-Za-z0-9_-]` at both the param
+   * schema and the extractor, so it cannot carry prose. Widening that charset
+   * would make the name a free-text surface and is a moderation change, not a
+   * validation one.
+   *
+   * WHERE IT APPEARS: `blocks.pollWorkflow` and `blocks.cancelWorkflow` — the
+   * same two wrapped procedures as `textOutputs`, for the same reason.
+   *
+   * OMITTED entirely when there are none, so every existing snapshot stays
+   * byte-identical.
+   *
+   * 🔴 WIRE CONTRACT: additive on the type `@civitai/app-sdk`'s `blocks/types.ts`
+   * mirrors, exactly like `textOutputs` and `modelSubstitutions` above. The SDK's
+   * inbound validator does not know it yet, so a block reads it only once that
+   * type is widened in the SDK repo — tracked separately; nothing here edits
+   * another repo.
+   */
+  toolCalls?: BlockStepToolCall[];
+  /**
+   * The raw orchestrator output of a PASS-THROUGH step (`kind:'step'` with a
+   * `$type` and no registry id), forwarded as-is — minus its blobs.
+   *
+   * 🔴 BLOBS ARE REMOVED, NOT PASSED THROUGH, AND THAT IS THE SAFETY PROPERTY.
+   * Every blob-SHAPED value is stripped (`splitPassThroughStepOutput`) and its
+   * available url goes to `snapshot.imageUrls` AND to `AppWorkflow.images` —
+   * both, because the block reads the snapshot and the publish path
+   * (`resolveOwnedWorkflowOutputs` → `publishGenerationOutputs`) reads the
+   * projection, and only the second leads to the per-viewer gated read
+   * (`blocks.getImagesByIds` → `BlockGatedImage`). A pass-through step must not
+   * create a SECOND image channel that those two do not see.
+   *
+   * 🔴 A TRAINED CHECKPOINT IS IN NEITHER CHANNEL. For the `training` /
+   * `imageResourceTraining` `$type`s the epoch checkpoint (`epochs[].model`, or
+   * `epochs[].blobUrl` + `blobName`) is dropped before the split, so it reaches
+   * neither `imageUrls` nor this field; which epochs had one is reported on
+   * {@link trainedEpochs} instead. The legacy type's plain-string
+   * `epochs[].sampleImages` are lifted to `imageUrls` by position. See
+   * `splitPassThroughStep`.
+   *
+   * ⚠️ "BLOB-SHAPED" IS THE EXACT SCOPE OF THAT PROPERTY, AND PLAIN-STRING URLS
+   * FALL OUTSIDE IT. `blobArchive`'s whole output is `{ url, entryCount, … }`,
+   * and `imageResourceTraining.sampleInputImages` is a string list; a shape test
+   * sees neither, so those reach the app here and are never seen by the publish
+   * path or the gated read. Stated rather than implied, because the measurement
+   * behind the splitter enumerated blob-TYPED fields and a reader takes it for
+   * the whole population. Closing them is a decision — handle a named field by
+   * position, or refuse the `$type` — not a cleanup.
+   *
+   * 🔴 EVERYTHING ELSE IS UNSCANNED. Unlike {@link textOutputs}, no moderation
+   * scan runs over this field: the pass-through arm has no `moderationPosture`,
+   * by operator decision (moderation moved to the publish boundary).
+   *
+   * ⚠️ AN EARLIER VERSION OF THIS PARAGRAPH ILLUSTRATED THAT WITH "a pass-through
+   * `chatCompletion` returns its prose here, unscanned", AND THAT IS FALSE —
+   * recorded rather than replaced, because it is the reading a reviewer arrives
+   * at from the wire shape alone. A `$type` that COLLIDES with a registry
+   * entry's `orchestratorType` — and `chat-completion` declares exactly
+   * `'chatCompletion'` — is claimed by the registry branch in BOTH extractors
+   * and by `attachModeratedStepTextOutputs`, all of which look the entry up by
+   * `$type` and never ask which arm submitted it. So that case IS scanned and
+   * never reaches this field.
+   *
+   * 🔴 THE REAL CONSEQUENCE IS THE SHADOWING ITSELF: whether a pass-through
+   * step's output is forwarded here or handled by a registry entry depends on a
+   * `$type` collision, and that flips the day someone registers a step. A new
+   * entry for a media-producing `$type` would silently stop surfacing that
+   * type's media for existing pass-through callers, with no error. The
+   * unscanned-text surface is real for every `$type` that does NOT collide.
+   *
+   * OMITTED entirely when the workflow carries no step with an UNRECOGNISED
+   * `$type` submitted by the pass-through arm — which is every workflow the other
+   * kinds produce (`kind:'workflow'` reports step output on {@link steps}) — so
+   * their snapshots stay byte-identical.
+   *
+   * 🔴 WIRE CONTRACT: additive on the type `@civitai/app-sdk`'s `blocks/types.ts`
+   * mirrors, exactly like `textOutputs` above. The SDK's inbound validator does
+   * not know it yet, so a block reads it only once that type is widened in the
+   * SDK repo — tracked separately; nothing here edits another repo.
+   */
+  stepOutputs?: Array<{ $type: string; output: unknown }>;
+  /**
+   * The epochs of a pass-through `training` / `imageResourceTraining` step whose
+   * checkpoint is ready — the `epoch` a block hands to
+   * `/models/train/from-orchestrator?workflowId=…&epoch=…`, the publish wizard.
+   * The checkpoint itself is never on the wire (see {@link stepOutputs}). Empty —
+   * so omitted — unless the run's `moderationStatus` is `approved`. Also on
+   * `AppWorkflow`.
+   *
+   * OMITTED when there is none, so every other snapshot stays byte-identical.
+   * 🔴 WIRE CONTRACT: name and shape are mirrored by `@civitai/app-sdk`.
+   */
+  trainedEpochs?: Array<{ $type: 'training' | 'imageResourceTraining'; epochNumber: number }>;
+  /**
+   * The model a block-run training workflow became, read from the ids the
+   * publish wizard stamps onto the workflow's metadata (`stampWorkflowDraftModel`
+   * on draft creation, `stampWorkflowPublished` on publish). `published` is
+   * false while it is still a draft. Also on `AppWorkflow`.
+   *
+   * Only for a workflow carrying a pass-through training step, and only when
+   * both ids are positive integers; OMITTED otherwise.
+   * 🔴 WIRE CONTRACT: name and shape are mirrored by `@civitai/app-sdk`.
+   */
+  publishedModel?: BlockPublishedModel;
+  /**
+   * The server-stored quote a `kind:'training'` ESTIMATE produced. The block passes
+   * `quoteId` back on `RUN_TRAINING`; the host shows the viewer this price (read
+   * back from the server, never from the block) and the submit charges against it.
+   * `expiresAt` is ISO-8601. Present only on a training estimate reply.
+   * 🔴 WIRE CONTRACT: additive; mirrored by `@civitai/app-sdk` in its own repo.
+   */
+  trainingQuote?: BlockTrainingQuote;
+  /**
+   * The server-stored quote a pass-through `kind:'step'` ESTIMATE produced when the
+   * orchestrator quoted a FIXED price above the token's per-call budget (and within
+   * the per-job ceiling). The block passes `quoteId` back on `RUN_CONFIRMED_STEP`; the
+   * host shows the viewer this price (read back from the server, never from the
+   * block), and only a submit naming a viewer-confirmed quote may charge it. `total`
+   * is the exact price confirmed and charged — it may differ from `cost.total`, which
+   * stays what an UNCONFIRMED submit would reserve (`max(maxBuzz, quote)`). Present
+   * only on such an estimate reply. 🔴 WIRE CONTRACT: additive; mirrored by
+   * `@civitai/app-sdk` in its own repo.
+   */
+  stepQuote?: BlockStepQuote;
+  /**
+   * Labels for the 3D models (`Model3dBlob`, `type: 'model3d'`) a pass-through step
+   * produced. Every one of those urls is ALSO in `imageUrls`, unchanged — this only
+   * says which entry is which: `format` is the orchestrator blob's own `format`
+   * (`glb`, `fbx`, …) and `variant` is the output key path it was found at
+   * (`model`, `riggedFbxModel`, `basicAnimations.walkingModel`, …). OMITTED when the
+   * workflow produced none. 🔴 WIRE CONTRACT: additive; mirrored by `@civitai/app-sdk`.
+   */
+  model3dOutputs?: BlockModel3dOutput[];
+  /**
+   * One entry per step of a `kind:'workflow'` submit, in the orchestrator's order.
+   * The children a `repeat` step generates follow it, named `<repeat name>.<n>`.
+   *
+   * `imageUrls` is that step's available media and is omitted for a step submitted
+   * with `suppressOutput`; the snapshot's own `imageUrls` is the union of the steps
+   * that did not suppress theirs. `output` follows the {@link stepOutputs} rule
+   * (blobs removed, the rest forwarded unscanned) and is absent for a step whose
+   * `$type` has its own extraction — scanned text arrives on {@link textOutputs}.
+   * `error` is the orchestrator's reason for a step that did not succeed, and only
+   * when it is plain prose.
+   *
+   * `cost` stays on the snapshot: the orchestrator reports one price for the whole
+   * workflow. A `failed` workflow can carry a non-zero `cost.total` and usable
+   * `imageUrls`, because steps that finished before the failing one stay charged.
+   * The author fee is the exception: it is reversed WHOLE for any workflow that
+   * does not succeed, whatever its earlier steps delivered.
+   *
+   * Present ONLY on a workflow this kind submitted; every other snapshot is
+   * byte-identical to before.
+   * 🔴 WIRE CONTRACT: additive; mirrored by `@civitai/app-sdk` in its own repo.
+   */
+  steps?: BlockWorkflowStepSnapshot[];
+};
+
+export type BlockWorkflowStepSnapshot = {
+  name: string;
+  $type: string;
+  status: BlockWorkflowSnapshot['status'];
+  imageUrls?: string[];
+  output?: unknown;
+  error?: string;
+};
+
+export type BlockStepQuote = {
+  quoteId: string;
+  total: number;
+  /** The orchestrator `$type` that was priced. */
+  stepType: string;
+  expiresAt: string;
+};
+
+export type BlockModel3dOutput = { url: string; format: string; variant: string };
+
+export type BlockTrainingQuote = {
+  quoteId: string;
+  total: number;
+  imageCount: number;
+  expiresAt: string;
+};
+
+export type BlockPublishedModel = { modelId: number; modelVersionId: number; published: boolean };

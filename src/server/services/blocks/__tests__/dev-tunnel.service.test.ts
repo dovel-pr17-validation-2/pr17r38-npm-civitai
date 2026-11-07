@@ -1,0 +1,1267 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createLuaRedis, type LuaRedis } from '~/server/utils/__tests__/redis-lua-harness';
+
+/**
+ * APP DEV TUNNEL — service coverage: manifest shape (SSRF-safe host match),
+ * startDevTunnel mint+render+persist, stop (ownership-checked), getActiveDevTunnel,
+ * the per-session spend-cap backstop, and the reaper.
+ */
+
+const {
+  mockK8sFetch,
+  mockGetDp1Target,
+  mockUnwrap,
+  mockWaitForApplyJob,
+  mockRecordTeardown,
+  mockRecordMint,
+  mockRecordDnsGc,
+  sysRedis,
+  luaRef,
+  mockEnv,
+  mockNewId,
+} = vi.hoisted(() => {
+  const store = new Map<string, string>();
+  const luaRef: { current: LuaRedis | null } = { current: null };
+  return {
+    luaRef,
+    store,
+    mockK8sFetch: vi.fn(),
+    mockGetDp1Target: vi.fn(async () => ({ server: 'https://k8s', token: 't' })),
+    mockUnwrap: vi.fn(async (res: any) => {
+      const t = await res.text();
+      return t ? JSON.parse(t) : {};
+    }),
+    // F1: the route now renders via an apps-applier Job that renderDevTunnelRoute
+    // awaits to Succeeded. Default the wait to 'succeeded' so start/render tests
+    // don't poll; the failure test overrides it.
+    mockWaitForApplyJob: vi.fn(async () => 'succeeded' as const),
+    mockRecordTeardown: vi.fn(),
+    mockRecordMint: vi.fn(),
+    mockRecordDnsGc: vi.fn(),
+    sysRedis: {
+      _store: store,
+      get: vi.fn(async (k: string) => store.get(k) ?? null),
+      set: vi.fn(async (k: string, v: string) => {
+        store.set(k, v);
+        return 'OK';
+      }),
+      del: vi.fn(async (k: string) => {
+        store.delete(k);
+        return 1;
+      }),
+      incrBy: vi.fn(async (k: string, n: number) => {
+        const cur = Number(store.get(k) ?? '0') + n;
+        store.set(k, String(cur));
+        return cur;
+      }),
+      decrBy: vi.fn(async (k: string, n: number) => {
+        const cur = Number(store.get(k) ?? '0') - n;
+        store.set(k, String(cur));
+        return cur;
+      }),
+      expire: vi.fn(async () => 1),
+      ttl: vi.fn(async () => 100),
+      // The per-user tunnel INDEX (a SET of blockIds), read by the publisher-ban
+      // revocation writer so a ban can find an ephemeral app's live tunnel — the only
+      // server record such an app leaves. It and every EVAL (the start's listing script, a
+      // teardown's compare-and-delete) run in the real Lua harness, set up per test in
+      // `beforeEach` over this same string store, so a test that reads the index or the
+      // pointer back is measuring what the service's own scripts wrote.
+      sAdd: vi.fn(async (k: string, v: string) =>
+        luaRef.current!.eval("return redis.call('SADD', KEYS[1], ARGV[1])", {
+          keys: [k],
+          arguments: [v],
+        })
+      ),
+      sRem: vi.fn(async (k: string, v: string) =>
+        luaRef.current!.eval("return redis.call('SREM', KEYS[1], ARGV[1])", {
+          keys: [k],
+          arguments: [v],
+        })
+      ),
+      sMembers: vi.fn(async (k: string) => luaRef.current!.set(k) ?? []),
+      eval: vi.fn(async (script: string, opts: { keys: string[]; arguments: string[] }) =>
+        luaRef.current!.eval(script, opts)
+      ),
+    },
+    mockEnv: {
+      APPS_DOMAIN: 'civit.ai',
+      APPS_KUBE_NAMESPACE: 'civitai-apps',
+      NEXTAUTH_URL: 'https://civitai.com',
+      APPS_DEV_TUNNEL_SISH_BACKEND: 'http://sish-http.apps-dev-tunnel.svc.cluster.local:80',
+      APPS_DEV_TUNNEL_ROUTE_NAMESPACE: 'apps-dev-tunnel',
+      APPS_DEV_TUNNEL_INGRESS_TARGET: '192.0.2.1' as string | undefined,
+      APPS_DEV_TUNNEL_FORWARDAUTH_URL: undefined as string | undefined,
+      APPS_DEV_TUNNEL_SSH_HOST_PUBKEY: 'ssh-ed25519 AAAAC3NzaHostKeyExample sish-host' as
+        | string
+        | undefined,
+      APPS_DEV_TUNNEL_CF_API_TOKEN: undefined as string | undefined,
+      APPS_DEV_TUNNEL_CF_ZONE_ID: undefined as string | undefined,
+    },
+    mockNewId: vi.fn(() => 'bki_testsession'),
+  };
+});
+
+vi.mock('~/env/server', () => ({ env: mockEnv }));
+vi.mock('~/server/services/blocks/apps-pipeline.service', () => ({
+  getDp1Target: (...a: unknown[]) => mockGetDp1Target(...(a as [])),
+  k8sFetch: (...a: unknown[]) => mockK8sFetch(...(a as [])),
+  unwrap: (...a: unknown[]) => mockUnwrap(...(a as [any])),
+  waitForApplyJob: (...a: unknown[]) => mockWaitForApplyJob(...(a as [])),
+}));
+vi.mock('~/server/redis/client', () => ({
+  sysRedis,
+  withSysReadDeadline: <T>(p: Promise<T>) => p,
+  REDIS_SYS_KEYS: { BLOCKS: { DEV_TUNNEL: 'system:blocks:dev-tunnel' } },
+}));
+vi.mock('~/server/utils/app-block-ids', () => ({ newBlockInstanceId: () => mockNewId() }));
+vi.mock('~/server/prom/dev-tunnel.metrics', () => ({
+  recordDevTunnelMint: (...a: unknown[]) => mockRecordMint(...(a as [])),
+  recordDevTunnelTeardown: (...a: unknown[]) => mockRecordTeardown(...(a as [])),
+  recordDevTunnelDnsGc: (...a: unknown[]) => mockRecordDnsGc(...(a as [])),
+}));
+
+import {
+  buildDevTunnelApplyJob,
+  buildDevTunnelIngressRoute,
+  buildDevTunnelMiddleware,
+  chargeDevSessionOverage,
+  deleteDevTunnelDns,
+  deleteDevTunnelRoute,
+  getActiveDevTunnel,
+  refundDevSessionBuzz,
+  reserveDevSessionBuzz,
+  startDevTunnel,
+  stopDevTunnel,
+  stopOwnDevTunnel,
+  stopDevTunnelForUserBlock,
+  listActiveDevTunnelBlockIds,
+  reapExpiredDevTunnels,
+  touchDevTunnelActivity,
+  keepAliveDevTunnel,
+  __resetDevTunnelDnsCacheForTest,
+  DEV_TUNNEL_IDLE_SECONDS,
+  DEV_TUNNEL_HARD_SECONDS,
+  DEV_TUNNEL_REAP_MIN_AGE_SECONDS,
+  DEV_TUNNEL_SESSION_BUZZ_CAP,
+} from '~/server/services/blocks/dev-tunnel.service';
+import { DEV_HOST_LABEL_REGEX } from '~/server/services/blocks/dev-tunnel-session';
+
+const PUBKEY = 'ssh-ed25519 AAAAC3NzaExampleBytes0123456789abcdef dev@laptop';
+
+// The index tests below drive the REAL startDevTunnel / teardown pair rather than poking
+// the fake, so they fail if the index write is removed from the service.
+const TEST_USER_ID = 555;
+const TEST_BLOCK_ID = 'my-app';
+const startTunnel = () =>
+  startDevTunnel({ userId: TEST_USER_ID, blockId: TEST_BLOCK_ID, sshPublicKey: PUBKEY });
+
+function okRes(body = '{}') {
+  return { ok: true, status: 200, text: async () => body };
+}
+
+beforeEach(() => {
+  sysRedis._store.clear();
+  luaRef.current = createLuaRedis(Date.now(), { integerArgs: true, strings: sysRedis._store });
+  vi.clearAllMocks();
+  mockK8sFetch.mockResolvedValue(okRes());
+  mockGetDp1Target.mockResolvedValue({ server: 'https://k8s', token: 't' });
+  mockWaitForApplyJob.mockResolvedValue('succeeded');
+  mockEnv.APPS_DEV_TUNNEL_CF_API_TOKEN = undefined;
+  mockEnv.APPS_DEV_TUNNEL_CF_ZONE_ID = undefined;
+  __resetDevTunnelDnsCacheForTest();
+});
+afterEach(() => {
+  vi.clearAllMocks();
+  vi.unstubAllGlobals();
+  mockEnv.APPS_DEV_TUNNEL_CF_API_TOKEN = undefined;
+  mockEnv.APPS_DEV_TUNNEL_CF_ZONE_ID = undefined;
+});
+
+describe('manifest builders (SSRF-safe, server-derived host)', () => {
+  const opts = {
+    host: 'dev-0123456789abcdef.civit.ai',
+    sessionId: 'bki_s',
+    namespace: 'civitai-apps',
+    forwardAuthUrl: 'http://civitai-web/api/internal/dev-tunnel-gate',
+    sishBackend: 'http://sish-http.apps-dev-tunnel.svc.cluster.local:8080',
+    ingressTarget: '192.0.2.1', // RFC-5737 doc placeholder; the real LB IP is a per-env secret
+  };
+
+  it('IngressRoute matches EXACTLY the assigned host (never a wildcard/user input)', () => {
+    const ir = buildDevTunnelIngressRoute(opts);
+    expect(ir.spec.routes[0].match).toBe('Host(`dev-0123456789abcdef.civit.ai`)');
+    // REGRESSION (dev-tunnel 404 via Cloudflare): CF pulls the civit.ai origin over
+    // HTTP :80 (Flexible SSL), so a websecure-only (443) route is invisible to CF's
+    // port-80 origin request → 404. Must listen on BOTH `web` (:80) and `websecure`
+    // (:443), mirroring the working app-block routes. Never revert to 443-only.
+    expect(ir.spec.entryPoints).toEqual(['web', 'websecure']);
+    expect(ir.spec.entryPoints).toContain('web');
+    // No explicit `tls` block — Traefik serves TLS on `websecure` via its default
+    // cert, matching the app-block IngressRoute shape (which carry no `tls` key).
+    expect('tls' in ir.spec).toBe(false);
+    // routes to the sish backend service, parsed into name/namespace/port
+    expect(ir.spec.routes[0].services[0]).toMatchObject({
+      name: 'sish-http',
+      namespace: 'apps-dev-tunnel',
+      port: 8080,
+    });
+    // gated by the forwardAuth middleware — the ref uses the DNS-1123-sanitized
+    // suffix (`bki_s` → `bki-s`), matching the Middleware's actual resource name.
+    expect(ir.spec.routes[0].middlewares[0].name).toBe('dev-tunnel-gate-bki-s');
+    // labelled for the reaper + teardown sweep — the LABEL keeps the RAW sessionId
+    // (label values permit `_`; the reaper deletes by this label, not by name).
+    expect(ir.metadata.labels['civitai.com/dev-tunnel']).toBe('true');
+    expect(ir.metadata.labels['civitai.com/dev-tunnel-session']).toBe('bki_s');
+    // external-dns annotations present when ingressTarget is set — without them the
+    // ephemeral host is NXDOMAIN and the browser can't load the tunnel.
+    expect(ir.metadata.annotations['external-dns.alpha.kubernetes.io/hostname']).toBe(
+      'dev-0123456789abcdef.civit.ai'
+    );
+    expect(ir.metadata.annotations['external-dns.alpha.kubernetes.io/target']).toBe('192.0.2.1');
+    expect(ir.metadata.annotations['external-dns.alpha.kubernetes.io/cloudflare-proxied']).toBe(
+      'true'
+    );
+  });
+
+  it('omits external-dns annotations when no ingressTarget is configured (no DNS record)', () => {
+    const { ingressTarget: _drop, ...noTarget } = opts;
+    const ir = buildDevTunnelIngressRoute(noTarget);
+    // No target → no annotations → external-dns creates no record. The route still
+    // renders (routing is correct); the host just won't resolve until the env is set.
+    expect(ir.metadata.annotations).toBeUndefined();
+  });
+
+  it('Middleware points forwardAuth at the dev-tunnel-gate endpoint', () => {
+    const mw = buildDevTunnelMiddleware(opts);
+    expect(mw.spec.forwardAuth.address).toBe('http://civitai-web/api/internal/dev-tunnel-gate');
+    expect(mw.spec.forwardAuth.authResponseHeaders).toContain('X-Dev-User-Id');
+  });
+
+  // REGRESSION: the real sessionId is `bki_<ULID>` — Crockford base32 (UPPERCASE)
+  // with a `_`. Interpolating it raw into a k8s RESOURCE name produces an invalid
+  // name ("must be a lowercase RFC 1123 subdomain"), so the route-apply Job fails,
+  // the mint hangs, and the CLI times out. The Middleware/IngressRoute names (and
+  // the route→middleware ref) MUST be DNS-1123-sanitized; the session LABEL keeps
+  // the raw id for the reaper.
+  it('derives DNS-1123-valid resource names from a real bki_<ULID> sessionId', () => {
+    const RFC1123 = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
+    const realId = 'bki_01KWW3E1GT3JZW1XNBA9XA06ZM'; // uppercase + underscore
+    const realOpts = { ...opts, sessionId: realId };
+
+    const mw = buildDevTunnelMiddleware(realOpts);
+    const ir = buildDevTunnelIngressRoute(realOpts);
+    const expectedSuffix = 'bki-01kww3e1gt3jzw1xnba9xa06zm';
+
+    // Names are valid k8s resource names (no uppercase / underscore).
+    expect(mw.metadata.name).toBe(`dev-tunnel-gate-${expectedSuffix}`);
+    expect(ir.metadata.name).toBe(`dev-tunnel-${expectedSuffix}`);
+    expect(mw.metadata.name).toMatch(RFC1123);
+    expect(ir.metadata.name).toMatch(RFC1123);
+    // The route's middleware ref must equal the Middleware's actual name.
+    expect(ir.spec.routes[0].middlewares[0].name).toBe(mw.metadata.name);
+    // Labels retain the RAW sessionId so the reaper's label-selector delete matches.
+    expect(mw.metadata.labels['civitai.com/dev-tunnel-session']).toBe(realId);
+    expect(ir.metadata.labels['civitai.com/dev-tunnel-session']).toBe(realId);
+  });
+});
+
+/**
+ * 🔴 THE DEV-TUNNEL INDEX — THE SEAM A PUBLISHER BAN READS.
+ *
+ * An EPHEMERAL app (unsubmitted, running over a tunnel) has no `AppBlock` row, no publish
+ * request and no listing, so a live tunnel session is the ONLY server record that it
+ * exists. `revokeBlockInstancesForPublisher` reads this index to turn a ban into a
+ * `page_ephemeral-<blockId>` revocation marker.
+ *
+ * These tests exist because the index-write block was, briefly, payload that NOTHING could
+ * fail on: deleting it outright left 707 files / 12,806 tests green. Both sides were
+ * hermetically tested — the revocation writer mocked `listActiveDevTunnelBlockIds` at the
+ * seam, and this suite had been given `sAdd`/`sRem`/`sMembers` on its fake with not one
+ * assertion using them — so the seam itself was owned by nobody. They assert the
+ * RELATIONSHIP: what `startDevTunnel` writes is what `listActiveDevTunnelBlockIds` reads,
+ * and what `teardownSession` removes.
+ */
+describe('the dev-tunnel index a ban enumerates', () => {
+  it('startDevTunnel makes the blockId readable by listActiveDevTunnelBlockIds', async () => {
+    await startTunnel();
+
+    expect(
+      await listActiveDevTunnelBlockIds(TEST_USER_ID),
+      'a live tunnel is invisible to listActiveDevTunnelBlockIds — a ban on this author ' +
+        'cannot revoke their page_ephemeral-<blockId> token, which lives 4h'
+    ).toEqual([TEST_BLOCK_ID]);
+  });
+
+  it('writes the index ATOMICALLY — one EVAL, not a SADD + EXPIRE pair, and with a TTL', async () => {
+    await startTunnel();
+
+    // The index write is an EVAL. The racy pair it replaced could land the SADD and
+    // drop the EXPIRE on a failover, leaving a TTL-less set that accumulates every
+    // blockId the user ever tunnels — and every later ban would then emit a marker for
+    // all of them.
+    expect(sysRedis.eval).toHaveBeenCalledTimes(1);
+    expect(sysRedis.sAdd, 'the non-atomic SADD is back').not.toHaveBeenCalled();
+
+    // 🔴 AND THE TTL IS ASSERTED, as the script left it: a TTL-less index is exactly the state
+    // the atomic write exists to make unreachable.
+    const key = `system:blocks:dev-tunnel:user-index:${TEST_USER_ID}`;
+    expect(luaRef.current!.set(key), 'the index write did not go through the EVAL path').toEqual([
+      TEST_BLOCK_ID,
+    ]);
+    expect(luaRef.current!.pttl(key)).toBe(DEV_TUNNEL_HARD_SECONDS * 1000);
+  });
+
+  it('teardown removes the member, so a stopped tunnel is not re-revoked', async () => {
+    await startTunnel();
+    expect(await listActiveDevTunnelBlockIds(TEST_USER_ID)).toEqual([TEST_BLOCK_ID]);
+
+    await stopDevTunnelForUserBlock(TEST_USER_ID, TEST_BLOCK_ID);
+
+    expect(await listActiveDevTunnelBlockIds(TEST_USER_ID)).toEqual([]);
+  });
+
+  it('reads EMPTY for a user with no tunnels — the negative control', async () => {
+    expect(await listActiveDevTunnelBlockIds(TEST_USER_ID + 1)).toEqual([]);
+  });
+
+  it('fails OPEN to an empty list when the index read throws', async () => {
+    await startTunnel();
+    sysRedis.sMembers.mockRejectedValueOnce(new Error('redis is down'));
+
+    // A ban must never be failable by this read. The cost is a coverage gap, which is
+    // the same direction every other leg of the ban fan-out degrades in.
+    expect(await listActiveDevTunnelBlockIds(TEST_USER_ID)).toEqual([]);
+  });
+});
+
+describe('startDevTunnel', () => {
+  it('mints an unguessable host, renders the route (via the apply Job), persists state, returns the URL + host pubkey', async () => {
+    const result = await startDevTunnel({ userId: 555, blockId: 'my-app', sshPublicKey: PUBKEY });
+    // host = dev-<16hex>.civit.ai
+    expect(result.host).toMatch(/^dev-[a-f0-9]{16}\.civit\.ai$/);
+    expect(result.host.split('.')[0]).toMatch(DEV_HOST_LABEL_REGEX);
+    expect(result.url).toBe('https://civitai.com/apps/dev/my-app');
+    expect(result.spendCapBuzz).toBe(DEV_TUNNEL_SESSION_BUZZ_CAP);
+    // R1: returns the sish host pubkey (from env) for the CLI to pin.
+    expect(result.sshHostPublicKey).toBe('ssh-ed25519 AAAAC3NzaHostKeyExample sish-host');
+    // F1: the route renders via ONE apply Job POST (NOT direct CRD POSTs from the
+    // web-pod SA), pre-deleted first, then awaited to Succeeded.
+    const posts = mockK8sFetch.mock.calls.filter((c) => (c[2] as any)?.method === 'POST');
+    expect(posts.length).toBe(1);
+    expect(posts[0][1]).toMatch(/\/jobs$/);
+    // NAMESPACE SPLIT (the fix): the apply Job is created in civitai-apps (APPS_KUBE_NAMESPACE,
+    // where apps-applier + the Job-create RBAC live), but the manifests it applies target the
+    // ROUTE namespace (apps-dev-tunnel = the sish backend's ns) so Traefik accepts the
+    // same-namespace service ref. Reverting manifestOpts to APPS_KUBE_NAMESPACE fails here.
+    expect(posts[0][1]).toContain('/namespaces/civitai-apps/jobs');
+    const job = JSON.parse((posts[0][2] as { body: string }).body);
+    const envVal = (name: string) =>
+      job.spec.template.spec.containers[0].env.find((e: { name: string }) => e.name === name)
+        ?.value;
+    const appliedIr = JSON.parse(envVal('INGRESSROUTE_JSON'));
+    const appliedMw = JSON.parse(envVal('MIDDLEWARE_JSON'));
+    expect(appliedIr.metadata.namespace).toBe('apps-dev-tunnel');
+    expect(appliedMw.metadata.namespace).toBe('apps-dev-tunnel');
+    // service + middleware refs are now SAME-namespace (the cross-ns 404 cause).
+    expect(appliedIr.spec.routes[0].services[0].namespace).toBe('apps-dev-tunnel');
+    // PORT: reference the sish-http SERVICE port (80), not the pod targetPort (8080) —
+    // Traefik matches a service ref by Service port number. A revert to :8080 fails here.
+    expect(appliedIr.spec.routes[0].services[0].port).toBe(80);
+    expect(appliedIr.spec.routes[0].middlewares[0].namespace).toBe('apps-dev-tunnel');
+    expect(mockWaitForApplyJob).toHaveBeenCalledTimes(1);
+    // persisted the 3 record keys (cred/session/host) with SET; the user-block pointer is written
+    // by the listing script, with the ban index, and names this session
+    expect(sysRedis.set).toHaveBeenCalledTimes(3);
+    expect(sysRedis._store.get('system:blocks:dev-tunnel:user:555:my-app')).toBe('bki_testsession');
+    // the credential is keyed by pubkey fingerprint (sish authz lookup index)
+    const credKeys = [...sysRedis._store.keys()].filter((k) => k.includes(':cred:'));
+    expect(credKeys.length).toBe(1);
+    // the session record carries the initial idle marker
+    const sessionRaw = sysRedis._store.get('system:blocks:dev-tunnel:session:bki_testsession')!;
+    expect(JSON.parse(sessionRaw).lastActivityAt).toBeTypeOf('number');
+  });
+
+  it('a start whose records could not all be written closes the route and what it did write', async () => {
+    // A credential written without its session is one the sish authz still accepts, for a
+    // tunnel no ban, reap or stop can find. The start must not leave it, or the route, behind.
+    const write = sysRedis.set.getMockImplementation()!;
+    sysRedis.set.mockImplementation(async (k: string, v: string) => {
+      if (k.includes(':host:')) throw new Error('redis blip');
+      return write(k, v);
+    });
+    try {
+      // The write's own error, not another one from the cleanup.
+      await expect(startTunnel()).rejects.toThrow('redis blip');
+    } finally {
+      sysRedis.set.mockImplementation(write);
+    }
+    // One mint and one teardown: the active-tunnel gauge ends where it began.
+    expect(mockRecordMint).toHaveBeenCalledTimes(1);
+    expect(mockRecordTeardown.mock.calls).toEqual([['stop']]);
+    expect(
+      [...sysRedis._store.keys()].filter((k) => /:(cred|session|host|user):/.test(k)),
+      'a partly-written start was left behind'
+    ).toEqual([]);
+    // The route goes too: its objects are listed by this session's own label, then deleted.
+    expect(mockK8sFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('dev-tunnel-session%3Dbki_testsession'),
+      expect.objectContaining({ method: 'GET' })
+    );
+  });
+
+  it('R1: returns an EMPTY host pubkey when the env is unset (CLI fails closed)', async () => {
+    mockEnv.APPS_DEV_TUNNEL_SSH_HOST_PUBKEY = undefined;
+    try {
+      const result = await startDevTunnel({ userId: 5, blockId: 'a', sshPublicKey: PUBKEY });
+      expect(result.sshHostPublicKey).toBe('');
+    } finally {
+      mockEnv.APPS_DEV_TUNNEL_SSH_HOST_PUBKEY = 'ssh-ed25519 AAAAC3NzaHostKeyExample sish-host';
+    }
+  });
+
+  it('F1: a FAILED route-apply Job aborts the mint — nothing is persisted', async () => {
+    mockWaitForApplyJob.mockResolvedValueOnce('failed');
+    await expect(startDevTunnel({ userId: 9, blockId: 'b', sshPublicKey: PUBKEY })).rejects.toThrow(
+      /apply Job failed/
+    );
+    // render threw before persist → no dev-tunnel keys left behind
+    const keys = [...sysRedis._store.keys()].filter((k) =>
+      k.startsWith('system:blocks:dev-tunnel')
+    );
+    expect(keys).toEqual([]);
+  });
+
+  it('rejects an invalid SSH public key before touching k8s/redis', async () => {
+    await expect(startDevTunnel({ userId: 1, blockId: 'a', sshPublicKey: 'junk' })).rejects.toThrow(
+      /invalid SSH public key/
+    );
+    expect(mockK8sFetch).not.toHaveBeenCalled();
+    expect(sysRedis.set).not.toHaveBeenCalled();
+  });
+
+  const readSession = () =>
+    JSON.parse(sysRedis._store.get('system:blocks:dev-tunnel:session:bki_testsession')!);
+
+  it('stores the CLI-declared scopes RAW (forensics) + a CLAMPED grantedScopes on the session', async () => {
+    await startDevTunnel({
+      userId: 555,
+      blockId: 'my-app',
+      sshPublicKey: PUBKEY,
+      // apps:storage:* is NOT in the tunnel allowlist — the clamp must strip it from
+      // grantedScopes, but the raw declaredScopes keeps it for "what did the dev ask".
+      declaredScopes: ['ai:write:budgeted', 'apps:storage:write'],
+    });
+    const s = readSession();
+    expect(s.declaredScopes).toEqual(['ai:write:budgeted', 'apps:storage:write']);
+    // grantedScopes = clampTunnelDeclaredScopes → storage stripped, self-read added, sorted.
+    expect(s.grantedScopes).toEqual(['ai:write:budgeted', 'user:read:self']);
+  });
+
+  it('stores the CLI-declared auth on the session and drops anything but the two known values', async () => {
+    await startDevTunnel({
+      userId: 555,
+      blockId: 'my-app',
+      sshPublicKey: PUBKEY,
+      declaredAuth: 'oauth',
+    });
+    expect(readSession().declaredAuth).toBe('oauth');
+
+    await startDevTunnel({
+      userId: 555,
+      blockId: 'my-app',
+      sshPublicKey: PUBKEY,
+      declaredAuth: 'whatever' as never,
+    });
+    expect(readSession()).not.toHaveProperty('declaredAuth');
+  });
+
+  it('#3703 step 1: startDevTunnel STILL PERSISTS ai:write:budgeted into the stored grantedScopes', async () => {
+    // The tunnel wrapper hardcodes spendEntitled/spendRequested = true/true, and it
+    // MUST stay that way: `startDevTunnel` clamps ONCE at WRITE and the result is
+    // what every later reader grants. A wrong value would not merely affect future
+    // mints — it would silently strip spend from ALREADY-STORED live sessions, and
+    // no re-clamp could restore them.
+    //
+    // Asserted at the layer where the value is STORED (the persisted session record
+    // read back out of redis), not merely where it is computed: a clamp that returns
+    // the right array but is never written is exactly the failure this guards.
+    await startDevTunnel({
+      userId: 555,
+      blockId: 'my-app',
+      sshPublicKey: PUBKEY,
+      declaredScopes: ['ai:write:budgeted', 'models:read:self'],
+    });
+    const stored = readSession();
+    // Enumerated set, never a word check.
+    expect(stored.grantedScopes).toEqual([
+      'ai:write:budgeted',
+      'models:read:self',
+      'user:read:self',
+    ]);
+    // And it really came off the persisted record, not an in-memory return value.
+    const raw = sysRedis._store.get('system:blocks:dev-tunnel:session:bki_testsession')!;
+    expect(JSON.parse(raw).grantedScopes).toEqual(stored.grantedScopes);
+  });
+
+  it('absent declaredScopes → empty raw declared + read-only granted (user:read:self)', async () => {
+    await startDevTunnel({ userId: 555, blockId: 'my-app', sshPublicKey: PUBKEY });
+    const s = readSession();
+    expect(s.declaredScopes).toEqual([]);
+    expect(s.grantedScopes).toEqual(['user:read:self']);
+  });
+
+  it('SANITIZES declaredScopes: drops non-strings + empties + over-64-char, trims, dedupes', async () => {
+    await startDevTunnel({
+      userId: 555,
+      blockId: 'my-app',
+      sshPublicKey: PUBKEY,
+      declaredScopes: [
+        '  ai:write:budgeted  ', // trimmed
+        'ai:write:budgeted', // duplicate → collapsed
+        '', // empty → dropped
+        'x'.repeat(80), // over 64 chars → dropped
+        123 as unknown as string, // non-string → dropped
+        null as unknown as string, // non-string → dropped
+      ],
+    });
+    const s = readSession();
+    expect(s.declaredScopes).toEqual(['ai:write:budgeted']); // trimmed, deduped, junk removed
+    expect(
+      s.declaredScopes.every((x: unknown) => typeof x === 'string' && (x as string).length <= 64)
+    ).toBe(true);
+    expect(s.grantedScopes).toEqual(['ai:write:budgeted', 'user:read:self']);
+  });
+
+  it('CAPS declaredScopes at 32 distinct entries', async () => {
+    const forty = Array.from({ length: 40 }, (_, i) => `zz-scope-${i}`);
+    await startDevTunnel({
+      userId: 555,
+      blockId: 'my-app',
+      sshPublicKey: PUBKEY,
+      declaredScopes: forty,
+    });
+    const s = readSession();
+    expect(s.declaredScopes.length).toBe(32);
+    // All are unknown scopes → clamp strips them → only the force-added self-read.
+    expect(s.grantedScopes).toEqual(['user:read:self']);
+  });
+});
+
+describe('buildDevTunnelApplyJob (F1 — renders via the scoped apps-applier SA)', () => {
+  it('runs as the apps-applier SA and injects both manifests (never the web-pod SA)', () => {
+    const mw = buildDevTunnelMiddleware({
+      host: 'dev-0123456789abcdef.civit.ai',
+      sessionId: 'bki_s',
+      namespace: 'civitai-apps',
+      forwardAuthUrl: 'http://civitai-web/api/internal/dev-tunnel-gate',
+      sishBackend: 'http://sish-http.apps-dev-tunnel.svc.cluster.local:8080',
+    });
+    const ir = buildDevTunnelIngressRoute({
+      host: 'dev-0123456789abcdef.civit.ai',
+      sessionId: 'bki_s',
+      namespace: 'civitai-apps',
+      forwardAuthUrl: 'http://civitai-web/api/internal/dev-tunnel-gate',
+      sishBackend: 'http://sish-http.apps-dev-tunnel.svc.cluster.local:8080',
+    });
+    const job = buildDevTunnelApplyJob({
+      ns: 'civitai-apps',
+      jobName: 'dev-tunnel-apply-bki_s',
+      sessionId: 'bki_s',
+      middleware: mw,
+      ingressRoute: ir,
+    });
+    // THE F1 SECURITY INVARIANT: the create runs as the narrowly-scoped applier SA.
+    expect(job.spec.template.spec.serviceAccountName).toBe('apps-applier');
+    // F1-1: a bounded deadline guarantees a hung apply pod becomes terminal → GC'd,
+    // and it must be >= the 180s render wait so a slow-succeeding pull isn't killed.
+    expect(job.spec.activeDeadlineSeconds).toBe(200);
+    expect(job.spec.activeDeadlineSeconds).toBeGreaterThanOrEqual(180);
+    // Both manifests are injected into the Job (kubectl apply -f -), not POSTed
+    // by the web pod.
+    const env = job.spec.template.spec.containers[0].env;
+    const mwEnv = env.find((e) => e.name === 'MIDDLEWARE_JSON')!;
+    const irEnv = env.find((e) => e.name === 'INGRESSROUTE_JSON')!;
+    expect(JSON.parse(mwEnv.value).kind).toBe('Middleware');
+    expect(JSON.parse(irEnv.value).kind).toBe('IngressRoute');
+    // labelled for the reaper/teardown sweep
+    expect(job.metadata.labels['civitai.com/dev-tunnel-session']).toBe('bki_s');
+    // hardened pod spec (non-root, RO fs, drop ALL)
+    expect(job.spec.template.spec.securityContext.runAsNonRoot).toBe(true);
+    expect(job.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem).toBe(true);
+  });
+});
+
+describe('stopDevTunnel (ownership-checked)', () => {
+  it('a caller can NEVER tear down another author’s tunnel', async () => {
+    await startDevTunnel({ userId: 555, blockId: 'my-app', sshPublicKey: PUBKEY });
+    // wrong user → no-op false, session survives
+    expect(await stopDevTunnel(999, 'bki_testsession')).toBe(false);
+    expect(sysRedis._store.has('system:blocks:dev-tunnel:session:bki_testsession')).toBe(true);
+  });
+
+  it('stopOwnDevTunnel tells an unreadable session (unavailable) apart from an absent or foreign one', async () => {
+    await startDevTunnel({ userId: 555, blockId: 'my-app', sshPublicKey: PUBKEY });
+    const baseGet = sysRedis.get.getMockImplementation()!;
+    try {
+      sysRedis.get.mockImplementation(async () => {
+        throw new Error('redis down');
+      });
+      expect(await stopOwnDevTunnel(555, 'bki_testsession')).toBe('unavailable');
+      // The boolean API keeps answering false for it, as before.
+      expect(await stopDevTunnel(555, 'bki_testsession')).toBe(false);
+    } finally {
+      sysRedis.get.mockReset();
+      sysRedis.get.mockImplementation(baseGet);
+    }
+    expect(sysRedis._store.has('system:blocks:dev-tunnel:session:bki_testsession')).toBe(true);
+    expect(await stopOwnDevTunnel(999, 'bki_testsession')).toBe('not_found');
+    expect(await stopOwnDevTunnel(555, 'bki_nosuchsession')).toBe('not_found');
+    expect(await stopOwnDevTunnel(555, 'bki_testsession')).toBe('stopped');
+  });
+
+  it('the owner tears down: deletes route + all keys', async () => {
+    await startDevTunnel({ userId: 555, blockId: 'my-app', sshPublicKey: PUBKEY });
+    expect(await stopDevTunnel(555, 'bki_testsession')).toBe(true);
+    const remaining = [...sysRedis._store.keys()].filter((k) =>
+      k.startsWith('system:blocks:dev-tunnel')
+    );
+    expect(remaining).toEqual([]);
+  });
+});
+
+describe('getActiveDevTunnel', () => {
+  it('returns the active session for the owner; null for a foreign/absent index', async () => {
+    await startDevTunnel({ userId: 555, blockId: 'my-app', sshPublicKey: PUBKEY });
+    const s = await getActiveDevTunnel(555, 'my-app');
+    expect(s?.userId).toBe(555);
+    expect(s?.host).toMatch(/^dev-[a-f0-9]{16}\.civit\.ai$/);
+    // wrong user / wrong block → null (no cross-tenant leak)
+    expect(await getActiveDevTunnel(999, 'my-app')).toBeNull();
+    expect(await getActiveDevTunnel(555, 'other-app')).toBeNull();
+  });
+});
+
+describe('reserveDevSessionBuzz (spend-cap backstop)', () => {
+  // The per-call budget cap equals the default session cap (both 5000).
+  it('at the default cap, one 5000 call fits a fresh session and a 5001 call never does', async () => {
+    expect(DEV_TUNNEL_SESSION_BUZZ_CAP).toBe(5000);
+    expect(await reserveDevSessionBuzz('over', 5001)).toEqual({ allowed: false, total: 0 });
+    expect(await reserveDevSessionBuzz('exact', 5000)).toEqual({ allowed: true, total: 5000 });
+    expect(await reserveDevSessionBuzz('exact', 1)).toEqual({ allowed: false, total: 5000 });
+  });
+
+  it('allows spend under the ceiling and DENIES + rolls back once it would exceed', async () => {
+    const cap = 100;
+    expect(await reserveDevSessionBuzz('sess', 60, cap)).toEqual({ allowed: true, total: 60 });
+    // 60 + 60 = 120 > 100 → denied, rolled back to 60
+    expect(await reserveDevSessionBuzz('sess', 60, cap)).toEqual({ allowed: false, total: 60 });
+    // a smaller top-up that fits still passes
+    expect(await reserveDevSessionBuzz('sess', 40, cap)).toEqual({ allowed: true, total: 100 });
+    // now full → any further spend denied
+    expect(await reserveDevSessionBuzz('sess', 1, cap)).toEqual({ allowed: false, total: 100 });
+  });
+
+  it('fails CLOSED (denied) on a redis error — never silently uncaps', async () => {
+    sysRedis.incrBy.mockRejectedValueOnce(new Error('redis down'));
+    const r = await reserveDevSessionBuzz('sess', 10, 100);
+    expect(r.allowed).toBe(false);
+  });
+});
+
+describe('touchDevTunnelActivity (F3 — idle refresh on gate entry)', () => {
+  it('stamps lastActivityAt without extending the hard-TTL', async () => {
+    await startDevTunnel({ userId: 555, blockId: 'my-app', sshPublicKey: PUBKEY });
+    const host = JSON.parse(
+      sysRedis._store.get('system:blocks:dev-tunnel:session:bki_testsession')!
+    ).host as string;
+    // move the marker back so a refresh is observable
+    const before = JSON.parse(
+      sysRedis._store.get('system:blocks:dev-tunnel:session:bki_testsession')!
+    );
+    before.lastActivityAt = 1000;
+    sysRedis._store.set('system:blocks:dev-tunnel:session:bki_testsession', JSON.stringify(before));
+
+    await touchDevTunnelActivity(host);
+
+    const after = JSON.parse(
+      sysRedis._store.get('system:blocks:dev-tunnel:session:bki_testsession')!
+    );
+    expect(after.lastActivityAt).toBeGreaterThan(1000);
+    // the re-persist used EX = remaining-until-hard-expiry, NOT a fresh 8h reset
+    const setCall = sysRedis.set.mock.calls.find(
+      (c) => c[0] === 'system:blocks:dev-tunnel:session:bki_testsession' && c[2]
+    );
+    expect((setCall![2] as { EX: number }).EX).toBeLessThanOrEqual(DEV_TUNNEL_HARD_SECONDS);
+  });
+
+  it('is a no-op for an unknown host (never throws)', async () => {
+    await expect(touchDevTunnelActivity('dev-ffffffffffffffff.civit.ai')).resolves.toBeUndefined();
+  });
+});
+
+describe('keepAliveDevTunnel (the server runner’s idle refresh, ownership-checked)', () => {
+  const OWNER = 6101;
+  const STRANGER = 6202;
+  const SESSION_KEY = 'system:blocks:dev-tunnel:session:bki_testsession';
+  const readSession = () => JSON.parse(sysRedis._store.get(SESSION_KEY)!);
+  const ageSession = (lastActivityAt: number) =>
+    sysRedis._store.set(SESSION_KEY, JSON.stringify({ ...readSession(), lastActivityAt }));
+
+  // Two cases below queue a one-shot answer on `get`/`set`. If the function under test never
+  // consumes it (absent, or returning early), it would leak into whichever test runs next — the
+  // reaper's, measured — so every case ends with both queues drained and the fakes restored.
+  const baseGet = sysRedis.get.getMockImplementation()!;
+  const baseSet = sysRedis.set.getMockImplementation()!;
+  afterEach(() => {
+    sysRedis.get.mockReset();
+    sysRedis.get.mockImplementation(baseGet);
+    sysRedis.set.mockReset();
+    sysRedis.set.mockImplementation(baseSet);
+  });
+
+  beforeEach(async () => {
+    await startDevTunnel({ userId: OWNER, blockId: 'kept-app', sshPublicKey: PUBKEY });
+    ageSession(1000);
+  });
+
+  it('stamps the owner’s session now, re-persisted only if it still exists, never past the hard cap', async () => {
+    const before = Math.floor(Date.now() / 1000);
+    const kept = await keepAliveDevTunnel(OWNER, 'bki_testsession');
+    expect(kept).toEqual({
+      status: 'kept',
+      lastActivityAt: expect.any(Number),
+      hardExpiresAt: readSession().hardExpiresAt,
+    });
+    expect(readSession().lastActivityAt).toBeGreaterThanOrEqual(before);
+    const write = sysRedis.set.mock.calls.filter((c) => c[0] === SESSION_KEY).at(-1)!;
+    const opts = write[2] as { EX: number; XX: boolean };
+    expect(opts.XX).toBe(true);
+    expect(opts.EX).toBeGreaterThan(0);
+    expect(opts.EX).toBeLessThanOrEqual(DEV_TUNNEL_HARD_SECONDS);
+  });
+
+  it('refuses another user’s session as not_found, and leaves its idle clock alone', async () => {
+    expect(await keepAliveDevTunnel(STRANGER, 'bki_testsession')).toEqual({ status: 'not_found' });
+    expect(readSession().lastActivityAt).toBe(1000);
+  });
+
+  it('answers not_found for an unknown session and for one past its hard cap', async () => {
+    expect(await keepAliveDevTunnel(OWNER, 'bki_nosuchsession')).toEqual({ status: 'not_found' });
+    sysRedis._store.set(SESSION_KEY, JSON.stringify({ ...readSession(), hardExpiresAt: 1 }));
+    expect(await keepAliveDevTunnel(OWNER, 'bki_testsession')).toEqual({ status: 'not_found' });
+    expect(readSession().lastActivityAt).toBe(1000);
+  });
+
+  it('answers not_found, not kept, when the session vanished between the read and the write', async () => {
+    // The XX write finds no key (a teardown won the race) and Redis answers null.
+    sysRedis.set.mockResolvedValueOnce(null as never);
+    expect(await keepAliveDevTunnel(OWNER, 'bki_testsession')).toEqual({ status: 'not_found' });
+  });
+
+  it('answers unavailable, not not_found, when the session cannot be read just now', async () => {
+    sysRedis.get.mockRejectedValueOnce(new Error('redis down'));
+    expect(await keepAliveDevTunnel(OWNER, 'bki_testsession')).toEqual({ status: 'unavailable' });
+    expect(readSession().lastActivityAt).toBe(1000);
+  });
+});
+
+describe('reserveDevSessionBuzz / refundDevSessionBuzz (F4 support)', () => {
+  it('refund reverses a reservation (best-effort DECRBY)', async () => {
+    const cap = 100;
+    await reserveDevSessionBuzz('sess', 60, cap);
+    await refundDevSessionBuzz('sess', 60);
+    // back under the cap → a fresh 60 fits again
+    expect(await reserveDevSessionBuzz('sess', 60, cap)).toEqual({ allowed: true, total: 60 });
+  });
+});
+
+// 🔴 FIX 5 — the THIRD reservation. A step submit reserves on the per-user
+// daily cap, the per-app aggregate cap AND the dev session; the price-divergence
+// correction touched only the first two while claiming it corrected "both". A
+// divergent submit inside a dev tunnel left this counter under-reading by the
+// overage — the one direction a backstop must never drift.
+describe('chargeDevSessionOverage (divergence correction, third reservation)', () => {
+  it('tops the counter up unconditionally — with NO deny path, even past the cap', async () => {
+    const cap = 100;
+    await reserveDevSessionBuzz('sess', 60, cap);
+    // 60 + 80 = 140, well past the cap. Money that has already moved is an
+    // accounting fact, not a request to approve: unlike `reserveDevSessionBuzz`
+    // this must NOT roll back, or the counter would under-read real spend.
+    await chargeDevSessionOverage('sess', 80);
+    // Proven by effect: the session is now over its ceiling, so any further
+    // reservation is denied — which is exactly the stricter posture wanted.
+    expect(await reserveDevSessionBuzz('sess', 1, cap)).toEqual({ allowed: false, total: 140 });
+  });
+
+  it('is a no-op for a zero/negative overage and ROUNDS UP a fractional one', async () => {
+    const cap = 1000;
+    await chargeDevSessionOverage('sess', 0);
+    await chargeDevSessionOverage('sess', -5);
+    expect(await reserveDevSessionBuzz('sess', 10, cap)).toEqual({ allowed: true, total: 10 });
+    await chargeDevSessionOverage('sess', 2.1);
+    expect(await reserveDevSessionBuzz('sess', 0, cap)).toEqual({ allowed: true, total: 13 });
+  });
+
+  it('NEVER throws on a redis error (best-effort; an already-billed submit must not break)', async () => {
+    sysRedis.incrBy.mockRejectedValueOnce(new Error('redis down'));
+    await expect(chargeDevSessionOverage('sess', 5)).resolves.toBeUndefined();
+  });
+});
+
+describe('reapExpiredDevTunnels (server-authoritative, idle + hardened)', () => {
+  const NOW = Math.floor(Date.now() / 1000);
+
+  function seedSession(sessionId: string, over: Partial<Record<string, unknown>> = {}) {
+    sysRedis._store.set(
+      `system:blocks:dev-tunnel:session:${sessionId}`,
+      JSON.stringify({
+        sessionId,
+        userId: 7,
+        blockId: 'x',
+        host: 'dev-aaaaaaaaaaaaaaaa.civit.ai',
+        fingerprint: 'fp',
+        createdAt: NOW - 60,
+        hardExpiresAt: NOW + DEV_TUNNEL_HARD_SECONDS, // NOT hard-expired
+        spendCapBuzz: 100,
+        lastActivityAt: NOW,
+        ...over,
+      })
+    );
+  }
+
+  /** Make the LIST return a single route labelled `sessionId`, with an optional
+   *  creationTimestamp; every other call (DELETE) is a plain OK. */
+  function listOneRoute(sessionId: string, creationTimestamp?: string) {
+    mockK8sFetch.mockImplementation(async (_t: unknown, path: string, init: any) => {
+      if (init?.method === 'GET' && path.includes('ingressroutes?labelSelector')) {
+        return okRes(
+          JSON.stringify({
+            items: [
+              {
+                metadata: {
+                  labels: { 'civitai.com/dev-tunnel-session': sessionId },
+                  ...(creationTimestamp ? { creationTimestamp } : {}),
+                },
+              },
+            ],
+          })
+        );
+      }
+      return okRes();
+    });
+  }
+
+  it('tears down a route whose backing session is HARD-expired (reap-maxttl)', async () => {
+    const sessionId = 'bki_expired';
+    seedSession(sessionId, { hardExpiresAt: 1, createdAt: 1, lastActivityAt: 1 });
+    listOneRoute(sessionId);
+    const result = await reapExpiredDevTunnels();
+    expect(result).toEqual({ swept: 1, reaped: 1, skipped: 0, listOk: true });
+    expect(sysRedis._store.has(`system:blocks:dev-tunnel:session:${sessionId}`)).toBe(false);
+    expect(mockRecordTeardown).toHaveBeenCalledWith('reap-maxttl');
+  });
+
+  it('F3: reaps an IDLE-expired session (activity older than the idle window) as reap-idle', async () => {
+    const sessionId = 'bki_idle';
+    seedSession(sessionId, { lastActivityAt: NOW - DEV_TUNNEL_IDLE_SECONDS - 60 });
+    listOneRoute(sessionId);
+    const result = await reapExpiredDevTunnels();
+    expect(result).toMatchObject({ reaped: 1, skipped: 0, listOk: true });
+    expect(mockRecordTeardown).toHaveBeenCalledWith('reap-idle');
+    expect(sysRedis._store.has(`system:blocks:dev-tunnel:session:${sessionId}`)).toBe(false);
+  });
+
+  it('F3: does NOT reap a recently-ACTIVE session (survives, not counted as skipped)', async () => {
+    const sessionId = 'bki_active';
+    seedSession(sessionId, { lastActivityAt: NOW - 5 }); // just active
+    listOneRoute(sessionId);
+    const result = await reapExpiredDevTunnels();
+    // a live session is kept: reaped 0 AND skipped 0 (skipped = read-error/guarded-absent only)
+    expect(result).toEqual({ swept: 1, reaped: 0, skipped: 0, listOk: true });
+    expect(sysRedis._store.has(`system:blocks:dev-tunnel:session:${sessionId}`)).toBe(true);
+  });
+
+  it('read-error skip: a Redis read error leaves a LIVE route alone (counted in skipped)', async () => {
+    const sessionId = 'bki_blip';
+    seedSession(sessionId);
+    listOneRoute(sessionId);
+    sysRedis.get.mockRejectedValueOnce(new Error('redis blip'));
+    const result = await reapExpiredDevTunnels();
+    expect(result).toEqual({ swept: 1, reaped: 0, skipped: 1, listOk: true });
+    // route + record untouched
+    expect(sysRedis._store.has(`system:blocks:dev-tunnel:session:${sessionId}`)).toBe(true);
+  });
+
+  it('min-age guard: an absent-record route that is TOO YOUNG (mid-mint) is skipped, not reaped', async () => {
+    const sessionId = 'bki_young';
+    // no session record seeded → absent; route created just now
+    listOneRoute(sessionId, new Date().toISOString());
+    const result = await reapExpiredDevTunnels();
+    expect(result).toEqual({ swept: 1, reaped: 0, skipped: 1, listOk: true });
+  });
+
+  it('min-age guard: an absent-record route with UNKNOWN age (no creationTimestamp) is skipped', async () => {
+    const sessionId = 'bki_noage';
+    listOneRoute(sessionId); // no creationTimestamp → age indeterminable → skip (never reap)
+    const result = await reapExpiredDevTunnels();
+    expect(result).toEqual({ swept: 1, reaped: 0, skipped: 1, listOk: true });
+  });
+
+  it('orphan reap: an absent-record route OLDER than the min-age is deleted', async () => {
+    const sessionId = 'bki_orphan';
+    const old = new Date((NOW - DEV_TUNNEL_REAP_MIN_AGE_SECONDS - 60) * 1000).toISOString();
+    listOneRoute(sessionId, old);
+    const result = await reapExpiredDevTunnels();
+    expect(result).toEqual({ swept: 1, reaped: 1, skipped: 0, listOk: true });
+    expect(mockRecordTeardown).toHaveBeenCalledWith('reap-maxttl');
+  });
+
+  it('listOk: a NON-2xx LIST surfaces listOk:false + the HTTP status (not a silent empty sweep)', async () => {
+    mockK8sFetch.mockResolvedValue({ ok: false, status: 403, text: async () => 'forbidden' });
+    const result = await reapExpiredDevTunnels();
+    expect(result).toEqual({ swept: 0, reaped: 0, skipped: 0, listOk: false, status: 403 });
+  });
+
+  it('listOk: a THROWN LIST (apiserver unreachable) surfaces listOk:false + status 0 sentinel', async () => {
+    mockK8sFetch.mockRejectedValue(new Error('connection refused'));
+    const result = await reapExpiredDevTunnels();
+    expect(result).toEqual({ swept: 0, reaped: 0, skipped: 0, listOk: false, status: 0 });
+  });
+
+  it('listOk: getDp1Target throwing (no SA token) surfaces listOk:false + status 0', async () => {
+    mockGetDp1Target.mockRejectedValueOnce(new Error('not in-cluster'));
+    const result = await reapExpiredDevTunnels();
+    expect(result).toEqual({ swept: 0, reaped: 0, skipped: 0, listOk: false, status: 0 });
+  });
+
+  it('F1-2: discovers + reaps an ORPHAN MIDDLEWARE (no IngressRoute) for an absent session', async () => {
+    const sessionId = 'bki_mw_orphan';
+    const old = new Date((NOW - DEV_TUNNEL_REAP_MIN_AGE_SECONDS - 60) * 1000).toISOString();
+    // ingressroutes LIST → EMPTY (the IngressRoute apply failed); middlewares LIST
+    // → the orphan Middleware. No session record seeded → absent.
+    mockK8sFetch.mockImplementation(async (_t: unknown, path: string, init: any) => {
+      if (init?.method === 'GET' && path.includes('ingressroutes?labelSelector')) {
+        return okRes(JSON.stringify({ items: [] }));
+      }
+      if (init?.method === 'GET' && path.includes('middlewares?labelSelector')) {
+        return okRes(
+          JSON.stringify({
+            items: [
+              {
+                metadata: {
+                  name: `dev-tunnel-gate-${sessionId}`,
+                  labels: { 'civitai.com/dev-tunnel-session': sessionId },
+                  creationTimestamp: old,
+                },
+              },
+            ],
+          })
+        );
+      }
+      return okRes();
+    });
+    const result = await reapExpiredDevTunnels();
+    // the Middleware-only session was discovered (swept) + reaped (both-kind delete)
+    expect(result.swept).toBe(1);
+    expect(result.reaped).toBe(1);
+    expect(mockRecordTeardown).toHaveBeenCalledWith('reap-maxttl');
+    // deleteDevTunnelRoute issued a DELETE against the orphan middleware
+    const mwDeletes = mockK8sFetch.mock.calls.filter(
+      (c) => (c[2] as any)?.method === 'DELETE' && String(c[1]).includes('/middlewares/')
+    );
+    expect(mwDeletes.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cloudflare orphan-DNS cleanup (best-effort, opt-in, dev-<hex>-only guard)
+// ---------------------------------------------------------------------------
+
+const CF_DEV_HOST = 'dev-0123456789abcdef.civit.ai';
+
+/** A CF v4 envelope Response stub. */
+function cfEnvelope(result: unknown, ok = true, status = 200) {
+  return { ok, status, json: async () => ({ success: ok, result, errors: [] }) };
+}
+
+/** Route CF fetch by URL + method: zone lookup, per-name record list, deletes. */
+function routeCfFetch(
+  recordsByName: Record<string, Array<{ id: string }>>,
+  zoneResult = [{ id: 'zone-1' }]
+) {
+  return vi.fn(async (url: string, init?: any) => {
+    const method = init?.method ?? 'GET';
+    if (String(url).includes('/zones?name=')) return cfEnvelope(zoneResult);
+    const listMatch = String(url).match(/dns_records\?name=([^&]+)$/);
+    if (method === 'GET' && listMatch) {
+      const name = decodeURIComponent(listMatch[1]);
+      return cfEnvelope(recordsByName[name] ?? []);
+    }
+    if (method === 'DELETE') return cfEnvelope({ id: 'deleted' });
+    return cfEnvelope([]);
+  });
+}
+
+describe('deleteDevTunnelDns (best-effort orphan CF DNS cleanup)', () => {
+  beforeEach(() => {
+    mockEnv.APPS_DEV_TUNNEL_CF_API_TOKEN = 'cf-token';
+    mockEnv.APPS_DEV_TUNNEL_CF_ZONE_ID = undefined;
+    __resetDevTunnelDnsCacheForTest();
+  });
+
+  it('looks up the zone by name, queries BOTH host + a-host names, and DELETEs each returned record', async () => {
+    const fetchMock = routeCfFetch({
+      [CF_DEV_HOST]: [{ id: 'rec-a' }],
+      [`a-${CF_DEV_HOST}`]: [{ id: 'rec-txt' }],
+    });
+    await deleteDevTunnelDns(CF_DEV_HOST, fetchMock as unknown as typeof fetch);
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    // zone looked up by the registrable (last-two-label) domain of the host
+    expect(urls.some((u) => u.includes('/zones?name=civit.ai'))).toBe(true);
+    // both name forms queried (A record + external-dns TXT-registry forms)
+    expect(
+      urls.some((u) => u.includes(`dns_records?name=${encodeURIComponent(CF_DEV_HOST)}`))
+    ).toBe(true);
+    expect(
+      urls.some((u) => u.includes(`dns_records?name=${encodeURIComponent('a-' + CF_DEV_HOST)}`))
+    ).toBe(true);
+    // one DELETE per returned record id
+    const deletes = fetchMock.mock.calls
+      .filter((c) => (c[1] as any)?.method === 'DELETE')
+      .map((c) => String(c[0]));
+    expect(deletes.some((u) => u.endsWith('/zones/zone-1/dns_records/rec-a'))).toBe(true);
+    expect(deletes.some((u) => u.endsWith('/zones/zone-1/dns_records/rec-txt'))).toBe(true);
+  });
+
+  it('uses APPS_DEV_TUNNEL_CF_ZONE_ID directly when set (no zone lookup)', async () => {
+    mockEnv.APPS_DEV_TUNNEL_CF_ZONE_ID = 'zone-env';
+    const fetchMock = routeCfFetch({ [CF_DEV_HOST]: [{ id: 'r1' }], [`a-${CF_DEV_HOST}`]: [] });
+    await deleteDevTunnelDns(CF_DEV_HOST, fetchMock as unknown as typeof fetch);
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => u.includes('/zones?name='))).toBe(false);
+    expect(urls.some((u) => u.includes('/zones/zone-env/dns_records'))).toBe(true);
+  });
+
+  it('SAFETY: refuses any host that is not a well-formed dev-<16hex>.… (no CF calls)', async () => {
+    const fetchMock = vi.fn();
+    await deleteDevTunnelDns('civitai.com', fetchMock as unknown as typeof fetch);
+    await deleteDevTunnelDns('dev-notenoughhex.civit.ai', fetchMock as unknown as typeof fetch);
+    await deleteDevTunnelDns(
+      'evil-dev-0123456789abcdef.civit.ai',
+      fetchMock as unknown as typeof fetch
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op when the CF token is unset (feature off — no fetch)', async () => {
+    mockEnv.APPS_DEV_TUNNEL_CF_API_TOKEN = undefined;
+    const fetchMock = vi.fn();
+    await deleteDevTunnelDns(CF_DEV_HOST, fetchMock as unknown as typeof fetch);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('never throws when the CF call rejects (best-effort)', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error('cf down');
+    });
+    await expect(
+      deleteDevTunnelDns(CF_DEV_HOST, fetchMock as unknown as typeof fetch)
+    ).resolves.toBeUndefined();
+  });
+
+  it('never throws on a non-2xx CF response and issues no deletes', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes('/zones?name=')) return cfEnvelope([], false, 403);
+      return cfEnvelope([], false, 500);
+    });
+    await expect(
+      deleteDevTunnelDns(CF_DEV_HOST, fetchMock as unknown as typeof fetch)
+    ).resolves.toBeUndefined();
+    const deletes = fetchMock.mock.calls.filter((c) => (c[1] as any)?.method === 'DELETE');
+    expect(deletes.length).toBe(0);
+  });
+});
+
+describe('deleteDevTunnelDns outcome counter (exactly one outcome per call)', () => {
+  const run = (host: string, fetchMock: unknown) =>
+    deleteDevTunnelDns(host, fetchMock as unknown as typeof fetch);
+  const isDelete = (c: unknown[]) => (c[1] as RequestInit | undefined)?.method === 'DELETE';
+
+  beforeEach(() => {
+    mockEnv.APPS_DEV_TUNNEL_CF_API_TOKEN = 'cf-token';
+    mockEnv.APPS_DEV_TUNNEL_CF_ZONE_ID = undefined;
+    __resetDevTunnelDnsCacheForTest();
+  });
+
+  it('skipped — zone id unresolvable (lookup returns no zone)', async () => {
+    const fetchMock = routeCfFetch({ [CF_DEV_HOST]: [{ id: 'rec-a' }] }, []);
+    await run(CF_DEV_HOST, fetchMock);
+    expect(mockRecordDnsGc.mock.calls).toEqual([['skipped']]);
+    expect(fetchMock.mock.calls.filter(isDelete)).toHaveLength(0);
+  });
+
+  it('failed — one DELETE returns non-ok while another succeeds', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') {
+        return String(url).endsWith('/rec-txt')
+          ? cfEnvelope(null, false, 500)
+          : cfEnvelope({ id: 'deleted' });
+      }
+      if (String(url).includes('/zones?name=')) return cfEnvelope([{ id: 'zone-1' }]);
+      if (String(url).includes(encodeURIComponent(`a-${CF_DEV_HOST}`)))
+        return cfEnvelope([{ id: 'rec-txt' }]);
+      return cfEnvelope([{ id: 'rec-a' }]);
+    });
+    await run(CF_DEV_HOST, fetchMock);
+    expect(fetchMock.mock.calls.filter(isDelete)).toHaveLength(2);
+    expect(mockRecordDnsGc.mock.calls).toEqual([['failed']]);
+  });
+
+  it('failed — the outer catch fires (zone lookup throws)', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error('cf down');
+    });
+    await expect(run(CF_DEV_HOST, fetchMock)).resolves.toBeUndefined();
+    expect(mockRecordDnsGc.mock.calls).toEqual([['failed']]);
+  });
+
+  it('still never throws when the recorder itself throws', async () => {
+    mockRecordDnsGc.mockImplementationOnce(() => {
+      throw new Error('registry exploded');
+    });
+    await expect(run(CF_DEV_HOST, routeCfFetch({}))).resolves.toBeUndefined();
+    expect(mockRecordDnsGc).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('orphan-DNS GC wiring (teardown + reap call the CF deleter, best-effort)', () => {
+  /** LIST a route carrying the external-dns hostname annotation so
+   *  deleteDevTunnelRoute can discover the host for CF cleanup. */
+  function listRouteWithHost(sessionId: string, host: string) {
+    mockK8sFetch.mockImplementation(async (_t: unknown, path: string, init: any) => {
+      if (init?.method === 'GET' && path.includes('ingressroutes?labelSelector')) {
+        return okRes(
+          JSON.stringify({
+            items: [
+              {
+                metadata: {
+                  name: 'dev-tunnel-x',
+                  labels: { 'civitai.com/dev-tunnel-session': sessionId },
+                  annotations: { 'external-dns.alpha.kubernetes.io/hostname': host },
+                },
+              },
+            ],
+          })
+        );
+      }
+      return okRes();
+    });
+  }
+
+  it('deleteDevTunnelRoute deletes the orphan CF record for the route host', async () => {
+    mockEnv.APPS_DEV_TUNNEL_CF_API_TOKEN = 'cf-token';
+    mockEnv.APPS_DEV_TUNNEL_CF_ZONE_ID = 'zone-1';
+    listRouteWithHost('bki_wire', CF_DEV_HOST);
+    const cf: Array<[string, string]> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: any) => {
+        cf.push([init?.method ?? 'GET', String(url)]);
+        if (String(url).includes('dns_records?name=')) return cfEnvelope([{ id: 'rec-1' }]);
+        return cfEnvelope({});
+      })
+    );
+    await deleteDevTunnelRoute('bki_wire');
+    // the CF deleter was invoked with the route host and DELETEd its record
+    expect(
+      cf.some(([m, u]) => m === 'DELETE' && u.endsWith('/zones/zone-1/dns_records/rec-1'))
+    ).toBe(true);
+  });
+
+  it('a CF failure does NOT break teardown (route + keys still deleted)', async () => {
+    mockEnv.APPS_DEV_TUNNEL_CF_API_TOKEN = 'cf-token';
+    mockEnv.APPS_DEV_TUNNEL_CF_ZONE_ID = 'zone-1';
+    sysRedis._store.set(
+      'system:blocks:dev-tunnel:session:bki_wire2',
+      JSON.stringify({
+        sessionId: 'bki_wire2',
+        userId: 42,
+        blockId: 'b',
+        host: CF_DEV_HOST,
+        fingerprint: 'fp',
+        createdAt: 1,
+        hardExpiresAt: 9999999999,
+        spendCapBuzz: 100,
+      })
+    );
+    listRouteWithHost('bki_wire2', CF_DEV_HOST);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('cf down');
+      })
+    );
+    // stopDevTunnel → teardownSession → deleteDevTunnelRoute (which GCs CF)
+    expect(await stopDevTunnel(42, 'bki_wire2')).toBe(true);
+    // teardown completed despite the CF failure — all keys gone
+    const remaining = [...sysRedis._store.keys()].filter((k) =>
+      k.startsWith('system:blocks:dev-tunnel')
+    );
+    expect(remaining).toEqual([]);
+  });
+
+  it('reapExpiredDevTunnels GCs CF DNS for a reaped session; a CF failure does not change counts', async () => {
+    mockEnv.APPS_DEV_TUNNEL_CF_API_TOKEN = 'cf-token';
+    mockEnv.APPS_DEV_TUNNEL_CF_ZONE_ID = 'zone-1';
+    const sessionId = 'bki_reapdns';
+    // hard-expired session record
+    sysRedis._store.set(
+      `system:blocks:dev-tunnel:session:${sessionId}`,
+      JSON.stringify({
+        sessionId,
+        userId: 7,
+        blockId: 'x',
+        host: CF_DEV_HOST,
+        fingerprint: 'fp',
+        createdAt: 1,
+        hardExpiresAt: 1,
+        spendCapBuzz: 100,
+        lastActivityAt: 1,
+      })
+    );
+    // LIST returns the route WITH the hostname annotation (discovery + host source)
+    mockK8sFetch.mockImplementation(async (_t: unknown, path: string, init: any) => {
+      if (init?.method === 'GET' && path.includes('ingressroutes?labelSelector')) {
+        return okRes(
+          JSON.stringify({
+            items: [
+              {
+                metadata: {
+                  name: 'dev-tunnel-x',
+                  labels: { 'civitai.com/dev-tunnel-session': sessionId },
+                  annotations: { 'external-dns.alpha.kubernetes.io/hostname': CF_DEV_HOST },
+                },
+              },
+            ],
+          })
+        );
+      }
+      return okRes();
+    });
+    const cfUrls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        cfUrls.push(String(url));
+        throw new Error('cf down');
+      })
+    );
+    const result = await reapExpiredDevTunnels();
+    // reap counts are unaffected by the (failing) best-effort CF cleanup
+    expect(result).toEqual({ swept: 1, reaped: 1, skipped: 0, listOk: true });
+    // the CF deleter WAS invoked for the reaped host's zone
+    expect(cfUrls.some((u) => u.includes('/zones/zone-1/dns_records'))).toBe(true);
+  });
+});

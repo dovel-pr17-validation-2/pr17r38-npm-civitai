@@ -1,0 +1,3 @@
+[submodule "event-engine-common"]
+	path = event-engine-common
+	url = https://github.com/civitai/event-engine-common.git

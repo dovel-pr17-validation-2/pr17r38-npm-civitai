@@ -1,0 +1,1099 @@
+import { beforeEach, describe, expect, test, vi } from 'vitest';
+import { page, userEvent } from 'vitest/browser';
+// `test/` lives outside `src`, so the `~` alias doesn't reach it — relative import.
+import { renderWithProviders } from '../../../test/component-setup';
+import type * as UserAvatarMod from '~/components/UserAvatar/UserAvatar';
+import type * as NotificationsModule from '~/utils/notifications';
+
+/**
+ * On-site (App Block) review modal — browser-mode render test (`Component tests`
+ * in CI). The modal was extracted from `src/pages/apps/review.tsx` to
+ * `OnsiteReviewModal.tsx` (mirrors #3154) so it is importable WITHOUT the page's
+ * `getServerSideProps` server graph — this suite is the coverage that extraction
+ * unlocks. Asserts:
+ *  - onsite-specific visibility (the in-app code-diff affordance + the mod
+ *    Review-preview panel + the structured manifest render), and that NO
+ *    raw-source deep-link is offered (retired in #3498 — in-review snapshots are
+ *    private, so such a link would 404 for the moderator who clicked it);
+ *  - Approve FIRES `blocks.approveRequest` with the request id;
+ *  - the reject reason gate (disabled < 3 chars) AND that Reject FIRES
+ *    `blocks.rejectRequest` with `{ publishRequestId, rejectionReason }`;
+ *  - a read-only (approved) selection surfaces the mod feedback and shows NO
+ *    approve/reject actions.
+ */
+
+const ONSITE_PENDING = {
+  id: 'onsite-req-1',
+  appBlockId: null as string | null,
+  slug: 'my-onsite-block',
+  version: '1.2.0',
+  submittedAt: new Date('2026-01-01T00:00:00Z'),
+  bundleSizeBytes: '2048',
+  bundleSha256: 'abcdef0123456789abcdef0123456789',
+  manifest: {
+    name: 'My Onsite Block',
+    blockId: 'blk_1',
+    version: '1.2.0',
+    scopes: ['user:read'],
+    targets: [{ slotId: 'model.sidebar_top', priority: 10 }],
+    iframe: { src: 'https://example.com/block', sandbox: 'allow-scripts' },
+    // An unexpected/novel top-level key — falls into the "Other manifest fields"
+    // disclosure so the mod can still inspect payloads the renderer doesn't model.
+    unexpectedTopLevelKey: { note: 'novel-payload' },
+  },
+  fileSummary: {
+    files: [{ path: 'index.js', sha256: 'x', sizeBytes: 10 }],
+    added: ['index.js'],
+    removed: [],
+    changed: [],
+  },
+  manifestDiffSummary: { kind: 'first-version', fields: ['name'] },
+  reviewRepoUrl: 'https://forgejo.example/repo',
+  pushCommitUrl: null as string | null,
+  submittedBy: { id: 7, username: 'dev-user', deletedAt: null, image: null },
+};
+
+const ONSITE_APPROVED = {
+  ...ONSITE_PENDING,
+  id: 'onsite-req-2',
+  slug: 'approved-block',
+  reviewedAt: new Date('2026-01-02T00:00:00Z'),
+  approvalNotes: 'looks good, shipping it',
+  reviewedBy: { id: 99, username: 'mod-user', deletedAt: null, image: null },
+};
+
+// A SECOND pending request (distinct `id`) used to prove the transient
+// approve/reject state does not leak when the mod switches from one app to
+// another in the same long-lived modal.
+const ONSITE_PENDING_B = {
+  ...ONSITE_PENDING,
+  id: 'onsite-req-3',
+  slug: 'other-onsite-block',
+};
+
+const mocks = vi.hoisted(() => ({
+  invalidate: vi.fn().mockResolvedValue(undefined),
+  mutate: vi.fn(),
+  errorMode: false,
+  // Drives the getReviewStatus mock so a test can flip the Review-preview panel
+  // into the live state (default undefined = no preview → "Start preview").
+  reviewStatus: undefined as unknown,
+  // When true, the approve/reject mutation mocks report `isPending: true` so the
+  // component's `busy` state (and the ref-published close-guard) can be exercised.
+  pending: false,
+}));
+
+/*
+  🔴 `UserAvatar` IS STUBBED, AND IT IS A NEW DEPENDENCY OF THIS TREE. The shared review
+  body's submitter line now renders the SAME avatar chip the queue list does, and the real
+  component reaches `trpc.user.getById`, `useCurrentUser`,
+  `useViewerBrowsingLevelDebounced` and `useBrowsingSettings` — none of which this harness
+  mounts, so it throws and blanks the whole render. The stub keeps the only contract this
+  suite cares about (WHICH user, and whether it links) and the real component is exercised
+  for real in `ReviewSubmitterMeta.browser.test.tsx`. Precedent:
+  `UnifiedReviewList.browser.test.tsx`, for the same component and the same reason.
+*/
+vi.mock('~/components/UserAvatar/UserAvatar', async (importOriginal) => ({
+  ...(await importOriginal<typeof UserAvatarMod>()),
+  UserAvatar: ({
+    user,
+    linkToProfile,
+  }: {
+    user: { id: number; username?: string | null };
+    linkToProfile?: boolean;
+  }) =>
+    linkToProfile ? (
+      <a href={`/user/${user.username ?? user.id}`} data-testid="submitter-link">
+        {user.username ?? '[deleted]'}
+      </a>
+    ) : (
+      <span>{user.username ?? '[deleted]'}</span>
+    ),
+}));
+
+vi.mock('~/providers/FeatureFlagsProvider', () => ({
+  useFeatureFlags: () => ({ appBlocks: true }),
+}));
+
+// Stub the review host bridge so the live-preview branch can render (and the
+// full-page link asserted) WITHOUT mounting the real PageBlockHost graph. The
+// bridge's own behaviour is covered by PageBlockHostReviewMode.browser.test.tsx.
+vi.mock('~/components/Apps/ReviewBlockPreviewHost', () => ({
+  ReviewBlockPreviewHost: () => <div data-testid="review-host-stub" />,
+}));
+
+const showError = vi.fn();
+/*
+  🔴 SPREAD THE ORIGINAL, never a one-key factory. A factory that omits an export fails the
+  WHOLE FILE at import the day anything in its graph starts calling it — and vitest reports
+  that as 0 tests collected, not as a failing assertion, so it reads as a skipped file. This
+  PR hit it four times at once: the panel gained a `showWarningNotification` call and every
+  suite listing only two exports stopped importing. `local-rules/no-wholesale-module-mock`
+  reds on the narrow form.
+*/
+vi.mock('~/utils/notifications', async (importOriginal) => ({
+  ...(await importOriginal<typeof NotificationsModule>()),
+  showSuccessNotification: vi.fn(),
+  showErrorNotification: (...a: unknown[]) => showError(...a),
+}));
+
+vi.mock('~/utils/trpc', () => {
+  // A mutation mock: records (name, vars), then drives onSuccess/onError so the
+  // component's success + error paths both run.
+  const mutation =
+    (name: string) =>
+    (opts?: { onSuccess?: () => void; onError?: (e: { message: string }) => void }) => ({
+      mutate: (vars: unknown) => {
+        mocks.mutate(name, vars);
+        if (mocks.errorMode) opts?.onError?.({ message: 'boom' });
+        else void opts?.onSuccess?.();
+      },
+      mutateAsync: vi.fn(),
+      isPending: mocks.pending,
+    });
+  const inert = { invalidate: mocks.invalidate };
+  const utils = {
+    blocks: {
+      listPendingRequests: inert,
+      listApprovedRequests: inert,
+      listRejectedRequests: inert,
+      getReviewStatus: inert,
+      listActivePreviews: inert,
+      getMarketplaceMeta: inert,
+      getFeaturedBlocks: inert,
+      listAvailable: inert,
+    },
+  };
+  return {
+    trpc: {
+      useUtils: () => utils,
+      blocks: {
+        approveRequest: { useMutation: mutation('approve') },
+        rejectRequest: { useMutation: mutation('reject') },
+        // Sub-panel queries the modal mounts (Review-preview / Screenshots / Code
+        // diff) — kept network-free with empty/no-op state.
+        getReviewStatus: {
+          useQuery: () => ({ data: mocks.reviewStatus, isLoading: false, error: null }),
+        },
+        previewRequest: { useMutation: mutation('preview') },
+        teardownPreview: { useMutation: mutation('teardown') },
+        getPublishRequestScreenshots: {
+          useQuery: () => ({ data: { items: [] }, isLoading: false, error: null }),
+        },
+        getPublishRequestDiff: {
+          useQuery: () => ({ data: undefined, isLoading: false, error: null }),
+        },
+        // Only reached by the (approved + appBlockId) curation panel — defined so
+        // the mock is complete if a future test exercises that branch.
+        getMarketplaceMeta: {
+          useQuery: () => ({ data: undefined, isLoading: false, isError: false, error: null }),
+        },
+        setMarketplaceMeta: { useMutation: mutation('setMeta') },
+      },
+    },
+  };
+});
+
+const { OnsiteReviewModal } = await import('./OnsiteReviewModal');
+
+beforeEach(() => {
+  mocks.invalidate.mockClear();
+  mocks.mutate.mockClear();
+  mocks.errorMode = false;
+  mocks.reviewStatus = undefined;
+  mocks.pending = false;
+  showError.mockClear();
+});
+
+describe('OnsiteReviewModal — onsite-specific contract', () => {
+  test('a pending selection renders the in-app code diff, the mod Review-preview panel, and the structured manifest — and NO raw-source link', async () => {
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    // The on-site code-review affordance (off-site has no bundle/code) is the
+    // in-app diff, not an external link.
+    await expect.element(page.getByText('Show code diff')).toBeInTheDocument();
+    // 🔴 #3498 regression guard: the modal's own raw-source affordances are
+    // retired and may not come back. (The per-FILE fallback that used to sit
+    // inside an elided diff row is guarded where it actually renders —
+    // `src/tests/pages/apps/review-diff-panels.browser.test.tsx`. Asserting it
+    // here would prove nothing: the code-diff panel is collapsed by default, so
+    // no file row is mounted at this point.)
+    expect(page.getByText('View full source').elements()).toHaveLength(0);
+    expect(page.getByText('View code in Forgejo').elements()).toHaveLength(0);
+    expect(document.querySelectorAll(`a[href="${ONSITE_PENDING.reviewRepoUrl}"]`).length).toBe(0);
+    // The mod Review-preview sandbox panel — on-site pending only.
+    await expect.element(page.getByText('Review preview')).toBeInTheDocument();
+    await expect.element(page.getByRole('button', { name: 'Start preview' })).toBeInTheDocument();
+    // Structured manifest render (scopes + slot targets), not a raw JSON dump.
+    await expect
+      .element(page.getByText('Other permissions (1)', { exact: true }))
+      .toBeInTheDocument();
+    await expect.element(page.getByText('model.sidebar_top')).toBeInTheDocument();
+    // A first-version submission shows the full-manifest note (no diff).
+    await expect
+      .element(page.getByText('First version — full manifest below.'))
+      .toBeInTheDocument();
+    // Both action entry points are present on a pending request.
+    await expect.element(page.getByRole('button', { name: 'Approve + build' })).toBeInTheDocument();
+    await expect.element(page.getByRole('button', { name: 'Reject…' })).toBeInTheDocument();
+  });
+
+  test('the iframe + other-manifest-fields sections render as collapsed-by-default disclosures the mod can expand', async () => {
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    // Both disclosure CONTROLS render — the moderator security signal (risky
+    // iframe sandbox flags; unexpected/novel manifest keys) is one click away,
+    // not lost. The fixture carries one iframe block + one unexpected top-level key.
+    const iframeCtrl = page.getByRole('button', { name: 'Iframe' });
+    const otherCtrl = page.getByRole('button', { name: 'Other manifest fields (1)' });
+    await expect.element(iframeCtrl).toBeInTheDocument();
+    await expect.element(otherCtrl).toBeInTheDocument();
+    // Default-CLOSED: both controls report aria-expanded="false". (Mantine keeps
+    // collapsed Accordion panel content MOUNTED but hidden, so the control's
+    // expanded-state is the deterministic default-closed signal, not DOM presence.)
+    await expect.element(iframeCtrl).toHaveAttribute('aria-expanded', 'false');
+    await expect.element(otherCtrl).toHaveAttribute('aria-expanded', 'false');
+    // Expanding the Iframe disclosure flips it open and reveals the sandbox flags
+    // (`allow-scripts` lives only inside the Iframe panel).
+    await iframeCtrl.click();
+    await expect.element(iframeCtrl).toHaveAttribute('aria-expanded', 'true');
+    await expect.element(page.getByText('allow-scripts')).toBeVisible();
+    // Expanding "Other manifest fields" reveals the raw JSON of the novel key.
+    await otherCtrl.click();
+    await expect.element(otherCtrl).toHaveAttribute('aria-expanded', 'true');
+    await expect.element(page.getByText(/novel-payload/)).toBeVisible();
+  });
+
+  test('a manifest with NO iframe config and no novel keys renders NO empty "Iframe"/"Other" disclosures', async () => {
+    // A block that only uses fully-handled inline fields — no iframe, no unexpected keys.
+    const nonIframe = {
+      ...ONSITE_PENDING,
+      id: 'onsite-req-noiframe',
+      slug: 'noiframe-block',
+      manifest: {
+        name: 'No Iframe Block',
+        blockId: 'blk_2',
+        version: '1.0.0',
+        scopes: ['user:read'],
+        targets: [{ slotId: 'model.sidebar_top', priority: 10 }],
+      },
+    };
+    renderWithProviders(
+      <OnsiteReviewModal selection={{ request: nonIframe, mode: 'pending' }} onClose={vi.fn()} />
+    );
+    // The inline structured render still shows (scopes/targets).
+    await expect.element(page.getByText('model.sidebar_top')).toBeInTheDocument();
+    // Neither disclosure control renders — no empty "Iframe" or "Other" accordion.
+    expect(page.getByRole('button', { name: 'Iframe' }).elements()).toHaveLength(0);
+    expect(page.getByText(/^Other manifest fields/).elements()).toHaveLength(0);
+  });
+});
+
+describe('OnsiteReviewModal — store-visible copy is surfaced INLINE for the mod', () => {
+  // `tagline` + `category` are MANIFEST-GOVERNED and go live on the app's /apps
+  // listing the moment this request is approved. The mod is the ONLY gate on
+  // store-visible copy changing, so they must render beside name/description —
+  // not be buried in the collapsed "Other manifest fields" raw-JSON disclosure.
+  test('renders the manifest tagline + category in the identity card, not the raw-JSON fallback', async () => {
+    const withCopy = {
+      ...ONSITE_PENDING,
+      manifest: {
+        ...ONSITE_PENDING.manifest,
+        tagline: 'The fastest way to remix a model',
+        category: 'generation',
+        contentRating: 'pg13',
+      },
+    };
+    renderWithProviders(
+      <OnsiteReviewModal selection={{ request: withCopy, mode: 'pending' }} onClose={vi.fn()} />
+    );
+    // Both are visible WITHOUT expanding any disclosure.
+    await expect.element(page.getByText('The fastest way to remix a model')).toBeInTheDocument();
+    /**
+     * 🔴 CALL-SITE ASSERTION — and a REPAIR of one that could not fail.
+     *
+     * This line was `getByText('generation')`. Without `exact`, Playwright matches
+     * a case-insensitive SUBSTRING, so it resolved happily against both the raw
+     * `generation` this modal used to render AND the `Generation` it renders now —
+     * it named the value without ever being able to discriminate it. The audit
+     * counted this site as uncovered, and it was right: the assertion was inert
+     * for the property that matters.
+     */
+    await expect.element(page.getByText('Generation', { exact: true })).toBeInTheDocument();
+    expect(page.getByText('generation', { exact: true }).query()).toBeNull();
+    // 🔴 The rating badge beside it, on the rung that separates the shared map from
+    // every mechanical transformation of the key (`PG13`, `Pg13`, `pg13`).
+    await expect.element(page.getByText('PG-13', { exact: true })).toBeInTheDocument();
+    expect(page.getByText('pg13', { exact: true }).query()).toBeNull();
+    // They are HANDLED keys, so the "Other manifest fields" count is unchanged
+    // (still just the one novel key from the base fixture) — i.e. they did not
+    // fall through to the raw-JSON dump.
+    await expect
+      .element(page.getByRole('button', { name: 'Other manifest fields (1)' }))
+      .toBeInTheDocument();
+  });
+
+  test('omitting them renders no empty tagline/category chrome', async () => {
+    // The base fixture declares neither.
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    await expect.element(page.getByText('My Onsite Block')).toBeInTheDocument();
+    expect(page.getByText('The fastest way to remix a model').elements()).toHaveLength(0);
+    // Neither spelling renders when the manifest declares no category.
+    expect(page.getByText('generation', { exact: true }).elements()).toHaveLength(0);
+    expect(page.getByText('Generation', { exact: true }).elements()).toHaveLength(0);
+  });
+});
+
+describe('OnsiteReviewModal — a PAID app is announced to the mod', () => {
+  /**
+   * 🔴 WHY THIS SUITE EXISTS — stated precisely, because the first version of this
+   * docblock got it wrong. An `app_unlock` good is what makes an app charge for
+   * ADMISSION. The sensitive-permissions panel does NOT announce that for an app
+   * that already sells ordinary goods: `goods:purchase:self` was declared and
+   * justified once, and adding an unlock moves no scope, so that panel renders
+   * exactly what it rendered before. If the goods card fails to render, nothing on
+   * the moderator's screen says the app now charges — and the approve button still
+   * works. A review signal that silently does not render is the entire failure mode,
+   * which is why both its PRESENCE and its PLACEMENT are asserted rather than
+   * assumed.
+   */
+  const UNLOCK_GOOD = {
+    id: 'full-access',
+    title: 'Unlock the whole app',
+    priceBuzz: 3100,
+    kind: 'app_unlock',
+    justification: 'Each session runs a paid model; this covers it once per viewer.',
+  };
+
+  test('an app_unlock good renders the "becoming PAID" alert with its price and stated reason', async () => {
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{
+          request: {
+            ...ONSITE_PENDING,
+            manifest: { ...ONSITE_PENDING.manifest, goods: [UNLOCK_GOOD] },
+          },
+          mode: 'pending',
+        }}
+        onClose={vi.fn()}
+      />
+    );
+    await expect.element(page.getByText('This app is becoming PAID')).toBeInTheDocument();
+    // The PRICE, formatted as the mod sees it — this is the number being approved.
+    // Thousands-separated, so it cannot accidentally match the raw `3100` in the
+    // JSON disclosure.
+    await expect.element(page.getByText('3,100 Buzz')).toBeInTheDocument();
+    // 🔴 `exact: true` IS LOAD-BEARING ON EVERY FIELD ALSO PRESENT IN THE RAW JSON.
+    // `goods` is deliberately left in the "Other manifest fields" disclosure as well
+    // (it carries an opaque `payload` this card does not render), so each of these
+    // strings legitimately appears TWICE — once in the card, once inside the
+    // collapsed `<pre>`. A non-exact query matches the `<pre>` too and fails strict
+    // mode. The duplication is the intended trade-off, not a defect.
+    await expect
+      .element(page.getByText('Unlock the whole app', { exact: true }))
+      .toBeInTheDocument();
+    // The developer's stated reason — the free→paid review trigger's whole payload.
+    // Asserted as the LABEL + the reason together: the card renders the label in a
+    // nested span, so the reason alone is not any single element's full text, and a
+    // non-exact match would also hit the raw-JSON `<pre>`. Pinning the whole string
+    // fixes both, and additionally proves the reason is LABELLED for the mod rather
+    // than floating unexplained.
+    await expect
+      .element(
+        page.getByText(
+          'Why this app charges: Each session runs a paid model; this covers it once per viewer.',
+          { exact: true }
+        )
+      )
+      .toBeInTheDocument();
+    await expect.element(page.getByText('Digital goods (1)')).toBeInTheDocument();
+
+    // 🔴 THE PLACEMENT, NOT JUST THE PRESENCE — the claim the panel's docblock makes
+    // in capitals ("INLINE, NOT IN THE 'Other manifest fields' DISCLOSURE") and the
+    // one every `toBeInTheDocument()` above is blind to. Mantine keeps a COLLAPSED
+    // Accordion panel's content MOUNTED but hidden (this file already records that at
+    // the iframe-disclosure test), so moving the card inside that panel keeps every
+    // assertion above green while the moderator sees nothing without clicking.
+    //
+    // `aria-hidden` is the discriminator rather than `toBeVisible()`: Mantine's
+    // collapsed style is `height: 0; overflow: hidden` plus `aria-hidden`, and
+    // jest-dom's visibility check inspects display/visibility/opacity — none of which
+    // move — so `toBeVisible()` can pass in BOTH placements. Watched to fail with the
+    // card relocated into the disclosure.
+    const alert = page.getByText('This app is becoming PAID').element();
+    expect(alert.closest('[aria-hidden="true"]')).toBeNull();
+    // Belt: the disclosure itself is still present and still CLOSED, so the assertion
+    // above is about a card outside it rather than about a panel that failed to mount.
+    const otherCtrl = page.getByRole('button', { name: /^Other manifest fields/ });
+    await expect.element(otherCtrl).toHaveAttribute('aria-expanded', 'false');
+
+    // 🔴 POSITIVE CONTROL ON THE DISCRIMINATOR ITSELF. Everything above rests on the
+    // claim that Mantine marks a collapsed panel's subtree `aria-hidden="true"`. That
+    // was prose; if a Mantine upgrade switches to `hidden` / `display:none` /
+    // unmounting, `closest(...)` returns null for EVERYTHING and the `toBeNull()`
+    // above becomes permanently, silently true in both placements — the exact vacuity
+    // this test rejected `toBeVisible()` for. So assert that content which IS inside
+    // the collapsed disclosure genuinely reports hidden. The raw-JSON `<pre>` is the
+    // handle (`goods` is deliberately left in that dump), reached non-exactly on
+    // purpose so it resolves the `<pre>` rather than the card.
+    const rawJson = page.getByText(/"full-access"/).element();
+    expect(rawJson.closest('[aria-hidden="true"]')).not.toBeNull();
+  });
+
+  test('an ARITY-violating catalog shows BOTH the paid alert and the errors card', async () => {
+    // 🔴 PINS AN INTENTIONAL ASYMMETRY THAT IS EASY TO MISREAD AS A BUG. The arity
+    // rule is the one catalog-level error that leaves `goods` POPULATED, precisely so
+    // this card can show a moderator WHAT was declared. So an invalid-by-arity
+    // manifest renders the alert for both unlocks AND the "does not validate" card —
+    // unlike an unjustified unlock, which is dropped and renders only the errors card.
+    // "Invalid ⇒ no alert" is therefore NOT true in general, and the parser comment
+    // owes this consumer the populated array.
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{
+          request: {
+            ...ONSITE_PENDING,
+            manifest: {
+              ...ONSITE_PENDING.manifest,
+              goods: [UNLOCK_GOOD, { ...UNLOCK_GOOD, id: 'full-access-2', priceBuzz: 4200 }],
+            },
+          },
+          mode: 'pending',
+        }}
+        onClose={vi.fn()}
+      />
+    );
+    await expect.element(page.getByText('This app is becoming PAID')).toBeInTheDocument();
+    await expect.element(page.getByText(/Goods catalog does not validate/)).toBeInTheDocument();
+    await expect.element(page.getByText(/at most 1 app_unlock good/)).toBeInTheDocument();
+    // Both unlocks are shown, so the moderator sees the whole declaration.
+    await expect.element(page.getByText('3,100 Buzz')).toBeInTheDocument();
+    await expect.element(page.getByText('4,200 Buzz')).toBeInTheDocument();
+  });
+
+  test('an ORDINARY goods catalog renders the goods card but NOT the paid-app alert', async () => {
+    // The discriminating control. Without it, an alert hardcoded to render whenever
+    // `goods` exists would pass the case above — and would cry "becoming PAID" at
+    // every app that merely sells an in-app item.
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{
+          request: {
+            ...ONSITE_PENDING,
+            manifest: {
+              ...ONSITE_PENDING.manifest,
+              goods: [{ id: 'extra-slots', title: 'Extra slots', priceBuzz: 1300 }],
+            },
+          },
+          mode: 'pending',
+        }}
+        onClose={vi.fn()}
+      />
+    );
+    await expect.element(page.getByText('Digital goods (1)')).toBeInTheDocument();
+    // `exact: true` for the same reason as above — the title is also in the raw JSON.
+    await expect.element(page.getByText('Extra slots', { exact: true })).toBeInTheDocument();
+    expect(page.getByText('This app is becoming PAID').elements()).toHaveLength(0);
+  });
+
+  test('a manifest with NO goods renders NEITHER the goods card nor the paid alert', async () => {
+    // 🔴 THE INERTNESS PROOF ON THE REVIEW SURFACE. Every app approved to date
+    // declares no `goods`, so this change must add nothing at all to their review
+    // screens — an empty panel on every review would be pure noise.
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    // Positive control: the modal DID render, so the two zeros below mean "absent",
+    // not "nothing mounted".
+    await expect
+      .element(page.getByText('Other permissions (1)', { exact: true }))
+      .toBeInTheDocument();
+    expect(page.getByText('This app is becoming PAID').elements()).toHaveLength(0);
+    expect(page.getByText(/^Digital goods/).elements()).toHaveLength(0);
+  });
+
+  test('an INVALID goods catalog is reported in words, not left as odd-looking JSON', async () => {
+    // An app_unlock with no justification: rejected by the parser, so the catalog
+    // sells nothing. The mod must be told why rather than inferring it.
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{
+          request: {
+            ...ONSITE_PENDING,
+            manifest: {
+              ...ONSITE_PENDING.manifest,
+              goods: [
+                { id: 'full-access', title: 'Full access', priceBuzz: 3100, kind: 'app_unlock' },
+              ],
+            },
+          },
+          mode: 'pending',
+        }}
+        onClose={vi.fn()}
+      />
+    );
+    await expect.element(page.getByText(/Goods catalog does not validate/)).toBeInTheDocument();
+    await expect.element(page.getByText(/justification is required/)).toBeInTheDocument();
+    // …and it must NOT be announced as a working paid app, because it cannot sell.
+    expect(page.getByText('This app is becoming PAID').elements()).toHaveLength(0);
+  });
+});
+
+describe('OnsiteReviewModal — declared analytics events are shown to the mod', () => {
+  // Every name and value below is distinct from every other and from the card's own
+  // copy, so each assertion can only be satisfied by the field it names.
+  const VALID_ANALYTICS = {
+    events: {
+      level_complete: {
+        description: 'A viewer finished a level',
+        properties: {
+          difficulty: { type: 'enum', values: ['casual_tier', 'brutal_tier'] },
+          score: { type: 'number' },
+          used_hint: { type: 'boolean' },
+        },
+      },
+      share_clicked: {},
+    },
+  };
+
+  function renderWithAnalytics(analytics: unknown) {
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{
+          request: { ...ONSITE_PENDING, manifest: { ...ONSITE_PENDING.manifest, analytics } },
+          mode: 'pending',
+        }}
+        onClose={vi.fn()}
+      />
+    );
+  }
+
+  function propertyRowParts(name: string): string[] {
+    const rows = page.getByTestId('apps-review-analytics-property').elements();
+    const row = rows.find((el) => el.querySelector('code')?.textContent === name);
+    if (!row) throw new Error(`no property row for ${name}`);
+    return [...row.children].map((child) => child.textContent ?? '');
+  }
+
+  test('a valid declaration lists every event, property type and enum value, inline', async () => {
+    renderWithAnalytics(VALID_ANALYTICS);
+    await expect.element(page.getByText('Analytics events')).toBeInTheDocument();
+    await expect.element(page.getByText(/^2 events declared\./)).toBeInTheDocument();
+
+    const eventNames = page
+      .getByTestId('apps-review-analytics-event')
+      .elements()
+      .map((el) => el.querySelector('code')?.textContent);
+    expect(eventNames).toEqual(['level_complete', 'share_clicked']);
+    await expect.element(page.getByText('A viewer finished a level')).toBeInTheDocument();
+    // The harness loads no Mantine CSS, so clipping can't be observed here; pin the
+    // wrap rule that keeps a long unbroken description inside the overflow-hidden Card.
+    expect(page.getByText('A viewer finished a level').element().style.overflowWrap).toBe(
+      'anywhere'
+    );
+    await expect.element(page.getByText('No properties')).toBeInTheDocument();
+
+    expect(propertyRowParts('difficulty')).toEqual([
+      'difficulty',
+      'enum',
+      '"casual_tier"',
+      '"brutal_tier"',
+    ]);
+    // Enum values keep their whitespace on screen (CSS would otherwise collapse runs).
+    const valueEl = page.getByText('"casual_tier"', { exact: true }).element();
+    expect(getComputedStyle(valueEl).whiteSpace).toBe('pre-wrap');
+    expect(propertyRowParts('score')).toEqual(['score', 'number']);
+    expect(propertyRowParts('used_hint')).toEqual(['used_hint', 'boolean']);
+
+    // INLINE, not inside the collapsed disclosure. Mantine keeps a collapsed panel
+    // mounted under `aria-hidden`, so presence alone cannot tell the two apart.
+    const card = page.getByTestId('apps-review-analytics').element();
+    expect(card.closest('[aria-hidden="true"]')).toBeNull();
+    // Positive control for that discriminator: the raw-JSON disclosure's own content
+    // (the fixture's novel key) IS reported hidden.
+    expect(
+      page
+        .getByText(/novel-payload/)
+        .element()
+        .closest('[aria-hidden="true"]')
+    ).not.toBeNull();
+  });
+
+  test('`analytics` is not repeated in the raw "Other manifest fields" disclosure', async () => {
+    renderWithAnalytics(VALID_ANALYTICS);
+    await expect.element(page.getByTestId('apps-review-analytics')).toBeInTheDocument();
+    // The raw dump is mounted while collapsed, so a leaked key would be found here.
+    expect(page.getByText(/"analytics"/).elements()).toHaveLength(0);
+    await expect
+      .element(page.getByRole('button', { name: 'Other manifest fields (1)' }))
+      .toBeInTheDocument();
+  });
+
+  test('a malformed declaration shows every error and NO event list', async () => {
+    // `level_complete` is valid on its own; `asked_prompt` declares a free-text property
+    // and `BadName` breaks the naming rule — two errors, so a list truncated to one is
+    // caught.
+    renderWithAnalytics({
+      events: {
+        level_complete: VALID_ANALYTICS.events.level_complete,
+        asked_prompt: { properties: { prompt: { type: 'string' } } },
+        BadName: {},
+      },
+    });
+    await expect
+      .element(page.getByText('Analytics declaration does not validate', { exact: true }))
+      .toBeInTheDocument();
+    await expect
+      .element(
+        page.getByText(/^analytics\.events\.asked_prompt\.properties\.prompt\.type must be one of/)
+      )
+      .toBeInTheDocument();
+    await expect
+      .element(page.getByText(/^analytics\.events key "BadName" must be lowercase snake_case/))
+      .toBeInTheDocument();
+    await expect
+      .element(
+        page.getByText(
+          "This declaration is invalid, so the submission can't be approved until the author fixes it.",
+          { exact: true }
+        )
+      )
+      .toBeInTheDocument();
+    // Long unbroken error paths must wrap rather than overflow (see the description note).
+    expect(page.getByText(/^analytics\.events key "BadName"/).element().style.overflowWrap).toBe(
+      'anywhere'
+    );
+    // Parser invariant (all-or-nothing), not card logic: any error empties `events`.
+    expect(page.getByTestId('apps-review-analytics-event').elements()).toHaveLength(0);
+    expect(page.getByText(/events declared/).elements()).toHaveLength(0);
+    expect(page.getByText('Declares analytics but no events.').elements()).toHaveLength(0);
+  });
+
+  test('`analytics: null` is an error, not an absent key', async () => {
+    renderWithAnalytics(null);
+    await expect
+      .element(page.getByText('Analytics declaration does not validate', { exact: true }))
+      .toBeInTheDocument();
+    await expect.element(page.getByText('analytics must be an object')).toBeInTheDocument();
+  });
+
+  test('a single event is counted in the singular', async () => {
+    renderWithAnalytics({ events: { share_clicked: {} } });
+    await expect.element(page.getByText(/^1 event declared\./)).toBeInTheDocument();
+  });
+
+  test('a valid declaration with no events says so', async () => {
+    renderWithAnalytics({ events: {} });
+    await expect.element(page.getByText('Declares analytics but no events.')).toBeInTheDocument();
+    expect(page.getByTestId('apps-review-analytics-event').elements()).toHaveLength(0);
+    expect(page.getByText(/does not validate/).elements()).toHaveLength(0);
+  });
+
+  test('a manifest with NO analytics key renders no card', async () => {
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    // Positive control: the modal rendered, so the zero below means "absent".
+    await expect
+      .element(page.getByText('Other permissions (1)', { exact: true }))
+      .toBeInTheDocument();
+    expect(page.getByTestId('apps-review-analytics').elements()).toHaveLength(0);
+  });
+});
+
+describe('OnsiteReviewModal — per-scope justifications shown to the mod', () => {
+  test('renders each declared permission with its dev-supplied justification, and a "No justification provided" fallback when absent', async () => {
+    const withJustifications = {
+      ...ONSITE_PENDING,
+      id: 'onsite-req-justify',
+      slug: 'justify-block',
+      manifest: {
+        ...ONSITE_PENDING.manifest,
+        scopes: ['models:read:self', 'user:read:self'],
+        // Only the first scope carries a justification — the second must fall back.
+        scopeJustifications: {
+          'models:read:self': 'We render the page model in a side-by-side comparison widget.',
+        },
+      },
+    };
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: withJustifications, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    // The non-sensitive group's heading, with its count.
+    await expect
+      .element(page.getByText('Other permissions (2)', { exact: true }))
+      .toBeInTheDocument();
+    // The supplied justification is surfaced verbatim under its badge, prefixed
+    // with the "Why:" label. Exact match on the full paragraph disambiguates from
+    // the raw manifest-JSON panel (which contains the string but not "Why:").
+    await expect
+      .element(
+        page.getByText('Why: We render the page model in a side-by-side comparison widget.', {
+          exact: true,
+        })
+      )
+      .toBeInTheDocument();
+    // The scope with no justification shows the muted fallback.
+    await expect.element(page.getByText('No justification provided')).toBeInTheDocument();
+  });
+});
+
+describe('OnsiteReviewModal — sensitive scopes are grouped + flagged for the mod', () => {
+  test('a mix of sensitive + normal scopes renders a "Sensitive permissions" group (first) and the normal "Permissions" group with per-group counts', async () => {
+    const withSensitive = {
+      ...ONSITE_PENDING,
+      id: 'onsite-req-sensitive',
+      slug: 'sensitive-block',
+      manifest: {
+        ...ONSITE_PENDING.manifest,
+        // 2 sensitive (spends/reads Buzz) + 1 normal.
+        scopes: ['ai:write:budgeted', 'buzz:read:self', 'models:read:self'],
+      },
+    };
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: withSensitive, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    // Sensitive group header with the sensitive-only count.
+    await expect
+      .element(page.getByText('Sensitive permissions (2)', { exact: true }))
+      .toBeInTheDocument();
+    // Normal group header counts ONLY the non-sensitive scopes.
+    await expect
+      .element(page.getByText('Other permissions (1)', { exact: true }))
+      .toBeInTheDocument();
+    // The sensitive scopes carry the reusable "Sensitive" indicator; the two
+    // sensitive scopes each get one badge (the normal scope does not).
+    expect(page.getByTestId('sensitive-scope-badge').elements()).toHaveLength(2);
+    // The sensitive + normal scope badges all render.
+    await expect.element(page.getByText('ai:write:budgeted')).toBeInTheDocument();
+    await expect.element(page.getByText('buzz:read:self')).toBeInTheDocument();
+    await expect.element(page.getByText('models:read:self')).toBeInTheDocument();
+  });
+
+  // The moderator sees the same order as the store listing will show the viewer.
+  test("each group is in the store listing's order, and an unknown scope is not dropped", async () => {
+    const unknown = 'zz:not-a-real:scope';
+    const input = [
+      'models:read:self',
+      unknown,
+      'apps:storage:shared:write',
+      'user:read:self',
+      'ai:write:budgeted',
+    ];
+    const mixed = {
+      ...ONSITE_PENDING,
+      id: 'onsite-req-order',
+      slug: 'order-block',
+      manifest: { ...ONSITE_PENDING.manifest, scopes: input },
+    };
+    renderWithProviders(
+      <OnsiteReviewModal selection={{ request: mixed, mode: 'pending' }} onClose={vi.fn()} />
+    );
+    await expect
+      .element(page.getByText('Sensitive permissions (2)', { exact: true }))
+      .toBeInTheDocument();
+    const order = Array.from(
+      document.querySelectorAll<HTMLElement>('[data-testid="apps-review-scope-row"]')
+    ).map((row) => row.dataset.scope);
+    expect(order).toEqual([
+      'ai:write:budgeted',
+      'apps:storage:shared:write',
+      'user:read:self',
+      'models:read:self',
+      unknown,
+    ]);
+  });
+
+  test('a manifest with ONLY normal scopes renders NO "Sensitive permissions" header', async () => {
+    const normalOnly = {
+      ...ONSITE_PENDING,
+      id: 'onsite-req-normal',
+      slug: 'normal-block',
+      manifest: {
+        ...ONSITE_PENDING.manifest,
+        scopes: ['models:read:self', 'user:read:self'],
+      },
+    };
+    renderWithProviders(
+      <OnsiteReviewModal selection={{ request: normalOnly, mode: 'pending' }} onClose={vi.fn()} />
+    );
+    // The normal group still shows all of them.
+    await expect
+      .element(page.getByText('Other permissions (2)', { exact: true }))
+      .toBeInTheDocument();
+    // No sensitive header and no sensitive badge when nothing is sensitive.
+    expect(page.getByText(/Sensitive permissions/).elements()).toHaveLength(0);
+    expect(page.getByTestId('sensitive-scope-badge').elements()).toHaveLength(0);
+  });
+});
+
+describe('OnsiteReviewModal — live preview links to the full-page route (not the raw host)', () => {
+  test('a live preview renders the "Open full-page preview" link (internal same-origin route, new tab) and NOT the old raw-host button', async () => {
+    // Flip the shared getReviewStatus poll into the live state. previewUrl carries
+    // the raw `?mr=` host URL the OLD "Open review host" button used to link — the
+    // new button must ignore it and link to the internal /apps/review/preview route.
+    mocks.reviewStatus = {
+      state: 'preview-live',
+      detail: {
+        host: 'my-onsite-block.civit.ai',
+        url: 'https://my-onsite-block.civit.ai/my-onsite-block',
+      },
+      previewUrl: 'https://my-onsite-block.civit.ai/my-onsite-block?mr=raw-entry-token',
+    };
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+
+    const link = page.getByRole('link', { name: /Open full-page preview/ });
+    await expect.element(link).toBeInTheDocument();
+    // Same-origin internal route, keyed by publishRequestId — NOT the raw `?mr=` URL.
+    const el = link.element() as HTMLAnchorElement;
+    expect(el.getAttribute('href')).toBe('/apps/review/preview/onsite-req-1');
+    expect(el.getAttribute('target')).toBe('_blank');
+    expect(el.getAttribute('href')).not.toContain('?mr=');
+    expect(el.getAttribute('href')).not.toContain('civit.ai');
+
+    // The old raw-host button is GONE, and no anchor in the panel links to the
+    // broken raw `?mr=` host URL.
+    expect(page.getByText('Open review host').elements()).toHaveLength(0);
+    const rawHostLinks = page
+      .getByRole('link')
+      .elements()
+      .filter((a) => (a as HTMLAnchorElement).getAttribute('href')?.includes('?mr='));
+    expect(rawHostLinks).toHaveLength(0);
+  });
+});
+
+describe('OnsiteReviewModal — onsite approve fires the mutation', () => {
+  test('clicking Approve + build fires blocks.approveRequest with the request id', async () => {
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    await page.getByRole('button', { name: 'Approve + build' }).click();
+    expect(mocks.mutate).toHaveBeenCalledWith(
+      'approve',
+      expect.objectContaining({ publishRequestId: 'onsite-req-1' })
+    );
+  });
+
+  test('an approve mutation error surfaces via showErrorNotification', async () => {
+    mocks.errorMode = true;
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    await page.getByRole('button', { name: 'Approve + build' }).click();
+    expect(showError).toHaveBeenCalledWith(expect.objectContaining({ title: 'Approve failed' }));
+  });
+
+  // The page threads the tab's `resetPaging` in as `onActioned` so a decided item
+  // leaves the accumulated Load-more list (ghost-row fix) — assert the modal forwards
+  // it to the action bar and it fires on a successful approve.
+  test('a successful approve invokes the optional onActioned callback', async () => {
+    const onActioned = vi.fn();
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+        onActioned={onActioned}
+      />
+    );
+    await page.getByRole('button', { name: 'Approve + build' }).click();
+    expect(onActioned).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('OnsiteReviewModal — onsite reject: reason gate + fired mutation', () => {
+  test('the reject confirm is disabled under the 3-char reason floor, then fires blocks.rejectRequest with the trimmed reason', async () => {
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    // No rejection textarea until "Reject…" is clicked.
+    expect(page.getByTestId('apps-review-reject-reason').elements()).toHaveLength(0);
+    await page.getByRole('button', { name: 'Reject…' }).click();
+    await expect.element(page.getByTestId('apps-review-reject-reason')).toBeInTheDocument();
+
+    const confirm = page.getByTestId('apps-review-reject-confirm');
+    // Empty reason → disabled.
+    await expect.element(confirm).toBeDisabled();
+    // A too-short reason (2 < OFFSITE_MOD_REASON_MIN=3) → still disabled.
+    await page.getByTestId('apps-review-reject-reason').fill('no');
+    await expect.element(confirm).toBeDisabled();
+    // Whitespace-only padding does NOT satisfy the gate (trimmed length counts).
+    await page.getByTestId('apps-review-reject-reason').fill('  a  ');
+    await expect.element(confirm).toBeDisabled();
+    expect(mocks.mutate).not.toHaveBeenCalled();
+
+    // A reason at/above the 3-char minimum → enabled → fires with the TRIMMED reason.
+    await page.getByTestId('apps-review-reject-reason').fill('needs changes');
+    await expect.element(confirm).toBeEnabled();
+    await confirm.click();
+    expect(mocks.mutate).toHaveBeenCalledWith('reject', {
+      publishRequestId: 'onsite-req-1',
+      rejectionReason: 'needs changes',
+    });
+  });
+});
+
+describe('OnsiteReviewModal — transient approve/reject state resets per request', () => {
+  test('switching from a request in reject-mode to a different request opens in the default view mode with an empty reason', async () => {
+    // Render request A and put it into reject mode with a typed reason.
+    const { rerender } = await renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    await page.getByRole('button', { name: 'Reject…' }).click();
+    const reasonA = page.getByTestId('apps-review-reject-reason');
+    await expect.element(reasonA).toBeInTheDocument();
+    await reasonA.fill('this needs changes before approval');
+    await expect.element(reasonA).toHaveValue('this needs changes before approval');
+
+    // Switch the SAME long-lived modal to a DIFFERENT pending request (new id).
+    await rerender(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING_B, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+
+    // B must open in the DEFAULT view mode: the approve/notes UI is shown and
+    // the reject textarea is gone (actionMode reset to 'view' via the keyed
+    // remount — not carried over from A).
+    await expect
+      .element(page.getByRole('textbox', { name: 'Approval notes (optional)' }))
+      .toBeInTheDocument();
+    await expect.element(page.getByRole('button', { name: 'Approve + build' })).toBeInTheDocument();
+    await expect.element(page.getByRole('button', { name: 'Reject…' })).toBeInTheDocument();
+    // The reject reason field from A must NOT be present (and thus carries no text).
+    expect(page.getByTestId('apps-review-reject-reason').elements()).toHaveLength(0);
+
+    // And re-entering reject mode on B starts from an EMPTY reason (A's text did
+    // not leak into B's state).
+    await page.getByRole('button', { name: 'Reject…' }).click();
+    await expect.element(page.getByTestId('apps-review-reject-reason')).toHaveValue('');
+  });
+
+  test('the real close-then-reopen path (A → selection=null → B) also opens B fresh', async () => {
+    // Production never swaps A→B directly: the parent sets `selection=null`
+    // (closing the modal) and later sets it to B. This pins the
+    // `{selection && <Body/>}` unmount-gate — B mounts fresh because the body
+    // was unmounted at null — independently of the per-id `key` remount above.
+    const { rerender } = await renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+    await page.getByRole('button', { name: 'Reject…' }).click();
+    const reasonA = page.getByTestId('apps-review-reject-reason');
+    await reasonA.fill('leaky reason that must not survive a close');
+    await expect.element(reasonA).toHaveValue('leaky reason that must not survive a close');
+
+    // Close the modal (selection → null): the body unmounts.
+    await rerender(<OnsiteReviewModal selection={null} onClose={vi.fn()} />);
+    expect(page.getByTestId('apps-review-reject-reason').elements()).toHaveLength(0);
+
+    // Reopen with a different request B: the body remounts fresh.
+    await rerender(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING_B, mode: 'pending' }}
+        onClose={vi.fn()}
+      />
+    );
+
+    // B opens in the default view mode, no leaked reject state.
+    await expect
+      .element(page.getByRole('textbox', { name: 'Approval notes (optional)' }))
+      .toBeInTheDocument();
+    expect(page.getByTestId('apps-review-reject-reason').elements()).toHaveLength(0);
+    await page.getByRole('button', { name: 'Reject…' }).click();
+    await expect.element(page.getByTestId('apps-review-reject-reason')).toHaveValue('');
+  });
+});
+
+describe('OnsiteReviewModal — busy close-guard while a mutation is in flight', () => {
+  test('does not call onClose via Escape or the close button while a mutation is pending', async () => {
+    // Both mutation mocks report isPending:true → the modal is `busy`, so the
+    // body publishes busy=true to the shell via the ref. The shell's onClose
+    // (Escape / overlay / the X) must then refuse to invoke the parent onClose.
+    mocks.pending = true;
+    const onClose = vi.fn();
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_PENDING, mode: 'pending' }}
+        onClose={onClose}
+      />
+    );
+    // Modal is open (body rendered).
+    await expect.element(page.getByText('Show code diff')).toBeInTheDocument();
+
+    // Close vector 1 — the modal's close (X) button (Mantine static class).
+    const closeBtn = document.querySelector<HTMLButtonElement>('.mantine-Modal-close');
+    expect(closeBtn).not.toBeNull();
+    await userEvent.click(closeBtn!);
+
+    // Close vector 2 — Escape (Mantine `closeOnEscape`).
+    await userEvent.keyboard('{Escape}');
+
+    // The busy guard swallowed both — the parent onClose was never called and the
+    // modal is still mounted.
+    expect(onClose).not.toHaveBeenCalled();
+    await expect.element(page.getByText('Show code diff')).toBeInTheDocument();
+  });
+});
+
+describe('OnsiteReviewModal — read-only (approved) posture', () => {
+  test('an approved selection surfaces the mod feedback and shows NO approve/reject actions', async () => {
+    renderWithProviders(
+      <OnsiteReviewModal
+        selection={{ request: ONSITE_APPROVED, mode: 'approved' }}
+        onClose={vi.fn()}
+      />
+    );
+    // The reviewer + notes are surfaced.
+    await expect.element(page.getByText('Approved by @mod-user')).toBeInTheDocument();
+    await expect.element(page.getByText('looks good, shipping it')).toBeInTheDocument();
+    // Read-only → neither action control renders, and no Review-preview panel.
+    expect(page.getByRole('button', { name: 'Approve + build' }).elements()).toHaveLength(0);
+    expect(page.getByRole('button', { name: 'Reject…' }).elements()).toHaveLength(0);
+    expect(page.getByText('Review preview').elements()).toHaveLength(0);
+  });
+});

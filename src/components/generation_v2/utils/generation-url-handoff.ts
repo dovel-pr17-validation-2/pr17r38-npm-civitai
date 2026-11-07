@@ -1,0 +1,130 @@
+/**
+ * Cross-domain generation form handoff.
+ *
+ * Encodes the current graph snapshot into a base64 URL parameter so a user
+ * jumping from .com to .red (or vice-versa) lands on the form pre-populated
+ * with the same workflow, prompt, resources, etc. The receiving side decodes
+ * the param and pushes it through `generationGraphStore.setData` as a remix.
+ */
+
+import type { GenerationResourceValue } from '~/shared/types/generation.types';
+import { combineResources } from '~/shared/utils/resource.utils';
+import { isMediaHost } from '~/shared/utils/media-host';
+import { env } from '~/env/client';
+
+export const GENERATION_HANDOFF_PARAM = 'gen';
+
+/** Output settings the receiver shouldn't override on the destination form. */
+const OUTPUT_KEYS = new Set(['quantity', 'priority', 'outputFormat']);
+
+/** Resource-bearing keys that get hoisted into the resources array on encode. */
+const RESOURCE_KEYS = ['model', 'upscaler', 'vae'] as const;
+
+interface DecodedHandoff {
+  params: Record<string, unknown>;
+  resources: GenerationResourceValue[];
+}
+
+/**
+ * Build a `?gen=...` payload from the current graph snapshot.
+ * Returns undefined when the snapshot has nothing meaningful to transfer.
+ */
+export function encodeGenerationHandoff(
+  snapshot: Record<string, unknown>,
+  options: { computedKeys?: string[] } = {}
+): string | undefined {
+  const { computedKeys = [] } = options;
+
+  const params: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(snapshot)) {
+    if (computedKeys.includes(key)) continue;
+    if (OUTPUT_KEYS.has(key)) continue;
+    if (RESOURCE_KEYS.includes(key as (typeof RESOURCE_KEYS)[number])) continue;
+    if (key === 'resources') continue;
+    if (value === undefined || value === null) continue;
+    params[key] = value;
+  }
+
+  const resources = combineResources({
+    model: snapshot.model as GenerationResourceValue | undefined,
+    upscaler: snapshot.upscaler as GenerationResourceValue | undefined,
+    vae: snapshot.vae as GenerationResourceValue | undefined,
+    resources: (snapshot.resources as GenerationResourceValue[] | undefined) ?? [],
+  });
+
+  if (Object.keys(params).length === 0 && resources.length === 0) return undefined;
+
+  const payload: DecodedHandoff = { params, resources };
+  const json = JSON.stringify(payload);
+  return toBase64Url(json);
+}
+
+/** Decode a `?gen=...` payload back into params + resources. Returns null on any failure. */
+export function decodeGenerationHandoff(value: string | null | undefined): DecodedHandoff | null {
+  if (!value) return null;
+  try {
+    const json = fromBase64Url(value);
+    const parsed = JSON.parse(json) as DecodedHandoff;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (!parsed.params || typeof parsed.params !== 'object') return null;
+    if (!Array.isArray(parsed.resources)) return null;
+    // A `?gen=` link is attacker-controlled input, and the form auto-fetches
+    // source image URLs client-side. Everything else stays permissive (this is
+    // a cross-domain form snapshot, so unknown keys are by design), but
+    // media-URL-valued keys are host-gated the same way the server's meta
+    // propagation is. ClickUp 868maend5.
+    parsed.params = stripForeignMediaUrls(parsed.params, env.NEXT_PUBLIC_IMAGE_LOCATION);
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/** Host-gates the media-URL keys of a decoded handoff payload, in place. */
+function stripForeignMediaUrls(
+  params: Record<string, unknown>,
+  imageLocation: string | undefined
+): Record<string, unknown> {
+  const { images, sourceImage, ...rest } = params;
+
+  // The working payload shapes are `images: [{url,...}]` and object `sourceImage`
+  // (string-form sourceImage is inert downstream). Array entries are filtered
+  // per-entry; anything that isn't that shape passes through untouched so the
+  // decode stays permissive for malformed payloads, as before.
+  if (Array.isArray(images)) {
+    const kept = images.filter((img) => isMediaHost(img?.url, imageLocation));
+    if (kept.length > 0) rest.images = kept;
+  } else if ('images' in params) {
+    rest.images = images;
+  }
+
+  if ('sourceImage' in params) {
+    const url = (sourceImage as { url?: unknown } | undefined)?.url;
+    if (isMediaHost(url, imageLocation) || typeof url !== 'string') {
+      rest.sourceImage = sourceImage;
+    }
+    // foreign-host sourceImage: dropped (key omitted)
+  }
+
+  return rest;
+}
+
+// URL-safe base64 — replace +/= with -_ and strip padding so the value
+// survives URL params without escaping.
+function toBase64Url(input: string): string {
+  const utf8 = typeof TextEncoder !== 'undefined' ? new TextEncoder().encode(input) : null;
+  const binary = utf8 ? String.fromCharCode(...utf8) : unescape(encodeURIComponent(input));
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function fromBase64Url(input: string): string {
+  const padded = input.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = padded.length % 4 === 0 ? '' : '='.repeat(4 - (padded.length % 4));
+  const binary = atob(padded + padding);
+  if (typeof TextDecoder !== 'undefined') {
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+  return decodeURIComponent(escape(binary));
+}

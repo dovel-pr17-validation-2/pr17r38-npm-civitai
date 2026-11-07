@@ -1,0 +1,89 @@
+import type { InstantSearchRoutingParser } from '~/components/Search/parsers/base';
+import {
+  parseSearchParams,
+  searchParamsSchema,
+  stringArrayParamSchema,
+} from '~/components/Search/parsers/base';
+import * as z from 'zod';
+import { QS } from '~/utils/qs';
+import { removeEmpty } from '~/utils/object-helpers';
+import type { UiState } from 'instantsearch.js';
+import { BOUNTIES_SEARCH_INDEX } from '~/server/common/constants';
+
+export const BountiesSearchIndexSortBy = [
+  BOUNTIES_SEARCH_INDEX,
+  `${BOUNTIES_SEARCH_INDEX}:stats.unitAmountCountAllTime:desc`,
+  `${BOUNTIES_SEARCH_INDEX}:stats.entryCountAllTime:desc`,
+  // `stats.`-prefixed, like its siblings: that is where the bounty document carries the count, and
+  // what the index declares sortable. A bare `favoriteCountAllTime` names no field at all.
+  `${BOUNTIES_SEARCH_INDEX}:stats.favoriteCountAllTime:desc`,
+  `${BOUNTIES_SEARCH_INDEX}:createdAt`,
+] as const;
+
+const defaultSortBy = BountiesSearchIndexSortBy[0];
+
+const collectionSearchParamsSchema = searchParamsSchema
+  .extend({
+    index: z.literal('bounties'),
+    sortBy: z.enum(BountiesSearchIndexSortBy),
+    baseModel: stringArrayParamSchema,
+    users: stringArrayParamSchema,
+    tags: stringArrayParamSchema,
+    type: stringArrayParamSchema,
+  })
+  .partial();
+
+export type BountySearchParams = z.output<typeof collectionSearchParamsSchema>;
+
+export const bountiesInstantSearchRoutingParser: InstantSearchRoutingParser = {
+  parseURL: ({ location }) => {
+    const collectionSearchIndexData = parseSearchParams(
+      collectionSearchParamsSchema,
+      QS.parse(location.search)
+    );
+
+    return { [BOUNTIES_SEARCH_INDEX]: removeEmpty(collectionSearchIndexData) };
+  },
+  routeToState: (routeState: UiState) => {
+    const bounties: BountySearchParams = (routeState[BOUNTIES_SEARCH_INDEX] ||
+      {}) as BountySearchParams;
+    const refinementList: Record<string, string[]> = removeEmpty({
+      'details.baseModel': bounties.baseModel as string[],
+      type: bounties.type as string[],
+      'tags.name': bounties.tags as string[],
+      'user.username': bounties.users as string[],
+    });
+    const { query, sortBy } = bounties;
+
+    return {
+      [BOUNTIES_SEARCH_INDEX]: {
+        sortBy: sortBy ?? defaultSortBy,
+        refinementList,
+        query,
+      },
+    };
+  },
+  stateToRoute: (uiState: UiState) => {
+    const baseModel = uiState[BOUNTIES_SEARCH_INDEX].refinementList?.['details.baseModel'];
+    const type = uiState[BOUNTIES_SEARCH_INDEX].refinementList?.['type'];
+    const users = uiState[BOUNTIES_SEARCH_INDEX].refinementList?.['user.username'];
+    const tags = uiState[BOUNTIES_SEARCH_INDEX].refinementList?.['tags.name'];
+    const sortBy =
+      (uiState[BOUNTIES_SEARCH_INDEX].sortBy as BountySearchParams['sortBy']) || defaultSortBy;
+
+    const { query } = uiState[BOUNTIES_SEARCH_INDEX];
+
+    const state: BountySearchParams = {
+      baseModel,
+      type,
+      tags,
+      users,
+      sortBy,
+      query,
+    };
+
+    return {
+      [BOUNTIES_SEARCH_INDEX]: state,
+    };
+  },
+};

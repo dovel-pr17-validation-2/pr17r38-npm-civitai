@@ -1,0 +1,1522 @@
+import type { TransactionNotification } from '@paddle/paddle-node-sdk';
+import { env } from '~/env/server';
+import { listUserSubscriptionRows } from '@civitai/db-queries/placement';
+import { dbWrite } from '~/server/db/client';
+import { loadKyselyDb } from '~/server/db/kyselyDb.lazy';
+import { inStripeKeyMode, stripeKeyMode } from '~/server/utils/stripe-key-mode';
+import {
+  subscriptionProductMetadataSchema,
+  type GetUserSubscriptionInput,
+  type SubscriptionMetadata,
+  type SubscriptionProductMetadata,
+  type PrepaidToken,
+} from '~/server/schema/subscriptions.schema';
+import { PaymentProvider } from '~/shared/utils/prisma/enums';
+import { isDefined } from '~/utils/type-guards';
+import { Prisma } from '@prisma/client';
+import { constants } from '~/server/common/constants';
+import {
+  TransactionType,
+  type BuzzAccountType,
+  type BuzzSpendType,
+} from '~/shared/constants/buzz.constants';
+import { upsertContact } from '~/server/integrations/freshdesk';
+import { throwNotFoundError } from '~/server/utils/errorHandling';
+import { clickhouse } from '~/server/clickhouse/client';
+import { redis, REDIS_KEYS } from '~/server/redis/client';
+import type { RedisKeyTemplateCache } from '~/server/redis/client';
+import { CacheTTL } from '~/server/common/constants';
+import {
+  BUZZ_AMOUNT_TO_TIER,
+  TIER_BUZZ_AMOUNTS,
+  type MembershipTier,
+} from '~/shared/utils/subscription-tokens';
+import {
+  BUZZ_MEMBERSHIP_SUBSCRIPTION_TYPE,
+  getBuzzMembershipPrice,
+  isMembershipActive,
+} from '~/shared/utils/buzz-membership';
+
+// const baseUrl = getBaseUrl();
+// const log = createLogger('subscriptions', 'blue');
+
+export const getPlans = async ({
+  paymentProvider = PaymentProvider.Stripe,
+  includeFree = false,
+  includeInactive = false,
+  interval = 'month',
+  buzzType,
+  buzzPurchase = false,
+}: {
+  paymentProvider?: PaymentProvider;
+  includeFree?: boolean;
+  includeInactive?: boolean;
+  interval?: 'month' | 'year';
+  buzzType?: string;
+  buzzPurchase?: boolean;
+}) => {
+  const products = await dbWrite.product.findMany({
+    where: {
+      provider: paymentProvider,
+      active: includeInactive ? undefined : true,
+      prices: { some: { type: 'recurring', active: true, interval } },
+    },
+    select: {
+      id: true,
+      name: true,
+      description: true,
+      metadata: true,
+      defaultPriceId: true,
+      provider: true,
+      prices: {
+        select: {
+          id: true,
+          interval: true,
+          intervalCount: true,
+          type: true,
+          unitAmount: true,
+          currency: true,
+          metadata: true,
+        },
+        where: {
+          active: true,
+          interval: interval,
+        },
+      },
+    },
+  });
+
+  // Before the metadata parse, which drops `live_id`.
+  const mode = stripeKeyMode(env.STRIPE_SECRET_KEY);
+  // Only show the default price for a subscription product
+  return products
+    .filter((product) => inStripeKeyMode(product, mode))
+    .map((product) => {
+      const prices = product.prices.map((x) => ({ ...x, unitAmount: x.unitAmount ?? 0 }));
+      const price = prices.filter((x) => x.id === product.defaultPriceId)[0] ?? prices[0];
+
+      return {
+        ...product,
+        price,
+        prices,
+        metadata: subscriptionProductMetadataSchema.parse(product.metadata),
+      };
+    })
+    .filter(({ metadata }) => {
+      // Filter by tier (membership products)
+      let hasTier = true;
+      if (env.TIER_METADATA_KEY) {
+        const key = env.TIER_METADATA_KEY as keyof typeof metadata;
+        hasTier = !!metadata[key] && (metadata[key] !== 'free' || includeFree);
+      }
+
+      const matchesCatalog = !!metadata.buzzPurchase === buzzPurchase;
+
+      // Buzz memberships are one catalog shared by every site — they grant no Buzz, so
+      // there's nothing to split green from yellow over. Only the cash plans, which do
+      // grant a colour, are filtered by it.
+      const matchesBuzzType = buzzPurchase || !buzzType ? true : metadata.buzzType === buzzType;
+
+      return hasTier && matchesBuzzType && matchesCatalog;
+    })
+
+    .sort((a, b) => (a.price?.unitAmount ?? 0) - (b.price?.unitAmount ?? 0));
+};
+
+export type SubscriptionPlan = Awaited<ReturnType<typeof getPlans>>[number];
+
+export const getUserSubscription = async ({
+  userId,
+  buzzType,
+  includeBadState,
+  includeCanceled,
+  includeBuzzPurchase,
+}: GetUserSubscriptionInput & {
+  buzzType?: string;
+  includeBadState?: boolean;
+  includeCanceled?: boolean;
+  includeBuzzPurchase?: boolean;
+}) => {
+  // If buzzType is provided, use the composite unique key
+  // Otherwise, get the first subscription (backward compatibility - defaults to yellow)
+  const subscriptionSelect = {
+    id: true,
+    status: true,
+    cancelAtPeriodEnd: true,
+    cancelAt: true,
+    canceledAt: true,
+    currentPeriodStart: true,
+    currentPeriodEnd: true,
+    createdAt: true,
+    endedAt: true,
+    metadata: true,
+    buzzType: true,
+    product: {
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        metadata: true,
+        provider: true,
+        active: true,
+      },
+    },
+    price: {
+      select: {
+        id: true,
+        unitAmount: true,
+        interval: true,
+        intervalCount: true,
+        currency: true,
+        active: true,
+      },
+    },
+  } satisfies Prisma.CustomerSubscriptionSelect;
+
+  // Buzz memberships live in their own slot, so the requested one comes up empty for a
+  // user whose only membership was bought with Buzz — which is how they were invisible on
+  // /user/membership, account settings and the pricing page. Opt-in fallback: callers
+  // asking "does this user have a membership at all" set it; callers probing the OTHER
+  // colour to offer a cross-site link must not, or a Buzz membership answers for a green
+  // or yellow one that doesn't exist.
+  const subscription =
+    (await dbWrite.customerSubscription.findFirst({
+      where: { userId, buzzType: buzzType ?? 'yellow' }, // Default to yellow for backward compatibility
+      select: subscriptionSelect,
+    })) ??
+    (includeBuzzPurchase && buzzType !== BUZZ_MEMBERSHIP_SUBSCRIPTION_TYPE
+      ? await dbWrite.customerSubscription.findFirst({
+          where: { userId, buzzType: BUZZ_MEMBERSHIP_SUBSCRIPTION_TYPE },
+          select: subscriptionSelect,
+        })
+      : null);
+
+  // Statuses that always exclude a subscription (terminal states)
+  const terminalStatuses = ['canceled', 'incomplete_expired'];
+  // Statuses that are bad but can be recovered (show to user if includeBadState is true)
+  const recoverableBadStatuses = ['past_due', 'unpaid'];
+
+  if (!subscription) return null;
+
+  // Exclude terminal statuses unless includeCanceled is true
+  if (!includeCanceled && terminalStatuses.includes(subscription.status)) return null;
+
+  // Exclude recoverable bad statuses unless includeBadState is true
+  if (!includeBadState && recoverableBadStatuses.includes(subscription.status)) return null;
+
+  const productMeta = subscriptionProductMetadataSchema.parse(subscription.product.metadata);
+
+  const subscriptionMeta = (subscription.metadata ?? {}) as SubscriptionMetadata;
+  if (subscriptionMeta.renewalEmailSent) {
+    // Makes it so that we don't consider this a "subscribed" user.
+    return null;
+  }
+
+  return {
+    ...subscription,
+    price: {
+      ...subscription.price,
+      unitAmount: subscription.price.unitAmount ?? 0,
+      interval: subscription.price.interval as 'month' | 'year',
+    },
+    isBadState: ['incomplete', 'incomplete_expired', 'past_due', 'unpaid'].includes(
+      subscription.status
+    ),
+    tier: (productMeta?.[env.TIER_METADATA_KEY] ?? 'free') as string,
+    productMeta,
+    product: {
+      ...subscription.product,
+      metadata: productMeta,
+    },
+  };
+};
+
+export type UserSubscription = Awaited<ReturnType<typeof getUserSubscription>>;
+
+const activeSubscriptionStatuses = {
+  notIn: ['canceled', 'incomplete_expired', 'past_due', 'unpaid'],
+};
+
+const userSubscriptionSelect = {
+  id: true,
+  status: true,
+  cancelAtPeriodEnd: true,
+  cancelAt: true,
+  canceledAt: true,
+  currentPeriodStart: true,
+  currentPeriodEnd: true,
+  createdAt: true,
+  endedAt: true,
+  metadata: true,
+  buzzType: true,
+  product: {
+    select: {
+      id: true,
+      name: true,
+      description: true,
+      metadata: true,
+      provider: true,
+      active: true,
+    },
+  },
+  price: {
+    select: {
+      id: true,
+      unitAmount: true,
+      interval: true,
+      intervalCount: true,
+      currency: true,
+      active: true,
+    },
+  },
+} satisfies Prisma.CustomerSubscriptionSelect;
+
+type UserSubscriptionRow = Prisma.CustomerSubscriptionGetPayload<{
+  select: typeof userSubscriptionSelect;
+}>;
+
+/** One subscription row as every reader sees it; null for one that no longer counts. */
+const toUserSubscription = (subscription: UserSubscriptionRow) => {
+  const productMeta = subscriptionProductMetadataSchema.parse(subscription.product.metadata);
+  const subscriptionMeta = (subscription.metadata ?? {}) as SubscriptionMetadata;
+
+  // Filter out renewalEmailSent subscriptions
+  if (subscriptionMeta.renewalEmailSent) return null;
+
+  return {
+    ...subscription,
+    price: {
+      ...subscription.price,
+      unitAmount: subscription.price.unitAmount ?? 0,
+      interval: subscription.price.interval as 'month' | 'year',
+    },
+    isBadState: ['incomplete', 'incomplete_expired', 'past_due', 'unpaid'].includes(
+      subscription.status
+    ),
+    tier: (productMeta?.[env.TIER_METADATA_KEY] ?? 'free') as string,
+    productMeta,
+  };
+};
+
+// Get all active subscriptions for a user
+export const getAllUserSubscriptions = async (userId: number) => {
+  const subscriptions = await dbWrite.customerSubscription.findMany({
+    where: { userId, status: activeSubscriptionStatuses },
+    select: userSubscriptionSelect,
+  });
+
+  return subscriptions.map(toUserSubscription).filter((sub) => sub !== null);
+};
+
+export type AllUserSubscriptions = Awaited<ReturnType<typeof getAllUserSubscriptions>>;
+
+/**
+ * Get the highest tier subscription for a user
+ * @param userId - The user ID
+ * @returns The subscription with the highest tier, or null if no subscriptions found
+ */
+// A tier missing from the hierarchy sorts lowest (indexOf -1 < any valid index).
+const pickHighestTier = <T extends { tier: string }>(subscriptions: T[]): T | null =>
+  subscriptions.reduce<T | null>(
+    (highest, current) =>
+      !highest ||
+      constants.memberships.tierOrder.indexOf(current.tier as any) >
+        constants.memberships.tierOrder.indexOf(highest.tier as any)
+        ? current
+        : highest,
+    null
+  );
+
+export const getHighestTierSubscription = async (userId: number) =>
+  pickHighestTier(await getAllUserSubscriptions(userId));
+
+/**
+ * Highest tier among subscriptions the user actually paid money for. Buzz-purchased
+ * (perks-only) memberships are excluded, so cash-gated perks — Creator Program
+ * membership, banking, cash out — never resolve off one.
+ */
+export const getHighestPaidTierSubscription = async (userId: number) =>
+  pickHighestTier(
+    (await getAllUserSubscriptions(userId)).filter((s) => !s.productMeta.buzzPurchase)
+  );
+
+/**
+ * The tier monetization CAPS resolve against — null when there's no good-standing subscription, which the
+ * cap helpers read as free. Excludes bad-state subs (which `getHighestTierSubscription` keeps), so a user
+ * mid-failed-payment can't get a gold cap on the write path while both UIs show them the free one.
+ */
+export const getCapTier = async (userId: number): Promise<string | null> =>
+  capTierOf(await getAllUserSubscriptions(userId));
+
+/**
+ * `getCapTier` through Kysely, for the placement read path (`placementPriceRange`): the same rows
+ * from the primary (a cap decides a charge), the same mapping and the same bad-state exclusion.
+ */
+export const getCapTierViaKysely = async (userId: number): Promise<string | null> => {
+  const rows = (await listUserSubscriptionRows((await loadKyselyDb()).kyselyWrite, {
+    userId,
+    excludedStatuses: activeSubscriptionStatuses.notIn,
+  })) as UserSubscriptionRow[];
+  return capTierOf(rows.map(toUserSubscription).filter((sub) => sub !== null));
+};
+
+const capTierOf = (subscriptions: NonNullable<ReturnType<typeof toUserSubscription>>[]) =>
+  pickHighestTier(subscriptions.filter((s) => !s.isBadState))?.tier ?? null;
+
+/**
+ * `getCapTier` for many users in one query, keyed by user id: the same rows, the same mapping and
+ * the same bad-state exclusion. A user with no good-standing subscription maps to null.
+ */
+export const getCapTiers = async (userIds: number[]): Promise<Map<number, string | null>> => {
+  const ids = [...new Set(userIds)];
+  const tiers = new Map<number, string | null>(ids.map((id) => [id, null]));
+  if (!ids.length) return tiers;
+  const rows = await dbWrite.customerSubscription.findMany({
+    where: { userId: { in: ids }, status: activeSubscriptionStatuses },
+    select: { ...userSubscriptionSelect, userId: true },
+  });
+  const byUser = new Map<number, NonNullable<ReturnType<typeof toUserSubscription>>[]>();
+  for (const { userId, ...row } of rows) {
+    const subscription = toUserSubscription(row);
+    if (!subscription || subscription.isBadState) continue;
+    byUser.set(userId, [...(byUser.get(userId) ?? []), subscription]);
+  }
+  for (const [userId, subscriptions] of byUser)
+    tiers.set(userId, pickHighestTier(subscriptions)?.tier ?? null);
+  return tiers;
+};
+
+export const paddleTransactionContainsSubscriptionItem = async (data: TransactionNotification) => {
+  const priceIds = data.items.map((i) => i.price?.id).filter(isDefined);
+
+  if (priceIds.length === 0) {
+    return false;
+  }
+
+  const products = await dbWrite.product.findMany({
+    where: {
+      provider: PaymentProvider.Paddle,
+      prices: { some: { id: { in: priceIds } } },
+    },
+  });
+
+  const nonFreeProducts = products.filter((p) => {
+    const meta = subscriptionProductMetadataSchema.parse(p.metadata);
+    return meta?.[env.TIER_METADATA_KEY] !== 'free';
+  });
+
+  return nonFreeProducts.length > 0;
+};
+
+/**
+ * Delivers monthly cosmetics to users with active Civitai subscriptions.
+ * TODO: This should be updated to do any provider not only Civitai.Not needed right now, but in the future
+ *
+ * Deliberately NOT limited to the subscription's monthly anniversary day: the insert is
+ * idempotent (ON CONFLICT DO NOTHING) and the daily cron re-attempts every active sub for
+ * as long as the badge's availability window is open. A single-shot day match permanently
+ * dropped the badge whenever anything wasn't in place at that exact moment — badge cosmetics
+ * authored after the cron already ran, codes redeemed after the day passed, or subs
+ * cancelled/reinstated across their anniversary.
+ * @param { userIds = [], tx }: { userIds?: number[]; tx?: Prisma.TransactionClient }
+ * @returns {Promise<void>}
+ */
+export const deliverMonthlyCosmetics = async ({
+  userIds = [],
+  tx,
+}: {
+  userIds?: number[];
+  tx?: Prisma.TransactionClient;
+}) => {
+  const client = tx ?? dbWrite;
+
+  await client.$executeRaw`
+      with users_affected AS (
+        SELECT
+          "userId",
+          COALESCE(pdl.id, pr.id) "productId",
+          NOW() as "createdAt",
+          (pr.metadata->>'buzzPurchase') IS NOT DISTINCT FROM 'true' as "buzzPurchase"
+        FROM "CustomerSubscription" cs
+        JOIN "Product" pr ON pr.id = cs."productId"
+        JOIN "Price" p ON p.id = cs."priceId"
+        LEFT JOIN "Product" pdl
+          ON pdl.active
+            AND jsonb_typeof(pr.metadata->'level') != 'undefined'
+            AND jsonb_typeof(pdl.metadata->'level') != 'undefined'
+            AND (pdl.metadata->>'level')::int <= (pr.metadata->>'level')::int
+            AND pdl.provider = pr.provider
+        WHERE ${
+          userIds.length > 0
+            ? Prisma.sql`cs."userId" IN (${Prisma.join(userIds)})`
+            : Prisma.sql`TRUE`
+        }
+        AND status = 'active'
+        AND "currentPeriodEnd" > NOW()
+        AND "currentPeriodEnd"::date > NOW()::date -- Don't grant cosmetics on the expiration day
+        AND pr.provider = 'Civitai'
+        -- Buzz-purchased memberships earn the monthly badge whether or not their product
+        -- carries a monthlyBuzz key (prod rows hold 0; the seed omits it).
+        AND (
+          pr.metadata->>'monthlyBuzz' IS NOT NULL
+          OR (pr.metadata->>'buzzPurchase') = 'true'
+        )
+      )
+      INSERT INTO "UserCosmetic" ("userId", "cosmeticId", "obtainedAt", "claimKey")
+      SELECT DISTINCT
+        p."userId",
+        c.id "cosmeticId",
+        now(),
+        'claimed'
+      FROM users_affected p
+      JOIN "Cosmetic" c ON
+        c."productId" = p."productId"
+        -- Compare at date granularity: membership badges represent a whole month, and the
+        -- delivery cron runs at 01:00 UTC while badges are authored with an 11:00 UTC
+        -- availableStart. A timestamp comparison made day-1-anniversary subscribers miss
+        -- their badge (cron fired 10h before the window opened, then never retried).
+        AND (c."availableStart" IS NULL OR p."createdAt"::date >= c."availableStart"::date)
+        AND (c."availableEnd" IS NULL OR p."createdAt"::date <= c."availableEnd"::date)
+        -- Buzz memberships get the monthly badge only: a Badge with both ends of its window
+        -- set, as upsertProductBadge creates them. Anything else (the undated Supporter
+        -- Nameplate, open-ended items) would outlive a lapse before the revoke cutoff.
+        AND (
+          NOT p."buzzPurchase"
+          OR (c.type = 'Badge' AND c."availableStart" IS NOT NULL AND c."availableEnd" IS NOT NULL)
+        )
+      ON CONFLICT ("userId", "cosmeticId", "claimKey") DO NOTHING;
+    `;
+
+  // No owned-sticker cache bust here on purpose: this delivers membership badges
+  // (joined on Cosmetic.productId), importing ~/server/redis/caches pulls the
+  // redis client into this module's whole dependency tree, and the cache's
+  // 5-minute TTL covers the case anyway.
+};
+
+/**
+ * Manually sync a user's membership tier to Freshdesk
+ */
+export const syncFreshdeskMembership = async ({
+  userId,
+  customerId,
+  fallbackTier,
+}: {
+  userId?: number;
+  customerId?: string;
+  // Used when there's no active sub but the caller knows a tier to apply
+  // (e.g. Paddle Buzz purchases mark the user as 'Buzz Purchaser').
+  fallbackTier?: string | null;
+}) => {
+  if (!userId && !customerId) {
+    throw new Error('syncFreshdeskMembership requires userId or customerId');
+  }
+
+  const user = await dbWrite.user.findFirst({
+    where: userId ? { id: userId } : { customerId },
+    select: { id: true, username: true, email: true },
+  });
+
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  if (!user.email) {
+    throw new Error('User has no email address');
+  }
+
+  const subscription = await getHighestTierSubscription(user.id);
+  const tier = subscription?.tier ?? fallbackTier ?? null;
+
+  await upsertContact({
+    id: user.id,
+    username: user.username ?? undefined,
+    email: user.email,
+    tier,
+  });
+
+  return { success: true, userId: user.id, tier };
+};
+
+/**
+ * Buys one month of a perks-only membership with Buzz.
+ *
+ * One month at a time, and only when the user holds no membership at all: a cash
+ * membership must be allowed to stay the better deal, and stockpiled months would make
+ * this hard to withdraw if it gets abused.
+ */
+export const purchaseMembershipWithBuzz = async ({
+  userId,
+  priceId,
+  buzzType,
+}: {
+  userId: number;
+  priceId: string;
+  /**
+   * The account to debit — the calling domain's currency (green on .com, yellow on .red),
+   * resolved by the router. Deliberately NOT read off the product's `buzzType`, which is
+   * the colour the membership is associated with rather than what it's paid for in.
+   */
+  buzzType: BuzzSpendType;
+}) => {
+  const { createBuzzTransaction, refundTransaction } = await import(
+    '~/server/services/buzz.service'
+  );
+  const { invalidateSubscriptionCaches } = await import('~/server/utils/subscription.utils');
+  const dayjs = (await import('~/shared/utils/dayjs')).default;
+
+  const price = await dbWrite.price.findFirst({
+    where: { id: priceId, active: true },
+    select: {
+      id: true,
+      interval: true,
+      intervalCount: true,
+      unitAmount: true,
+      product: { select: { id: true, name: true, metadata: true, provider: true, active: true } },
+    },
+  });
+
+  if (!price || !price.product.active) throw new Error('Membership is not available');
+  if (price.product.provider !== PaymentProvider.Civitai)
+    throw new Error('This membership cannot be purchased with Buzz');
+  // The grant below is hard-coded to one month, so a multi-month price would be sold short.
+  if (price.interval !== 'month' || (price.intervalCount ?? 1) !== 1)
+    throw new Error('Memberships can only be purchased with Buzz one month at a time');
+
+  const productMeta = subscriptionProductMetadataSchema.parse(price.product.metadata);
+  if (!productMeta.buzzPurchase) throw new Error('This membership cannot be purchased with Buzz');
+  if (!productMeta.tier || productMeta.tier === 'free' || productMeta.tier === 'founder')
+    throw new Error('This membership cannot be purchased with Buzz');
+
+  // Enforced at the debit rather than trusting the caller: Blue is earned, not bankable,
+  // and must never buy a membership.
+  if (buzzType !== 'green' && buzzType !== 'yellow')
+    throw new Error('Memberships can only be purchased with Green or Yellow Buzz');
+
+  const existing = await getAllUserSubscriptions(userId);
+  if (existing.some((s) => isMembershipActive(s)))
+    throw new Error(
+      'You already have an active membership. Let it lapse before purchasing one with Buzz.'
+    );
+
+  const amount = getBuzzMembershipPrice({
+    unitAmount: price.unitAmount ?? 0,
+    buzzPrice: productMeta.buzzPrice,
+  });
+  if (amount <= 0) throw new Error('This membership has no Buzz price configured');
+
+  const now = dayjs.utc();
+  // Same-day retries reuse the id so a client double-submit can't double-charge. The paid
+  // currency is part of it so a retry that switches colour isn't swallowed as a duplicate.
+  const externalTransactionId = `buzz-membership:${userId}:${price.id}:${buzzType}:${now.format(
+    'YYYY-MM-DD'
+  )}`;
+
+  const { transactionId } = await createBuzzTransaction({
+    fromAccountId: userId,
+    fromAccountType: buzzType,
+    toAccountId: 0,
+    toAccountType: buzzType,
+    amount,
+    type: TransactionType.Purchase,
+    externalTransactionId,
+    description: `${price.product.name} membership (1 month)`,
+    details: { type: 'buzz-membership', tier: productMeta.tier, priceId: price.id, buzzType },
+    insufficientFundsErrorMsg: `You need ${amount} Buzz to purchase this membership.`,
+  });
+
+  try {
+    await dbWrite.$transaction(
+      async (tx) => {
+        // Re-check inside the transaction: the balance check above is a network round trip,
+        // so a concurrent purchase could have created a membership in the meantime.
+        const conflicting = await tx.customerSubscription.findFirst({
+          where: {
+            userId,
+            status: { notIn: ['canceled', 'incomplete_expired'] },
+            currentPeriodEnd: { gt: now.toDate() },
+          },
+          select: { id: true },
+        });
+        if (conflicting) throw new Error('You already have an active membership');
+
+        // Upsert rather than insert: a repeat buyer's lapsed row still holds the
+        // (userId, BUZZ_MEMBERSHIP_SUBSCRIPTION_TYPE) slot. Nothing is deleted — the
+        // conflicting check above already proved this row carries no live benefit.
+        const period = {
+          productId: price.product.id,
+          priceId: price.id,
+          status: 'active',
+          currentPeriodStart: now.toDate(),
+          currentPeriodEnd: now.add(1, 'month').toDate(),
+          // Never renews — buying another month is an explicit purchase.
+          cancelAtPeriodEnd: true,
+          cancelAt: null,
+          canceledAt: null,
+          endedAt: null,
+          metadata: {},
+        };
+
+        await tx.customerSubscription.upsert({
+          where: {
+            userId_buzzType: { userId, buzzType: BUZZ_MEMBERSHIP_SUBSCRIPTION_TYPE },
+          },
+          create: {
+            id: externalTransactionId,
+            userId,
+            buzzType: BUZZ_MEMBERSHIP_SUBSCRIPTION_TYPE,
+            createdAt: now.toDate(),
+            ...period,
+          },
+          update: { ...period, updatedAt: now.toDate() },
+        });
+
+        // `tx` is load-bearing: the subscription row above is uncommitted, so a delivery on
+        // any other client reads no active sub and silently inserts nothing.
+        await deliverMonthlyCosmetics({ userIds: [userId], tx });
+      },
+      // Same allowance as code redemption, which delivers cosmetics in its transaction too.
+      { timeout: 30000 }
+    );
+  } catch (error) {
+    if (transactionId)
+      await refundTransaction(transactionId, 'Failed to purchase membership with Buzz');
+    throw error;
+  }
+
+  await invalidateSubscriptionCaches(userId);
+  await syncFreshdeskMembership({ userId });
+
+  return {
+    tier: productMeta.tier,
+    amount,
+    buzzType,
+    currentPeriodEnd: now.add(1, 'month').toDate(),
+  };
+};
+
+export const liveBuzzMembershipWhere = (userId: number) => ({
+  userId,
+  buzzType: BUZZ_MEMBERSHIP_SUBSCRIPTION_TYPE,
+  status: { notIn: ['canceled', 'incomplete_expired'] },
+});
+const endedSubscriptionData = (now: Date) => ({
+  status: 'canceled',
+  canceledAt: now,
+  endedAt: now,
+  updatedAt: now,
+});
+
+/**
+ * Ends a Buzz-purchased membership because the user now has a real one.
+ *
+ * Nothing else does this: the cash flows upsert keyed on `userId_buzzType` with the CASH
+ * colour, so they never touch the `buzzPurchase` slot and the user would silently hold
+ * both. Since tier resolution takes the HIGHEST across all subscriptions, a leftover Buzz
+ * gold would keep granting gold perks to someone paying for bronze.
+ *
+ * Cancelled rather than deleted so the purchase stays auditable; `getAllUserSubscriptions`
+ * filters cancelled rows, so it stops granting tier immediately either way.
+ */
+export const supersedeBuzzMembershipForPaidSubscription = async ({
+  userId,
+}: {
+  userId: number;
+}) => {
+  const now = new Date();
+  const { count } = await dbWrite.customerSubscription.updateMany({
+    where: liveBuzzMembershipWhere(userId),
+    data: endedSubscriptionData(now),
+  });
+
+  if (!count) return { superseded: 0 };
+
+  const { invalidateSubscriptionCaches } = await import('~/server/utils/subscription.utils');
+  await invalidateSubscriptionCaches(userId);
+
+  return { superseded: count };
+};
+
+/**
+ * Ends a Buzz-purchased membership on a moderator's behalf, e.g. after support refunds the Buzz.
+ *
+ * Moves no Buzz: refunding the purchase and clawing back any membership Buzz are separate steps.
+ * Cancelled rather than deleted, like `supersedeBuzzMembershipForPaidSubscription`.
+ */
+export const endBuzzMembership = async ({
+  userId,
+  moderatorId,
+}: {
+  userId: number;
+  moderatorId: number;
+}) => {
+  const { trackModActivity } = await import('~/server/services/moderator.service');
+
+  const now = new Date();
+  const ended = await dbWrite.$transaction(async (tx) => {
+    const row = await tx.customerSubscription.findFirst({
+      where: liveBuzzMembershipWhere(userId),
+      select: {
+        id: true,
+        status: true,
+        productId: true,
+        currentPeriodEnd: true,
+      },
+    });
+    if (!row) throw throwNotFoundError('This account has no Buzz-purchased membership to end.');
+
+    await tx.customerSubscription.update({
+      where: { id: row.id },
+      data: endedSubscriptionData(now),
+    });
+    await trackModActivity(
+      moderatorId,
+      { entityType: 'user', entityId: userId, activity: `endBuzzMembership:${row.productId}` },
+      tx
+    );
+
+    return row;
+  });
+
+  const { invalidateSubscriptionCaches } = await import('~/server/utils/subscription.utils');
+  await invalidateSubscriptionCaches(userId);
+  // The row is already committed: a Freshdesk failure must not report the end as failed.
+  const freshdeskSynced = await syncFreshdeskMembership({ userId }).then(
+    () => true,
+    () => false
+  );
+
+  return {
+    subscriptionId: ended.id,
+    productId: ended.productId,
+    previousStatus: ended.status,
+    currentPeriodEnd: ended.currentPeriodEnd,
+    endedAt: now,
+    freshdeskSynced,
+  };
+};
+
+export const claimPrepaidToken = async ({
+  tokenId,
+  userId,
+}: {
+  tokenId: string;
+  userId: number;
+}) => {
+  const { getPrepaidTokens } = await import('~/server/utils/subscription.utils');
+  const { createBuzzTransaction } = await import('~/server/services/buzz.service');
+
+  // Mark as claimed in a short DB transaction first, then deliver buzz outside.
+  // This keeps the transaction short (no network calls inside) and prevents double-spend.
+  // If buzz delivery fails, token is "claimed but no buzz" — recoverable via retry
+  // since createBuzzTransaction uses externalTransactionId for idempotency.
+  const result = await dbWrite.$transaction(async (tx) => {
+    const subscription = await tx.customerSubscription.findFirst({
+      where: {
+        userId,
+        product: { provider: 'Civitai' },
+        buzzType: 'yellow', // Prepaid tokens are only for yellow tier
+      },
+      select: {
+        id: true,
+        metadata: true,
+        product: {
+          select: { metadata: true },
+        },
+      },
+    });
+
+    if (!subscription) {
+      throw new Error('No active prepaid membership found');
+    }
+
+    const meta = (subscription.metadata ?? {}) as SubscriptionMetadata;
+    const tokens = getPrepaidTokens({ metadata: meta });
+    const tokenIndex = tokens.findIndex((t) => t.id === tokenId);
+
+    if (tokenIndex === -1) {
+      throw new Error('Token not found');
+    }
+
+    const token = tokens[tokenIndex];
+
+    if (token.status !== 'unlocked') {
+      throw new Error(
+        token.status === 'claimed' ? 'Token already claimed' : 'Token is still locked'
+      );
+    }
+
+    const productMeta = subscription.product.metadata as SubscriptionProductMetadata;
+    const buzzType = productMeta.buzzType ?? 'yellow';
+    const now = new Date().toISOString();
+    const dateKey = now.split('T')[0];
+    const externalTransactionId = `prepaid-token-claim:${userId}:${tokenId}:${dateKey}`;
+
+    tokens[tokenIndex] = {
+      ...token,
+      status: 'claimed',
+      claimedAt: now,
+      buzzTransactionId: externalTransactionId,
+    };
+
+    const updatedMeta: Record<string, any> = { ...meta, tokens };
+
+    // For legacy tokens: decrement prepaids counter if the metadata didn't already
+    // have a tokens array (meaning the unlock job hasn't migrated this user yet).
+    if (tokenId.startsWith('legacy_') && meta.prepaids && !meta.tokens?.length) {
+      const tierKey = token.tier as keyof NonNullable<typeof meta.prepaids>;
+      updatedMeta.prepaids = {
+        ...meta.prepaids,
+        [tierKey]: Math.max(0, (meta.prepaids[tierKey] ?? 0) - 1),
+      };
+      updatedMeta.buzzTransactionIds = [...(meta.buzzTransactionIds ?? []), externalTransactionId];
+    }
+
+    await tx.customerSubscription.update({
+      where: { id: subscription.id },
+      data: {
+        metadata: updatedMeta,
+        updatedAt: new Date(),
+      },
+    });
+
+    return {
+      tokenId,
+      buzzAmount: token.buzzAmount,
+      tier: token.tier,
+      buzzType: buzzType as BuzzAccountType,
+      externalTransactionId,
+    };
+  });
+
+  // Deliver buzz OUTSIDE the transaction — idempotent via externalTransactionId
+  await createBuzzTransaction({
+    fromAccountId: 0,
+    toAccountId: userId,
+    toAccountType: result.buzzType,
+    type: TransactionType.Purchase,
+    externalTransactionId: result.externalTransactionId,
+    amount: result.buzzAmount,
+    description: `Claimed prepaid ${result.tier} token`,
+    details: {
+      type: 'prepaid-token-claim',
+      tokenId: result.tokenId,
+      tier: result.tier,
+    },
+  });
+
+  const { invalidateSubscriptionCaches } = await import('~/server/utils/subscription.utils');
+  await invalidateSubscriptionCaches(userId);
+
+  return result;
+};
+
+export const claimAllPrepaidTokens = async ({ userId }: { userId: number }) => {
+  const { getPrepaidTokens } = await import('~/server/utils/subscription.utils');
+  const { createBuzzTransactionMany } = await import('~/server/services/buzz.service');
+
+  // Short DB transaction to mark all tokens as claimed, then deliver buzz outside.
+  const result = await dbWrite.$transaction(async (tx) => {
+    const subscription = await tx.customerSubscription.findFirst({
+      where: {
+        userId,
+        product: { provider: 'Civitai' },
+      },
+      select: {
+        id: true,
+        metadata: true,
+        product: {
+          select: { metadata: true },
+        },
+      },
+    });
+
+    if (!subscription) {
+      throw new Error('No active prepaid membership found');
+    }
+
+    const meta = (subscription.metadata ?? {}) as SubscriptionMetadata;
+    const tokens = getPrepaidTokens({ metadata: meta });
+    const unlockedTokens = tokens.filter((t) => t.status === 'unlocked');
+
+    if (unlockedTokens.length === 0) {
+      throw new Error('No unlocked tokens to claim');
+    }
+
+    const productMeta = subscription.product.metadata as SubscriptionProductMetadata;
+    const buzzType = productMeta.buzzType ?? 'yellow';
+    const now = new Date().toISOString();
+    const dateKey = now.split('T')[0];
+
+    const updatedTokens = tokens.map((t) => {
+      if (t.status === 'unlocked') {
+        return {
+          ...t,
+          status: 'claimed' as const,
+          claimedAt: now,
+          buzzTransactionId: `prepaid-token-claim:${userId}:${t.id}:${dateKey}`,
+        };
+      }
+      return t;
+    });
+
+    const updatedMeta: Record<string, any> = { ...meta, tokens: updatedTokens };
+
+    // For legacy tokens: decrement prepaids if not yet migrated to tokens array
+    const legacyClaimed = unlockedTokens.filter((t) => t.id.startsWith('legacy_'));
+    if (legacyClaimed.length > 0 && meta.prepaids && !meta.tokens?.length) {
+      const updatedPrepaids = { ...meta.prepaids };
+      const newTxIds = [...(meta.buzzTransactionIds ?? [])];
+      for (const t of legacyClaimed) {
+        const tierKey = t.tier as keyof typeof updatedPrepaids;
+        updatedPrepaids[tierKey] = Math.max(0, (updatedPrepaids[tierKey] ?? 0) - 1);
+        newTxIds.push(`prepaid-token-claim:${userId}:${t.id}:${dateKey}`);
+      }
+      updatedMeta.prepaids = updatedPrepaids;
+      updatedMeta.buzzTransactionIds = newTxIds;
+    }
+
+    await tx.customerSubscription.update({
+      where: { id: subscription.id },
+      data: {
+        metadata: updatedMeta,
+        updatedAt: new Date(),
+      },
+    });
+
+    const totalBuzz = unlockedTokens.reduce((sum, t) => sum + t.buzzAmount, 0);
+    return {
+      claimed: unlockedTokens.length,
+      totalBuzz,
+      buzzType: buzzType as BuzzAccountType,
+      dateKey,
+      unlockedTokens,
+    };
+  });
+
+  // Deliver buzz OUTSIDE the transaction — idempotent via externalTransactionId
+  const transactions = result.unlockedTokens.map((token) => ({
+    fromAccountId: 0,
+    toAccountId: userId,
+    toAccountType: result.buzzType,
+    type: TransactionType.Purchase,
+    externalTransactionId: `prepaid-token-claim:${userId}:${token.id}:${result.dateKey}`,
+    amount: token.buzzAmount,
+    description: `Claimed prepaid ${token.tier} token`,
+    details: {
+      type: 'prepaid-token-claim',
+      tokenId: token.id,
+      tier: token.tier,
+    },
+  }));
+
+  await createBuzzTransactionMany(transactions);
+
+  const { invalidateSubscriptionCaches } = await import('~/server/utils/subscription.utils');
+  await invalidateSubscriptionCaches(userId);
+
+  return { claimed: result.claimed, totalBuzz: result.totalBuzz };
+};
+
+/**
+ * Unlock tokens for a specific user (admin/mod endpoint). This does the full process:
+ * 1. Reads subscription metadata (supports both new tokens and legacy prepaids)
+ * 2. When force=false: unlocks one locked token matching the current tier
+ * 3. When force=true: unlocks ALL locked tokens matching the current tier
+ * 4. Persists updated metadata (migrating legacy prepaids → tokens if needed)
+ * 5. Sends notification email
+ */
+export const unlockTokensForUser = async ({
+  userId,
+  force = false,
+}: {
+  userId: number;
+  /** When true, unlocks ALL locked tokens regardless of unlock date */
+  force?: boolean;
+}) => {
+  const { getPrepaidTokens } = await import('~/server/utils/subscription.utils');
+  const { prepaidTokenUnlockedEmail } = await import(
+    '~/server/email/templates/prepaidTokenUnlocked.email'
+  );
+
+  const subscription = await dbWrite.customerSubscription.findFirst({
+    where: {
+      userId,
+      product: { provider: 'Civitai' },
+    },
+    select: {
+      id: true,
+      metadata: true,
+      currentPeriodStart: true,
+      product: {
+        select: { metadata: true },
+      },
+      user: {
+        select: { email: true, username: true },
+      },
+    },
+  });
+
+  if (!subscription) {
+    throw new Error('No active prepaid membership found');
+  }
+
+  const meta = (subscription.metadata ?? {}) as SubscriptionMetadata;
+  const productMeta = subscription.product.metadata as SubscriptionProductMetadata;
+  const currentTier = productMeta.tier;
+
+  if (!currentTier || currentTier === 'free') {
+    return { unlocked: 0, totalBuzz: 0, message: 'Subscription has no paid tier' };
+  }
+
+  const tokens = getPrepaidTokens({ metadata: meta });
+
+  if (tokens.length === 0) {
+    return { unlocked: 0, totalBuzz: 0, message: 'No tokens found' };
+  }
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  let unlockedCount = 0;
+  let totalBuzz = 0;
+
+  let updatedTokens: typeof tokens;
+  if (force) {
+    // Unlock ALL locked tokens matching the current tier only
+    updatedTokens = tokens.map((token) => {
+      if (token.status === 'locked' && token.tier === currentTier) {
+        unlockedCount++;
+        totalBuzz += token.buzzAmount;
+        return { ...token, status: 'unlocked' as const, unlockedAt: nowIso };
+      }
+      return token;
+    });
+  } else {
+    // Unlock ONE locked token matching the current tier
+    const targetIndex = tokens.findIndex((t) => t.status === 'locked' && t.tier === currentTier);
+
+    if (targetIndex === -1) {
+      return { unlocked: 0, totalBuzz: 0, message: `No locked ${currentTier} tokens to unlock` };
+    }
+
+    updatedTokens = tokens.map((token, i) => {
+      if (i === targetIndex) {
+        unlockedCount++;
+        totalBuzz += token.buzzAmount;
+        return { ...token, status: 'unlocked' as const, unlockedAt: nowIso };
+      }
+      return token;
+    });
+  }
+
+  if (unlockedCount === 0) {
+    return { unlocked: 0, totalBuzz: 0, message: 'No tokens eligible for unlock yet' };
+  }
+
+  // Persist — write full tokens array (this migrates legacy prepaids to new format)
+  await dbWrite.customerSubscription.update({
+    where: { id: subscription.id },
+    data: {
+      metadata: { ...meta, tokens: updatedTokens },
+      updatedAt: now,
+    },
+  });
+
+  const { invalidateSubscriptionCaches } = await import('~/server/utils/subscription.utils');
+  await invalidateSubscriptionCaches(userId);
+
+  // Send notification email
+  if (subscription.user?.email) {
+    try {
+      await prepaidTokenUnlockedEmail.send({
+        user: {
+          email: subscription.user.email,
+          username: subscription.user.username ?? 'there',
+        },
+        tokensUnlocked: unlockedCount,
+        totalBuzz,
+      });
+    } catch (err) {
+      console.error(`Failed to send token unlock email to user ${userId}:`, err);
+    }
+  }
+
+  return { unlocked: unlockedCount, totalBuzz };
+};
+
+/**
+ * Core unlock logic shared by the daily job and the manual API endpoint.
+ * Finds all active Civitai memberships whose currentPeriodStart day-of-month
+ * matches `targetDate`, then unlocks ONE locked token per membership.
+ *
+ * @param targetDate - The date to use for day-of-month matching and idempotency checks.
+ * @returns Summary of how many tokens were unlocked.
+ */
+export const unlockPrepaidTokensForDate = async ({ date }: { date: Date }) => {
+  const { getPrepaidTokens } = await import('~/server/utils/subscription.utils');
+  const { chunk } = await import('lodash-es');
+  const target = (await import('~/shared/utils/dayjs')).default(date);
+  const currentDay = target.date();
+
+  const memberships = await dbWrite.$queryRaw<
+    {
+      id: string;
+      userId: number;
+      metadata: any;
+      tier: string;
+    }[]
+  >`
+    SELECT
+      cs.id,
+      cs."userId",
+      cs.metadata,
+      pr.metadata->>'tier' as "tier"
+    FROM "CustomerSubscription" cs
+    JOIN "Product" pr ON pr.id = cs."productId"
+    WHERE (
+      EXTRACT(day from cs."currentPeriodStart") = ${currentDay}
+      OR
+      (
+        EXTRACT(day from cs."currentPeriodStart") > EXTRACT(day from (DATE_TRUNC('month', ${date}::timestamp) + INTERVAL '1 month' - INTERVAL '1 day'))
+        AND ${currentDay} = EXTRACT(day from (DATE_TRUNC('month', ${date}::timestamp) + INTERVAL '1 month' - INTERVAL '1 day'))
+      )
+    )
+    AND cs."createdAt" < ${date}::date
+    AND cs.status = 'active'
+    AND cs."currentPeriodEnd" > ${date}::timestamp
+    AND cs."currentPeriodEnd"::date > ${date}::date
+    AND pr.provider = 'Civitai'
+    AND pr.metadata->>'monthlyBuzz' IS NOT NULL
+    -- Buzz-purchased memberships never earn monthly Buzz. Their products carry
+    -- monthlyBuzz: 0 in prod, which the line above lets through.
+    AND (pr.metadata->>'buzzPurchase') IS DISTINCT FROM 'true'
+  `;
+
+  if (!memberships.length) {
+    return { matched: 0, unlocked: 0, message: 'No Civitai memberships match for token unlock' };
+  }
+
+  let totalUnlocked = 0;
+  const updates: Array<{ id: string; userId: number; metadata: SubscriptionMetadata }> = [];
+
+  for (const membership of memberships) {
+    const meta = (membership.metadata ?? {}) as SubscriptionMetadata;
+    const currentTier = membership.tier;
+
+    if (!currentTier || currentTier === 'free') continue;
+
+    const tokens = getPrepaidTokens({ metadata: meta });
+    if (tokens.length === 0) continue;
+
+    // Idempotency: skip if ANY token was unlocked on the target date
+    const dayStart = target.startOf('day').toISOString();
+    const dayEnd = target.add(1, 'day').startOf('day').toISOString();
+    const alreadyUnlockedOnDate = tokens.some(
+      (t) => t.unlockedAt != null && t.unlockedAt >= dayStart && t.unlockedAt < dayEnd
+    );
+    if (alreadyUnlockedOnDate) continue;
+
+    // Only unlock a token matching the user's CURRENT subscription tier
+    const tokenIndex = tokens.findIndex((t) => t.status === 'locked' && t.tier === currentTier);
+    if (tokenIndex === -1) continue;
+
+    const updatedTokens = tokens.map((t, i) => {
+      if (i === tokenIndex) {
+        return { ...t, status: 'unlocked' as const, unlockedAt: target.toISOString() };
+      }
+      return t;
+    });
+
+    const updatedMeta: Record<string, any> = {
+      ...meta,
+      tokens: updatedTokens,
+      prepaids: {},
+    };
+
+    totalUnlocked++;
+    updates.push({
+      id: membership.id,
+      userId: membership.userId,
+      metadata: updatedMeta as SubscriptionMetadata,
+    });
+  }
+
+  // Batch update all memberships with unlocked tokens
+  if (updates.length > 0) {
+    const batches = chunk(updates, 100);
+    for (const batch of batches) {
+      await dbWrite.$executeRaw`
+        UPDATE "CustomerSubscription"
+        SET
+          "metadata" = (updates.data ->> 'metadata')::jsonb,
+          "updatedAt" = NOW()
+        FROM (
+          SELECT
+            (value ->> 'id')::text AS "id",
+            value AS data
+          FROM json_array_elements(${JSON.stringify(
+            batch.map((u) => ({
+              id: u.id,
+              metadata: JSON.stringify(u.metadata),
+            }))
+          )}::json)
+        ) AS updates
+        WHERE "CustomerSubscription"."id" = updates."id"
+      `;
+    }
+
+    // Grant monthly cosmetics/badges for users who got tokens unlocked
+    const userIds = updates.map((u) => u.userId);
+    await deliverMonthlyCosmetics({ userIds });
+  }
+
+  return {
+    matched: memberships.length,
+    unlocked: totalUnlocked,
+    message:
+      updates.length > 0
+        ? `Unlocked ${totalUnlocked} tokens for ${updates.length} users`
+        : 'No tokens to unlock for the given date',
+  };
+};
+
+// Paddle-era annual subscription product codes that map to a known tier.
+// Used to infer tier from `annual-sub-payment-YYYY-MM:userId:productCode` rows.
+const ANNUAL_PRODUCT_CODE_TO_TIER: Record<string, MembershipTier> = {
+  pro_01j6d5x820zmcs1ycgwnwa9rk5: 'bronze',
+  pro_01j6d72j9eaf5sqsvha0xbafgv: 'silver',
+  pro_01j6d7mvn41ynah2qrbeg29fh5: 'gold',
+};
+
+// Legacy lookup window. annual-sub-payment txns only existed during the Paddle
+// migration era; reward-based comp tickets cluster here too. Bounding the date
+// range keeps the buzzTransactions scan tractable (~10s vs 2min for full 24mo).
+const LEGACY_QUERY_START_DATE = '2025-05-01';
+const LEGACY_QUERY_END_DATE = '2025-09-01';
+
+const isMembershipCompReward = (description: string | null | undefined): boolean => {
+  if (!description) return false;
+  const d = description.toLowerCase();
+  // Exclude reward types that occasionally mention "membership" but are not
+  // membership-buzz comp (challenge prizes, contests, generation credits, etc.)
+  if (d.includes('challenge')) return false;
+  if (d.includes('contest')) return false;
+  if (d.includes('generation reward')) return false;
+  if (d.includes('deleted account')) return false;
+  if (d.includes('onboarding')) return false;
+  if (d.includes('crypto')) return false;
+  // Every legitimate migration-era comp ticket includes "membership" in its
+  // description. Matching on "missing X buzz" alone produced false positives
+  // (e.g. "Missing Gift Card Buzz" — not membership-related).
+  if (d.includes('membership')) return true;
+  return false;
+};
+
+const inferTierFromAmount = (amount: number, fallbackTier?: MembershipTier): MembershipTier => {
+  const direct = BUZZ_AMOUNT_TO_TIER[amount];
+  if (direct) return direct;
+  // Multi-month comp — prefer the user's own annual tier if amount divides evenly
+  if (fallbackTier && amount % TIER_BUZZ_AMOUNTS[fallbackTier] === 0) {
+    return fallbackTier;
+  }
+  // Heuristic: smallest tier that divides evenly
+  if (amount % TIER_BUZZ_AMOUNTS.bronze === 0 && amount % TIER_BUZZ_AMOUNTS.silver !== 0)
+    return 'bronze';
+  if (amount % TIER_BUZZ_AMOUNTS.gold === 0) return 'gold';
+  if (amount % TIER_BUZZ_AMOUNTS.silver === 0) return 'silver';
+  return 'bronze';
+};
+
+export const getHistoricalPrepaidDeliveries = async ({
+  userId,
+  accountType = 'yellow',
+}: {
+  userId: number;
+  accountType?: 'yellow' | 'green';
+}): Promise<PrepaidToken[]> => {
+  if (!clickhouse) return [];
+
+  // Two ClickHouse queries run in parallel:
+  //   1. membership_prepaid_deliveries (materialized view) → civitai-membership rows. Fast (~0.5s).
+  //   2. buzzTransactions (raw, yellow only, narrow date window) → annual-sub-payment + reward
+  //      rows from the Paddle migration era. Slow (~10s) due to the table being sorted by
+  //      (date, fromAccountId, toAccountId); the date filter limits the scan. The byToAccount
+  //      projection exists but can't be used with SharedReplacingMergeTree.
+  // Cache aggressively since legacy txns are historical and don't change.
+  const cacheKey =
+    `${REDIS_KEYS.SYSTEM.BLOCKLIST}:prepaid-deliveries:${userId}:${accountType}:v2` as RedisKeyTemplateCache;
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached) return JSON.parse(cached) as PrepaidToken[];
+  } catch {
+    // Redis down — fall through to ClickHouse
+  }
+
+  const membershipPromise = clickhouse.$query<{
+    date: string;
+    amount: number;
+    externalTransactionId: string;
+    details: string;
+  }>`
+    SELECT
+      date,
+      amount,
+      externalTransactionId,
+      details
+    FROM membership_prepaid_deliveries
+    WHERE toAccountId = ${userId}
+      AND toAccountType = '${accountType}'
+      AND date >= now() - INTERVAL 24 MONTH
+    ORDER BY date DESC
+  `;
+
+  // Legacy annual-sub-payment + migration-era reward comps. Description-based
+  // filtering for rewards happens server-side (below) to keep the SQL fast.
+  const legacyPromise =
+    accountType === 'yellow'
+      ? clickhouse.$query<{
+          date: string;
+          type: string;
+          amount: number;
+          externalTransactionId: string;
+          description: string;
+        }>`
+          SELECT date, type, amount, externalTransactionId, description
+          FROM buzzTransactions
+          WHERE date >= '${LEGACY_QUERY_START_DATE}'
+            AND date < '${LEGACY_QUERY_END_DATE}'
+            AND toAccountId = ${userId}
+            AND toAccountType = '${accountType}'
+            AND (
+              (type = 'purchase' AND externalTransactionId LIKE 'annual-sub-payment%')
+              OR type = 'reward'
+            )
+          ORDER BY date DESC
+        `
+      : Promise.resolve([] as never[]);
+
+  const [membershipRows, legacyRows] = await Promise.all([membershipPromise, legacyPromise]);
+  // Pull the YYYY-MM period out of `civitai-membership:YYYY-MM:...` or
+  // `annual-sub-payment-YYYY-MM:...` so we can label the token by month.
+  const formatPeriod = (yyyyMm: string | undefined): string | undefined => {
+    if (!yyyyMm || !/^\d{4}-\d{2}$/.test(yyyyMm)) return undefined;
+    const [year, month] = yyyyMm.split('-');
+    const monthNames = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    const m = monthNames[parseInt(month, 10) - 1];
+    return m ? `${m} ${year}` : undefined;
+  };
+
+  const tokens: PrepaidToken[] = membershipRows.map((tx) => {
+    let tier: MembershipTier | 'silver' = BUZZ_AMOUNT_TO_TIER[tx.amount] ?? 'silver';
+    try {
+      const parsed = JSON.parse(tx.details);
+      if (parsed?.tier) tier = parsed.tier;
+    } catch {
+      // details may not be valid JSON
+    }
+
+    // externalTransactionId: `civitai-membership:YYYY-MM:userId:tier[:variant]`
+    const periodLabel = formatPeriod(tx.externalTransactionId.split(':')[1]);
+
+    return {
+      id: `history_${tx.externalTransactionId}`,
+      tier: tier as PrepaidToken['tier'],
+      status: 'claimed' as const,
+      buzzAmount: tx.amount,
+      // ClickHouse DateTime strings have no TZ suffix; treat them as UTC
+      // so parsing doesn't skew by the server's local timezone.
+      claimedAt: new Date(`${tx.date.replace(' ', 'T')}Z`).toISOString(),
+      buzzTransactionId: tx.externalTransactionId,
+      description: periodLabel ? `Membership · ${periodLabel}` : 'Membership',
+    };
+  });
+
+  // Derive user's annual tier from any annual-sub-payment row so multi-month
+  // reward comps (e.g. "Missing May, June, July Membership Buzz" = 30k bronze)
+  // get the correct tier when amount alone is ambiguous.
+  let userAnnualTier: MembershipTier | undefined;
+  for (const tx of legacyRows) {
+    if (tx.externalTransactionId.startsWith('annual-sub-payment-')) {
+      const parts = tx.externalTransactionId.split(':');
+      const productCode = parts[2];
+      if (productCode && ANNUAL_PRODUCT_CODE_TO_TIER[productCode]) {
+        userAnnualTier = ANNUAL_PRODUCT_CODE_TO_TIER[productCode];
+        break;
+      }
+    }
+  }
+
+  legacyRows.forEach((tx, idx) => {
+    const claimedAt = new Date(`${tx.date.replace(' ', 'T')}Z`).toISOString();
+
+    if (tx.type === 'purchase' && tx.externalTransactionId.startsWith('annual-sub-payment-')) {
+      const productCode = tx.externalTransactionId.split(':')[2];
+      const tier: MembershipTier =
+        (productCode && ANNUAL_PRODUCT_CODE_TO_TIER[productCode]) ||
+        BUZZ_AMOUNT_TO_TIER[tx.amount] ||
+        'silver';
+      // externalTransactionId: `annual-sub-payment-YYYY-MM:userId:productCode`
+      const yyyyMm = tx.externalTransactionId.split(':')[0]?.replace('annual-sub-payment-', '');
+      const periodLabel = formatPeriod(yyyyMm);
+      tokens.push({
+        id: `history_${tx.externalTransactionId}`,
+        tier: tier as PrepaidToken['tier'],
+        status: 'claimed',
+        buzzAmount: tx.amount,
+        claimedAt,
+        buzzTransactionId: tx.externalTransactionId,
+        description: periodLabel ? `Annual · ${periodLabel}` : 'Annual subscription',
+      });
+      return;
+    }
+
+    if (tx.type === 'reward' && tx.amount > 0 && isMembershipCompReward(tx.description)) {
+      const tier = inferTierFromAmount(tx.amount, userAnnualTier);
+      const monthly = TIER_BUZZ_AMOUNTS[tier];
+      // Multi-month comps (e.g. "Missing May, June, July Membership Buzz" = 30k
+      // bronze) should surface as one token per month rather than a single
+      // odd-amount token. Split when the amount divides evenly into the
+      // inferred tier; otherwise keep as one token at the raw amount.
+      const months = monthly && tx.amount % monthly === 0 ? tx.amount / monthly : 1;
+      // Reward externalTransactionIds are often empty/non-unique; synthesize a
+      // stable virtual id so React keys don't collide.
+      const virtualTxId = tx.externalTransactionId || `reward:${tx.date}:${tx.amount}:${idx}`;
+      const baseId = tx.date.replace(/\s/g, '_');
+      const baseDescription = tx.description || 'Membership comp';
+      for (let i = 0; i < months; i++) {
+        tokens.push({
+          id: `history_reward_${baseId}_${tx.amount}_${idx}_${i}`,
+          tier,
+          status: 'claimed',
+          buzzAmount: months > 1 ? monthly : tx.amount,
+          claimedAt,
+          // Only mark the first split token with the buzzTransactionId so
+          // metadata-side dedup still works without dropping the siblings.
+          buzzTransactionId: i === 0 ? virtualTxId : undefined,
+          description: months > 1 ? `${baseDescription} (${i + 1}/${months})` : baseDescription,
+        });
+      }
+    }
+  });
+
+  // Cache for 1 hour — historical/migration txns don't change
+  try {
+    await redis.set(cacheKey, JSON.stringify(tokens), { EX: CacheTTL.hour });
+  } catch {
+    // Redis down — result still returned
+  }
+
+  return tokens;
+};

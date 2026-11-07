@@ -1,0 +1,30 @@
+.checkbox {
+  & input:checked {
+    border-color: var(--mantine-color-white);
+  }
+}
+
+.actionsFooter {
+  border-top: 1px solid light-dark(var(--mantine-color-gray-2), var(--mantine-color-dark-5));
+  background: light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-7));
+  padding: 6px;
+}
+
+.favoriteButton {
+  background: rgba(240, 62, 62, 0.5);
+}
+
+.improveMenu {
+  border-radius: var(--mantine-radius-sm);
+  background: light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-6));
+  border: none;
+  box-shadow: 0 -2px 6px 1px rgba(0, 0, 0, 0.16);
+  padding: 4px;
+}
+
+.scrollableDropdown {
+  @media (max-height: 900px) {
+    max-height: calc(90dvh - 32px);
+    overflow-y: auto;
+  }
+}

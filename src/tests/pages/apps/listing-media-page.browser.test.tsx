@@ -1,0 +1,901 @@
+import { useEffect, useState } from 'react';
+import { beforeEach, describe, expect, test, vi } from 'vitest';
+import { page, userEvent } from 'vitest/browser';
+// `test/` lives outside `src`, so the `~` alias doesn't reach it — relative import.
+import { renderWithProviders } from '../../../../test/component-setup';
+import { useRouter } from 'next/router';
+import { NsfwLevel } from '~/server/common/enums';
+
+/**
+ * On-site listing-media OWNER editor (`ListingMediaEditor`, the "Listing media" tab of
+ * `/apps/<appBlockId>/edit`) — render test (browser mode, `Component tests` in CI).
+ *
+ * Asserts the client wiring: it resolves `appBlockId` → `appListingId`
+ * (`getMyListingForApp`), re-hosts the reused `ListingAssetStep` against the
+ * server-resolved `editTargetId` + the listing's content rating, prefills it from that
+ * target's assets, re-pulls the projection after an asset mutation, surfaces the
+ * honest live-app framing copy (+ the pending-revision notice when applicable), and
+ * fires `submitListingRevision({ shadowId })` from the Submit-for-review button. The
+ * asset step itself is stubbed — its real behaviour is covered by
+ * `ListingAssetStep.browser.test.tsx`.
+ *
+ * 🔴 NO `beginListingRevision` ON MOUNT. Firing it here made merely OPENING the tab
+ * create a `draft` AppListing (78% of approved onsite parents on prod carried a
+ * never-edited shadow, self-refilling on every view). The shadow is minted by the
+ * first asset MUTATION, server-side. `editTargetId` is the shadow when one exists and
+ * the listing itself otherwise; `editBlockedReason` carries the "this can't be edited"
+ * verdict the on-mount call used to deliver as INVALID_REVISION.
+ *
+ * 🔴 This file used to import the default export of `~/pages/apps/[appBlockId]/listing`.
+ * That route is now a getServerSideProps REDIRECT stub whose default export renders
+ * `<NotFound />` and nothing else, so every test here rendered an empty not-found div
+ * and asserted nothing — a structurally dead suite that still reported green. It now
+ * targets the real component the route redirects to. Keep it pointed at a COMPONENT.
+ */
+
+const state = vi.hoisted(() => ({
+  // getMyListingForApp.useQuery control object.
+  query: {
+    data: undefined as unknown,
+    isLoading: false,
+    error: null as unknown,
+  },
+  // getAssets.useQuery control object: the per-asset levels the rating badges/callout read.
+  // Reset per test to a NO-RAISE read (every level within the declared rating).
+  assets: { data: undefined as unknown, isError: false },
+  // submitListingRevision — captured args.
+  submit: { calls: [] as unknown[], pending: false },
+  // Props the stubbed ListingAssetStep received.
+  assetProps: {
+    last: null as null | {
+      listingId: string;
+      contentRating: string;
+      initial?: { icon: { imageId: number | null }; cover: { imageId: number | null } };
+      rating?: unknown;
+    },
+  },
+  // Floor state the stubbed step reports up via onCompletenessChange (drives the
+  // submit button's disabled binding). Default meets-floor so the happy paths click.
+  floor: { meetsFloor: true, complete: false },
+  invalidate: vi.fn().mockResolvedValue(undefined),
+  invalidateAssets: vi.fn().mockResolvedValue(undefined),
+  flags: { appBlocks: true } as Record<string, boolean>,
+  // Drives WHICH live-app notice the editor renders. `useCurrentUser()` throws
+  // without a CivitaiSessionProvider (which `renderWithProviders` deliberately does
+  // not mount), so it is mocked rather than provided.
+  currentUser: null as null | { id: number; username: string; isModerator?: boolean },
+}));
+
+// Runs as a developer who has accepted the App Developer Terms.
+vi.mock('~/components/Apps/AppDeveloperTerms/AppDeveloperTermsCheckbox', () => ({
+  AppDeveloperTermsCheckbox: () => null,
+  useAppDeveloperTermsAccepted: () => true,
+}));
+
+vi.mock('~/providers/FeatureFlagsProvider', () => ({
+  useFeatureFlags: () => state.flags,
+}));
+
+// 🔴 THE SHARED NAV'S DATA HOOK IS STUBBED, and that is a scoping decision rather than
+// convenience. `/apps/listing/[appListingId]/edit` renders `AppsPageLayout`, which calls
+// `useAppsNavSections` — a hook with three context/data inputs of its own
+// (`useIsClient`, `useCurrentUser`, `blocks.getNavSummary`). Wiring them here would
+// make this suite, which is about the listing editor, fail the next time the nav
+// gains an input. The ADOPTION is covered where it belongs: structurally in
+// `__tests__/appsPageWidths.test.ts` (every rendering /apps page mounts the layout),
+// as pixels in `AppsPageLayout.chromeAlignment.browser.test.tsx`, and end-to-end on
+// one page in `AppEditPage.browser.test.tsx`.
+//
+// ⚠️ AN EMPTY SECTION LIST MEANS NO RAIL AT ALL — the `< 2 sections` collapse — so this
+// stub also removes the 276px of rail chrome from the tree. That is the right scoping
+// for a suite about the editor's own body, and it is why the stub returns `[]` rather
+// than a placeholder element: the layout, not the nav, decides whether the rail exists.
+vi.mock('~/components/Apps/useAppsNavSections', () => ({
+  useAppsNavSections: () => [],
+}));
+
+vi.mock('~/hooks/useCurrentUser', () => ({
+  useCurrentUser: () => state.currentUser,
+}));
+
+vi.mock('~/components/AppLayout/NotFound', () => ({
+  NotFound: () => <div data-testid="not-found">Not found</div>,
+}));
+vi.mock('~/utils/notifications', () => ({
+  showSuccessNotification: vi.fn(),
+  showErrorNotification: vi.fn(),
+}));
+
+// Stub the reused asset step — capture the props to prove the shell threads the
+// SHADOW id + rating, without re-running its own (covered) upload behaviour.
+vi.mock('~/components/Apps/ListingAssetStep', () => ({
+  ListingAssetStep: (props: {
+    listingId: string;
+    contentRating: string;
+    initial?: { icon: { imageId: number | null }; cover: { imageId: number | null } };
+    rating?: unknown;
+    onAssetMutated?: () => void;
+    onCompletenessChange?: (s: { meetsFloor: boolean; complete: boolean }) => void;
+  }) => {
+    state.assetProps.last = props;
+    // Mirror the real step's seeding EXACTLY: it reads `initial` in its useState
+    // INITIALISERS, so what it shows is whatever `initial` held at MOUNT — a mere
+    // re-render never re-seeds it, only a remount does. That is what makes the tab
+    // round-trip below an end-to-end assertion instead of a prop-passthrough one.
+    const [seededIcon] = useState(() => props.initial?.icon.imageId ?? null);
+    // Mirror the real step: report the floor state up so the page can gate submit.
+    // In an EFFECT, not during render — the real step reports from an effect, and
+    // calling the parent's setState mid-render trips React's cross-component warning.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    useEffect(() => props.onCompletenessChange?.(state.floor), []);
+    return (
+      <div data-testid="asset-step">
+        assets:{props.listingId}:{props.contentRating}
+        <span data-testid="asset-step-seeded-icon">{String(seededIcon ?? 'none')}</span>
+        {/* Stands in for a successful attach/remove inside the real step. */}
+        <button
+          type="button"
+          data-testid="asset-step-mutate"
+          onClick={() => props.onAssetMutated?.()}
+        >
+          mutate
+        </button>
+      </div>
+    );
+  },
+}));
+
+vi.mock('~/utils/trpc', () => ({
+  trpc: {
+    useUtils: () => ({
+      appListings: {
+        getMyListingForApp: { invalidate: state.invalidate },
+        getAssets: { invalidate: state.invalidateAssets },
+      },
+    }),
+    appListings: {
+      getMyListingForApp: { useQuery: () => state.query },
+      getAssets: { useQuery: () => state.assets },
+      // 🔴 `beginListingRevision` is deliberately ABSENT from this mock. If the editor
+      // ever re-adds an on-mount call to it, these tests crash rather than silently
+      // re-introducing the write-on-view that this change removed.
+      submitListingRevision: {
+        useMutation: () => ({
+          mutateAsync: async (vars: unknown) => {
+            state.submit.calls.push(vars);
+            return { publishRequestId: 'alpr_1', shadowId: 'apl_shadow', slug: 'my-app' };
+          },
+          isPending: state.submit.pending,
+        }),
+      },
+    },
+  },
+}));
+
+// 🔴 The REAL editor component — NOT the `/apps/[appBlockId]/listing` route module,
+// which is now a redirect stub that only ever renders <NotFound />.
+const { ListingMediaEditor } = await import('~/components/Apps/ListingMediaEditor');
+const ListingMediaPage = () => <ListingMediaEditor appBlockId="my-block" />;
+
+/**
+ * Stands in for the owning `/apps/[appBlockId]/edit` page's tab shell, which mounts
+ * its panels with `keepMounted={false}`: leaving the media tab and coming back
+ * genuinely UNMOUNTS and REMOUNTS the editor while the page itself stays put. The key
+ * bump reproduces that inside one render tree (a manual `unmount()` fights the
+ * scaffold's auto-`cleanup()` and blanks the following test's container).
+ */
+function TabRoundTrip() {
+  const [mountKey, setMountKey] = useState(0);
+  return (
+    <>
+      <button type="button" data-testid="tab-round-trip" onClick={() => setMountKey((n) => n + 1)}>
+        leave and re-enter the media tab
+      </button>
+      <ListingMediaEditor key={mountKey} appBlockId="my-block" />
+    </>
+  );
+}
+
+function setRouterQuery(query: Record<string, string>) {
+  const router = (useRouter as unknown as () => { query: Record<string, string> })();
+  router.query = query;
+}
+
+beforeEach(() => {
+  state.query = {
+    data: {
+      appListingId: 'apl_onsite',
+      status: 'approved',
+      // 🔴 THE CALLER'S ROLE, returned by `getMyListingForApp`. Spelled in the default
+      // fixture rather than left absent, because absent is a REAL third state here (an
+      // older cached payload) with its own copy branch — a fixture that omits it would
+      // silently test that branch while reading as if it tested the owner one.
+      role: 'owner',
+      contentRating: 'pg13',
+      declaredContentRating: 'pg13',
+      hasPendingRevision: false,
+      shadowId: 'apl_shadow',
+      editTargetId: 'apl_shadow',
+      editBlockedReason: null,
+      // The SHADOW's assets — what the proc now projects so the step can prefill.
+      assets: {
+        icon: { imageId: 137918008, url: 'edge:icon' },
+        cover: { imageId: 137918011, url: 'edge:cover' },
+        screenshots: [],
+      },
+    },
+    isLoading: false,
+    error: null,
+  };
+  // The levels of the SAME icon/cover the fixture above attaches, both within pg13.
+  state.assets = {
+    data: {
+      iconId: 137918008,
+      coverId: 137918011,
+      iconNsfwLevel: NsfwLevel.PG,
+      coverNsfwLevel: NsfwLevel.PG,
+      screenshots: [],
+    },
+    isError: false,
+  };
+  state.invalidateAssets.mockReset();
+  state.invalidateAssets.mockResolvedValue(undefined);
+  state.submit = { calls: [], pending: false };
+  state.floor = { meetsFloor: true, complete: false };
+  state.assetProps.last = null;
+  // mockRESET, not mockClear: a per-test `mockImplementation` (the round-trip test
+  // publishes a post-attach projection through it) otherwise leaks into every later
+  // test in the file.
+  state.invalidate.mockReset();
+  state.invalidate.mockResolvedValue(undefined);
+  state.flags = { appBlocks: true };
+  state.currentUser = { id: 7, username: 'owner' };
+  setRouterQuery({ appBlockId: 'my-block' });
+});
+
+describe('ListingMediaPage — owner listing-media route shell', () => {
+  test('resolves the listing and renders the asset step against the server-resolved edit target + rating', async () => {
+    renderWithProviders(<ListingMediaPage />);
+
+    // The reused asset step is hosted against the edit target + the listing's rating.
+    await expect.element(page.getByTestId('asset-step')).toBeInTheDocument();
+    await expect
+      .element(page.getByTestId('asset-step'))
+      .toHaveTextContent('assets:apl_shadow:pg13');
+    expect(state.assetProps.last).toMatchObject({ listingId: 'apl_shadow', contentRating: 'pg13' });
+    expect(page.getByTestId('not-found').elements()).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // 🔴 LAZY CREATION — no shadow yet.
+  // -------------------------------------------------------------------------
+
+  test('🔴 with NO shadow yet, the editor mounts against the PARENT id and never opens a revision', async () => {
+    state.query.data = {
+      ...(state.query.data as Record<string, unknown>),
+      shadowId: null,
+      editTargetId: 'apl_onsite',
+    };
+    renderWithProviders(<ListingMediaPage />);
+
+    // It renders (no "Preparing your revision…" gate — there is nothing to prepare),
+    // hosted against the LIVE listing id. The first mutation mints the shadow
+    // server-side and applies there.
+    await expect
+      .element(page.getByTestId('asset-step'))
+      .toHaveTextContent('assets:apl_onsite:pg13');
+  });
+
+  test('🔴 Submit is DISABLED until a shadow exists — no edits means no revision to submit', async () => {
+    state.query.data = {
+      ...(state.query.data as Record<string, unknown>),
+      shadowId: null,
+      editTargetId: 'apl_onsite',
+    };
+    state.floor = { meetsFloor: true, complete: false };
+    renderWithProviders(<ListingMediaPage />);
+
+    const submit = page.getByTestId('apps-listing-media-submit');
+    await expect.element(submit).toBeDisabled();
+    await expect.element(page.getByTestId('apps-listing-media-no-changes')).toBeInTheDocument();
+  });
+
+  test('🔴 editBlockedReason renders the inline alert and keeps the editor unmounted', async () => {
+    state.query.data = {
+      ...(state.query.data as Record<string, unknown>),
+      status: 'removed',
+      shadowId: null,
+      editTargetId: 'apl_onsite',
+      editBlockedReason: 'this listing has been removed by a moderator and can no longer be edited',
+    };
+    renderWithProviders(<ListingMediaPage />);
+
+    const alert = page.getByTestId('apps-listing-media-begin-error');
+    await expect.element(alert).toHaveTextContent(/removed by a moderator/i);
+    // No editor over a dead listing, and no contradictory "this app is live" notice.
+    expect(page.getByTestId('asset-step').elements()).toHaveLength(0);
+    expect(page.getByTestId('apps-listing-media-live-notice').elements()).toHaveLength(0);
+    expect(page.getByTestId('not-found').elements()).toHaveLength(0);
+  });
+
+  test('a DRAFT listing is edited in place — no live notice, no revision Submit button', async () => {
+    state.query.data = {
+      ...(state.query.data as Record<string, unknown>),
+      status: 'draft',
+      shadowId: null,
+      editTargetId: 'apl_draft',
+      editBlockedReason: null,
+    };
+    renderWithProviders(<ListingMediaPage />);
+
+    await expect.element(page.getByTestId('asset-step')).toHaveTextContent('assets:apl_draft:pg13');
+    expect(page.getByTestId('apps-listing-media-live-notice').elements()).toHaveLength(0);
+    expect(page.getByTestId('apps-listing-media-submit').elements()).toHaveLength(0);
+  });
+
+  test('prefills the asset step with the SHADOW revision assets the proc projects', async () => {
+    renderWithProviders(<ListingMediaPage />);
+
+    await expect.element(page.getByTestId('asset-step')).toBeInTheDocument();
+    // Without this prop the step seeded every slot empty → "Icon none / Cover none"
+    // → the publish floor could never be met → Submit stayed permanently disabled.
+    expect(state.assetProps.last?.initial).toMatchObject({
+      icon: { imageId: 137918008 },
+      cover: { imageId: 137918011 },
+    });
+  });
+
+  test('hands the asset step the image levels from `getAssets` with the declared and current rating', async () => {
+    // The cover is rated above the declared pg13, and the listing already carries that r.
+    // The step itself turns this into the "imagery raised your rating" callout
+    // (covered in `ListingAssetStep.browser.test.tsx`); the editor's job is the wiring.
+    state.query.data = {
+      ...(state.query.data as Record<string, unknown>),
+      contentRating: 'r',
+      declaredContentRating: 'pg13',
+    };
+    const levels = {
+      iconId: 137918008,
+      coverId: 137918011,
+      iconNsfwLevel: NsfwLevel.PG,
+      coverNsfwLevel: NsfwLevel.R,
+      screenshots: [],
+    };
+    state.assets = { data: levels, isError: false };
+    renderWithProviders(<ListingMediaPage />);
+
+    await expect.element(page.getByTestId('asset-step')).toHaveTextContent('assets:apl_shadow:r');
+    expect(state.assetProps.last?.rating).toEqual({
+      declaredRating: 'pg13',
+      listingRating: 'r',
+      stage: 'live-revision',
+      assets: levels,
+      // `getAssets` reported no media split, so the author's rating callout counts every image.
+      mediaSplit: false,
+    });
+  });
+
+  const mediaSplitProp = () =>
+    (state.assetProps.last?.rating as { mediaSplit?: unknown } | undefined)?.mediaSplit;
+  const splitLevels = { iconNsfwLevel: NsfwLevel.PG, coverNsfwLevel: NsfwLevel.R, screenshots: [] };
+
+  test('passes a granted media split through to the asset step', async () => {
+    state.assets = { data: { ...splitLevels, mediaSplitApproved: true }, isError: false };
+    renderWithProviders(<ListingMediaPage />);
+    await expect.element(page.getByTestId('asset-step')).toBeInTheDocument();
+    expect(mediaSplitProp()).toBe(true);
+  });
+
+  test('an unreadable split (`null`) reaches the asset step as unsplit', async () => {
+    // `null` means the split state could not be read: the author's callout treats it as unsplit.
+    state.assets = { data: { ...splitLevels, mediaSplitApproved: null }, isError: false };
+    renderWithProviders(<ListingMediaPage />);
+    await expect.element(page.getByTestId('asset-step')).toBeInTheDocument();
+    expect(mediaSplitProp()).toBe(false);
+  });
+
+  test('surfaces the honest live-app framing copy', async () => {
+    renderWithProviders(<ListingMediaPage />);
+    const notice = page.getByTestId('apps-listing-media-live-notice');
+    await expect.element(notice).toBeInTheDocument();
+    await expect.element(notice).toHaveTextContent(/live/i);
+    await expect.element(notice).toHaveTextContent(/moderator re-approves/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // 🔴 The live-app notice must match the CALLER's actual write semantics, and the
+  // discriminator is `isModerator && !shadowId` — NOT `isModerator`.
+  //
+  // With NO shadow, `editTargetId` is the live parent and
+  // `resolveOwnerAssetEditTarget` + `assertOwnerAssetEditable` both short-circuit on
+  // `user.isModerator`, so a moderator's edit is written DIRECTLY to the live listing.
+  // (Confirmed in production, on listings the moderator also OWNED — this editor's
+  // read is owner-bound with no mod branch, so it is only ever reachable for your own
+  // listing.)
+  //
+  // 🔴 But `getMyListingForApp` redirects `editTargetId` to an EXISTING shadow with no
+  // moderator branch of its own, so the step is hosted against the SHADOW's id — and
+  // `resolveOwnerAssetEditTarget` returns its target UNCHANGED for a moderator (the
+  // `isModerator` early return is its FIRST line; the `revisionOfId` check below it is
+  // the OWNER branch and is never reached for a mod). "Unchanged" is the shadow, so
+  // that write IS staged. Gating on `isModerator` alone replaces one false banner with
+  // another. How OFTEN a mod hits that state is unmeasured and the gate does not depend
+  // on it — see the header comment in `ListingMediaEditor` before reaching for the 78%
+  // figure quoted above, which measured a pre-fix condition that no longer holds.
+  //
+  // The four states below are the whole matrix; each has a test.
+  // -------------------------------------------------------------------------
+
+  test('🔴 MOD + NO shadow: told they are editing the LIVE listing directly — never that it is staged', async () => {
+    state.currentUser = { id: 1, username: 'mod', isModerator: true };
+    // The mod bypass only reaches the live parent when there is no shadow to redirect
+    // the edit target onto. (The shared fixture carries a shadow — see the next test.)
+    state.query.data = {
+      ...(state.query.data as Record<string, unknown>),
+      shadowId: null,
+      editTargetId: 'apl_onsite',
+    };
+    renderWithProviders(<ListingMediaPage />);
+
+    // The step really is hosted against the LIVE parent — the precondition for the
+    // copy, asserted rather than assumed.
+    await expect.element(page.getByTestId('asset-step')).toHaveTextContent('assets:apl_onsite:');
+
+    const notice = page.getByTestId('apps-listing-media-mod-live-notice');
+    await expect.element(notice).toBeInTheDocument();
+    await expect.element(notice).toHaveTextContent(/live/i);
+    await expect.element(notice).toHaveTextContent(/apply to the live listing immediately/i);
+    await expect.element(notice).toHaveTextContent(/not.*staged as a revision/i);
+
+    // The owner variant — the one carrying the false "staged / re-approval" claim —
+    // must be GONE, not merely supplemented.
+    expect(page.getByTestId('apps-listing-media-live-notice').elements()).toHaveLength(0);
+    // And no surviving copy anywhere may assert the staged/re-approval semantics.
+    expect(page.getByText(/go live only after a moderator re-approves/i).elements()).toHaveLength(
+      0
+    );
+  });
+
+  test('🔴 MOD + shadow ALREADY exists: the edit IS staged, so the STAGED copy must render', async () => {
+    // `getMyListingForApp` redirects `editTargetId` onto an existing shadow with no
+    // moderator branch, so this write goes to the shadow and only goes live on
+    // re-approval. Gating the "applies immediately" copy on `isModerator` alone told
+    // this moderator the opposite. The shared fixture is exactly this shape.
+    state.currentUser = { id: 1, username: 'mod', isModerator: true };
+    renderWithProviders(<ListingMediaPage />);
+
+    // Precondition: the step is hosted against the SHADOW, not the live parent.
+    await expect.element(page.getByTestId('asset-step')).toHaveTextContent('assets:apl_shadow:');
+
+    const notice = page.getByTestId('apps-listing-media-live-notice');
+    await expect.element(notice).toBeInTheDocument();
+    await expect.element(notice).toHaveTextContent(/staged as a revision/i);
+    await expect.element(notice).toHaveTextContent(/go live only after a moderator re-approves/i);
+
+    // The immediate-edit claim must NOT appear for this moderator.
+    expect(page.getByTestId('apps-listing-media-mod-live-notice').elements()).toHaveLength(0);
+    expect(page.getByText(/apply to the live listing immediately/i).elements()).toHaveLength(0);
+  });
+
+  test('🔴 a NON-moderator owner keeps the staged-revision copy (and never sees the mod variant)', async () => {
+    state.currentUser = { id: 7, username: 'owner', isModerator: false };
+    renderWithProviders(<ListingMediaPage />);
+
+    const notice = page.getByTestId('apps-listing-media-live-notice');
+    await expect.element(notice).toBeInTheDocument();
+    await expect.element(notice).toHaveTextContent(/staged as a revision/i);
+    await expect.element(notice).toHaveTextContent(/go live only after a moderator re-approves/i);
+
+    expect(page.getByTestId('apps-listing-media-mod-live-notice').elements()).toHaveLength(0);
+  });
+
+  test('a NON-moderator owner with NO shadow still gets the STAGED copy (their first edit mints one)', async () => {
+    // `!shadowId` alone must not flip the copy — it only means "immediate" for a mod.
+    state.currentUser = { id: 7, username: 'owner', isModerator: false };
+    state.query.data = {
+      ...(state.query.data as Record<string, unknown>),
+      shadowId: null,
+      editTargetId: 'apl_onsite',
+    };
+    renderWithProviders(<ListingMediaPage />);
+
+    await expect
+      .element(page.getByTestId('apps-listing-media-live-notice'))
+      .toHaveTextContent(/staged as a revision/i);
+    expect(page.getByTestId('apps-listing-media-mod-live-notice').elements()).toHaveLength(0);
+  });
+
+  test('a MODERATOR on a non-approved (draft) listing sees NEITHER live notice', async () => {
+    // The bypass only matters for an APPROVED, non-shadow listing — a draft is edited
+    // in place for everyone, so neither "this is live" framing applies.
+    state.currentUser = { id: 1, username: 'mod', isModerator: true };
+    state.query.data = {
+      ...(state.query.data as Record<string, unknown>),
+      status: 'draft',
+      shadowId: null,
+      editTargetId: 'apl_draft',
+    };
+    renderWithProviders(<ListingMediaPage />);
+
+    await expect.element(page.getByTestId('asset-step')).toBeInTheDocument();
+    expect(page.getByTestId('apps-listing-media-mod-live-notice').elements()).toHaveLength(0);
+    expect(page.getByTestId('apps-listing-media-live-notice').elements()).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // The Submit affordance must follow the SAME discriminator as the notice.
+  // -------------------------------------------------------------------------
+
+  test('🔴 MOD + NO shadow: no dead Submit button and no "stage a revision" hint', async () => {
+    // No edit by this moderator will ever mint a shadow, so `disabled={… || !shadowId}`
+    // would leave Submit permanently dead beneath a banner correctly saying the change
+    // is already live, next to a hint promising a revision that never appears.
+    state.currentUser = { id: 1, username: 'mod', isModerator: true };
+    state.query.data = {
+      ...(state.query.data as Record<string, unknown>),
+      shadowId: null,
+      editTargetId: 'apl_onsite',
+    };
+    renderWithProviders(<ListingMediaPage />);
+
+    await expect.element(page.getByTestId('asset-step')).toBeInTheDocument();
+    expect(page.getByTestId('apps-listing-media-submit').elements()).toHaveLength(0);
+    expect(page.getByTestId('apps-listing-media-no-changes').elements()).toHaveLength(0);
+  });
+
+  test('🔴 MOD + shadow: Submit REMAINS — that revision still needs re-approval', async () => {
+    // The mirror of the test above: hiding Submit on `isModerator` alone would strand a
+    // real revision with no way to send it for review.
+    state.currentUser = { id: 1, username: 'mod', isModerator: true };
+    state.floor = { meetsFloor: true, complete: false };
+    renderWithProviders(<ListingMediaPage />);
+
+    const submit = page.getByTestId('apps-listing-media-submit');
+    await expect.element(submit).toBeInTheDocument();
+    await expect.element(submit).not.toBeDisabled();
+  });
+
+  test('Submit for review fires submitListingRevision with the shadow id', async () => {
+    renderWithProviders(<ListingMediaPage />);
+    await expect.element(page.getByTestId('apps-listing-media-submit')).toBeInTheDocument();
+    await userEvent.click(page.getByTestId('apps-listing-media-submit'));
+    await vi.waitFor(() => expect(state.submit.calls).toHaveLength(1));
+    expect(state.submit.calls[0]).toEqual({ shadowId: 'apl_shadow' });
+  });
+
+  test('the Submit button is ENABLED when the step reports it meets the floor (icon+cover)', async () => {
+    state.floor = { meetsFloor: true, complete: false };
+    renderWithProviders(<ListingMediaPage />);
+    const submit = page.getByTestId('apps-listing-media-submit');
+    await expect.element(submit).toBeInTheDocument();
+    await expect.element(submit).not.toBeDisabled();
+  });
+
+  test('the Submit button is DISABLED when the step reports it is below the floor', async () => {
+    state.floor = { meetsFloor: false, complete: false };
+    renderWithProviders(<ListingMediaPage />);
+    const submit = page.getByTestId('apps-listing-media-submit');
+    await expect.element(submit).toBeInTheDocument();
+    await expect.element(submit).toBeDisabled();
+  });
+
+  test('shows the pending-revision notice when a revision is already under review', async () => {
+    state.query = {
+      data: {
+        appListingId: 'apl_onsite',
+        status: 'approved',
+        contentRating: 'g',
+        hasPendingRevision: true,
+        shadowId: 'apl_shadow',
+        editTargetId: 'apl_shadow',
+        editBlockedReason: null,
+      },
+      isLoading: false,
+      error: null,
+    };
+    renderWithProviders(<ListingMediaPage />);
+    await expect
+      .element(page.getByTestId('apps-listing-media-pending-revision-notice'))
+      .toBeInTheDocument();
+  });
+
+  test('does NOT show the pending-revision notice when none is queued', async () => {
+    renderWithProviders(<ListingMediaPage />);
+    await expect.element(page.getByTestId('asset-step')).toBeInTheDocument();
+    expect(page.getByTestId('apps-listing-media-pending-revision-notice').elements()).toHaveLength(
+      0
+    );
+  });
+
+  test('fails closed to NotFound when the owner resolve errors (non-owner / missing listing)', async () => {
+    state.query = {
+      data: undefined,
+      isLoading: false,
+      error: { message: 'you can only manage your own listings', data: { code: 'FORBIDDEN' } },
+    };
+    renderWithProviders(<ListingMediaPage />);
+    await expect.element(page.getByTestId('not-found')).toBeInTheDocument();
+    expect(page.getByTestId('asset-step').elements()).toHaveLength(0);
+  });
+
+  test('a NON-owner-gating error surfaces the inline alert instead of collapsing to NotFound', async () => {
+    // Anything that isn't FORBIDDEN/NOT_FOUND arrives here as a settled query error.
+    // Blanket-NotFound'ing it hid the one surface that explains it and told the owner
+    // their LIVE app did not exist.
+    state.query = {
+      data: undefined,
+      isLoading: false,
+      error: { message: 'cannot edit a listing in status removed', data: { code: 'BAD_REQUEST' } },
+    };
+    renderWithProviders(<ListingMediaPage />);
+    const alert = page.getByTestId('apps-listing-media-begin-error');
+    await expect.element(alert).toBeInTheDocument();
+    await expect.element(alert).toHaveTextContent(/cannot edit a listing in status removed/i);
+    expect(page.getByTestId('not-found').elements()).toHaveLength(0);
+  });
+
+  test('re-pulls the projected assets after an asset mutation (stale-prefill guard)', async () => {
+    renderWithProviders(<ListingMediaPage />);
+    await expect.element(page.getByTestId('asset-step')).toBeInTheDocument();
+    expect(state.invalidate).not.toHaveBeenCalled();
+
+    // The step reports a successful attach/remove.
+    await userEvent.click(page.getByTestId('asset-step-mutate'));
+
+    // Without this the cached `assets` stay pre-mutation and the /edit page's
+    // `keepMounted={false}` tab round-trip re-seeds the step from them — a just-
+    // attached icon reads as unattached and Submit goes disabled again.
+    await vi.waitFor(() =>
+      expect(state.invalidate).toHaveBeenCalledWith({ appBlockId: 'my-block' })
+    );
+    // …and the edit target's image levels, so its rating badges follow the change.
+    expect(state.invalidateAssets).toHaveBeenCalledWith({ listingId: 'apl_shadow' });
+  });
+
+  test('a re-attached icon survives a tab round-trip: the REMOUNT re-seeds from the refreshed assets', async () => {
+    // Start below the floor — the shadow has no icon yet.
+    const before = {
+      icon: { imageId: null as number | null, url: null as string | null },
+      cover: { imageId: 137918011, url: 'edge:cover' },
+      screenshots: [] as unknown[],
+    };
+    state.query = {
+      data: {
+        appListingId: 'apl_onsite',
+        status: 'approved',
+        contentRating: 'pg13',
+        hasPendingRevision: false,
+        shadowId: 'apl_shadow',
+        editTargetId: 'apl_shadow',
+        editBlockedReason: null,
+        assets: before,
+      },
+      isLoading: false,
+      error: null,
+    };
+    // The real `invalidate` refetches `getMyListingForApp`; stand in for that refetch
+    // by publishing the post-attach projection the server would now return.
+    state.invalidate.mockImplementation(async () => {
+      (state.query.data as { assets: typeof before }).assets = {
+        ...before,
+        icon: { imageId: 555, url: 'edge:new-icon' },
+      };
+    });
+
+    renderWithProviders(<TabRoundTrip />);
+    await expect.element(page.getByTestId('asset-step-seeded-icon')).toHaveTextContent('none');
+
+    // The step reports a successful icon attach.
+    await userEvent.click(page.getByTestId('asset-step-mutate'));
+    await vi.waitFor(() =>
+      expect(state.invalidate).toHaveBeenCalledWith({ appBlockId: 'my-block' })
+    );
+
+    // media → manifest → media: the editor UNMOUNTS and REMOUNTS, and the step re-runs
+    // its useState INITIALISERS against whatever `initial` holds now.
+    await userEvent.click(page.getByTestId('tab-round-trip'));
+
+    // Without the post-mutation invalidation the remount re-seeds from the ORIGINAL
+    // cached assets: the just-attached icon reads as unattached, the publish floor is
+    // unmet and Submit goes disabled again — the exact symptom this fix exists to kill.
+    await expect.element(page.getByTestId('asset-step-seeded-icon')).toHaveTextContent('555');
+  });
+
+  test('a settled error does NOT also claim "this app is live" (no contradictory half-UI)', async () => {
+    // A `removed` listing, an INTERNAL_SERVER_ERROR, or a client error with no
+    // `data.code` all land here. Narrowing the NotFound guard (so the inline alert is
+    // reachable) must not leave the blue live-app notice asserting context that never
+    // resolved — "This app is live" directly above "cannot edit a listing in status
+    // removed".
+    state.query = {
+      data: undefined,
+      isLoading: false,
+      error: { message: 'cannot edit a listing in status removed', data: { code: 'BAD_REQUEST' } },
+    };
+    renderWithProviders(<ListingMediaPage />);
+
+    await expect.element(page.getByTestId('apps-listing-media-begin-error')).toBeInTheDocument();
+    expect(page.getByTestId('apps-listing-media-live-notice').elements()).toHaveLength(0);
+    expect(page.getByTestId('asset-step').elements()).toHaveLength(0);
+  });
+});
+
+/**
+ * 🔴 THE OWNER-UNPUBLISHED FRAME — the third write semantics, and the one that had no copy.
+ *
+ * Every notice this editor renders was gated on `isApproved`, so an OWNER-UNPUBLISHED
+ * listing mounted the image editor with NO framing at all: no statement that the app is
+ * currently DOWN, and no statement of how these writes behave — which is a third case again
+ * (no shadow, no re-approval, the write lands on the listing and becomes visible on
+ * republish). That was unreachable until the editor tabs opened on this state; opening them
+ * without this ships the bare editor.
+ *
+ * 🔴 THE DISCRIMINATOR IS THE SERVER'S OWN VERDICT, not a second reading of `status`.
+ * `status === 'removed'` is ambiguous (owner self-unpublish vs moderator takedown);
+ * `editBlockedReason` is `null` for exactly the first. So the frame appears on precisely the
+ * rows the server will accept an asset write for, and the moderator case keeps its red
+ * alert with no frame — never both, which is the contradictory half-UI the case above pins.
+ */
+describe('ListingMediaEditor — the OWNER-UNPUBLISHED frame', () => {
+  function unpublished(over: Record<string, unknown> = {}) {
+    state.query.data = {
+      ...(state.query.data as Record<string, unknown>),
+      status: 'removed',
+      shadowId: null,
+      editTargetId: 'apl_onsite',
+      editBlockedReason: null,
+      ...over,
+    };
+  }
+
+  test('🔴 an owner-unpublished listing is framed as DOWN, and the editor still mounts', async () => {
+    unpublished();
+    renderWithProviders(<ListingMediaPage />);
+
+    const notice = page.getByTestId('apps-listing-media-unpublished-notice');
+    await expect.element(notice).toBeInTheDocument();
+    // The two facts the author needs, asserted separately: the app is not visible, and
+    // these edits are NOT staged (unlike the live case they have seen before).
+    await expect.element(notice).toHaveTextContent(/not visible in the store/i);
+    await expect.element(notice).toHaveTextContent(/republish/i);
+    // Control arm: it is a FRAME over a working editor, not a replacement for one. The
+    // server permits asset edits here, so withholding the editor would be the mirror defect.
+    await expect.element(page.getByTestId('asset-step')).toHaveTextContent('assets:apl_onsite');
+  });
+
+  test('🔴 it does NOT claim the app is live, and offers no revision to submit', async () => {
+    // Both live notices are wrong here, and `Submit for review` is `isApproved`-gated with
+    // `disabled={… || !shadowId}` — on a removed listing no edit ever mints a shadow, so a
+    // rendered button would be permanently dead and would contradict the frame above it.
+    unpublished();
+    renderWithProviders(<ListingMediaPage />);
+
+    await expect
+      .element(page.getByTestId('apps-listing-media-unpublished-notice'))
+      .toBeInTheDocument();
+    expect(page.getByTestId('apps-listing-media-live-notice').elements()).toHaveLength(0);
+    expect(page.getByTestId('apps-listing-media-mod-live-notice').elements()).toHaveLength(0);
+    expect(page.getByTestId('apps-listing-media-submit').elements()).toHaveLength(0);
+    expect(page.getByTestId('apps-listing-media-begin-error').elements()).toHaveLength(0);
+  });
+
+  /**
+   * 🔴 THE SEATED EDITOR, AND BOTH HALVES OF THE OWNER SENTENCE WERE FALSE FOR THEM.
+   *
+   * This editor is NOT owner-only, though its header said so for a long time.
+   * `getMyListingForApp` refuses on `resolveListingRole(...) === null`, which is non-null
+   * for the owner OR an ACCEPTED COLLABORATOR — and `editorTabsFor` deliberately hands an
+   * editor `['details','media','history']` in exactly this repair state (pinned at
+   * `appListingEditorTabs.test.ts`). So a seated editor reaches this component, and was
+   * told:
+   *
+   *   "you unpublished it"                        — they did not; the owner did.
+   *   "republish it from the Publishing tab"      — `publishing` is OWNER-ONLY in
+   *                                                 `editorTabsFor`, so that tab is not on
+   *                                                 their screen. An instruction naming a
+   *                                                 surface the reader cannot see is worse
+   *                                                 than no instruction.
+   *
+   * The WRITE SEMANTICS are identical for both roles, so only the attribution and the way
+   * out change — the control below pins that the editor is still fully mounted.
+   */
+  test('🔴 a seated EDITOR is not blamed for the unpublish, nor sent to an owner-only tab', async () => {
+    unpublished({ role: 'editor' });
+    renderWithProviders(<ListingMediaPage />);
+
+    const notice = page.getByTestId('apps-listing-media-unpublished-notice');
+    await expect.element(notice).toBeInTheDocument();
+    // Still told the app is DOWN — that fact is role-independent and is the whole point of
+    // the frame.
+    await expect.element(notice).toHaveTextContent(/not visible in the store/i);
+    // Attribution is correct…
+    await expect.element(notice).toHaveTextContent(/its owner unpublished it/i);
+    await expect.element(notice).not.toHaveTextContent(/you unpublished it/i);
+    // …and they are not pointed at a tab they cannot open.
+    await expect.element(notice).not.toHaveTextContent(/from the Publishing tab/i);
+
+    // 🔴 CONTROL ARM. The editor still MOUNTS for them — the server accepts their asset
+    // writes, so withholding the editor would be the mirror defect of mis-addressing them.
+    await expect.element(page.getByTestId('asset-step')).toHaveTextContent('assets:apl_onsite');
+  });
+
+  test('🔴 the OWNER still gets the owner copy — the branch is not a blanket reword', () => {
+    // Guards the other direction: a mutant that emits the editor copy for everyone passes
+    // every assertion above. Run as a pair with it.
+    unpublished({ role: 'owner' });
+    renderWithProviders(<ListingMediaPage />);
+
+    return (async () => {
+      const notice = page.getByTestId('apps-listing-media-unpublished-notice');
+      await expect.element(notice).toHaveTextContent(/you unpublished it/i);
+      await expect.element(notice).toHaveTextContent(/from the Publishing tab/i);
+    })();
+  });
+
+  test('🔴 an ABSENT role falls back to the NON-owner copy, never the owner copy', async () => {
+    // 🔴 THE FAIL-SAFE DIRECTION, and it is the opposite of a normal narrowing. Absence
+    // cannot tell owner from editor; the owner wording asserts two things an editor would
+    // find false, while the non-owner wording is true for both. So unknown resolves to
+    // non-owner. Reachable in production from an older cached payload.
+    unpublished({ role: undefined });
+    renderWithProviders(<ListingMediaPage />);
+
+    const notice = page.getByTestId('apps-listing-media-unpublished-notice');
+    await expect.element(notice).toBeInTheDocument();
+    await expect.element(notice).not.toHaveTextContent(/you unpublished it/i);
+  });
+
+  test('🔴 a MODERATOR takedown gets the red alert and NO frame — same status, one field apart', async () => {
+    // `editBlockedReason` is the ONLY difference from the fixture above. Rendering the
+    // unpublished frame here would put "you unpublished it" over a listing a moderator took
+    // down — the false attribution civitai/civitai#4413 exists to delete.
+    unpublished({
+      editBlockedReason: 'this listing has been removed by a moderator and can no longer be edited',
+    });
+    renderWithProviders(<ListingMediaPage />);
+
+    await expect
+      .element(page.getByTestId('apps-listing-media-begin-error'))
+      .toHaveTextContent(/removed by a moderator/i);
+    expect(page.getByTestId('apps-listing-media-unpublished-notice').elements()).toHaveLength(0);
+    expect(page.getByTestId('asset-step').elements()).toHaveLength(0);
+  });
+
+  test('🔴 a moderator on their OWN unpublished app gets the same frame, not the mod-live one', async () => {
+    // `modDirectLiveEdit` (`isModerator && !shadowId`) is true for this fixture, and it is
+    // consumed only inside `isApproved` gates — so a mutant that widens the mod-live notice
+    // past that gate lands here. The copy is also CORRECT for them: a removed listing mints
+    // no shadow for anyone, so nobody's write is staged.
+    state.currentUser = { id: 7, username: 'mod', isModerator: true };
+    unpublished();
+    renderWithProviders(<ListingMediaPage />);
+
+    await expect
+      .element(page.getByTestId('apps-listing-media-unpublished-notice'))
+      .toBeInTheDocument();
+    expect(page.getByTestId('apps-listing-media-mod-live-notice').elements()).toHaveLength(0);
+  });
+
+  test.each(['approved', 'draft', 'pending'] as const)(
+    '🔴 a %s listing shows NO unpublished frame — the status arm',
+    async (status) => {
+      // The control for the whole block: without it the frame could be unconditional and
+      // every case above would pass while every OTHER listing gained a false "this app is
+      // unpublished" banner.
+      state.query.data = {
+        ...(state.query.data as Record<string, unknown>),
+        status,
+        shadowId: status === 'approved' ? 'apl_shadow' : null,
+        editTargetId: status === 'approved' ? 'apl_shadow' : 'apl_onsite',
+        editBlockedReason: null,
+      };
+      renderWithProviders(<ListingMediaPage />);
+
+      await expect.element(page.getByTestId('asset-step')).toBeInTheDocument();
+      expect(
+        page.getByTestId('apps-listing-media-unpublished-notice').elements(),
+        status
+      ).toHaveLength(0);
+    }
+  );
+});

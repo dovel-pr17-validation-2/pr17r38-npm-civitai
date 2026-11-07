@@ -1,0 +1,95 @@
+import { Prisma } from '@prisma/client';
+import type { ModelHashType } from '~/shared/utils/prisma/enums';
+import { primaryModelFileTypes } from '~/utils/file-display-helpers';
+import type { ModelFileType } from '../common/constants';
+import { modelFileSelect } from './modelFile.selector';
+import { modelHashSelect } from './modelHash.selector';
+
+export const getModelVersionDetailsSelect = Prisma.validator<Prisma.ModelVersionSelect>()({
+  id: true,
+  modelId: true,
+  name: true,
+  nsfwLevel: true,
+  createdAt: true,
+  updatedAt: true,
+  status: true,
+  publishedAt: true,
+  trainedWords: true,
+  trainingStatus: true,
+  trainingDetails: true,
+  baseModel: true,
+  baseModelType: true,
+  description: true,
+  uploadType: true,
+  usageControl: true,
+  licensingFee: true,
+  metrics: {
+    select: {
+      downloadCount: true,
+      thumbsUpCount: true,
+      thumbsDownCount: true,
+    },
+  },
+  files: {
+    select: modelFileSelect,
+    where: { replacedAt: null },
+  },
+});
+
+export const getModelVersionApiSelect = Prisma.validator<Prisma.ModelVersionSelect>()({
+  ...getModelVersionDetailsSelect,
+  availability: true,
+  model: {
+    select: {
+      name: true,
+      sfwName: true,
+      type: true,
+      nsfw: true,
+      poi: true,
+      mode: true,
+      availability: true,
+      userId: true,
+    },
+  },
+});
+const modelVersionApi = Prisma.validator<Prisma.ModelVersionDefaultArgs>()({
+  select: getModelVersionApiSelect,
+});
+export type ModelVersionApiReturn = Prisma.ModelVersionGetPayload<typeof modelVersionApi>;
+
+export const getModelVersionsForSearchIndex = Prisma.validator<Prisma.ModelVersionSelect>()({
+  id: true,
+  name: true,
+  nsfwLevel: true,
+  createdAt: true,
+  flags: true,
+  generatorLoaded: true,
+  usageControl: true,
+  generationCoverage: { select: { covered: true, coveredNext: true } },
+  trainedWords: true,
+  baseModel: true,
+  baseModelType: true,
+  settings: true,
+  steps: true,
+  epochs: true,
+  clipSkip: true,
+  files: { select: { metadata: true }, where: { type: 'Model' } },
+  hashes: {
+    select: {
+      ...modelHashSelect,
+      hashType: true,
+    },
+    where: {
+      fileType: { in: primaryModelFileTypes as ModelFileType[] },
+      hashType: { notIn: ['AutoV1'] as ModelHashType[] },
+    },
+  },
+  metrics: {
+    select: {
+      downloadCount: true,
+      thumbsUpCount: true,
+      thumbsDownCount: true,
+      generationCount: true,
+    },
+  },
+});

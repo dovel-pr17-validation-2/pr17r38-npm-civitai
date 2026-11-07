@@ -1,0 +1,1175 @@
+import fs from 'fs';
+import path from 'path';
+import { ImageResponse } from 'next/og';
+import type { NextApiRequest, NextApiResponse } from 'next';
+import { z } from 'zod';
+import { dbRead } from '~/server/db/client';
+import { getImageMetricsObject } from '~/server/services/image.service';
+import { getIsSafeBrowsingLevel } from '~/shared/constants/browsingLevel.constants';
+import { ArticleIngestionStatus, ArticleStatus, Availability } from '~/shared/utils/prisma/enums';
+import { getChallengeDetail } from '~/server/services/challenge.service';
+import { getFeatureFlagsAsync } from '~/server/services/feature-flags.service';
+import { assertImageVisibleToViewer } from '~/server/services/image-visibility.service';
+import { getPostDetailVisibility } from '~/server/services/post-detail-visibility';
+import type { MediaType } from '~/shared/utils/prisma/enums';
+import { abbreviateNumber } from '~/utils/number-helpers';
+import { removeTags } from '~/utils/string-helpers';
+import { removeSpoilers } from '~/utils/html-sanitize-helpers';
+import { buildOgCoverEdgeUrl, fetchImageAsDataUri } from '~/server/utils/og-image-helpers';
+import { hasValidCreatorMembershipCached } from '~/server/services/creator-program.service';
+import {
+  anyMetricHidden,
+  getMetaMetricPrivacy,
+  getUserMetricPrivacyDefaults,
+  resolveModelHiddenMetrics,
+} from '~/server/utils/model-metric-privacy';
+import { isDefined } from '~/utils/type-guards';
+import { getHubCardData } from '~/server/services/user-hub.service';
+import { decodeHubId } from '~/server/utils/hub-id';
+import {
+  BADGE_SIZE,
+  getMilestoneShareCard,
+} from '~/server/services/creator-milestone-share.service';
+import { parseMilestoneShareId } from '~/shared/constants/creator-journey.constants';
+import { decorationFrameBox } from '~/components/UserAvatar/decoration-frame.util';
+import { servableBanner } from '~/shared/utils/article-card-image';
+
+// --- Schema & Types ---
+
+const querySchema = z.object({
+  type: z.enum(['model', 'post', 'image', 'article', 'bounty', 'challenge', 'hub', 'milestone']),
+  // Read as text and resolved per type below: a hub's is its ENCODED key, not the
+  // row's int. This endpoint is unauthenticated and id-addressable, so an int there
+  // would make every public hub walkable by counting.
+  id: z.string().min(1),
+});
+
+// Every type but `hub` and `milestone` is addressed by the row's own int.
+function asEntityId(raw: string) {
+  const id = Number(raw);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+type StatItem = { value: string; label: string };
+
+type OgImage = {
+  url: string;
+  nsfwLevel: number;
+  type: MediaType;
+  width: number | null;
+  height: number | null;
+};
+
+type EntityData = {
+  title: string;
+  description: string;
+  creator: string;
+  imageUrl: string | null;
+  imageAspectRatio: number;
+  stats: StatItem[];
+};
+
+// --- Constants ---
+
+const CANVAS_WIDTH = 1200;
+const CANVAS_HEIGHT = 630;
+const IMAGE_WIDTH = 450;
+const STATS_HEIGHT = 80;
+const ACCENT_HEIGHT = 6;
+const CONTENT_PADDING_Y = 100; // 60 top + 40 bottom
+const IMAGE_HEIGHT = CANVAS_HEIGHT - STATS_HEIGHT - ACCENT_HEIGHT - CONTENT_PADDING_Y;
+
+const colors = {
+  bg: 'radial-gradient(ellipse at center, #25262B, #101113)',
+  statsBg: '#141517', // dark-8
+  border: '#373A40', // dark-4
+  textPrimary: '#C1C2C5', // dark-0
+  textSecondary: '#8c8fa3', // dark-2
+  blue: '#228BE6', // blue-6
+};
+
+const ogImageSelect = {
+  url: true,
+  nsfwLevel: true,
+  type: true,
+  width: true,
+  height: true,
+} as const;
+
+// --- Static app assets (inlined) ---
+//
+// The card embeds a couple of small app PNGs (the logo placeholder / stats-bar
+// icon and the fallback logo). Referenced as `${baseUrl}/images/...` they'd make
+// satori do a self-HTTP-fetch back to our own origin on every render. They're
+// tiny (≈10KB / ≈3KB) and static, so read them from `public/` once at module
+// load and inline as data URIs. If the read fails (e.g. `public/` not on disk in
+// some runtime), fall back to the HTTP URL so the card still renders.
+function loadStaticAssetDataUri(relPath: string, contentType: string): string | null {
+  try {
+    const file = fs.readFileSync(path.join(process.cwd(), 'public', relPath));
+    return `data:${contentType};base64,${file.toString('base64')}`;
+  } catch {
+    return null;
+  }
+}
+
+const APPLE_TOUCH_ICON_DATA_URI = loadStaticAssetDataUri(
+  'images/apple-touch-icon.png',
+  'image/png'
+);
+const LOGO_DARK_DATA_URI = loadStaticAssetDataUri('images/logo_dark_mode.png', 'image/png');
+
+// --- Utilities ---
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max).trim() + '…';
+}
+
+function cleanDescription(html: string, max = 120): string {
+  return truncate(removeTags(html), max);
+}
+
+function formatStat(n: number): string {
+  return abbreviateNumber(n);
+}
+
+function getAspectRatio(img: { width?: number | null; height?: number | null }): number {
+  if (img.width && img.height && img.height > 0) return img.width / img.height;
+  return 1;
+}
+
+function getSafeImage(image: OgImage | null | undefined): OgImage | null {
+  if (!image || !getIsSafeBrowsingLevel(image.nsfwLevel)) return null;
+  return image;
+}
+
+function buildEntityImage(
+  image: OgImage | null
+): Pick<EntityData, 'imageUrl' | 'imageAspectRatio'> {
+  if (!image) return { imageUrl: null, imageAspectRatio: 1 };
+  // Video covers resolve to a bounded still frame (not a skip) — see
+  // buildOgCoverEdgeUrl. The handler's bounded prefetch caps the cold-miss cost.
+  return {
+    imageUrl: buildOgCoverEdgeUrl(image, { width: IMAGE_WIDTH, height: IMAGE_HEIGHT }),
+    imageAspectRatio: getAspectRatio(image),
+  };
+}
+
+function sumReactions(metric: {
+  heartCount: number;
+  likeCount: number;
+  laughCount: number;
+  cryCount: number;
+}): number {
+  return metric.heartCount + metric.likeCount + metric.laughCount + metric.cryCount;
+}
+
+// --- Data fetchers ---
+
+async function fetchModelData(id: number): Promise<EntityData | null> {
+  const model = await dbRead.model.findFirst({
+    where: { id, status: 'Published' },
+    select: {
+      name: true,
+      description: true,
+      sfwName: true,
+      sfwDescription: true,
+      coverImageId: true,
+      sfwCoverImageId: true,
+      meta: true,
+      userId: true,
+      user: { select: { username: true, settings: true } },
+      modelVersions: {
+        where: { status: 'Published' },
+        select: { id: true, description: true },
+        orderBy: { index: 'asc' },
+        take: 1,
+      },
+    },
+  });
+  if (!model) return null;
+
+  const publishedVersion = model.modelVersions[0];
+  if (!publishedVersion) return null;
+
+  // Creator Controls: the OG card is a public, shared asset — gate downloads /
+  // generations by the owner's stored flags + active CP membership.
+  // Only resolve CP membership when the owner actually hides something. When nothing is
+  // hidden, the resolver returns NONE regardless of membership, so the cached membership
+  // read can be skipped — byte-identical. The check, when needed, uses the read-through cache.
+  const ownerHidesAnything =
+    anyMetricHidden(getMetaMetricPrivacy(model.meta)) ||
+    anyMetricHidden(getUserMetricPrivacyDefaults(model.user?.settings));
+  const hidden = resolveModelHiddenMetrics({
+    modelMeta: model.meta,
+    userSettings: model.user?.settings,
+    isOwnerOrModerator: false,
+    hasValidMembership: ownerHidesAnything
+      ? await hasValidCreatorMembershipCached(model.userId)
+      : false,
+  });
+
+  // Run metric + image queries in parallel
+  // Link previews have no signed-in viewer, so they get the .com cover whenever the face is on.
+  const coverId = (model.sfwName != null ? model.sfwCoverImageId : null) ?? model.coverImageId;
+  const ownPosts = model.userId === -1 ? {} : { userId: model.userId };
+  const previewableImage = {
+    tosViolation: false,
+    needsReview: null,
+    ingestion: 'Scanned' as const,
+  };
+  const [metric, defaultImage, coverImage] = await Promise.all([
+    dbRead.modelMetric
+      .findUnique({
+        where: { modelId: id },
+        select: {
+          downloadCount: true,
+          thumbsUpCount: true,
+          commentCount: true,
+          generationCount: true,
+        },
+      })
+      .catch(() => null),
+    // Same pick as the model page's showcase (getImagesForModelVersion): the owner's own
+    // posts only, earliest post first, unless the model belongs to the system account.
+    dbRead.image.findFirst({
+      where: {
+        post: {
+          publishedAt: { not: null },
+          modelVersionId: publishedVersion.id,
+          availability: Availability.Public,
+          ...(model.userId !== -1 ? { userId: model.userId } : {}),
+        },
+        tosViolation: false,
+        needsReview: null,
+        ingestion: 'Scanned',
+      },
+      select: ogImageSelect,
+      orderBy: [{ postId: 'asc' }, { index: 'asc' }, { id: 'asc' }],
+    }),
+    coverId
+      ? dbRead.image.findFirst({
+          where: {
+            id: coverId,
+            post: {
+              publishedAt: { not: null },
+              modelVersion: { modelId: id },
+              availability: Availability.Public,
+              ...ownPosts,
+            },
+            ...previewableImage,
+          },
+          select: ogImageSelect,
+        })
+      : null,
+  ]);
+
+  const stats: StatItem[] = metric
+    ? [
+        !hidden.downloads ? { value: formatStat(metric.downloadCount), label: 'Downloads' } : null,
+        { value: formatStat(metric.thumbsUpCount), label: 'Likes' },
+        !hidden.generations
+          ? { value: formatStat(metric.generationCount), label: 'Generations' }
+          : null,
+        { value: formatStat(metric.commentCount), label: 'Comments' },
+      ].filter(isDefined)
+    : [];
+
+  // Link previews have no signed-in viewer, so they always get the .com face when one is set.
+  const { sfwName } = model;
+  const description =
+    sfwName != null
+      ? model.sfwDescription ?? ''
+      : publishedVersion.description || model.description || '';
+
+  return {
+    title: sfwName ?? model.name,
+    description: cleanDescription(description),
+    creator: model.user.username ?? 'Unknown',
+    ...buildEntityImage(getSafeImage(coverImage) ?? getSafeImage(defaultImage)),
+    stats,
+  };
+}
+
+async function fetchArticleData(id: number): Promise<EntityData | null> {
+  const [article, metric] = await Promise.all([
+    dbRead.article.findFirst({
+      where: {
+        id,
+        publishedAt: { not: null },
+        status: ArticleStatus.Published,
+        tosViolation: false,
+        ingestion: ArticleIngestionStatus.Scanned,
+      },
+      select: {
+        title: true,
+        content: true,
+        user: { select: { username: true } },
+        coverImage: { select: ogImageSelect },
+        bannerImage: { select: { ...ogImageSelect, ingestion: true, needsReview: true } },
+      },
+    }),
+    dbRead.articleMetric
+      .findFirst({
+        where: { articleId: id, timeframe: 'AllTime' },
+        select: {
+          viewCount: true,
+          commentCount: true,
+          collectedCount: true,
+          tippedAmountCount: true,
+        },
+      })
+      .catch(() => null),
+  ]);
+  if (!article) return null;
+  // Cover-image NSFW handling is done downstream via getSafeImage() +
+  // buildEntityImage(null) — when the cover is NSFW the template renders the
+  // LogoPlaceholder instead, while still showing title/content/stats.
+
+  const stats: StatItem[] = metric
+    ? [
+        { value: formatStat(metric.viewCount), label: 'Views' },
+        { value: formatStat(metric.commentCount), label: 'Comments' },
+        { value: formatStat(metric.collectedCount), label: 'Collected' },
+        { value: formatStat(metric.tippedAmountCount), label: 'Tipped' },
+      ]
+    : [];
+
+  return {
+    title: article.title,
+    description: cleanDescription(removeSpoilers(article.content ?? '')),
+    creator: article.user.username ?? 'Unknown',
+    ...buildEntityImage(getSafeImage(article.coverImage ?? servableBanner(article.bannerImage))),
+    stats,
+  };
+}
+
+async function fetchPostData(id: number): Promise<EntityData | null> {
+  // The post page's anonymous rule: getPostDetail's visibility, and its SSR 404 on Private.
+  const post = await dbRead.post.findFirst({
+    where: {
+      id,
+      availability: { not: Availability.Private },
+      ...getPostDetailVisibility(undefined),
+    },
+    select: {
+      title: true,
+      detail: true,
+      user: { select: { username: true } },
+      _count: { select: { images: true } },
+    },
+  });
+  if (!post) return null;
+
+  const [metric, image] = await Promise.all([
+    dbRead.postMetric
+      .findFirst({
+        where: { postId: id, timeframe: 'AllTime' },
+        select: {
+          heartCount: true,
+          likeCount: true,
+          laughCount: true,
+          cryCount: true,
+          commentCount: true,
+          collectedCount: true,
+        },
+      })
+      .catch(() => null),
+    dbRead.image.findFirst({
+      where: {
+        postId: id,
+        post: { publishedAt: { not: null } },
+        tosViolation: false,
+        needsReview: null,
+        ingestion: 'Scanned',
+      },
+      select: ogImageSelect,
+      orderBy: [{ index: 'asc' }, { id: 'asc' }],
+    }),
+  ]);
+
+  const stats: StatItem[] = metric
+    ? [
+        { value: formatStat(sumReactions(metric)), label: 'Reactions' },
+        { value: formatStat(metric.commentCount), label: 'Comments' },
+        { value: formatStat(metric.collectedCount), label: 'Collected' },
+        { value: String(post._count.images), label: 'Images' },
+      ]
+    : [{ value: String(post._count.images), label: 'Images' }];
+
+  return {
+    title: post.title || `Post by ${post.user.username}`,
+    description: cleanDescription(post.detail ?? ''),
+    creator: post.user.username ?? 'Unknown',
+    ...buildEntityImage(getSafeImage(image)),
+    stats,
+  };
+}
+
+async function fetchImageData(id: number): Promise<EntityData | null> {
+  const [visible, image] = await Promise.all([
+    // The image page's anonymous rule. Any failure hides the card rather than showing it.
+    assertImageVisibleToViewer({ id }).catch(() => null),
+    dbRead.image.findFirst({
+      where: { id, tosViolation: false, needsReview: null, ingestion: 'Scanned' },
+      select: {
+        ...ogImageSelect,
+        user: { select: { username: true } },
+        post: {
+          select: {
+            title: true,
+            modelVersion: { select: { model: { select: { name: true } } } },
+          },
+        },
+      },
+    }),
+  ]);
+  if (!visible || !image) return null;
+
+  const modelName = image.post?.modelVersion?.model?.name;
+  const postTitle = image.post?.title;
+  const title = postTitle || (modelName ? `Generated with ${modelName}` : 'Image on Civitai');
+
+  // Only show the image if it's SFW; otherwise card renders with logo placeholder
+  const safeImage = getSafeImage(image);
+
+  let reactionCount = 0;
+  let commentCount = 0;
+  let collectedCount = 0;
+  // ClickHouse entity metrics don't track image views; card shows 0.
+  const viewCount = 0;
+  try {
+    const metrics = await getImageMetricsObject([{ id }]);
+    const metric = metrics[id];
+    if (metric) {
+      reactionCount =
+        (metric.reactionLike ?? 0) +
+        (metric.reactionHeart ?? 0) +
+        (metric.reactionLaugh ?? 0) +
+        (metric.reactionCry ?? 0);
+      commentCount = metric.comment ?? 0;
+      collectedCount = metric.collection ?? 0;
+    }
+  } catch {
+    /* stats unavailable */
+  }
+
+  return {
+    title,
+    description: '',
+    creator: image.user.username ?? 'Unknown',
+    ...buildEntityImage(safeImage),
+    stats: [
+      { value: formatStat(reactionCount), label: 'Reactions' },
+      { value: formatStat(commentCount), label: 'Comments' },
+      { value: formatStat(collectedCount), label: 'Collected' },
+      { value: formatStat(viewCount), label: 'Views' },
+    ],
+  };
+}
+
+async function fetchBountyData(id: number): Promise<EntityData | null> {
+  const [bounty, metric, connection] = await Promise.all([
+    dbRead.bounty.findFirst({
+      where: { id, availability: { not: 'Private' } },
+      select: {
+        name: true,
+        description: true,
+        user: { select: { username: true } },
+      },
+    }),
+    dbRead.bountyMetric
+      .findFirst({
+        where: { bountyId: id, timeframe: 'AllTime' },
+        select: {
+          entryCount: true,
+          favoriteCount: true,
+          commentCount: true,
+          unitAmountCount: true,
+        },
+      })
+      .catch(() => null),
+    dbRead.imageConnection.findFirst({
+      where: {
+        entityType: 'Bounty',
+        entityId: id,
+        image: { tosViolation: false, needsReview: null, ingestion: 'Scanned' },
+      },
+      select: { image: { select: ogImageSelect } },
+    }),
+  ]);
+  if (!bounty) return null;
+
+  const stats: StatItem[] = metric
+    ? [
+        { value: formatStat(metric.entryCount), label: 'Entries' },
+        { value: formatStat(metric.favoriteCount), label: 'Favorites' },
+        { value: formatStat(metric.commentCount), label: 'Comments' },
+        ...(metric.unitAmountCount > 0
+          ? [{ value: formatStat(metric.unitAmountCount), label: 'Buzz' }]
+          : []),
+      ]
+    : [];
+
+  return {
+    title: bounty.name,
+    description: cleanDescription(bounty.description ?? ''),
+    creator: bounty.user?.username ?? 'Unknown',
+    ...buildEntityImage(getSafeImage(connection?.image)),
+    stats,
+  };
+}
+
+async function fetchChallengeData(id: number, req: NextApiRequest): Promise<EntityData | null> {
+  // The challenge page's read, as an anonymous viewer on this request's host.
+  const features = await getFeatureFlagsAsync({ req });
+  if (!features.challengePlatform) return null;
+  const challenge = await getChallengeDetail(
+    id,
+    undefined,
+    features.isGreen,
+    false,
+    features.userChallenges
+  );
+  if (!challenge) return null;
+
+  const winnerCount = challenge.winners.length;
+
+  const stats: StatItem[] = [
+    { value: formatStat(challenge.entryCount), label: 'Entries' },
+    ...(winnerCount > 0 ? [{ value: String(winnerCount), label: 'Winners' }] : []),
+    ...(challenge.prizePool > 0
+      ? [{ value: formatStat(challenge.prizePool), label: 'Buzz Prize' }]
+      : []),
+  ];
+
+  return {
+    title: challenge.title,
+    description: cleanDescription(
+      (challenge.invitation || challenge.theme || challenge.description) ?? ''
+    ),
+    creator: 'Civitai Challenge',
+    ...buildEntityImage(getSafeImage(challenge.coverImage)),
+    stats,
+  };
+}
+
+async function fetchHubData(id: number): Promise<EntityData | null> {
+  const hub = await getHubCardData(id);
+  if (!hub) return null;
+
+  // No cover: a hub has no image of its own, and the first image of its FEED is not
+  // a safe substitute — this card is served unauthenticated, so it would show that
+  // image to everyone the link reaches whatever their own browsing level is. The
+  // shared card already falls back to the Civitai mark. Justin's call, 2026-08-26.
+  return {
+    title: hub.name,
+    description: cleanDescription(hub.description ?? ''),
+    creator: hub.username ?? 'Unknown',
+    imageUrl: null,
+    imageAspectRatio: 1,
+    stats: [
+      { value: formatStat(hub.sourceCount), label: 'Sources' },
+      ...(hub.followerCount > 0
+        ? [{ value: formatStat(hub.followerCount), label: 'Followers' }]
+        : []),
+    ],
+  };
+}
+
+// Entity types whose visibility the owner can withdraw after a link is shared. They
+// take the short cache below, so revocation is not deferred by the edge.
+const REVOCABLE_TYPES = new Set(['hub', 'bounty']);
+const SHORT_CACHE = 'public, max-age=300, s-maxage=300';
+
+const dataFetchers: Record<
+  string,
+  (id: number, req: NextApiRequest) => Promise<EntityData | null>
+> = {
+  model: fetchModelData,
+  post: fetchPostData,
+  image: fetchImageData,
+  article: fetchArticleData,
+  bounty: fetchBountyData,
+  challenge: fetchChallengeData,
+  hub: fetchHubData,
+};
+
+// --- Layout components ---
+
+function CoverImage({ url, aspectRatio }: { url: string; aspectRatio: number }) {
+  const imgWidth =
+    aspectRatio < 1 ? IMAGE_WIDTH : Math.max(IMAGE_WIDTH, Math.round(IMAGE_HEIGHT * aspectRatio));
+  const imgHeight = aspectRatio < 1 ? Math.round(IMAGE_WIDTH / aspectRatio) : IMAGE_HEIGHT;
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        width: IMAGE_WIDTH,
+        height: IMAGE_HEIGHT,
+        flexShrink: 0,
+        borderRadius: 12,
+        overflow: 'hidden',
+        alignItems: 'flex-start',
+        justifyContent: 'center',
+      }}
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={url} width={imgWidth} height={imgHeight} alt="" />
+    </div>
+  );
+}
+
+function LogoPlaceholder({ baseUrl }: { baseUrl: string }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        width: 200,
+        flexShrink: 0,
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={APPLE_TOUCH_ICON_DATA_URI ?? `${baseUrl}/images/apple-touch-icon.png`}
+        width={120}
+        height={120}
+        alt=""
+        style={{ borderRadius: 24 }}
+      />
+    </div>
+  );
+}
+
+function OgCard({ data }: { data: EntityData }) {
+  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL ?? 'https://civitai.com';
+  const titleFontSize = data.title.length > 40 ? 40 : 48;
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        width: CANVAS_WIDTH,
+        height: CANVAS_HEIGHT,
+        background: colors.bg,
+      }}
+    >
+      {/* Main content */}
+      <div
+        style={{
+          display: 'flex',
+          flexGrow: 1,
+          paddingTop: 60,
+          paddingRight: 64,
+          paddingBottom: 40,
+          paddingLeft: 64,
+          gap: 40,
+        }}
+      >
+        {/* Text column */}
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            flexGrow: 1,
+            flexShrink: 1,
+            justifyContent: 'center',
+            gap: 16,
+            overflow: 'hidden',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              fontSize: titleFontSize,
+              fontWeight: 700,
+              color: colors.textPrimary,
+              lineHeight: 1.1,
+            }}
+          >
+            {truncate(data.title, 70)}
+          </div>
+          {data.description ? (
+            <div
+              style={{
+                display: 'flex',
+                fontSize: 22,
+                color: colors.textSecondary,
+                lineHeight: 1.4,
+              }}
+            >
+              {data.description}
+            </div>
+          ) : null}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ display: 'flex', fontSize: 18, color: colors.textSecondary }}>by</div>
+            <div
+              style={{
+                display: 'flex',
+                fontSize: 18,
+                fontWeight: 600,
+                color: colors.textPrimary,
+              }}
+            >
+              {data.creator}
+            </div>
+          </div>
+        </div>
+
+        {data.imageUrl ? (
+          <CoverImage url={data.imageUrl} aspectRatio={data.imageAspectRatio} />
+        ) : (
+          <LogoPlaceholder baseUrl={baseUrl} />
+        )}
+      </div>
+
+      {/* Stats bar */}
+      <div
+        style={{
+          display: 'flex',
+          height: STATS_HEIGHT,
+          paddingLeft: 64,
+          paddingRight: 64,
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          backgroundColor: colors.statsBg,
+          borderTop: `1px solid ${colors.border}`,
+        }}
+      >
+        <div style={{ display: 'flex', gap: 40 }}>
+          {data.stats.map((stat, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div
+                style={{
+                  display: 'flex',
+                  fontSize: 18,
+                  fontWeight: 600,
+                  color: colors.textPrimary,
+                }}
+              >
+                {stat.value}
+              </div>
+              <div style={{ display: 'flex', fontSize: 16, color: colors.textSecondary }}>
+                {stat.label}
+              </div>
+            </div>
+          ))}
+        </div>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={APPLE_TOUCH_ICON_DATA_URI ?? `${baseUrl}/images/apple-touch-icon.png`}
+          width={36}
+          height={36}
+          alt=""
+          style={{ borderRadius: 6 }}
+        />
+      </div>
+
+      {/* Blue accent bar */}
+      <div
+        style={{
+          display: 'flex',
+          height: ACCENT_HEIGHT,
+          backgroundColor: colors.blue,
+          width: CANVAS_WIDTH,
+        }}
+      />
+    </div>
+  );
+}
+
+function FallbackCard() {
+  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL ?? 'https://civitai.com';
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        width: CANVAS_WIDTH,
+        height: CANVAS_HEIGHT,
+        background: colors.bg,
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          flexGrow: 1,
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 20,
+        }}
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        {/* satori requires an explicit width+height on remote <img> or it throws
+            "Image size cannot be determined" — which made FallbackCard itself 500,
+            so any missing entity (or any OgCard render error) hit the catch's
+            fallback and STILL returned 500. logo_dark_mode.png is 142x30 (≈4.733),
+            so width 284 keeps aspect at height 60. */}
+        <img
+          src={LOGO_DARK_DATA_URI ?? `${baseUrl}/images/logo_dark_mode.png`}
+          width={284}
+          height={60}
+          alt=""
+        />
+        <div style={{ display: 'flex', fontSize: 16, color: colors.textSecondary }}>
+          The Home of Open-Source Generative AI
+        </div>
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          height: ACCENT_HEIGHT,
+          backgroundColor: colors.blue,
+          width: CANVAS_WIDTH,
+        }}
+      />
+    </div>
+  );
+}
+
+type MilestoneCardData = NonNullable<Awaited<ReturnType<typeof getMilestoneShareCard>>>;
+
+// satori draws in its bundled regular-weight face unless handed others, which is what made the tier
+// name thin. Read once, like the logo; a failed read leaves the default face.
+function loadFont(file: string) {
+  try {
+    return fs.readFileSync(path.join(process.cwd(), 'public/fonts', file));
+  } catch {
+    return null;
+  }
+}
+const MILESTONE_FONTS = [
+  { file: 'Montserrat-Regular.ttf', weight: 400 as const },
+  { file: 'Montserrat-Bold.ttf', weight: 700 as const },
+].flatMap(({ file, weight }) => {
+  const data = loadFont(file);
+  return data ? [{ name: 'Montserrat', data, weight, style: 'normal' as const }] : [];
+});
+
+const MILESTONE_AVATAR = 92;
+
+function MilestoneAvatar({ card }: { card: MilestoneCardData }) {
+  const frame = card.decoration ? decorationFrameBox(MILESTONE_AVATAR, card.decoration) : null;
+  return (
+    <div
+      style={{
+        display: 'flex',
+        position: 'relative',
+        width: MILESTONE_AVATAR,
+        height: MILESTONE_AVATAR,
+        flexShrink: 0,
+      }}
+    >
+      {card.avatarUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={card.avatarUrl}
+          width={MILESTONE_AVATAR}
+          height={MILESTONE_AVATAR}
+          alt=""
+          style={{ borderRadius: MILESTONE_AVATAR }}
+        />
+      ) : (
+        <div
+          style={{
+            display: 'flex',
+            width: MILESTONE_AVATAR,
+            height: MILESTONE_AVATAR,
+            borderRadius: MILESTONE_AVATAR,
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: 'rgba(255,255,255,0.12)',
+            color: '#f1f3f5',
+            fontSize: 40,
+            fontWeight: 700,
+          }}
+        >
+          {card.username.slice(0, 1).toUpperCase()}
+        </div>
+      )}
+      {card.decoration && frame ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={card.decoration.url}
+          width={frame.width}
+          height={frame.height}
+          alt=""
+          style={{ position: 'absolute', left: frame.left, top: frame.top }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function MilestoneCard({ card }: { card: MilestoneCardData }) {
+  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL ?? 'https://civitai.com';
+  const accent = card.accent ?? colors.blue;
+  // Sized to the name so a long one ("100k Reactions") still fits the column beside the badge.
+  const nameFontSize = Math.min(132, Math.floor(640 / (card.name.length * 0.68)));
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        width: CANVAS_WIDTH,
+        height: CANVAS_HEIGHT,
+        fontFamily: 'Montserrat',
+        backgroundColor: '#0b0b10',
+        backgroundImage: [
+          `radial-gradient(circle at 22% 46%, ${accent}66 0%, ${accent}22 28%, transparent 55%)`,
+          `radial-gradient(circle at 100% 0%, ${accent}33 0%, transparent 45%)`,
+          `linear-gradient(135deg, ${accent}30 0%, #101016 55%, #08080b 100%)`,
+        ].join(', '),
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          flexGrow: 1,
+          alignItems: 'center',
+          paddingLeft: 64,
+          paddingRight: 72,
+          gap: 48,
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            width: BADGE_SIZE,
+            height: BADGE_SIZE,
+            flexShrink: 0,
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          {card.badgeUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={card.badgeUrl} width={BADGE_SIZE} height={BADGE_SIZE} alt="" />
+          ) : null}
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 20, marginBottom: 28 }}>
+            <MilestoneAvatar card={card} />
+            <div style={{ display: 'flex', fontSize: 38, fontWeight: 700, color: '#f1f3f5' }}>
+              {truncate(card.username, 20)}
+            </div>
+            {card.profileBadgeUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={card.profileBadgeUrl} width={64} height={64} alt="" />
+            ) : null}
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              fontSize: 20,
+              fontWeight: 700,
+              letterSpacing: 6,
+              color: accent,
+              textTransform: 'uppercase',
+              marginBottom: 6,
+            }}
+          >
+            {card.eyebrow}
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              fontSize: nameFontSize,
+              fontWeight: 700,
+              lineHeight: 1.05,
+              letterSpacing: -2,
+              color: '#fff',
+              backgroundImage: `linear-gradient(180deg, #ffffff 15%, ${accent} 120%)`,
+              backgroundClip: 'text',
+              WebkitTextFillColor: 'transparent',
+              textShadow: `0 0 40px ${accent}88`,
+            }}
+          >
+            {card.name}
+          </div>
+          {card.line && (
+            <div style={{ display: 'flex', fontSize: 26, color: '#dee2e6', marginTop: 14 }}>
+              {card.line}
+            </div>
+          )}
+          {card.reached && (
+            <div style={{ display: 'flex', fontSize: 22, color: '#adb5bd', marginTop: 14 }}>
+              {`${card.reachedVerb} ${card.reached}`}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: 'flex',
+          height: 72,
+          paddingLeft: 72,
+          paddingRight: 72,
+          alignItems: 'center',
+          justifyContent: 'flex-end',
+          backgroundColor: 'rgba(0,0,0,0.35)',
+          borderTop: '1px solid rgba(255,255,255,0.08)',
+        }}
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={LOGO_DARK_DATA_URI ?? `${baseUrl}/images/logo_dark_mode.png`}
+          width={142}
+          height={30}
+          alt=""
+        />
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          height: ACCENT_HEIGHT,
+          width: CANVAS_WIDTH,
+          backgroundImage: `linear-gradient(90deg, ${accent}, ${accent}55)`,
+        }}
+      />
+    </div>
+  );
+}
+
+/** Embeds the card's remote images first, for the same reason the cover is prefetched below. */
+async function getMilestoneCardElement(raw: string) {
+  const shareId = parseMilestoneShareId(raw);
+  if (!shareId) return null;
+  const card = await getMilestoneShareCard(shareId);
+  if (!card) return null;
+  const [avatarUrl, badgeUrl, decorationUrl, profileBadgeUrl] = await Promise.all([
+    card.avatarUrl ? fetchImageAsDataUri(card.avatarUrl) : null,
+    card.badgeUrl ? fetchImageAsDataUri(card.badgeUrl) : null,
+    card.decoration ? fetchImageAsDataUri(card.decoration.url) : null,
+    card.profileBadgeUrl ? fetchImageAsDataUri(card.profileBadgeUrl) : null,
+  ]);
+  const decoration =
+    card.decoration && decorationUrl ? { ...card.decoration, url: decorationUrl } : null;
+  return <MilestoneCard card={{ ...card, avatarUrl, badgeUrl, decoration, profileBadgeUrl }} />;
+}
+
+// --- Main handler ---
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  const parsed = querySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid parameters. Expected ?type=model&id=123' });
+  }
+
+  const { type, id: rawId } = parsed.data;
+
+  try {
+    if (type === 'milestone') {
+      const card = await getMilestoneCardElement(rawId);
+      const milestoneImage = new ImageResponse(card ?? <FallbackCard />, {
+        width: CANVAS_WIDTH,
+        height: CANVAS_HEIGHT,
+        ...(card && MILESTONE_FONTS.length ? { fonts: MILESTONE_FONTS } : {}),
+      });
+      const milestoneBuffer = Buffer.from(await milestoneImage.arrayBuffer());
+      res.setHeader('Content-Type', 'image/png');
+      // Short either way: a hidden badge or a new strike must take a shared card down within
+      // minutes, and a creator whose card is not live yet must not be stuck on the fallback.
+      res.setHeader('Cache-Control', SHORT_CACHE);
+      return res.send(milestoneBuffer);
+    }
+
+    // Inside the try: `decodeHubId` builds on the codec, and anything it can throw
+    // belongs to this handler's own fallback path rather than to an unhandled 500.
+    const id = type === 'hub' ? decodeHubId(rawId) : asEntityId(rawId);
+    if (!id) {
+      return res.status(400).json({ error: 'Invalid parameters. Expected ?type=model&id=123' });
+    }
+
+    const fetcher = dataFetchers[type];
+    const data = await fetcher(id, req);
+
+    // Prefetch the cover image ourselves with a bounded timeout and embed it as
+    // a data URI, so satori does NOT fetch the remote CF URL internally (which it
+    // does with NO timeout — the source of the p99 19.4s tail). On timeout /
+    // non-2xx / oversize / empty / error, fetchImageAsDataUri returns null and we
+    // drop to the logo-placeholder path — a slow cover must never block the
+    // render. This is an ADDITIONAL bounded step; it does NOT change the
+    // data ? OgCard : FallbackCard logic.
+    //
+    // We DO track whether this prefetch FAILED (had a cover URL, got null back)
+    // so the cache decision below can distinguish a transient cover-fetch failure
+    // (short cache → retry once the CDN recovers) from "no cover by design"
+    // (NSFW-filtered / video-skip / genuinely no image — where data.imageUrl was
+    // already null and no prefetch ran, so coverFetchFailed stays false → those
+    // permanent placeholders correctly keep the long edge cache).
+    let coverFetchFailed = false;
+    if (data?.imageUrl) {
+      const dataUri = await fetchImageAsDataUri(data.imageUrl);
+      coverFetchFailed = dataUri === null;
+      data.imageUrl = dataUri;
+    }
+
+    const element = data ? <OgCard data={data} /> : <FallbackCard />;
+
+    const imageResponse = new ImageResponse(element, {
+      width: CANVAS_WIDTH,
+      height: CANVAS_HEIGHT,
+    });
+
+    const buffer = Buffer.from(await imageResponse.arrayBuffer());
+
+    res.setHeader('Content-Type', 'image/png');
+    if (data && !coverFetchFailed && REVOCABLE_TYPES.has(type)) {
+      // A hub's sharing can be switched back off, and the share dialog tells the
+      // owner every link they handed out stops working. The long branch below would
+      // keep serving that hub's name, description and owner from the CDN edge for a
+      // week after revocation, so a revocable entity takes a short cache instead.
+      res.setHeader('Cache-Control', SHORT_CACHE);
+    } else if (data && !coverFetchFailed) {
+      // Real entity card with the cover embedded, OR no cover by design (NSFW /
+      // video / genuinely no image — a PERMANENT placeholder) → long edge cache.
+      res.setHeader(
+        'Cache-Control',
+        'public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400'
+      );
+      res.setHeader('CDN-Cache-Control', 'max-age=604800');
+    } else {
+      // Missing/deleted/unpublished entity (no data) → generic fallback card; OR a
+      // real entity whose cover prefetch FAILED (timeout/non-2xx/empty — a
+      // TRANSIENT placeholder). Cache SHORT (mirror the catch-block fallback) so a
+      // later-published / replica-lagged entity, or a placeholder pinned only by a
+      // transient CDN blip, isn't stuck at the CF edge for up to 7 days — the next
+      // request retries once the underlying condition recovers.
+      res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+    }
+    res.send(buffer);
+  } catch (error) {
+    console.error('OG image generation failed:', error);
+
+    try {
+      const fallback = new ImageResponse(<FallbackCard />, {
+        width: CANVAS_WIDTH,
+        height: CANVAS_HEIGHT,
+      });
+      const buffer = Buffer.from(await fallback.arrayBuffer());
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader(
+        'Cache-Control',
+        type === 'milestone' ? SHORT_CACHE : 'public, max-age=3600, s-maxage=3600'
+      );
+      res.send(buffer);
+    } catch {
+      res.status(500).json({ error: 'Failed to generate OG image' });
+    }
+  }
+}

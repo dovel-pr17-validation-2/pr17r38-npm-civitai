@@ -1,0 +1,150 @@
+import { Center, Loader, Text, Title } from '@mantine/core';
+import { IconAlertTriangle } from '@tabler/icons-react';
+import { useRouter } from 'next/router';
+import React, { useState } from 'react';
+import { NotFound } from '~/components/AppLayout/NotFound';
+import { PostEdit } from '~/components/Post/EditV2/PostEdit';
+import { PostEditProvider } from '~/components/Post/EditV2/PostEditProvider';
+import { PostImageDropzone } from '~/components/Post/EditV2/PostImageDropzone';
+import { ModelStatus, ModelUsageControl } from '~/shared/utils/prisma/enums';
+import { useS3UploadStore } from '~/store/s3-upload.store';
+import { notifyIfPublishHeld } from '~/utils/model-publish-toast';
+import { showErrorNotification } from '~/utils/notifications';
+import { getModelUrl } from '~/utils/string-helpers';
+import { trpc } from '~/utils/trpc';
+
+export function PostUpsertForm2({
+  postId: initialPostId = 0,
+  modelVersionId,
+  modelId,
+}: {
+  postId?: number;
+  modelVersionId: number;
+  modelId: number;
+}) {
+  // #region [state]
+  const router = useRouter();
+  const [createdPostId, setCreatedPostId] = useState(initialPostId);
+  const getFileUploadStatus = useS3UploadStore((state) => state.getStatus);
+  const { uploading = 0 } = getFileUploadStatus((item) => item.meta?.versionId === modelVersionId);
+  // #endregion
+
+  // #region [queries]
+  const { data: modelVersion } = trpc.modelVersion.getById.useQuery({
+    id: modelVersionId,
+    withFiles: true,
+  });
+
+  // Prefer the creator's own post for this version (freshest source) so
+  // navigating back to the upload step and forward again doesn't spin up a
+  // duplicate post. The locally-created id covers the gap within a single mount
+  // before the modelVersion query refetches. Must filter by the model owner:
+  // `posts` also contains other users' community gallery posts, and grabbing a
+  // foreign post here makes post.getEdit throw (auth) and 404s the wizard when
+  // the creator has no post of their own (e.g. after deleting all showcase images).
+  const ownerId = modelVersion?.model.user.id;
+  const existingPostId = modelVersion?.posts?.find((post) => post.userId === ownerId)?.id ?? 0;
+  const postId = createdPostId || existingPostId;
+
+  const { data, isInitialLoading } = trpc.post.getEdit.useQuery(
+    { id: postId },
+    { enabled: postId > 0, placeholderData: undefined }
+  );
+  // #endregion
+
+  // #region [mutations]
+  async function onSuccess(result: Parameters<typeof notifyIfPublishHeld>[0]) {
+    notifyIfPublishHeld(result);
+    await router.replace(getModelUrl({ modelId, modelVersionId }));
+  }
+
+  function onError(error: any) {
+    const reason = error?.message?.includes('Insufficient funds')
+      ? 'You do not have enough funds to publish this model. You can remove early access or purchase more Buzz in order to publish.'
+      : 'Something went wrong while publishing your model. Please try again later.';
+
+    showErrorNotification({
+      title: 'Failed to publish',
+      error: new Error(error.message),
+      reason,
+    });
+  }
+  const publishModelMutation = trpc.model.publish.useMutation({ onError, onSuccess });
+  const publishVersionMutation = trpc.modelVersion.publish.useMutation({ onError, onSuccess });
+
+  // #endregion
+
+  // #region [misc]
+  const isCreatePage = !postId;
+  const is404 = !data && !isInitialLoading && !isCreatePage;
+  const loading = isInitialLoading && !isCreatePage;
+  const isUploading = uploading > 0;
+  // ExternalGeneration versions are intentionally file-less (routed via external engines),
+  // so the no-files publish warning doesn't apply to them.
+  const isExternalGeneration = modelVersion?.usageControl === ModelUsageControl.ExternalGeneration;
+  const hasFiles = !!modelVersion?.files?.length || isExternalGeneration;
+  // Publishing without files is allowed (the model is just not downloadable until
+  // files are added) — warn rather than block.
+  const confirmPublish = isUploading || !hasFiles;
+  const confirmMessage = isUploading
+    ? 'Files are still uploading. Publishing now will make your model visible, but downloads will not work until uploads finish. Continue?'
+    : !hasFiles
+    ? "This model version doesn't have any files attached. Publishing now will make it visible on your profile, but users won't be able to download it until you upload files. Continue?"
+    : undefined;
+  const confirmTitle = (
+    <div className="flex items-center gap-1">
+      <IconAlertTriangle color="gold" />
+      <span>Publish post</span>
+    </div>
+  );
+  // #endregion
+
+  return (
+    <div className={`container flex flex-col gap-3 ${isCreatePage ? 'max-w-sm' : 'max-w-lg'}`}>
+      <Title order={3}>{isCreatePage ? 'Create your post' : 'Edit post'}</Title>
+      <PostEditProvider
+        post={data}
+        params={{ modelVersionId, src: 'trainer' }}
+        confirmPublish={confirmPublish}
+        confirmMessage={confirmMessage}
+        confirmTitle={confirmTitle}
+        postTitle={
+          modelVersion ? `${modelVersion.model.name} - ${modelVersion.name} Showcase` : undefined
+        }
+        afterPublish={({ publishedAt }) => {
+          // Always publish the model alongside the post — otherwise the post
+          // goes live while the model silently stays in Draft (orphaned state).
+          // If the user confirmed through the no-files warning, honor that choice.
+          if (!modelVersion) return;
+          if (modelVersion.model.status !== ModelStatus.Published) {
+            publishModelMutation.mutate({
+              id: modelId,
+              versionIds: [modelVersionId],
+              publishedAt,
+            });
+          } else {
+            publishVersionMutation.mutate({ id: modelVersionId, publishedAt });
+          }
+        }}
+      >
+        {is404 ? (
+          <NotFound />
+        ) : loading ? (
+          <Center p="xl">
+            <Loader />
+          </Center>
+        ) : isCreatePage ? (
+          <div className="flex flex-col gap-3">
+            <Text size="xs" c="dimmed">
+              Our site is mostly used for sharing AI generated content. Make sure the images you are
+              sharing for this resource have been generated with it.
+            </Text>
+            <PostImageDropzone onCreatePost={(post) => setCreatedPostId(post.id)} />
+          </div>
+        ) : (
+          <PostEdit />
+        )}
+      </PostEditProvider>
+    </div>
+  );
+}

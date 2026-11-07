@@ -1,0 +1,2133 @@
+import {
+  ActionIcon,
+  Alert,
+  Anchor,
+  Box,
+  Card,
+  Checkbox,
+  Divider,
+  Group,
+  Input,
+  NumberInput,
+  Radio,
+  SegmentedControl,
+  Select,
+  Stack,
+  Switch,
+  Text,
+  useComputedColorScheme,
+  useMantineTheme,
+} from '@mantine/core';
+import { Popover } from '~/components/MantineOverlays';
+import { IconAlertTriangle, IconInfoCircle, IconPlus } from '@tabler/icons-react';
+import { getQueryKey } from '@trpc/react-query';
+import { uniq } from 'lodash-es';
+import { useRouter } from 'next/router';
+import React, { useEffect, useRef, useState } from 'react';
+import * as z from 'zod';
+
+import { CapUpsell } from '~/components/Buzz/CapUpsell';
+import { PricingSlotHistory } from '~/components/Buzz/PricingSlotHistory';
+import { CreatorScoreGateMessage } from '~/components/CreatorJourney/CreatorScoreGateMessage';
+import { EarlyAccessLockedRow } from '~/components/CreatorJourney/EarlyAccessLockedRow';
+import { creatorScoreFromSession } from '~/shared/utils/creator-score';
+import { CurrencyIcon } from '~/components/Currency/CurrencyIcon';
+import InputResourceSelectMultiple from '~/components/ImageGeneration/GenerationForm/ResourceSelectMultiple';
+import { MAX_DONATION_GOAL, MIN_DONATION_GOAL } from '~/shared/constants/donation-goal.constants';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useCreatorProgramRequirements } from '~/components/Buzz/CreatorProgramV2/CreatorProgram.util';
+import { useCurrentUserSettings, useMutateUserSettings } from '~/components/UserSettings/hooks';
+import {
+  inheritedMetricPrivacy,
+  metricPrivacyAccessFor,
+} from '~/components/Resource/Forms/metric-privacy-hints';
+import { MetricPrivacyControls } from '~/components/Resource/Forms/MetricPrivacyControls';
+import { RecommendedRangeInputs } from '~/components/Resource/Forms/RecommendedRangeInputs';
+import { scopeRecommendedSettings } from '~/components/Resource/Forms/model-version-settings';
+import { ResourceSelect } from '~/components/ImageGeneration/GenerationForm/ResourceSelect';
+import type { GenerationResource } from '~/shared/types/generation.types';
+import {
+  getMetricVisibilityChoices,
+  type HiddenModelMetrics,
+} from '~/server/utils/model-metric-privacy';
+import {
+  Form,
+  InputCheckbox,
+  InputCreatableMultiSelect,
+  InputNumber,
+  InputRTE,
+  InputSelect,
+  InputSwitch,
+  InputText,
+  useForm,
+} from '~/libs/form';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { Flags } from '~/shared/utils/flags';
+import { ModelVersionFlag } from '~/shared/constants/model-version-flags.constants';
+import {
+  constants,
+  EARLY_ACCESS_CONFIG,
+  isNonCommercialBaseModel,
+  nsfwRestrictedBaseModels,
+} from '~/server/common/constants';
+import type { BaseModel } from '~/shared/constants/basemodel.constants';
+import { LORA_STRENGTH_BOUNDS } from '~/shared/constants/generation.constants';
+import {
+  getBaseModelConfig,
+  getEcosystemTurboSettings,
+} from '~/shared/constants/basemodel.constants';
+import {
+  BASE_MODEL_ATTESTATION_STATEMENT,
+  hasBaseModelAttestation,
+  requiresBaseModelAttestation as requiresBaseModelAttestationFor,
+} from '~/shared/constants/base-model-attestation.constants';
+import {
+  baseModelSupportsClipSkip,
+  defaultBaseModel,
+  getActiveBaseModels,
+} from '~/shared/constants/basemodel.constants';
+import { useLastUsedBaseModelStore } from '~/store/last-used-base-model.store';
+import type { GenerationResourceSchema } from '~/server/schema/generation.schema';
+import { generationResourceSchema } from '~/server/schema/generation.schema';
+import type {
+  ModelVersionPaidAccessDto,
+  ModelVersionUpsertInput,
+} from '~/server/schema/model-version.schema';
+import {
+  baseModelToTraningDetailsBaseModelMap,
+  modelVersionUpsertSchema2,
+  TURBO_VARIANT_MODEL_TYPES,
+} from '~/server/schema/model-version.schema';
+import {
+  type ModelVersionTerms,
+  ACCEPTS_BLUE_BUZZ_HINT,
+  DEFAULT_GENERATION_TRIAL_LIMIT,
+  EARLY_ACCESS_NOT_COUNTED,
+  PRICING_SLOT_EXPLAINER,
+  DEFAULT_FEE_IMAGES,
+  MONETIZATION_RIGHTS_AFFIRMATION_STATEMENT,
+  feeMaxFor,
+  hasCurrentRightsAffirmation,
+  paidAccessCharges,
+  feeToRatio,
+  formatPricingAllowance,
+  monetizationLimits,
+  pricingAllowanceState,
+  feeAllowanceBoostNote,
+  ratioToFee,
+  resolveCapTier,
+  seedFeeRatio,
+} from '@civitai/buzz';
+import type { ModelUpsertInput } from '~/server/schema/model.schema';
+import {
+  getMaxEarlyAccessDays,
+  getMaxEarlyAccessModels,
+} from '~/server/utils/early-access-helpers';
+import {
+  Availability,
+  LicensingFeeSettlementCurrency,
+  ModelStatus,
+  ModelType,
+  ModelUsageControl,
+} from '~/shared/utils/prisma/enums';
+import type { MyRecentlyRecommended } from '~/types/router';
+import { isFutureDate } from '~/utils/date-helpers';
+import { showErrorNotification } from '~/utils/notifications';
+import { getDisplayName } from '~/utils/string-helpers';
+import { queryClient, trpc } from '~/utils/trpc';
+import { isDefined } from '~/utils/type-guards';
+import {
+  type FormPaidAccessConfig,
+  type MonetizationDefaults,
+  formPaidAccessConfigSchema,
+  monetizationDefaultsSchema,
+} from '~/components/Resource/Forms/model-version-monetization-defaults';
+import { monetizationDefaultsStore } from '~/store/model-version-monetization-defaults.store';
+
+import {
+  type GenerationMode,
+  decideModelVersionSubmit,
+  generationModeOf,
+  toFormPaidAccessConfig,
+  toPaidAccessInput,
+} from '~/components/Resource/Forms/model-version-submit';
+
+const schema = modelVersionUpsertSchema2
+  .omit({ paidAccess: true, donationGoal: true })
+  .extend({
+    skipTrainedWords: z.boolean().default(false),
+    paidAccessConfig: formPaidAccessConfigSchema
+      // A timed gate needs a valid window; a permanent gate ignores the timeframe entirely.
+      .refine(
+        (c) => c.permanent || EARLY_ACCESS_CONFIG.timeframeValues.some((x) => x === c.timeframe),
+        {
+          error: 'Invalid value',
+          path: ['timeframe'],
+        }
+      )
+      .nullish(),
+    useMonetization: z.boolean().default(false),
+    recommendedResources: generationResourceSchema.array().nullish(),
+  })
+  .refine((data) => (!data.skipTrainedWords ? (data.trainedWords ?? []).length > 0 : true), {
+    error: 'You need to specify at least one trained word',
+    path: ['trainedWords'],
+  })
+  .refine(
+    (data) => {
+      if (data.settings?.minStrength && data.settings?.maxStrength) {
+        return data.settings.minStrength <= data.settings.maxStrength;
+      }
+
+      return true;
+    },
+    { error: 'Min strength must be less than max strength', path: ['settings.minStrength'] }
+  )
+  .refine(
+    (data) => {
+      if (data.settings?.minStrength && data.settings.maxStrength) {
+        return data.settings.maxStrength >= data.settings.minStrength;
+      }
+
+      return true;
+    },
+    { error: 'Max strength must be greater than min strength', path: ['settings.maxStrength'] }
+  )
+  // Pricing rules (paid access). A charging config must carry an access price (blank → silently ungated);
+  // for a gen-only version this same price is the generation charge. The optional generation-only tier
+  // can't cost more than the access price.
+  .refine(
+    (data) => {
+      const c = data.paidAccessConfig;
+      if (!c) return true;
+      return c.accessPrice != null && c.accessPrice > 0;
+    },
+    { error: 'Enter a price for access', path: ['paidAccessConfig.accessPrice'] }
+  )
+  .refine(
+    (data) => {
+      const { generationPrice, accessPrice } = data.paidAccessConfig ?? {};
+      if (generationPrice && accessPrice) return generationPrice <= accessPrice;
+      return true;
+    },
+    {
+      error: 'Generation-only price cannot be greater than the access price',
+      path: ['paidAccessConfig.generationPrice'],
+    }
+  );
+type Schema = z.infer<typeof schema>;
+
+// Unfiltered on purpose: a legacy value must always be present in the options or
+// the Select renders blank.
+const baseModelTypeOptions = constants.baseModelTypes.map((x) => ({ label: x, value: x }));
+const capitalizeFirst = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+const licensingOptionLabel = (versionName: string, fee: number | null) =>
+  `${capitalizeFirst(versionName)}${fee != null ? ` (${fee} Buzz)` : ''}`;
+const querySchema = z.object({
+  templateId: z.coerce.number().optional(),
+  bountyId: z.coerce.number().optional(),
+});
+
+export function ModelVersionUpsertForm({
+  id,
+  model,
+  version,
+  previousBaseModel,
+  children,
+  onSubmit,
+  afterName,
+}: Props) {
+  const features = useFeatureFlags();
+  const router = useRouter();
+  const queryUtils = trpc.useUtils();
+  const currentUser = useCurrentUser();
+  const userSettings = useCurrentUserSettings();
+  const { hideDonationGoals } = userSettings;
+  const { mutate: mutateUserSettings, isPending: hideDonationGoalsUpdating } =
+    useMutateUserSettings();
+  const { requirements } = useCreatorProgramRequirements();
+  const isActiveCreatorMember = !!requirements?.validMembership;
+  const isModelOwner = !model?.user || model.user.id === currentUser?.id;
+  const inheritedMetrics = inheritedMetricPrivacy({
+    level: 'version',
+    userSettings,
+    modelMeta: model?.meta,
+    isOwner: isModelOwner,
+    ownerDefaults: model?.ownerMetricPrivacyDefaults,
+  });
+  const metricPrivacyAccess = metricPrivacyAccessFor({
+    isOwner: isModelOwner,
+    ownerHasMembership: isActiveCreatorMember,
+  });
+  const lastUsedBaseModel = useLastUsedBaseModelStore((s) => s.lastUsedBaseModel);
+  const setLastUsedBaseModel = useLastUsedBaseModelStore((s) => s.setLastUsedBaseModel);
+  // For a brand-new version, seed the base model from the previous version (if any),
+  // then the user's last-used selection, then the global default.
+  const initialBaseModel =
+    version?.baseModel ?? previousBaseModel ?? lastUsedBaseModel ?? defaultBaseModel;
+  const colorScheme = useComputedColorScheme('dark');
+  const theme = useMantineTheme();
+
+  const acceptsTrainedWords = [
+    'Checkpoint',
+    'TextualInversion',
+    'LORA',
+    'LoCon',
+    'DoRA',
+    'Wildcards',
+  ].includes(model?.type ?? '');
+  const isTextualInversion = model?.type === 'TextualInversion';
+  // Retired field: only surfaced for legacy versions already carrying a non-default
+  // value, so they stay editable/clearable without letting anyone newly opt in.
+  // Read from the saved version, not form state, so picking 'Standard' doesn't rip
+  // the control out mid-edit.
+  const showBaseModelType = !!version?.baseModelType && version.baseModelType !== 'Standard';
+  const showStrengthInput = ['LORA', 'Hypernetwork', 'LoCon', 'DoRA'].includes(model?.type ?? '');
+  const isCheckpointVersion = model?.type === ModelType.Checkpoint;
+  // "Over" means a TIMED window that has ended. A permanent gate (endsAt null) never ends, and a version
+  // with no gate has nothing to be over — neither should lock the controls.
+  const isEarlyAccessOver =
+    version?.status === 'Published' &&
+    !!version?.paidAccess?.endsAt &&
+    !isFutureDate(version.paidAccess.endsAt);
+  // A donation goal is immutable once it exists (create-once), and locked once the EA window is over.
+  const donationGoalLocked = !!version?.donationGoal || isEarlyAccessOver;
+
+  const MAX_EARLY_ACCCESS = 30;
+
+  // The form never LOADS with a fee: the type-based suggestion (non-checkpoints = 1 ⚡ per 10 images) is
+  // applied when the creator opens the fee editor, not before — a fee seeded behind a closed editor is a
+  // charge nobody asked for, and it tripped the rights affirmation at submit (CU 868kq69rv).
+  const initialLicensingFee = Number(version?.licensingFee ?? 0);
+
+  const defaultValues: Schema = {
+    ...version,
+    name: version?.name ?? 'v1.0',
+    baseModel: initialBaseModel,
+    baseModelType: version?.baseModelType ?? undefined,
+    trainedWords: version?.trainedWords ?? [],
+    skipTrainedWords: acceptsTrainedWords
+      ? version?.trainedWords
+        ? !version.trainedWords.length
+        : false
+      : true,
+    paidAccessConfig: features.earlyAccessModel
+      ? toFormPaidAccessConfig(version?.paidAccess, version?.donationGoal)
+      : null,
+    modelId: model?.id ?? -1,
+    description: version?.description ?? null,
+    epochs: version?.epochs ?? null,
+    steps: version?.steps ?? null,
+    clipSkip: version?.clipSkip ?? null,
+    useMonetization: !!version?.monetization,
+    monetization: version?.monetization ?? null,
+    licensingFee: initialLicensingFee,
+    licensingFeeType: version?.licensingFeeType ?? null,
+    licensingFeeSettlementCurrency: version?.licensingFeeSettlementCurrency ?? null,
+    licensingSourceVersionId: version?.licensingSourceVersionId ?? null,
+    requireAuth: version?.requireAuth ?? true,
+    recommendedResources: version?.recommendedResources ?? [],
+    // Being extra safe here and ensuring this value exists.
+    usageControl: !!version?.usageControl
+      ? version?.usageControl ?? ModelUsageControl.Download
+      : ModelUsageControl.Download,
+    // The form holds the schema INPUT (choices, including inherit); Schema is typed as its output.
+    meta: { metricVisibility: getMetricVisibilityChoices(version?.meta) } as Schema['meta'],
+  };
+
+  const form = useForm({ schema, defaultValues, shouldUnregister: false, mode: 'onChange' });
+
+  const skipTrainedWords = !isTextualInversion && (form.watch('skipTrainedWords') ?? false);
+  const trainedWords = form.watch('trainedWords') ?? [];
+  const baseModel = form.watch('baseModel') ?? initialBaseModel;
+  // Non-commercial base models (e.g. Ideogram) can't be monetized — hide the
+  // licensing-fee and early-access controls for these versions.
+  const isNonCommercial = isNonCommercialBaseModel(baseModel);
+  const recResources = form.watch('recommendedResources') ?? [];
+  // Clip skip only applies to SD1.x / SDXL-family base models — hide it elsewhere.
+  const showClipSkip = baseModelSupportsClipSkip(baseModel);
+  // Recommended Resources clutter the form; only surface the section when the
+  // version already has recommended resources set.
+  const showRecommendedResources = recResources.length > 0;
+  const [minStrength, maxStrength] = form.watch([
+    'settings.minStrength',
+    'settings.maxStrength',
+  ]) as number[];
+  const isTurbo = !!form.watch('settings.turbo');
+  const ecosystemTurboSettings = getEcosystemTurboSettings(
+    getBaseModelConfig(baseModel).ecosystemId
+  );
+  const showTurboSection =
+    !!ecosystemTurboSettings && TURBO_VARIANT_MODEL_TYPES.includes(model?.type as ModelType);
+  const showTurboLoraPicker = isCheckpointVersion && !!ecosystemTurboSettings;
+  // The form keeps only the id; the card needs the resource, picked here or fetched for a stored id.
+  const turboLoraId = form.watch('settings.generation.turboLora')?.id;
+  const [pickedTurboLora, setPickedTurboLora] = useState<GenerationResource | null>(null);
+  const { data: storedTurboLora } = trpc.generation.getResourceDataByIds.useQuery(
+    { ids: [turboLoraId ?? 0] },
+    { enabled: isCheckpointVersion && !!turboLoraId && pickedTurboLora?.id !== turboLoraId }
+  );
+  const turboLora = !turboLoraId
+    ? null
+    : pickedTurboLora?.id === turboLoraId
+    ? pickedTurboLora
+    : storedTurboLora?.find((r) => r.id === turboLoraId) ?? null;
+  const { isDirty } = form.formState;
+  const paidAccessConfig = form.watch('paidAccessConfig');
+  // The three generation grants the terms model supports. Seeded from the stored config so an existing
+  // choice survives an unrelated edit, and resynced in the form.reset effect below — without that, a reset
+  // restores a price underneath a stale radio.
+  const [genMode, setGenMode] = useState<GenerationMode>(() =>
+    generationModeOf(toFormPaidAccessConfig(version?.paidAccess, version?.donationGoal))
+  );
+  const usageControl = form.watch('usageControl');
+  const currentLicensingFee = form.watch('licensingFee') ?? 0;
+  const existingSettlementCurrency = version?.licensingFeeSettlementCurrency ?? null;
+  const hasExistingLicensingFee = Number(version?.licensingFee ?? 0) > 0;
+  // Two reasons a version can't earn anything at all — not a gate, not a per-generation fee. Every
+  // control goes and the section explains itself, rather than leaving editable inputs whose values the
+  // submit would drop. Private models keep their fee editor; only the gate is theirs to lose.
+  const monetizationBlockedReason = model?.poi ? 'poi' : isNonCommercial ? 'nonCommercial' : null;
+  const monetizationBlocked = !!monetizationBlockedReason;
+  // What the submit actually sends, so the warnings and the affirmation gate read the same value the
+  // payload carries instead of the untouched form state.
+  const submittedFee = monetizationBlocked ? 0 : currentLicensingFee ?? 0;
+  // A version that already charges opens with the monetization section expanded; everything else starts
+  // collapsed behind the master switch below.
+  const hasExistingCharge = !!version?.paidAccess || hasExistingLicensingFee;
+  const [chargeEnabled, setChargeEnabled] = useState(hasExistingCharge);
+  // The generation fee gets its own opt-in beside paid access, so each of the two ways to charge opens
+  // its own card. Paid access tracks `paidAccessConfig != null`; the fee has no such object, so it needs
+  // state of its own rather than reading `licensingFee > 0` (which would collapse the card the moment a
+  // creator cleared the field to retype it).
+  const [feeEnabled, setFeeEnabled] = useState(hasExistingLicensingFee);
+  const rightsAffirmed = form.watch('rightsAffirmed') ?? false;
+  // The fee is edited as a whole-number "buzz per N images" ratio; the stored `licensingFee` stays per-image.
+  const [feeRatio, setFeeRatio] = useState(() => feeToRatio(initialLicensingFee));
+  const applyFeeRatio = (next: { buzz: number; images: number }) => {
+    setFeeRatio(next);
+    form.setValue('licensingFee', ratioToFee(next.buzz, next.images), {
+      shouldDirty: true,
+      shouldValidate: true,
+    });
+  };
+  // `memberInBadState` mirrors the server's getCapTier, which excludes bad-state subs — so the UI never
+  // advertises an allowance the server will reject.
+  const feeCapTier = resolveCapTier({
+    tier: currentUser?.tier ?? null,
+    isMember: !!currentUser?.tier && currentUser.tier !== 'free' && !currentUser.memberInBadState,
+  });
+  // Keyed to the WATCHED base model, not the seeded one, so switching ecosystem mid-form moves the fee
+  // ceiling instead of stranding it on whatever the form loaded with.
+  const limits = monetizationLimits({ tier: feeCapTier, baseModel });
+  const licensingFeeCap = limits.fee.maxPerGeneration;
+  const feeImageOptions = limits.fee.denominators;
+  // Paid access has no ceiling; the input still needs a sane bound, so it borrows the donation one.
+  const paidAccessCap = MAX_DONATION_GOAL;
+  const storedTerms = version?.paidAccess?.terms as ModelVersionTerms | undefined;
+  const storedPaidGen =
+    storedTerms?.generation && !('free' in storedTerms.generation)
+      ? storedTerms.generation
+      : undefined;
+  // What the version already charges for access — the download bundle, or the generation price on a gen-only
+  // version (which has no download tier, so `download?.price` alone would read as unpriced).
+  const storedAccessPrice = storedTerms?.download?.price ?? storedPaidGen?.price ?? 0;
+  const showLicensingFeeBlock =
+    !monetizationBlocked &&
+    (!!features.licensingFee ||
+      hasExistingLicensingFee ||
+      existingSettlementCurrency === LicensingFeeSettlementCurrency.Cash);
+  const showLicensingFeeSettlementCurrency =
+    existingSettlementCurrency === LicensingFeeSettlementCurrency.Cash ||
+    !!currentUser?.isModerator;
+
+  // POI and private: the two model-level reasons a gate can't exist. Read by both the hidden editor
+  // (`showPaidAccessInput`, which has further reasons of its own) and the submitted gate, because hiding
+  // alone leaves the stored config intact (`shouldUnregister: false`) and resubmits a gate the creator can
+  // neither see nor clear — which is what POI did.
+  const gateSuppressed =
+    model?.availability === Availability.Private || !!model?.poi || isNonCommercial;
+
+  // Asked once per version, the first time it earns anything — a version already on record keeps its
+  // affirmation, so editing a price later doesn't ask again.
+  //
+  // Derived from the value the submit actually sends, not from the raw watched config: the config
+  // survives (shouldUnregister: false) when its editor is hidden — a private model, or a usage control
+  // that can't be gated — and reading it directly asked for an affirmation the server would never want.
+  // The cast is the input-vs-output type of the form schema; both seed paths write concrete values.
+  const gateCharges = paidAccessCharges(
+    toPaidAccessInput(
+      gateSuppressed ? null : (paidAccessConfig as FormPaidAccessConfig | null | undefined),
+      usageControl
+    )
+  );
+  // Scoped to the current owner, as the server scopes it (resolveRightsAffirmation passes
+  // `ownerId: model.userId`): an affirmation is a named person accepting liability, so it doesn't
+  // transfer with the model. Unscoped, a model transferred after its affirmation was recorded read as
+  // affirmed here, rendered no checkbox, and failed server-side with nothing on screen to tick.
+  const modelOwnerId = model?.user?.id;
+  const alreadyAffirmed = hasCurrentRightsAffirmation(version?.meta, modelOwnerId);
+  // The carve-out is ownership-scoped, not role-based — exempting on the role alone let every staff
+  // creator skip the affirmation on their OWN models. Requiring a known owner who isn't the current user
+  // is the same condition the server applies, and it discards a moderator's tick on someone else's model
+  // anyway, so without this the gate blocks a save the server would have accepted.
+  const moderatingSomeoneElsesModel =
+    !!currentUser?.isModerator && modelOwnerId != null && modelOwnerId !== currentUser.id;
+  const requiresRightsAffirmation =
+    !alreadyAffirmed && !moderatingSomeoneElsesModel && (submittedFee > 0 || gateCharges);
+  // Owner-only, as on the server: a moderator can't give this statement on the creator's behalf.
+  // A version already public on this base model is grandfathered, so its edits don't ask.
+  const attestingOwnerId = modelOwnerId ?? currentUser?.id;
+  const attestationGrandfathered =
+    requiresBaseModelAttestationFor({ baseModel: version?.baseModel, modelType: model?.type }) &&
+    !!version?.status &&
+    version.status !== ModelStatus.Draft &&
+    version.status !== ModelStatus.Scheduled &&
+    version.status !== ModelStatus.Training;
+  const requiresBaseModelAttestation =
+    !attestationGrandfathered &&
+    requiresBaseModelAttestationFor({ baseModel, modelType: model?.type }) &&
+    attestingOwnerId != null &&
+    attestingOwnerId === currentUser?.id &&
+    !hasBaseModelAttestation(version?.meta, { baseModel, ownerId: attestingOwnerId });
+  // Step 2 of the disclosure: asked as soon as the creator says they want to charge, so the pricing
+  // controls never appear before the affirmation. Distinct from `requiresRightsAffirmation`, which is the
+  // submit gate and stays keyed to an actual charge — toggling the switch and changing your mind must not
+  // block a save.
+  const showRightsAffirmation = !alreadyAffirmed && !moderatingSomeoneElsesModel && chargeEnabled;
+  // Step 3: the pricing controls. A version already charging without an affirmation on record (predates
+  // the requirement) keeps them visible, so it can still be edited or turned off.
+  // The carve-out has to reach the disclosure too, not just the submit gate: without it a moderator
+  // pricing someone else's model can only reveal these controls by ticking a statement that is false for
+  // them, to satisfy a gate that no longer asks for it.
+  const showChargeSettings =
+    chargeEnabled &&
+    (alreadyAffirmed || rightsAffirmed || hasExistingCharge || moderatingSomeoneElsesModel);
+  // Keyed to the VALUES, not to the switch: a stored charge can also be cleared with the section open (a
+  // hand-typed 0, the inner paid-access switch) or with it unmounted entirely (a non-commercial base
+  // model), and those lose exactly as much as closing the section does. Reading the switch position
+  // instead reduces to `!chargeEnabled` — `hasExistingCharge` forces the `showChargeSettings` OR-arm
+  // true — and misses every one of them.
+  // Step 4 for the fee: its own opt-in, so the fee editor is reached by saying you want to charge per
+  // generation rather than by the section being open at all.
+  const feeEditorOpen = showChargeSettings && showLicensingFeeBlock && feeEnabled;
+  const removingStoredFee = hasExistingLicensingFee && submittedFee <= 0;
+  // Read through `gateCharges` — what the submit actually sends — for the same reason it exists: the raw
+  // config survives behind a hidden editor, so a version that went private, or whose usage control can no
+  // longer be gated, drops its gate on save while the config still reads non-null.
+  //
+  // "charges nothing" stands in for "sends no gate" because `buildModelVersionTerms` has no branch that
+  // emits a gate charging nothing (and the server rejects that shape). Add one and this starts lying —
+  // switch it to the nullness of `toPaidAccessInput` then.
+  const removingStoredGate = !!version?.paidAccess && !gateCharges;
+  const removingStoredCharge = removingStoredFee || removingStoredGate;
+
+  const licensingSourceVersionId = form.watch('licensingSourceVersionId') ?? null;
+  // 🔴 `enabled` waits on the model's TYPE, not just on `baseModel`. Do not relax it back.
+  // `baseModel` is seeded synchronously (version -> previousBaseModel -> lastUsedBaseModel -> default)
+  // while `model` arrives from a query, so gating on `baseModel` alone fires a first fetch with
+  // `modelType: undefined`. The type filter inside `getLicensingRoots` is conditional, so that
+  // unscoped fetch returns the ecosystem's CHECKPOINT roots — and the default-selection effect below
+  // stamps one onto a LoRA with `shouldDirty: false`, where nothing on screen marks it as changed. The
+  // scoped refetch then returns [], and the effect early-returns on a null default, so it can never
+  // clear what it already set. That is how 160 non-Checkpoint versions came to charge a checkpoint's
+  // per-image fee (CU 868kwf2fd). The server coerces the same case, but this is what stops the form
+  // showing a selection it is about to lose.
+  const { data: licensingRootsData } = trpc.modelVersion.getLicensingRoots.useQuery(
+    { baseModel, modelType: model?.type },
+    { enabled: !!baseModel && !!model?.type }
+  );
+  const defaultLicensingSourceId = licensingRootsData?.defaultVersionId ?? null;
+  // A version that is itself a licensing root is the source, so it doesn't pick a parent.
+  const currentIsLicensingRoot = (licensingRootsData?.roots ?? []).some(
+    (r) => r.id === version?.id
+  );
+  // Versions flagged NotDerivative (e.g. API-only official checkpoints) aren't
+  // fine-tunes, so the form doesn't require/auto-select a parent for them. They
+  // can still set their own licensing fee via the fee field above.
+  const notDerivative = Flags.hasFlag(version?.flags ?? 0, ModelVersionFlag.NotDerivative);
+  // Exclude only the version being edited (a root can't point at itself). The
+  // default root is a normal, pre-selected option — there is no null "Default".
+  const licensingRoots = (licensingRootsData?.roots ?? []).filter((r) => r.id !== version?.id);
+  const showLicensingPicker =
+    licensingRoots.length > 0 && !currentIsLicensingRoot && !notDerivative;
+
+  // A base-model change invalidates the selected source (roots are base-scoped);
+  // the default effect below re-selects the new base's default.
+  const prevBaseModelRef = useRef(baseModel);
+  useEffect(() => {
+    if (prevBaseModelRef.current === baseModel) return;
+    prevBaseModelRef.current = baseModel;
+    if (form.getValues('licensingSourceVersionId') != null)
+      form.setValue('licensingSourceVersionId', null, { shouldDirty: true });
+  }, [baseModel]);
+
+  // No effect clears the source when the MODEL TYPE changes, and adding one is not the oversight it
+  // looks like — a round of this fix did add one, and it was dead code. Mantine's Stepper renders only
+  // the active step's children, so this form is UNMOUNTED for the whole of the step-1 edit where the
+  // type is chosen; coming back remounts it and any `useRef` seed already holds the new type. No other
+  // in-app surface has a type control. The effect could not fire, and the test that appeared to cover
+  // it only passed because the harness re-rendered a MOUNTED form with a swapped type — a transition
+  // the wizard never produces. The server coerces a mismatched source regardless, which is where that
+  // rule belongs.
+  // A derivative must record an explicit parent — a null source means no fee, so
+  // pre-select the ecosystem's default root when none is set. Skipped for roots
+  // and exempt versions (which legitimately have no parent).
+  useEffect(() => {
+    if (currentIsLicensingRoot || notDerivative) return;
+    if (defaultLicensingSourceId == null) return;
+    if (form.getValues('licensingSourceVersionId') == null)
+      form.setValue('licensingSourceVersionId', defaultLicensingSourceId, { shouldDirty: false });
+  }, [defaultLicensingSourceId, currentIsLicensingRoot, notDerivative]);
+
+  // handle mismatched baseModels in training data
+  useEffect(() => {
+    if (!baseModel) return;
+    const value =
+      baseModelToTraningDetailsBaseModelMap[
+        baseModel as keyof typeof baseModelToTraningDetailsBaseModelMap
+      ];
+    if (value) {
+      const { trainingDetails } = form.getValues();
+      if (trainingDetails && value !== trainingDetails.baseModel) {
+        trainingDetails.baseModel = value;
+        form.setValue('trainingDetails', trainingDetails);
+      }
+    }
+  }, [baseModel]);
+
+  // Nothing may survive behind a collapsed section: `shouldUnregister` is false, so a hidden value is
+  // still submitted, and a fee the creator can no longer see is both a charge they didn't make and (via
+  // `requiresRightsAffirmation`) a submit blocked by a control that isn't on screen.
+  const feeSeededRef = useRef(false);
+  const clearCharges = () => {
+    setFeeEnabled(false);
+    if ((form.getValues('licensingFee') ?? 0) > 0) {
+      form.setValue('licensingFee', 0, { shouldDirty: true });
+      setFeeRatio((r) => ({ buzz: 0, images: r.images }));
+    }
+    if (form.getValues('paidAccessConfig')) {
+      form.setValue('paidAccessConfig', null, { shouldDirty: true });
+      setGenMode(generationModeOf(null));
+    }
+    if (form.getValues('licensingFeeSettlementCurrency'))
+      form.setValue('licensingFeeSettlementCurrency', null, { shouldDirty: true });
+    // A version that already charges keeps its tick: it's the answer to a question the creator was asked
+    // about THIS version, and clearing it turns a switch round-trip that changed nothing into the
+    // "Confirmation required" save this ticket is about.
+    if (!hasExistingCharge && form.getValues('rightsAffirmed'))
+      form.setValue('rightsAffirmed', false);
+  };
+
+  // Restoring is an explicit action next to the warning, not a side effect of switching back on: the
+  // switch's job is disclosure, and having it silently re-apply the stored price would undo edits the
+  // creator made on purpose (dropping the gate but keeping the fee, or lowering the fee) as well as the
+  // clear. Re-opens the section too — a restored price behind a collapsed switch is the original bug.
+  const restoreStoredCharges = () => {
+    setChargeEnabled(true);
+    if (hasExistingLicensingFee) {
+      setFeeEnabled(true);
+      applyFeeRatio(feeToRatio(Number(version?.licensingFee ?? 0)));
+    }
+    if (version?.paidAccess) {
+      const stored = toFormPaidAccessConfig(version.paidAccess, version.donationGoal);
+      form.setValue('paidAccessConfig', stored, { shouldDirty: true });
+      setGenMode(generationModeOf(stored));
+    }
+    if (version?.licensingFeeSettlementCurrency)
+      form.setValue('licensingFeeSettlementCurrency', version.licensingFeeSettlementCurrency, {
+        shouldDirty: true,
+      });
+  };
+
+  // Unticking the affirmation withdraws the permission the pricing controls depend on, so it clears them
+  // too — leaving a fee behind a hidden editor is the bug this whole change is about. A version that was
+  // already charging is left alone: it has a stored price the creator didn't touch.
+  const prevRightsAffirmedRef = useRef(rightsAffirmed);
+  useEffect(() => {
+    const withdrawn = prevRightsAffirmedRef.current && !rightsAffirmed;
+    prevRightsAffirmedRef.current = rightsAffirmed;
+    if (withdrawn && !hasExistingCharge && !alreadyAffirmed) clearCharges();
+  }, [rightsAffirmed]);
+
+  // The suggested fee lands when the editor first opens, not when the form loads, and once per version:
+  // re-suggesting on a second visit would re-price a creator who had already set the fee to 0 and closed
+  // the section.
+  useEffect(() => {
+    if (!feeEditorOpen || feeSeededRef.current) return;
+    feeSeededRef.current = true;
+    if (hasExistingCharge || (form.getValues('licensingFee') ?? 0) > 0) return;
+    const seeded = seedFeeRatio({ modelType: model?.type, baseModel });
+    if (seeded.buzz > 0) applyFeeRatio(seeded);
+  }, [feeEditorOpen]);
+
+  // Non-commercial base models can't be monetized. The monetization controls are
+  // hidden (shouldUnregister is false, so their values would otherwise persist and
+  // be re-submitted, then rejected server-side with a confusing error). Clear them
+  // when switching to such a base model so the form can save.
+  useEffect(() => {
+    if (!isNonCommercial) return;
+    if ((form.getValues('licensingFee') ?? 0) > 0) {
+      form.setValue('licensingFee', 0);
+      setFeeRatio((r) => ({ buzz: 0, images: r.images }));
+    }
+    if (form.getValues('monetization')) form.setValue('monetization', null);
+    if (form.getValues('paidAccessConfig')) form.setValue('paidAccessConfig', null);
+    if (form.getValues('useMonetization')) form.setValue('useMonetization', false);
+    // `chargeEnabled` is deliberately left alone. A non-commercial base model hides the whole section
+    // anyway, and turning the switch off here would mean switching back to a commercial base model shows
+    // a collapsed section with no sign that the version's charges were just cleared.
+  }, [isNonCommercial]);
+
+  const upsertVersionMutation = trpc.modelVersion.upsert.useMutation({
+    onError(error) {
+      showErrorNotification({
+        error: new Error(error.message),
+        title: 'Failed to save model version',
+      });
+    },
+  });
+  const handleSubmit = async ({
+    recommendedResources: rawRecommendedResources,
+    ...data
+  }: Schema) => {
+    const schemaResult = querySchema.safeParse(router.query);
+    const settings = scopeRecommendedSettings(data.settings, {
+      turboSection: showTurboSection,
+      turboLoraPicker: showTurboLoraPicker,
+    });
+    const decision = decideModelVersionSubmit(
+      { ...data, settings, recommendedResources: rawRecommendedResources },
+      {
+        modelId: model?.id,
+        modelNsfw: !!model?.nsfw,
+        gateSuppressed,
+        monetizationBlocked,
+        showClipSkip,
+        genMode,
+        requiresRightsAffirmation,
+        requiresBaseModelAttestation,
+        isDirty,
+        versionId: version?.id,
+        storedPaidAccessConfig: toFormPaidAccessConfig(version?.paidAccess, version?.donationGoal),
+        templateId: schemaResult.success ? schemaResult.data.templateId : undefined,
+        bountyId: schemaResult.success ? schemaResult.data.bountyId : undefined,
+      }
+    );
+
+    if (decision.kind === 'refuse') {
+      // The offending control can be well below the fold, and a refusal also blocks wizard step
+      // navigation — an inline-only error reads as the button doing nothing, so both surface.
+      if (decision.field) form.setError(decision.field, { message: decision.message });
+      showErrorNotification({ error: new Error(decision.message), title: decision.title });
+      return;
+    }
+
+    if (data.baseModel) setLastUsedBaseModel(data.baseModel);
+
+    if (decision.kind === 'submit') {
+      const { payload, submittedFee, submittedGate, gatedConfig } = decision;
+      const result = await upsertVersionMutation.mutateAsync(
+        payload as Parameters<typeof upsertVersionMutation.mutateAsync>[0]
+      );
+
+      // Remembered only once the server has taken it, so what comes back next time is a configuration
+      // that already cleared the eligibility floor, the fee ceiling and the affirmation — and read off
+      // the submitted values rather than form state, which can still hold a charge the payload dropped.
+      if (model?.type && (submittedFee > 0 || submittedGate)) {
+        let paidAccess: MonetizationDefaults['paidAccess'] = null;
+        if (submittedGate && gatedConfig) {
+          const { donationGoalEnabled, donationGoal, ...rest } = gatedConfig;
+          paidAccess = rest;
+        }
+        monetizationDefaultsStore.set(model.type, { fee: feeToRatio(submittedFee), paidAccess });
+      }
+
+      await queryUtils.modelVersion.getById.invalidate({ id: result.id, withFiles: true });
+      await queryUtils.modelVersion.getById.invalidate({ id: result.id });
+      await queryUtils.modelVersion.getByIdForEdit.invalidate({ id: result.id, withFiles: true });
+      await queryUtils.modelVersion.getByIdForEdit.invalidate({ id: result.id });
+      if (model) await queryUtils.model.getById.invalidate({ id: model.id });
+      if (rawRecommendedResources?.length) {
+        const queryKey = getQueryKey(trpc.model.getRecentlyRecommended);
+        queryClient.setQueriesData<MyRecentlyRecommended>({ queryKey, exact: false }, (old) => {
+          if (!old) return;
+          return uniq([
+            ...rawRecommendedResources.map((r) => r.model.id).filter(isDefined),
+            ...old,
+          ]);
+        });
+      }
+      onSubmit(result as ModelVersionUpsertInput);
+    } else {
+      onSubmit(version as ModelVersionUpsertInput);
+    }
+  };
+
+  useEffect(() => {
+    if (version) {
+      form.reset({
+        ...version,
+        licensingFee: Number(version.licensingFee ?? 0),
+        modelId: version.modelId ?? model?.id ?? -1,
+        baseModel: version.baseModel,
+        skipTrainedWords: isTextualInversion
+          ? false
+          : acceptsTrainedWords
+          ? version?.trainedWords
+            ? !version.trainedWords.length
+            : false
+          : true,
+        paidAccessConfig: features.earlyAccessModel
+          ? toFormPaidAccessConfig(version?.paidAccess, version?.donationGoal)
+          : null,
+        recommendedResources: version.recommendedResources ?? [],
+        meta: { metricVisibility: getMetricVisibilityChoices(version.meta) } as Schema['meta'],
+      });
+      // Keep the ratio inputs in step with the form value reset (they're local state, not form-bound).
+      setFeeRatio(feeToRatio(Number(version.licensingFee ?? 0)));
+      // Same for the generation-price checkbox. Without this it keeps its mount-time value while `reset`
+      // restores a generationPrice underneath it: on first render `version` is undefined so the box seeds
+      // off, then a price arrives and is charged while the input stays hidden — and after the creator
+      // unchecks it, any refetch/invalidate re-populates the value they just cleared and re-saves it.
+      setGenMode(
+        generationModeOf(toFormPaidAccessConfig(version.paidAccess, version.donationGoal))
+      );
+      // And for the master switch, for the same reason: `reset` restores the stored fee/gate, so the
+      // switch has to follow what was actually restored rather than its mount-time value.
+      setChargeEnabled(!!version.paidAccess || Number(version.licensingFee ?? 0) > 0);
+      setFeeEnabled(Number(version.licensingFee ?? 0) > 0);
+      feeSeededRef.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [acceptsTrainedWords, isTextualInversion, model?.id, version]);
+
+  const maxEarlyAccessModels = getMaxEarlyAccessModels({ userMeta: currentUser?.meta, features });
+  const earlyAccessUnlockedDays = EARLY_ACCESS_CONFIG.scoreTimeFrameUnlock
+    // TODO: Update to model scores.
+    .map((data) => {
+      const [, days] = data;
+      return currentUser?.isModerator ||
+        days <= getMaxEarlyAccessDays({ userMeta: currentUser?.meta, features })
+        ? days
+        : null;
+    })
+    .filter(isDefined);
+
+  // A gate is present (timed OR permanent) — a permanent gate has no endsAt, so check the row, not endsAt.
+  // Keeps the Paid Access section visible/editable for a published permanent-gated version.
+  const atEarlyAccess = !!version?.paidAccess;
+  const isPublished = version?.status === 'Published';
+  // The stored price is a FLOOR, never a ceiling: the server allows resubmitting over-cap, so clamping
+  // down would silently cut a grandfathered price. Keying the ceiling to `isPublished` made the stored
+  // price its own maximum on every released version — Mantine clamps to `max` on blur, so a raise
+  // reverted on save with nothing on screen (CU 868kwjc13). Raises are the server's call
+  // (assertPaidAccessCaps), and it blocks only what exceeds the tier cap.
+  const accessPriceMax = Math.max(Math.min(MAX_DONATION_GOAL, paidAccessCap), storedAccessPrice);
+  const isPrivateModel = model?.availability === Availability.Private;
+  // A timed Early Access window can't be *started* after publish; only a version already on one keeps it.
+  // Permanent Paid Access has no window, so it stays available post-publish.
+  const timedAlreadySet = version?.paidAccess?.timeframeDays != null;
+  const canChooseTimed = !isPublished || timedAlreadySet;
+  // Paid access applies only to downloadable or on-site-generation versions (undefined = Download);
+  // on-site-generation-only can't charge for download (see isGenOnly). Other controls can't be gated.
+  const isGenOnly = usageControl === ModelUsageControl.Generation;
+  const paidAccessUsageOk =
+    !usageControl || usageControl === ModelUsageControl.Download || isGenOnly;
+  // Who may configure a gate: a moderator; a creator with early-access score (timed EA, only pre-publish
+  // or while already gated); or anyone adding permanent Paid Access post-publish (no timed window).
+  const canConfigurePaidAccess =
+    currentUser?.isModerator ||
+    (maxEarlyAccessModels > 0 &&
+      features.earlyAccessModel &&
+      earlyAccessUnlockedDays.length > 0 &&
+      (!isPublished || atEarlyAccess)) ||
+    isPublished;
+  const showPaidAccessInput =
+    !gateSuppressed &&
+    !isNonCommercial && // Non-commercial base models can't be monetized.
+    paidAccessUsageOk &&
+    canConfigurePaidAccess;
+  // Where the score alone keeps the timed window shut, say so instead of leaving no section at all.
+  const showEarlyAccessLocked =
+    !showPaidAccessInput &&
+    !currentUser?.isModerator &&
+    features.earlyAccessModel &&
+    !gateSuppressed &&
+    paidAccessUsageOk &&
+    !isPublished &&
+    !atEarlyAccess &&
+    (maxEarlyAccessModels === 0 || earlyAccessUnlockedDays.length === 0);
+  const canIncreaseEarlyAccess = version?.status !== 'Published';
+  const maxEarlyAccessValue = canIncreaseEarlyAccess
+    ? MAX_EARLY_ACCCESS
+    : version?.paidAccess?.timeframeDays ?? 0;
+
+  // Fetched for moderators too — they are not exempt from the allowance, so hiding the counter from
+  // them makes the server's refusal their first warning. Gated on the monetization sections being
+  // visible: getCapTier behind it is three uncached queries against the primary.
+  const { data: pricingAllowance } = trpc.modelVersion.getPricingAllowance.useQuery(undefined, {
+    enabled: showPaidAccessInput || showLicensingFeeBlock,
+  });
+  // A version that already carries a price is exempt, so the counter must not read "used up" while the
+  // edit in front of the creator is free (a boosted licensed version gaining a gate aside).
+  const allowanceState = pricingAllowance
+    ? pricingAllowanceState({
+        used: pricingAllowance.used,
+        limit: pricingAllowance.baseLimit,
+        exempt: hasExistingCharge,
+      })
+    : null;
+  // Held to baseLimit above, which is what a paid-access gate is enforced against; only a licensing fee
+  // may spend the boost.
+  const feeAllowanceState =
+    pricingAllowance && pricingAllowance.feeBoost > 0
+      ? pricingAllowanceState({
+          used: pricingAllowance.used,
+          limit: pricingAllowance.feeLimit,
+          exempt: hasExistingCharge,
+        })
+      : null;
+  // Not waived for moderators, and not applied to a version that already charges. Absent while the
+  // query is in flight, so the control stays enabled rather than flickering shut; the server refuses anyway.
+  const eligibility = pricingAllowance?.eligibility;
+  const belowPricingFloor = !!eligibility && !eligibility.eligible && !hasExistingCharge;
+
+  // Editing a version that already holds an EA slot doesn't count against the cap — mirrors the
+  // server carve-out in assertUserEarlyAccessLimits.
+  const { data: userEarlyAccessVersions } = trpc.modelVersion.getUserEarlyAccessVersions.useQuery(
+    undefined,
+    { enabled: showPaidAccessInput && !currentUser?.isModerator }
+  );
+  const activeEarlyAccessCount = userEarlyAccessVersions?.length ?? 0;
+  const editingCountsTowardCap =
+    version?.id != null && !!userEarlyAccessVersions?.some((v) => v.id === version.id);
+  const atEarlyAccessModelCap =
+    !currentUser?.isModerator &&
+    maxEarlyAccessModels > 0 &&
+    activeEarlyAccessCount >= maxEarlyAccessModels &&
+    !editingCountsTowardCap;
+  const resourceLabel = getDisplayName(model?.type ?? '');
+  const modelDownloadEnabled = !usageControl || usageControl === ModelUsageControl.Download;
+
+  // Check if current base model selection violates NSFW restrictions
+  const hasNsfwBaseModelViolation =
+    model?.nsfw && baseModel && nsfwRestrictedBaseModels.includes(baseModel as BaseModel);
+
+  const canSave = !hasNsfwBaseModelViolation;
+
+  // A card header carrying its own toggle needs to read as a header, not as another row of fields.
+  const cardHeaderBg = colorScheme === 'dark' ? 'dark.6' : 'gray.1';
+
+  // Removals the creator cannot prevent — the gate goes on save whatever they do, whether the submit
+  // substitutes null (suppressed model, ungatable usage control) or an effect already cleared the config
+  // (non-commercial base model). Nothing to offer them, so say why instead.
+  const gateRemovalIsStructural = removingStoredGate && (gateSuppressed || !paidAccessUsageOk);
+  // The one thing a gate removal actually costs. A timed Early Access window can't be started again
+  // after publish (`canChooseTimed`), so dropping one is one-way; permanent Paid Access can be re-added
+  // whenever, so there is nothing to warn about there.
+  const gateRemovalLosesTimedWindow =
+    removingStoredGate && !gateRemovalIsStructural && isPublished && timedAlreadySet;
+  // Whether the control each sentence is about is actually on screen (see the colour rule below).
+  const removalControlsVisible =
+    (!removingStoredFee || (showChargeSettings && showLicensingFeeBlock)) &&
+    (!removingStoredGate || (showChargeSettings && showPaidAccessInput));
+
+  // What the creator last saved a charge with for this model type, offered back on a new version — the
+  // settings block otherwise resets on every model. Only ever a starting point: nothing is applied until
+  // they save, and the affirmation is never remembered, because it is a statement about THIS model.
+  //
+  // A version that already charges is left alone. Switching the section back on there is the explicit
+  // `restoreStoredCharges` path, and overwriting a stored price with a remembered one would be the
+  // silent re-pricing that path exists to avoid.
+  const applyMonetizationDefaults = () => {
+    if (hasExistingCharge) return;
+    const parsed = monetizationDefaultsSchema.safeParse(monetizationDefaultsStore.get(model?.type));
+    if (!parsed.success) return;
+    const { fee, paidAccess } = parsed.data;
+
+    // Clamped, not rejected: the ceiling is 5x on a video base model, so a fee remembered from one can
+    // exceed what this version may charge. The denominator has no such fallback — one the select cannot
+    // offer would seed an option with no item.
+    if (fee.buzz > 0 && showLicensingFeeBlock && feeImageOptions.includes(fee.images)) {
+      feeSeededRef.current = true;
+      setFeeEnabled(true);
+      applyFeeRatio({
+        buzz: Math.min(fee.buzz, feeMaxFor(limits, fee.images)),
+        images: fee.images,
+      });
+    }
+
+    // A remembered timed window is dropped rather than coerced when this version cannot offer it (past
+    // publish, or a length this creator hasn't unlocked): shortening someone's early-access window on
+    // their behalf is a worse answer than leaving the gate for them to set.
+    const timeframe = paidAccess?.timeframe;
+    const timedOfferable =
+      canChooseTimed &&
+      timeframe != null &&
+      earlyAccessUnlockedDays.includes(timeframe) &&
+      timeframe <= maxEarlyAccessValue;
+    if (paidAccess && showPaidAccessInput && (paidAccess.permanent || timedOfferable)) {
+      const config: FormPaidAccessConfig = {
+        ...paidAccess,
+        donationGoalEnabled: false,
+        donationGoal: undefined,
+      };
+      form.setValue('paidAccessConfig', config, { shouldDirty: true });
+      setGenMode(generationModeOf(config));
+    }
+  };
+
+  // Keyed to the pricing controls mounting, NOT to the switch: at the switch the creator has only the
+  // affirmation on screen, so a fee restored there is a charge with no control to see it by — and one
+  // `requiresRightsAffirmation` then refuses the save over. Same disclosure rule the seeded suggestion
+  // follows, and once per mount for the same reason: re-applying after a clear would undo it.
+  const monetizationDefaultsAppliedRef = useRef(false);
+  useEffect(() => {
+    if (!showChargeSettings || monetizationDefaultsAppliedRef.current) return;
+    monetizationDefaultsAppliedRef.current = true;
+    applyMonetizationDefaults();
+  }, [showChargeSettings]);
+
+  return (
+    <>
+      <Form id={id} form={form} onSubmit={handleSubmit}>
+        <Stack>
+          <Card withBorder p="md">
+            <Stack>
+              <Text fw={600}>Version details</Text>
+              <InputText
+                name="name"
+                label="Name"
+                placeholder="e.g.: v1.0"
+                withAsterisk
+                maxLength={25}
+              />
+              {afterName}
+
+              {features.generationOnlyModels && (!isPrivateModel || currentUser?.isModerator) && (
+                <>
+                  <InputSelect
+                    name="usageControl"
+                    label="Usage Control"
+                    description="Determines what other users can do with your model. You can change this setting at any time."
+                    placeholder="Select how this resource can be used"
+                    withAsterisk
+                    style={{ flex: 1 }}
+                    data={Object.values(ModelUsageControl)
+                      .map((x) => ({
+                        value: x,
+                        label: getDisplayName(x, {
+                          overwrites: {
+                            [ModelUsageControl.Download]: 'Download & On-Site Generation',
+                            [ModelUsageControl.Generation]: 'On-Site Generation Only',
+                            [ModelUsageControl.InternalGeneration]: 'Internal API Generation Only',
+                            [ModelUsageControl.ExternalGeneration]:
+                              'External API Generation (no files)',
+                          },
+                        }),
+                      }))
+                      .filter(
+                        // Mod-only options: hide unless already selected or user is a moderator.
+                        (x) =>
+                          (x.value !== ModelUsageControl.InternalGeneration &&
+                            x.value !== ModelUsageControl.ExternalGeneration) ||
+                          x.value === usageControl ||
+                          currentUser?.isModerator
+                      )}
+                    allowDeselect={false}
+                  />
+
+                  <Alert color="blue">
+                    {modelDownloadEnabled ? (
+                      <Text>
+                        People will be able to download & generate with this model version.
+                      </Text>
+                    ) : (
+                      <Text>
+                        People will be able to generate with this model version, but will{' '}
+                        <span className="underline">not</span> be able to download it.
+                      </Text>
+                    )}
+                  </Alert>
+                </>
+              )}
+
+              <Group gap="xs" grow>
+                <InputSelect
+                  name="baseModel"
+                  label="Base Model"
+                  placeholder="Base Model"
+                  style={{ flex: 1 }}
+                  data={getActiveBaseModels(currentUser?.isModerator).map((x) => ({
+                    value: x.name,
+                    label: x.name,
+                  }))}
+                  allowDeselect={false}
+                  withAsterisk
+                  searchable
+                  // Select the current value on focus so the user can click and immediately
+                  // type to filter (e.g. "wan") instead of clearing the field first.
+                  onFocus={(e) => e.currentTarget.select()}
+                />
+                {showBaseModelType && (
+                  <InputSelect
+                    name="baseModelType"
+                    label="Base Model Type"
+                    placeholder="Base Model Type"
+                    data={baseModelTypeOptions}
+                    allowDeselect={false}
+                  />
+                )}
+              </Group>
+              {requiresBaseModelAttestation && (
+                <InputCheckbox name="baseModelAttested" label={BASE_MODEL_ATTESTATION_STATEMENT} />
+              )}
+              {showLicensingPicker && (
+                <Stack gap="xs">
+                  <Select
+                    label="Fine-tuned from"
+                    description="Select the parent model this version was fine-tuned from. Its licensing fee applies to generations made with your model."
+                    placeholder="Select a parent model"
+                    allowDeselect={false}
+                    comboboxProps={{ withinPortal: true }}
+                    value={licensingSourceVersionId ? String(licensingSourceVersionId) : null}
+                    onChange={(val) =>
+                      form.setValue('licensingSourceVersionId', val ? Number(val) : null, {
+                        shouldDirty: true,
+                      })
+                    }
+                    data={licensingRoots.map((r) => ({
+                      value: String(r.id),
+                      label: licensingOptionLabel(r.versionName, r.licensingFee),
+                    }))}
+                  />
+                </Stack>
+              )}
+              {hasNsfwBaseModelViolation && (
+                <Alert color="red" title="License Restriction Violation">
+                  <Text size="sm">
+                    NSFW models cannot use base models with license restrictions. The selected base
+                    model does not permit NSFW content. Please select a different base model.
+                  </Text>
+                  <Text size="sm" mt="xs">
+                    Restricted base models: {nsfwRestrictedBaseModels.join(', ')}
+                  </Text>
+                </Alert>
+              )}
+              {baseModel === 'SD 3' && (
+                <Alert color="yellow" title="SD3 Unsupported">
+                  <Text>
+                    On-site generation with SD3 is unsupported.{' '}
+                    <Text
+                      td="underline"
+                      component="a"
+                      target="_blank"
+                      href={`/articles/${EARLY_ACCESS_CONFIG.article}`}
+                    >
+                      Learn more
+                    </Text>
+                  </Text>
+                </Alert>
+              )}
+              {isNonCommercial && (
+                <Alert color="yellow" title="Non-commercial base model">
+                  <Text>
+                    {baseModel} is licensed for non-commercial use only. This version cannot be
+                    monetized (no licensing fees or paid early access) and commercial use is
+                    disabled.
+                  </Text>
+                </Alert>
+              )}
+              <InputRTE
+                key="description"
+                name="description"
+                label="Version changes or notes"
+                includeControls={['formatting', 'list', 'link', 'blurb']}
+                editorSize="xl"
+              />
+              {acceptsTrainedWords && (
+                <Stack gap="xs">
+                  {!skipTrainedWords && (
+                    <InputCreatableMultiSelect
+                      name="trainedWords"
+                      label="Trigger Words"
+                      placeholder="e.g.: Master Chief"
+                      description={`Please input the words you have trained your model with${
+                        isTextualInversion ? ' (max 1 word)' : ''
+                      }`}
+                      data={trainedWords}
+                      maxValues={isTextualInversion ? 1 : undefined}
+                      clearable
+                      required
+                    />
+                  )}
+                  {!isTextualInversion && (
+                    <InputSwitch
+                      name="skipTrainedWords"
+                      label="This version doesn't require any trigger words"
+                      onChange={(e) =>
+                        e.target.checked ? form.setValue('trainedWords', []) : undefined
+                      }
+                    />
+                  )}
+                </Stack>
+              )}
+              {modelDownloadEnabled && (
+                <InputSwitch
+                  name="requireAuth"
+                  label="Require users to be logged in to download this asset"
+                  description={
+                    <>
+                      This limits a bots ability to download the files associated with this
+                      resource.
+                      <br />
+                      This will also require third-party applications to utilize a user API key to
+                      download the asset files.
+                    </>
+                  }
+                />
+              )}
+              <Stack gap={4}>
+                <Divider label="Training Params" />
+                <Group gap="xs" grow>
+                  <InputNumber
+                    name="epochs"
+                    label="Epochs"
+                    placeholder="Training Epochs"
+                    min={0}
+                    max={100000}
+                    style={{ flexGrow: 1 }}
+                  />
+                  <InputNumber
+                    name="steps"
+                    label="Steps"
+                    placeholder="Training Steps"
+                    min={0}
+                    step={500}
+                    style={{ flexGrow: 1 }}
+                  />
+                </Group>
+              </Stack>
+              {(showClipSkip ||
+                showStrengthInput ||
+                showRecommendedResources ||
+                showTurboLoraPicker) && (
+                <Stack gap={4}>
+                  <Divider label="Recommended Settings" />
+                  <Group gap="xs" className="*:grow">
+                    {showTurboLoraPicker && (
+                      <Stack gap="xs" w="100%">
+                        <ResourceSelect
+                          buttonLabel={
+                            <Stack gap={2} align="center" py="xs">
+                              <Group gap={6}>
+                                <IconPlus size={18} />
+                                <Text fw={600}>Default turbo LoRA</Text>
+                              </Group>
+                              <Text size="xs" c="dimmed" ta="center" fw={400}>
+                                What the generator&apos;s Turbo picker starts on with this
+                                checkpoint. Leave empty for the ecosystem&apos;s default.
+                              </Text>
+                            </Stack>
+                          }
+                          buttonProps={{
+                            variant: 'default',
+                            h: 'auto',
+                            leftSection: null,
+                            className: 'border-2 border-dashed',
+                            styles: {
+                              root: { borderColor: 'var(--mantine-color-default-border)' },
+                              label: { whiteSpace: 'normal' },
+                            },
+                          }}
+                          value={turboLora}
+                          onChange={(resource) => {
+                            setPickedTurboLora(resource);
+                            form.setValue(
+                              'settings.generation.turboLora',
+                              resource ? { id: resource.id } : null,
+                              { shouldDirty: true }
+                            );
+                          }}
+                          selectSource="modelVersion"
+                          options={{
+                            resources: TURBO_VARIANT_MODEL_TYPES.map((type) => ({
+                              type,
+                              baseModels: [baseModel],
+                            })),
+                            turboOnly: true,
+                          }}
+                        />
+                        {turboLora && (
+                          <InputNumber
+                            name="settings.generation.turboLora.strength"
+                            label="Turbo LoRA strength"
+                            description={`Leave empty for the LoRA's own default (${turboLora.settings.strength.default}).`}
+                            min={turboLora.settings.strength.min}
+                            max={turboLora.settings.strength.max}
+                            decimalScale={2}
+                            step={0.05}
+                          />
+                        )}
+                        {turboLora && (turboLora.isPrivate || !turboLora.canGenerate) && (
+                          <Text size="xs" c="yellow.6">
+                            This LoRA is not published or not generatable right now. The generator
+                            uses the ecosystem default until it is, and your pick is kept.
+                          </Text>
+                        )}
+                      </Stack>
+                    )}
+                    {showClipSkip && (
+                      <InputNumber
+                        name="clipSkip"
+                        label="Clip Skip"
+                        placeholder="Clip Skip"
+                        min={1}
+                        max={12}
+                      />
+                    )}
+                    {showStrengthInput && (
+                      <Group w="100%" align="start" grow>
+                        <InputNumber
+                          name="settings.minStrength"
+                          label="Min Strength"
+                          min={-100}
+                          max={100}
+                          decimalScale={1}
+                          step={0.1}
+                        />
+                        <InputNumber
+                          name="settings.maxStrength"
+                          label="Max Strength"
+                          min={-100}
+                          max={100}
+                          decimalScale={1}
+                          step={0.1}
+                        />
+                        <InputNumber
+                          name="settings.strength"
+                          label="Strength"
+                          min={minStrength ?? LORA_STRENGTH_BOUNDS.min}
+                          max={maxStrength ?? LORA_STRENGTH_BOUNDS.max}
+                          decimalScale={1}
+                          step={0.1}
+                        />
+                      </Group>
+                    )}
+                    {showRecommendedResources && (
+                      <InputResourceSelectMultiple
+                        name="recommendedResources"
+                        label="Resources"
+                        description="Select which resources work best with your model"
+                        selectSource="modelVersion"
+                        buttonLabel="Add resource"
+                        w="100%"
+                        limit={10}
+                        options={{
+                          resources: [{ type: ModelType.Checkpoint, baseModels: [baseModel] }],
+                          excludeIds: recResources.map((r) => r.id),
+                        }}
+                      />
+                    )}
+                  </Group>
+                </Stack>
+              )}
+              {showTurboSection && (
+                <Stack gap="xs">
+                  <Divider label="Turbo" />
+                  <Checkbox
+                    label="Turbo variant"
+                    description="A distillation LoRA for fewer steps. The generator's Turbo picker lists it and applies these settings when it is on."
+                    checked={isTurbo}
+                    onChange={(e) =>
+                      form.setValue(
+                        'settings.turbo',
+                        e.currentTarget.checked ? ecosystemTurboSettings ?? null : null,
+                        { shouldDirty: true, shouldValidate: true }
+                      )
+                    }
+                  />
+                  {isTurbo && (
+                    <>
+                      <RecommendedRangeInputs
+                        name="settings.turbo.steps"
+                        label="Steps"
+                        min={1}
+                        max={100}
+                        required
+                      />
+                      <RecommendedRangeInputs
+                        name="settings.turbo.cfgScale"
+                        label="CFG scale"
+                        min={0}
+                        max={30}
+                        step={0.5}
+                        decimalScale={1}
+                        required
+                      />
+                    </>
+                  )}
+                </Stack>
+              )}
+            </Stack>
+          </Card>
+          {(showPaidAccessInput ||
+            showEarlyAccessLocked ||
+            showLicensingFeeBlock ||
+            requiresRightsAffirmation ||
+            removingStoredCharge ||
+            monetizationBlocked) && (
+            <Card withBorder p="md">
+              <Stack gap={0}>
+                <Stack gap={4} mb="sm">
+                  <Text fw={600}>Monetization</Text>
+                  {!monetizationBlocked &&
+                    (showPaidAccessInput || showLicensingFeeBlock) &&
+                    allowanceState && (
+                      <Group gap={6}>
+                        <Text size="xs" c={allowanceState.atLimit ? 'yellow.5' : 'dimmed'}>
+                          {formatPricingAllowance(allowanceState)}
+                          {feeAllowanceState && pricingAllowance
+                            ? ` · licensing fees: ${feeAllowanceState.used} of ${
+                                feeAllowanceState.limit
+                              }, ${feeAllowanceBoostNote(pricingAllowance.feeBoost)}`
+                            : ''}
+                          {hasExistingCharge ? ' · editing this one is free' : ''}
+                        </Text>
+                        <Popover width={320} withArrow withinPortal shadow="sm">
+                          <Popover.Target>
+                            <ActionIcon
+                              variant="subtle"
+                              color="gray"
+                              size="xs"
+                              aria-label="What counts toward this limit"
+                            >
+                              <IconInfoCircle size={14} />
+                            </ActionIcon>
+                          </Popover.Target>
+                          <Popover.Dropdown>
+                            <Text size="xs">{PRICING_SLOT_EXPLAINER}</Text>
+                          </Popover.Dropdown>
+                        </Popover>
+                        <PricingSlotHistory />
+                        {!allowanceState.unlimited && (
+                          <CapUpsell
+                            used={allowanceState.used}
+                            limit={pricingAllowance?.baseLimit ?? Infinity}
+                            capTier={feeCapTier}
+                          />
+                        )}
+                      </Group>
+                    )}
+                </Stack>
+                {!monetizationBlocked &&
+                  !belowPricingFloor &&
+                  (showPaidAccessInput || showLicensingFeeBlock) &&
+                  allowanceState?.atLimit && (
+                    <Alert
+                      color="yellow"
+                      icon={<IconAlertTriangle size={18} />}
+                      title={
+                        feeAllowanceState && !feeAllowanceState.atLimit
+                          ? "You've used this month's paid-access allowance"
+                          : "You've priced all this month's versions"
+                      }
+                      mb="sm"
+                    >
+                      <Text size="sm">{PRICING_SLOT_EXPLAINER}</Text>
+                      {feeAllowanceState && !feeAllowanceState.atLimit && (
+                        <Text size="sm" mt={4}>
+                          You can still add a licensing fee: your extra slots cover{' '}
+                          {feeAllowanceState.remaining} more this month. They don&apos;t cover
+                          permanent paid access.
+                        </Text>
+                      )}
+                      {showPaidAccessInput && canChooseTimed && (
+                        <Text size="sm" mt={4}>
+                          You can still put this version on a timed Early Access window — that
+                          doesn&apos;t need a slot. A licensing fee or permanent paid access does.
+                        </Text>
+                      )}
+                      <Box mt="xs">
+                        <CapUpsell
+                          used={allowanceState.used}
+                          limit={pricingAllowance?.baseLimit ?? Infinity}
+                          capTier={feeCapTier}
+                          expanded
+                        />
+                      </Box>
+                    </Alert>
+                  )}
+                {monetizationBlocked && (
+                  <Alert
+                    color="red"
+                    icon={<IconAlertTriangle size={18} />}
+                    title={
+                      monetizationBlockedReason === 'poi'
+                        ? "Models depicting a real person can't be monetized"
+                        : 'This base model is licensed for non-commercial use'
+                    }
+                  >
+                    <Text size="sm">
+                      Paid access and per-generation license fees are both unavailable for this{' '}
+                      {monetizationBlockedReason === 'poi' ? 'model' : 'base model'}.
+                      {monetizationBlockedReason === 'nonCommercial' &&
+                        ' Switch back to a commercial base model to restore them.'}
+                    </Text>
+                    {removingStoredCharge && (
+                      <Text size="xs" mt={4}>
+                        Saving now removes this version&apos;s{' '}
+                        {removingStoredFee && removingStoredGate
+                          ? 'license fee and paid access'
+                          : removingStoredFee
+                          ? 'license fee'
+                          : 'paid access'}
+                        .
+                      </Text>
+                    )}
+                  </Alert>
+                )}
+                {!monetizationBlocked && belowPricingFloor && eligibility && (
+                  <Alert
+                    color="yellow"
+                    icon={<IconAlertTriangle size={18} />}
+                    title={`Monetizing a model needs a Creator Score of ${eligibility.required.toLocaleString()}`}
+                    mb="sm"
+                  >
+                    <Text size="sm">
+                      <CreatorScoreGateMessage
+                        score={eligibility.score}
+                        total={creatorScoreFromSession(currentUser)}
+                        required={eligibility.required}
+                      />{' '}
+                      Prices you have already set are unaffected.
+                    </Text>
+                  </Alert>
+                )}
+                {!monetizationBlocked && (showPaidAccessInput || showLicensingFeeBlock) && (
+                  <Switch
+                    label="I want to monetize this version"
+                    description="Sell access to the version, charge a fee per generation, or both."
+                    checked={chargeEnabled}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setChargeEnabled(checked);
+                      if (!checked) clearCharges();
+                    }}
+                    disabled={belowPricingFloor || (isEarlyAccessOver && !!version?.paidAccess)}
+                  />
+                )}
+                {removingStoredCharge && !monetizationBlocked && (
+                  <Stack gap={4} mt="sm" align="flex-start">
+                    {/* Red only when the control the sentence is about is off screen — that's the case
+                        the creator can't see. On screen, this describes an edit they just made. */}
+                    <Text size="xs" c={removalControlsVisible ? 'yellow.5' : 'red'}>
+                      Saving now removes this version&apos;s{' '}
+                      {removingStoredFee && removingStoredGate
+                        ? 'license fee and paid access'
+                        : removingStoredFee
+                        ? 'license fee'
+                        : 'paid access'}
+                      .
+                    </Text>
+                    {removingStoredGate &&
+                      (gateRemovalIsStructural ? (
+                        <Text size="xs" c="red">
+                          {isPrivateModel
+                            ? "A private model can't have paid access, so this can't be kept."
+                            : "This version's usage control can't be gated, so this can't be kept."}
+                        </Text>
+                      ) : gateRemovalLosesTimedWindow ? (
+                        <Text size="xs" c="red">
+                          This version is already published, so its Early Access window can&apos;t
+                          be started again once removed. Permanent paid access can still be added
+                          back at any time.
+                        </Text>
+                      ) : null)}
+                    {/* No affordance for a removal the creator cannot prevent: the submit substitutes
+                        null for these regardless, so restoring would clear nothing and read as broken.
+                        The fully-blocked reasons (POI, non-commercial) never reach here — they render the
+                        alert above instead, which has no controls to restore into. */}
+                    {(removingStoredFee || !gateRemovalIsStructural) && (
+                      <Anchor
+                        component="button"
+                        type="button"
+                        size="xs"
+                        onClick={restoreStoredCharges}
+                      >
+                        Restore the stored settings
+                      </Anchor>
+                    )}
+                  </Stack>
+                )}
+                {(showRightsAffirmation || requiresRightsAffirmation) && (
+                  <InputCheckbox
+                    name="rightsAffirmed"
+                    label={MONETIZATION_RIGHTS_AFFIRMATION_STATEMENT}
+                    mt="sm"
+                  />
+                )}
+                {showEarlyAccessLocked && (
+                  <EarlyAccessLockedRow score={creatorScoreFromSession(currentUser)} />
+                )}
+                {showChargeSettings && showPaidAccessInput && (
+                  <Stack gap={0} mt="md">
+                    {isEarlyAccessOver && (
+                      <Text size="xs" c="red">
+                        Early access has ended for this model version. You cannot make changes to
+                        early access settings.
+                      </Text>
+                    )}
+                    {atEarlyAccessModelCap && paidAccessConfig === null && (
+                      <Alert color="yellow" icon={<IconAlertTriangle size={18} />} my="sm">
+                        <Text size="xs">
+                          You&apos;ve reached your limit of {maxEarlyAccessModels} concurrent early
+                          access {maxEarlyAccessModels === 1 ? 'model' : 'models'}. Remove early
+                          access from another model, or wait for one to end, before adding it here.
+                        </Text>
+                      </Alert>
+                    )}
+                    <Card withBorder mt="sm">
+                      <Card.Section withBorder inheritPadding py="xs" bg={cardHeaderBg}>
+                        <Group justify="space-between" wrap="nowrap">
+                          <div>
+                            <Text fw={600} size="sm">
+                              Charge for access to this version
+                            </Text>
+                            <Text size="xs" c="dimmed">
+                              Buyers unlock download and generation — for a timed Early Access
+                              window, or ongoing.
+                            </Text>
+                          </div>
+                          <Switch
+                            aria-label="Charge for access to this version"
+                            checked={paidAccessConfig !== null}
+                            onChange={(e) => {
+                              const next = e.target.checked
+                                ? {
+                                    permanent: !canChooseTimed,
+                                    timeframe: EARLY_ACCESS_CONFIG.timeframeValues[0],
+                                    accessPrice: 5000,
+                                    generationPrice: undefined,
+                                    // Required now that the literal is checked against the config type
+                                    // rather than inferred from `setValue`'s input type.
+                                    freeGeneration: false,
+                                    acceptsBlueBuzz: false,
+                                    freePreviewGenerations: DEFAULT_GENERATION_TRIAL_LIMIT,
+                                    donationGoalEnabled: false,
+                                    donationGoal: undefined,
+                                  }
+                                : null;
+                              form.setValue('paidAccessConfig', next);
+                              // The radio is local state, so it has to follow the config it describes.
+                              // Left alone, a creator who picked "Free for everyone" and then toggled this
+                              // switch off and on again kept a radio reading free over a config that
+                              // charges — the screen and the saved price disagreeing about money.
+                              setGenMode(generationModeOf(next));
+                            }}
+                            disabled={
+                              isEarlyAccessOver ||
+                              (atEarlyAccessModelCap && paidAccessConfig === null)
+                            }
+                          />
+                        </Group>
+                      </Card.Section>
+                      {paidAccessConfig && (
+                        <>
+                          <Card.Section inheritPadding py="sm">
+                            <Stack>
+                              <Input.Wrapper
+                                label={
+                                  <Text fw={500} size="sm">
+                                    Access mode
+                                  </Text>
+                                }
+                                description={
+                                  paidAccessConfig.permanent
+                                    ? 'Always requires purchase — this version never becomes free. Uses one of your monthly pricing slots.'
+                                    : `A timed Early Access window; the version becomes free when it ends. ${EARLY_ACCESS_NOT_COUNTED}`
+                                }
+                              >
+                                <SegmentedControl
+                                  value={paidAccessConfig.permanent ? 'permanent' : 'timed'}
+                                  onChange={(value) =>
+                                    form.setValue(
+                                      'paidAccessConfig.permanent',
+                                      value === 'permanent'
+                                    )
+                                  }
+                                  data={[
+                                    {
+                                      label: 'Early Access (timed)',
+                                      value: 'timed',
+                                      // A timed window can't be started after publish (permanent stays available).
+                                      disabled: !canChooseTimed,
+                                    },
+                                    {
+                                      label: 'Paid Access (permanent)',
+                                      value: 'permanent',
+                                    },
+                                  ]}
+                                  color="blue"
+                                  size="xs"
+                                  fullWidth
+                                  disabled={isEarlyAccessOver}
+                                  styles={{
+                                    root: {
+                                      border: `1px solid ${
+                                        colorScheme === 'dark'
+                                          ? theme.colors.dark[4]
+                                          : theme.colors.gray[4]
+                                      }`,
+                                      background: 'none',
+                                      marginTop: 'calc(var(--mantine-spacing-xs) * 0.5)',
+                                    },
+                                  }}
+                                />
+                              </Input.Wrapper>
+                              {!paidAccessConfig.permanent && (
+                                <Input.Wrapper
+                                  label={
+                                    <Group gap="xs">
+                                      <Text fw={500} size="sm">
+                                        Early access time frame
+                                      </Text>
+                                      <Popover width={300} withArrow withinPortal shadow="sm">
+                                        <Popover.Target>
+                                          <IconInfoCircle size={16} />
+                                        </Popover.Target>
+                                        <Popover.Dropdown>
+                                          <Stack gap="xs">
+                                            <Text size="sm">
+                                              The amount of resources you can have in early access
+                                              and for how long is determined by actions you&rsquo;ve
+                                              taken on the site. Increase your limits by posting
+                                              more free models that people want, being kind, and
+                                              generally doing good within the community.
+                                            </Text>
+                                          </Stack>
+                                        </Popover.Dropdown>
+                                      </Popover>
+                                    </Group>
+                                  }
+                                  description={`When the window ends the version becomes free.${
+                                    earlyAccessUnlockedDays.length > 0
+                                      ? ` You can set up to ${Math.max(
+                                          ...earlyAccessUnlockedDays
+                                        )} days.`
+                                      : ''
+                                  }`}
+                                  error={form.formState.errors.paidAccessConfig?.message}
+                                >
+                                  <SegmentedControl
+                                    onChange={(value) =>
+                                      form.setValue(
+                                        'paidAccessConfig.timeframe',
+                                        parseInt(value, 10)
+                                      )
+                                    }
+                                    value={
+                                      paidAccessConfig?.timeframe?.toString() ??
+                                      EARLY_ACCESS_CONFIG.timeframeValues[0]
+                                    }
+                                    data={earlyAccessUnlockedDays.map((v) => ({
+                                      label: `${v} days`,
+                                      value: v.toString(),
+                                      disabled: maxEarlyAccessValue < v,
+                                    }))}
+                                    color="blue"
+                                    size="xs"
+                                    styles={{
+                                      root: {
+                                        border: `1px solid ${
+                                          colorScheme === 'dark'
+                                            ? theme.colors.dark[4]
+                                            : theme.colors.gray[4]
+                                        }`,
+                                        background: 'none',
+                                        marginTop: 'calc(var(--mantine-spacing-xs) * 0.5)', // 5px
+                                      },
+                                    }}
+                                    fullWidth
+                                    disabled={isEarlyAccessOver}
+                                  />
+                                  {earlyAccessUnlockedDays.length !==
+                                    EARLY_ACCESS_CONFIG.timeframeValues.length && (
+                                    <Group wrap="nowrap">
+                                      <Text size="xs" c="yellow">
+                                        You will unlock more early access day over time by posting
+                                        models to the site.
+                                      </Text>
+                                    </Group>
+                                  )}
+                                  {!canIncreaseEarlyAccess && (
+                                    <Text size="xs" c="dimmed" mt="sm">
+                                      You cannot increase early access value after a model has been
+                                      published
+                                    </Text>
+                                  )}
+                                </Input.Wrapper>
+                              )}
+                            </Stack>
+                          </Card.Section>
+                          <Card.Section inheritPadding py="sm" withBorder>
+                            <Stack>
+                              <InputNumber
+                                name="paidAccessConfig.accessPrice"
+                                label="Price for access"
+                                description={
+                                  isGenOnly
+                                    ? 'What buyers pay to generate with this version on-site.'
+                                    : 'Buyers unlock download + generation.'
+                                }
+                                min={100}
+                                max={accessPriceMax}
+                                step={100}
+                                leftSection={<CurrencyIcon currency="BUZZ" size={16} />}
+                                withAsterisk
+                                disabled={isEarlyAccessOver}
+                              />
+                              {!isGenOnly && (
+                                <>
+                                  <Radio.Group
+                                    label="Generating on-site"
+                                    value={genMode}
+                                    onChange={(next) => {
+                                      const mode = next as GenerationMode;
+                                      setGenMode(mode);
+                                      // Only `separate` carries a price — the other two must clear it, or a
+                                      // stale value would keep the cheaper tier alive underneath the choice.
+                                      if (mode !== 'separate')
+                                        form.setValue(
+                                          'paidAccessConfig.generationPrice',
+                                          undefined as never
+                                        );
+                                      form.setValue(
+                                        'paidAccessConfig.freeGeneration',
+                                        mode === 'free'
+                                      );
+                                    }}
+                                  >
+                                    <Stack gap={4} mt={4}>
+                                      <Radio
+                                        value="bundled"
+                                        label="Same as the access price"
+                                        disabled={isEarlyAccessOver}
+                                      />
+                                      <Radio
+                                        value="separate"
+                                        label="A cheaper generation-only price"
+                                        disabled={isEarlyAccessOver}
+                                      />
+                                      <Radio
+                                        value="free"
+                                        label="Free for everyone"
+                                        description="Anyone can generate on-site without buying; only the download is gated. Earn per generation with a licensing fee instead."
+                                        disabled={isEarlyAccessOver}
+                                      />
+                                    </Stack>
+                                  </Radio.Group>
+                                  {genMode === 'separate' && (
+                                    <InputNumber
+                                      name="paidAccessConfig.generationPrice"
+                                      label="Generation-only price"
+                                      description="What buyers pay to generate on-site without unlocking the download. Can't exceed the access price."
+                                      min={50}
+                                      // Grandfather floor, as on the access price — generation is capped
+                                      // per-component and increase-only.
+                                      max={Math.max(
+                                        Math.min(
+                                          paidAccessConfig?.accessPrice ?? paidAccessCap,
+                                          paidAccessCap
+                                        ),
+                                        storedPaidGen?.price ?? 0
+                                      )}
+                                      step={100}
+                                      leftSection={<CurrencyIcon currency="BUZZ" size={16} />}
+                                      withAsterisk
+                                      disabled={isEarlyAccessOver}
+                                    />
+                                  )}
+                                </>
+                              )}
+                              {/* A free grant has no trial to run out, so there's nothing to sample toward. */}
+                              {!(genMode === 'free' && !isGenOnly) && (
+                                <InputNumber
+                                  name="paidAccessConfig.freePreviewGenerations"
+                                  label="Free preview generations"
+                                  description={`How many free test generations a user can do before purchasing the ${resourceLabel}.`}
+                                  min={0}
+                                  max={1000}
+                                  disabled={isEarlyAccessOver}
+                                  withAsterisk
+                                />
+                              )}
+                              <InputSwitch
+                                name="paidAccessConfig.acceptsBlueBuzz"
+                                label="Also accept Blue Buzz"
+                                description={ACCEPTS_BLUE_BUZZ_HINT}
+                                disabled={isEarlyAccessOver}
+                              />
+                            </Stack>
+                          </Card.Section>
+                        </>
+                      )}
+                    </Card>
+                    {!!paidAccessConfig &&
+                      !paidAccessConfig.permanent &&
+                      (version?.status !== 'Published' || version?.donationGoal) &&
+                      features.donationGoals && (
+                        <Stack mt="sm">
+                          <Card withBorder>
+                            <Card.Section withBorder bg={cardHeaderBg}>
+                              <Group py="xs" px="md" justify="space-between" wrap="nowrap">
+                                <div>
+                                  <Text fw={600} size="sm">
+                                    Let the community unlock this early
+                                  </Text>
+                                  <Text size="xs" c="dimmed">
+                                    If the goal is met before the window ends, early access ends
+                                    immediately and the version becomes free for everyone. After the
+                                    model is published, you cannot change this value.
+                                  </Text>
+                                </div>
+                                <InputSwitch
+                                  name="paidAccessConfig.donationGoalEnabled"
+                                  disabled={donationGoalLocked}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      form.setValue('paidAccessConfig.donationGoal', 50000);
+                                    } else {
+                                      form.setValue('paidAccessConfig.donationGoal', undefined);
+                                    }
+                                  }}
+                                />
+                              </Group>
+                            </Card.Section>
+                            {paidAccessConfig?.donationGoalEnabled && (
+                              <Card.Section py="sm" px="md">
+                                <Stack>
+                                  <InputNumber
+                                    name="paidAccessConfig.donationGoal"
+                                    label="Goal amount"
+                                    description="Early access purchases count toward this goal. After publishing, you cannot change this value."
+                                    min={MIN_DONATION_GOAL}
+                                    max={MAX_DONATION_GOAL}
+                                    step={100}
+                                    leftSection={<CurrencyIcon currency="BUZZ" size={16} />}
+                                    disabled={donationGoalLocked}
+                                  />
+                                  <Switch
+                                    label="Hide donation goals from public view"
+                                    description="Others won't see the progress bar or collected amount. The goal still works, and you and moderators can still see it. This applies to all of your donation goals."
+                                    checked={hideDonationGoals ?? false}
+                                    onChange={(e) =>
+                                      mutateUserSettings({
+                                        hideDonationGoals: e.target.checked,
+                                      })
+                                    }
+                                    disabled={hideDonationGoalsUpdating}
+                                  />
+                                </Stack>
+                              </Card.Section>
+                            )}
+                          </Card>
+                        </Stack>
+                      )}
+                  </Stack>
+                )}
+                {showChargeSettings && showLicensingFeeBlock && (
+                  <Stack gap={0} mt="md">
+                    <Card withBorder>
+                      <Card.Section withBorder inheritPadding py="xs" bg={cardHeaderBg}>
+                        <Group justify="space-between" wrap="nowrap">
+                          <div>
+                            <Text fw={600} size="sm">
+                              Charge a fee to generate with this version
+                            </Text>
+                            <Text size="xs" c="dimmed">
+                              Earn Buzz every time someone generates with it, whether or not they
+                              bought access.
+                            </Text>
+                          </div>
+                          <Switch
+                            aria-label="Charge a fee to generate with this version"
+                            checked={feeEnabled}
+                            onChange={(e) => {
+                              const checked = e.target.checked;
+                              setFeeEnabled(checked);
+                              if (!checked && (form.getValues('licensingFee') ?? 0) > 0) {
+                                form.setValue('licensingFee', 0, { shouldDirty: true });
+                                setFeeRatio((r) => ({ buzz: 0, images: r.images }));
+                              }
+                            }}
+                          />
+                        </Group>
+                      </Card.Section>
+                      {feeEditorOpen && (
+                        <Card.Section inheritPadding py="sm">
+                          <Stack gap="xs">
+                            <Input.Wrapper
+                              label={
+                                <Group gap="xs">
+                                  <Text fw={500} size="sm">
+                                    Fee per generation
+                                  </Text>
+                                  <Popover width={320} withArrow withinPortal shadow="sm">
+                                    <Popover.Target>
+                                      <IconInfoCircle size={16} />
+                                    </Popover.Target>
+                                    <Popover.Dropdown>
+                                      <Stack gap="xs">
+                                        <Text size="sm">
+                                          You earn this in Buzz each time someone generates with
+                                          this version on-site, set as Buzz per number of
+                                          generations.
+                                        </Text>
+                                        <Text size="sm">
+                                          If this is a derivative of a base model that already
+                                          charges a licensing fee, yours is added on top of it.
+                                        </Text>
+                                        <Text size="sm">
+                                          A licensing fee can be at most {licensingFeeCap} Buzz per
+                                          generation.
+                                        </Text>
+                                      </Stack>
+                                    </Popover.Dropdown>
+                                  </Popover>
+                                </Group>
+                              }
+                            >
+                              <Group gap="xs" wrap="nowrap" mt={4}>
+                                <NumberInput
+                                  aria-label="Licensing fee (Buzz)"
+                                  value={feeRatio.buzz}
+                                  onChange={(v) =>
+                                    applyFeeRatio({
+                                      buzz: typeof v === 'number' ? v : 0,
+                                      images: feeRatio.images,
+                                    })
+                                  }
+                                  min={0}
+                                  max={feeMaxFor(limits, feeRatio.images)}
+                                  step={1}
+                                  allowDecimal={false}
+                                  leftSection={<CurrencyIcon currency="BUZZ" size={16} />}
+                                  w={140}
+                                />
+                                <Text size="sm" c="dimmed">
+                                  per
+                                </Text>
+                                <Select
+                                  aria-label="Number of generations"
+                                  value={String(feeRatio.images)}
+                                  onChange={(v) => {
+                                    const images = Number(v) || DEFAULT_FEE_IMAGES;
+                                    // Clamp to the absolute ceiling only, in the RATIO domain: the cap is
+                                    // per-image and can be fractional, so `cap * images` would put a decimal
+                                    // into a whole-number field the schema rejects. floor() keeps it valid.
+                                    applyFeeRatio({
+                                      buzz: Math.min(feeRatio.buzz, feeMaxFor(limits, images)),
+                                      images,
+                                    });
+                                  }}
+                                  data={feeImageOptions.map((n) => ({
+                                    value: String(n),
+                                    label: String(n),
+                                  }))}
+                                  allowDeselect={false}
+                                  w={90}
+                                />
+                                <Text size="sm" c="dimmed">
+                                  {feeRatio.images === 1 ? 'generation' : 'generations'}
+                                </Text>
+                              </Group>
+                            </Input.Wrapper>
+                            {showLicensingFeeSettlementCurrency && (
+                              <InputSelect
+                                name="licensingFeeSettlementCurrency"
+                                label="Settlement Currency"
+                                description="Currency used to pay you out for license fees. Cash settlement is restricted; contact support to enable."
+                                data={[
+                                  { value: LicensingFeeSettlementCurrency.Buzz, label: 'Buzz' },
+                                  { value: LicensingFeeSettlementCurrency.Cash, label: 'Cash' },
+                                ]}
+                                allowDeselect={false}
+                              />
+                            )}
+                            {currentLicensingFee > 0 && (
+                              <Group gap="xs" wrap="nowrap" align="flex-start">
+                                <IconAlertTriangle
+                                  size={14}
+                                  className="text-yellow-500"
+                                  style={{ flexShrink: 0, marginTop: 2 }}
+                                />
+                                <Text size="xs" c="yellow">
+                                  With a license fee set, this version stops earning creator
+                                  compensation — you earn through the license fee instead. It can
+                                  still receive creator tips.
+                                </Text>
+                              </Group>
+                            )}
+                          </Stack>
+                        </Card.Section>
+                      )}
+                    </Card>
+                  </Stack>
+                )}
+              </Stack>
+            </Card>
+          )}
+          <Card withBorder p="md">
+            <Stack gap="sm">
+              <Text fw={600}>Version metric privacy</Text>
+              <MetricPrivacyControls
+                level="version"
+                inherited={inheritedMetrics}
+                access={metricPrivacyAccess}
+              />
+            </Stack>
+          </Card>
+        </Stack>
+        {children({ loading: upsertVersionMutation.isPending, canSave })}
+      </Form>
+    </>
+  );
+}
+
+type VersionInput = Omit<
+  ModelVersionUpsertInput,
+  'recommendedResources' | 'paidAccess' | 'donationGoal'
+> & {
+  createdAt: Date | null;
+  recommendedResources?: GenerationResourceSchema[];
+  // The DTO shape the version is loaded with (getById), NOT the write-input shape.
+  paidAccess: ModelVersionPaidAccessDto | null;
+  donationGoal: { goalAmount: number } | null;
+};
+type Props = {
+  id?: string;
+  onSubmit: (version?: ModelVersionUpsertInput) => void;
+  children: (data: { loading: boolean; canSave: boolean }) => React.ReactNode;
+  // `user` is the model's OWNER, needed to scope the rights affirmation the way the server does. The edit
+  // page and both wizards pass a query result carrying it; ModelWizard's template/bounty paths don't, but
+  // those carry no version `meta` either, so the check lands on asking rather than on a silent bypass.
+  model?: Partial<
+    ModelUpsertInput & {
+      publishedAt: Date | null;
+      user: { id: number } | null;
+      ownerMetricPrivacyDefaults: HiddenModelMetrics | null;
+    }
+  >;
+  // Base model of the model's most recent existing version; used to default the
+  // picker when adding a brand-new version to an existing model.
+  previousBaseModel?: string | null;
+  // licensingFee comes off a Prisma read as a Decimal; the form coerces it to a number in defaultValues.
+  version?: Omit<Partial<VersionInput>, 'licensingFee' | 'meta'> & {
+    licensingFee?: number | { valueOf(): string } | null;
+    flags?: number;
+    meta?: unknown;
+  };
+  afterName?: React.ReactNode;
+};

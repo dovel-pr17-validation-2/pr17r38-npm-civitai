@@ -1,0 +1,1793 @@
+import { Currency } from '~/shared/utils/prisma/enums';
+import type { MetadataParam } from '@stripe/stripe-js';
+import { chunk } from 'lodash-es';
+import type { Stripe } from 'stripe';
+import { env } from '~/env/server';
+import { constants } from '~/server/common/constants';
+import { dbRead, dbWrite } from '~/server/db/client';
+import {
+  handleLogError,
+  throwAuthorizationError,
+  throwBadRequestError,
+  throwNotFoundError,
+  withRetries,
+} from '~/server/utils/errorHandling';
+import { getServerStripe } from '~/server/utils/get-server-stripe';
+import { isSandboxCopy } from '~/server/utils/stripe-key-mode';
+import { logToAxiom } from '~/server/logging/client';
+import { refreshSession } from '~/server/auth/session-invalidation';
+import { getBaseUrl } from '~/server/utils/url-helpers';
+import { createLogger } from '~/utils/logging';
+import { formatPriceForDisplay } from '~/utils/number-helpers';
+
+import * as Schema from '../schema/stripe.schema';
+import type { PaymentMethodDeleteInput } from '../schema/stripe.schema';
+import {
+  completeStripeBuzzTransaction,
+  createBuzzTransaction,
+  getMultipliersForUser,
+} from './buzz.service';
+import { getOrCreateVault } from '~/server/services/vault.service';
+import { validateBuzzPurchaseAttribution } from '~/server/services/blocks/attribution-validator.service';
+import {
+  encodeAttributionMetadata,
+  extractAttribution,
+  type BlockAttribution,
+} from '~/server/schema/blocks/attribution.schema';
+import { sleep } from '~/server/utils/concurrency-helpers';
+import type { SubscriptionProductMetadata } from '~/server/schema/subscriptions.schema';
+import { subscriptionProductMetadataSchema } from '~/server/schema/subscriptions.schema';
+import {
+  TransactionType,
+  buzzConstants,
+  deriveDomainBuzzType,
+} from '~/shared/constants/buzz.constants';
+import type { ColorDomain } from '~/shared/constants/domain.constants';
+import { invalidateSubscriptionCaches } from '~/server/utils/subscription.utils';
+import { userUpdateCounter } from '~/server/prom/client';
+
+const baseUrl = getBaseUrl('green'); // Stripe lives in civitai green
+const log = createLogger('stripe', 'blue');
+
+// A label on `cancellation_details.comment` for people reading the subscription. It decides nothing:
+// Stripe keeps the comment through later updates, and the billing portal's survey writes there too.
+const MODERATION_CANCELLATION = 'civitai-moderation-cancel';
+// The `canceled_at` of the cancel a ban / restriction flow made. reinstateSubscription resumes only
+// while it matches: a member's own later cancel gets a new `canceled_at`.
+export const MODERATION_CANCEL_MARK = 'civitai_moderation_cancel';
+// A gift subscription's own `cancel_at` (the end of all its gifted months), saved when a moderation
+// cancel cuts it to the current period so a reinstate can put it back.
+const MODERATION_PREV_CANCEL_AT = 'civitai_moderation_prev_cancel_at';
+
+export const createCustomer = async ({ id, email }: Schema.CreateCustomerInput) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+
+  const user = await dbWrite.user.findUnique({ where: { id }, select: { customerId: true } });
+  if (user?.customerId) return user.customerId;
+
+  const customer = await stripe.customers.create({ email, metadata: { userId: String(id) } });
+
+  // Only the first checkout to get here records its customer; any other one charges that customer.
+  const { count } = await dbWrite.user.updateMany({
+    where: { id, customerId: null },
+    data: { customerId: customer.id },
+  });
+  if (count === 0) {
+    const winner = await dbWrite.user.findUnique({ where: { id }, select: { customerId: true } });
+    await stripe.customers.del(customer.id).catch((error) =>
+      logToAxiom({
+        type: 'error',
+        name: 'stripe-unused-customer-delete',
+        userId: id,
+        customerId: winner?.customerId,
+        unusedCustomerId: customer.id,
+        message: (error as Error).message,
+      })
+    );
+    if (!winner?.customerId) throw throwNotFoundError(`No user with id ${id}`);
+    return winner.customerId;
+  }
+
+  userUpdateCounter?.inc({ location: 'stripe.service:createCustomer' });
+
+  await refreshSession(id, { caller: 'subscription' });
+
+  return customer.id;
+};
+
+/**
+ * W3 flow C FIN-1 — re-derive App Blocks membership attribution
+ * SERVER-SIDE before stamping it onto a Stripe subscription's metadata.
+ *
+ * The browser passes a `blockAttribution` bag (appId / appBlockId /
+ * blockInstanceId / scope / modelId / slotId) from the block's "Buy
+ * membership" CTA. We NEVER trust it: we run it through the SAME chokepoint
+ * the Buzz-purchase path uses (`validateBuzzPurchaseAttribution`, which
+ * resolves the cited instance AS THE BUYER, strips/corrects forged
+ * appId/scope, and drops attribution that doesn't resolve), then re-encode
+ * the SERVER-DERIVED fields for the subscription metadata.
+ *
+ * Returns a flat string-keyed metadata bag (the `block*` keys) ready to
+ * spread onto `subscription_data.metadata` / `subscriptions.update`
+ * metadata, or `null` when there's nothing valid to stamp (no attribution,
+ * or it was forged/stripped) — so the caller stamps it conditionally and a
+ * normal (non-block) membership purchase carries no block keys.
+ *
+ * This reuses the buzz validator verbatim (same resolver, same strip-on-
+ * forge, same page_* path) so model-slot AND page-surface membership CTAs
+ * are both covered with zero duplicated FIN-1 logic.
+ */
+export async function deriveSubscriptionAttributionMetadata({
+  blockAttribution,
+  sessionUserId,
+}: {
+  blockAttribution?: BlockAttribution;
+  sessionUserId: number;
+}): Promise<Record<string, string> | null> {
+  if (!blockAttribution) return null;
+  // Encode → validate (FIN-1) → decode the server-derived bag.
+  const encoded = encodeAttributionMetadata(blockAttribution);
+  if (!encoded) return null;
+  // validateBuzzPurchaseAttribution pins/asserts a `userId` too; we don't
+  // carry a client userId on the subscription bag, so the spender pin is a
+  // no-op here (the buyer is ctx.user.id, captured by the caller).
+  const validated = await validateBuzzPurchaseAttribution({
+    metadata: { ...encoded } as Record<string, unknown> & { userId?: unknown },
+    sessionUserId,
+  });
+  // Pull the SERVER-DERIVED block fields back out. If the validator stripped
+  // them (forged / non-resolving instance), extractAttribution returns null
+  // and we stamp nothing — the membership purchase proceeds un-attributed.
+  const derived = extractAttribution(
+    validated as Record<string, string | number | null | undefined>
+  );
+  return encodeAttributionMetadata(derived);
+}
+
+/**
+ * Resolve the membership Price this customer can actually be charged.
+ *
+ * Stripe pins a customer to ONE billing currency the first time they are invoiced
+ * (`customer.currency`) and it is immutable thereafter. Every subscription price billed to
+ * that customer has to be payable in it, or Stripe rejects the call with
+ *
+ *   The price specified only supports `usd`. This doesn't match the expected currency: `aud`.
+ *
+ * That rejection is a raw throw out of `checkout.sessions.create` / `subscriptions.update`,
+ * so it reached the client as a tRPC INTERNAL_SERVER_ERROR (HTTP 500).
+ *
+ * The membership IS purchasable in that currency — each membership Product carries an
+ * active monthly sibling Price per supported currency, and the pricing page ships the whole
+ * set to the browser (`getPlans` selects `product.prices`). What the client cannot know is
+ * which one the customer is pinned to: `customer.currency` is a Stripe-side fact with no
+ * representation in our database and no endpoint that exposes it. So the substitution
+ * belongs here, where both the customer and the price are already in hand, rather than in
+ * the price picker — and putting it here also covers the plan-change path and any caller
+ * that reaches the procedure without going through the pricing page at all.
+ *
+ * Returns the Price to charge. Throws a typed BAD_REQUEST only in the two cases where no
+ * single correct answer exists; it never guesses an amount.
+ */
+async function resolvePriceForCustomerCurrency({
+  stripe,
+  customer,
+  price,
+}: {
+  stripe: Stripe;
+  customer: Stripe.Customer;
+  price: Stripe.Price;
+}): Promise<Stripe.Price> {
+  // Null until Stripe has invoiced them — an unpinned customer constrains nothing.
+  const customerCurrency = customer.currency?.toLowerCase();
+  if (!customerCurrency) return price;
+
+  // Lower-cased on both sides. Stripe's API returns lower-case currency codes, but this
+  // value is also compared against data that reaches us from the price picker, and the
+  // Product/Price tables carry upper-case codes for the other payment provider, so a
+  // case-sensitive comparison is one catalog edit away from being wrong in both directions.
+  // `Stripe.Price.currency` is non-optional, so there is no absent-currency case here.
+  if (price.currency.toLowerCase() === customerCurrency) return price;
+
+  // A multi-currency Price is payable in every currency it declares, so there is nothing to
+  // substitute. Our membership catalog does not use this — it uses sibling Prices, which is
+  // what the lookup below is for — but Stripe supports both, and without this check
+  // provisioning `currency_options` on a Price would turn a purchase that works today into
+  // the error below. `currency_options` is an expandable field and is NOT returned by
+  // default, hence the expand at the call site; without it this branch is dead.
+  if (price.currency_options?.[customerCurrency]) return price;
+
+  const productId = typeof price.product === 'string' ? price.product : price.product.id;
+  const interval = price.recurring?.interval;
+
+  // Every membership price is recurring (the caller has already checked the price belongs to
+  // a membership product), so this is a shape assertion rather than a reachable branch.
+  if (!interval) {
+    throw throwBadRequestError(
+      `This membership cannot be billed in ${customerCurrency.toUpperCase()}, the currency your billing account is set up in.`
+    );
+  }
+
+  // Scoped to the SAME product, so the substitute is the same membership tier. `product` is
+  // read off the Stripe Price we just retrieved, which also keeps the lookup inside Stripe's
+  // catalog — the Product/Price tables hold rows for other payment providers under the same
+  // tier names, and one of those price ids handed to Stripe would be a different failure.
+  const { data: siblings } = await stripe.prices.list({
+    product: productId,
+    currency: customerCurrency,
+    active: true,
+    type: 'recurring',
+    recurring: { interval },
+    limit: 100,
+  });
+
+  // `interval_count` is not a list filter, so it is applied here. Without it a monthly
+  // membership could be substituted by a price billed every 3 months at the same interval.
+  const intervalCount = price.recurring?.interval_count ?? 1;
+  const candidates = siblings.filter((p) => (p.recurring?.interval_count ?? 1) === intervalCount);
+
+  if (candidates.length === 1) return candidates[0];
+
+  if (candidates.length === 0) {
+    // The genuine fallback: the membership really is not sold in this currency. Says that,
+    // and does not claim the account is unusable — the other tiers may well be sold in it.
+    throw throwBadRequestError(
+      `Your billing account is set up in ${customerCurrency.toUpperCase()}, and this ` +
+        `membership is not currently sold in ${customerCurrency.toUpperCase()}. Stripe does ` +
+        `not allow an account's billing currency to change once it is set. Please contact ` +
+        `support and we can look at the options for your account.`
+    );
+  }
+
+  // More than one active price matches. Picking one would charge an amount nobody chose, and
+  // the amounts in a duplicated row are not necessarily close — so refuse instead. This is a
+  // catalog problem support can actually get fixed, unlike the currency pin.
+  throw throwBadRequestError(
+    `We could not determine the price of this membership in ${customerCurrency.toUpperCase()}, ` +
+      `the currency your billing account is set up in. Please contact support so we can ` +
+      `correct it — you have not been charged.`
+  );
+}
+
+export const createSubscribeSession = async ({
+  priceId,
+  refCode,
+  blockAttribution,
+  customerId,
+  user,
+}: Schema.CreateSubscribeSessionInput & {
+  customerId?: string;
+  user: Schema.CreateCustomerInput;
+}) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+
+  // FIN-1: re-derive the membership attribution server-side ONCE, up front,
+  // against the authenticated buyer. Stamped onto whichever Stripe path the
+  // purchase takes below (upgrade subscriptions.update OR new-sub Checkout).
+  const blockAttributionMetadata = await deriveSubscriptionAttributionMetadata({
+    blockAttribution,
+    sessionUserId: user.id,
+  });
+
+  if (!customerId) {
+    customerId = await createCustomer(user);
+  }
+
+  const products = await dbRead.product.findMany({});
+  const membershipProducts = products.filter(({ metadata }) => {
+    return !!(metadata as any)?.[env.TIER_METADATA_KEY];
+  });
+
+  // Check to see if this user has a subscription with Stripe
+  const { data: subscriptions } = await stripe.subscriptions.list({
+    customer: customerId,
+  });
+  const customer = await stripe.customers.retrieve(customerId);
+
+  if (!customer || customer.deleted) {
+    throw throwBadRequestError(`Could not find customer with id: ${customerId}`);
+  }
+
+  // `currency_options` is an expandable field and is NOT returned by default, so without
+  // this expand the multi-currency branch of resolvePriceForCustomerCurrency is dead and a
+  // Price that Stripe would happily charge in the customer's currency gets substituted (or
+  // rejected) anyway. Expanding costs no extra round trip, only a larger response body.
+  const requestedPrice = await stripe.prices.retrieve(priceId, { expand: ['currency_options'] });
+
+  if (
+    !requestedPrice ||
+    !membershipProducts.find((x) => x.id === (requestedPrice.product as string))
+  ) {
+    throw throwNotFoundError(`The product you are trying to purchase does not exists`);
+  }
+
+  // Everything downstream charges `price`, never the requested id: the customer may be
+  // pinned to a billing currency the requested Price is not sold in, in which case this is
+  // the same membership's sibling Price in that currency. Resolved once, ahead of BOTH
+  // price-carrying Stripe calls — the in-place `subscriptions.update` plan change rejects on
+  // a currency mismatch exactly as `checkout.sessions.create` does, so substituting in front
+  // of only one of them would still 500 every pinned member's upgrade.
+  const price = await resolvePriceForCustomerCurrency({ stripe, customer, price: requestedPrice });
+
+  const activeSubscription = subscriptions.find((x) => x.status !== 'canceled');
+  const subscriptionItem = activeSubscription?.items.data.find((d) =>
+    membershipProducts.some((p) => p.id === (d.price.product as string))
+  );
+  const activeProduct = membershipProducts.find((p) => p.id === subscriptionItem?.price.product);
+  const priceProduct = products.find((p) => p.id === price.product);
+  const oldTier = ((activeProduct?.metadata ?? {}) as SubscriptionProductMetadata)?.tier;
+  const newTier = ((priceProduct?.metadata ?? {}) as SubscriptionProductMetadata).tier;
+
+  const isUpgrade =
+    activeSubscription &&
+    constants.memberships.tierOrder.indexOf(oldTier) <
+      constants.memberships.tierOrder.indexOf(newTier);
+
+  if (activeSubscription) {
+    if (!subscriptionItem) {
+      throw throwBadRequestError(
+        `Your subscription does not have a main plan. Please contact administration`
+      );
+    }
+
+    const isActivePrice = subscriptionItem.price.id === price.id;
+    if (!isActivePrice) {
+      // Confirm user has a default credit card:
+      if (!customer.default_source) {
+        // Attempt to get and set outselves:
+        const paymentMethods = await stripe.paymentMethods.list({
+          customer: customerId,
+          type: 'card',
+        });
+
+        if (paymentMethods.data.length === 0) {
+          return {
+            sessionId: null,
+            url: `/user/account?missingPaymentMethod=true&tier=${newTier}#payment-methods`,
+          };
+        } else {
+          // Set the first card as the default:
+          await stripe.customers.update(customerId, {
+            invoice_settings: {
+              default_payment_method: paymentMethods.data[0].id,
+            },
+          });
+        }
+      }
+
+      const isFounder =
+        (activeProduct?.metadata as SubscriptionProductMetadata)?.tier ===
+        constants.memberships.founderDiscount.tier;
+
+      const discounts = [];
+
+      if (
+        isUpgrade &&
+        isFounder &&
+        new Date() < constants.memberships.founderDiscount.maxDiscountDate
+      ) {
+        // Create a custom discount for founders to get $5 off
+        const coupon = await stripe.coupons.create({
+          duration: 'once',
+          percent_off: constants.memberships.founderDiscount.discountPercent,
+          max_redemptions: 1,
+          metadata: {
+            customerId,
+          },
+        });
+
+        discounts.push({
+          coupon: coupon.id,
+        });
+      }
+
+      const items = [
+        {
+          id: subscriptionItem.id,
+          price: price.id,
+        },
+      ];
+
+      const subscriptionId = subscriptionItem.subscription as string;
+
+      // Stripe does not allow setting proration_behavior on a paused subscription.
+      // Use the dedicated resume endpoint to reactivate it before applying the plan change.
+      if (activeSubscription.status === 'paused') {
+        await stripe.subscriptions.resume(subscriptionId, {
+          billing_cycle_anchor: 'unchanged',
+          proration_behavior: 'none',
+        });
+      }
+
+      // Upgrades don't go through Stripe Checkout, so the custom_fields
+      // ref_code path on createCheckout doesn't apply. Capture an explicitly
+      // entered refCode (or the cookie carried into the upgrade modal) by
+      // patching it onto the subscription metadata in the same update call.
+      // The next invoice.paid (billing_reason: subscription_update) will
+      // surface it via subscription_details.metadata and route through
+      // recordMembershipPaymentReward.
+      const cleanRefCode = refCode?.trim().toUpperCase();
+      const sanitizedRefCode = cleanRefCode && cleanRefCode.length > 0 ? cleanRefCode : undefined;
+
+      // Upgrades skip Checkout, so the new-sub metadata stamp below doesn't
+      // apply — patch BOTH ref_code AND the FIN-1 block attribution onto the
+      // subscription metadata here, in the same update call (mirrors the
+      // ref_code pattern). The next invoice.paid (billing_reason:
+      // subscription_update / _cycle) reads it back via
+      // subscription_details.metadata → recordSubscriptionAttribution.
+      const upgradeMetadata: Record<string, string> = {
+        ...(sanitizedRefCode ? { ref_code: sanitizedRefCode } : {}),
+        ...(blockAttributionMetadata ?? {}),
+      };
+
+      const { releaseArmedGiftMonth, restoreArmedGiftMonth } = await import(
+        '~/server/services/membership-gift.service'
+      );
+      const releasedGiftMonth = await releaseArmedGiftMonth({ userId: user.id });
+
+      // 'default_incomplete' applies the new price at once and leaves the subscription past_due,
+      // which ends the plan the member already paid for. 'pending_if_incomplete' holds the price
+      // change until the invoice is paid. A paused subscription was just resumed without payment,
+      // so holding its change would leave it active unpaid; it keeps the old behaviour.
+      const holdUntilPaid = isUpgrade && activeSubscription.status !== 'paused';
+
+      let updated: Stripe.Subscription;
+      try {
+        updated = await stripe.subscriptions.update(subscriptionId, {
+          items,
+          billing_cycle_anchor: isUpgrade ? 'now' : 'unchanged',
+          proration_behavior: 'none',
+          payment_behavior: holdUntilPaid
+            ? 'pending_if_incomplete'
+            : isUpgrade
+            ? 'default_incomplete'
+            : undefined,
+          expand: holdUntilPaid ? ['latest_invoice'] : undefined,
+          ...(releasedGiftMonth
+            ? { coupon: '' }
+            : {
+                // @ts-ignore This is valid as per stripe's documentation
+                discounts,
+              }),
+          ...(Object.keys(upgradeMetadata).length > 0 ? { metadata: upgradeMetadata } : {}),
+        });
+      } catch (error) {
+        if (releasedGiftMonth) await restoreArmedGiftMonth(releasedGiftMonth);
+        throw error;
+      }
+
+      if (sanitizedRefCode) {
+        const { bindReferralCodeForUser } = await import('~/server/services/referral.service');
+        await bindReferralCodeForUser(user.id, sanitizedRefCode).catch(handleLogError);
+      }
+
+      // The released gifted month is NOT restored here: Stripe removes the coupon immediately
+      // even while the price change is held, and the subscription.updated webhook re-arms it.
+      if (updated.pending_update) {
+        const invoice = updated.latest_invoice;
+        const hostedInvoiceUrl = typeof invoice === 'object' ? invoice?.hosted_invoice_url : null;
+        if (hostedInvoiceUrl) return { sessionId: null, url: hostedInvoiceUrl };
+        throw throwBadRequestError(
+          `Your payment for the upgrade did not go through, so your current membership is unchanged. Please check your payment method and try again.`
+        );
+      }
+
+      await refreshSession(user.id, { caller: 'subscription' });
+      return {
+        sessionId: null,
+        url: isUpgrade
+          ? `/payment/success?cid=${customerId.slice(-8)}`
+          : `/user/membership?downgraded=true&tier=${newTier}`,
+      };
+    } else {
+      const { url } = await createManageSubscriptionSession({ customerId });
+      await refreshSession(user.id, { caller: 'subscription' });
+      return { sessionId: null, url };
+    }
+  }
+
+  // array of items we are charging the customer. `price.id`, NOT the requested `priceId` —
+  // they differ whenever the customer is pinned to a currency the requested Price is not
+  // sold in, and Checkout rejects a mismatched currency exactly as the plan-change path does.
+  const lineItems = [
+    {
+      price: price.id,
+      quantity: 1,
+    },
+  ];
+
+  // Build the metadata bag stamped onto BOTH the subscription
+  // (subscription_data.metadata → read back on every invoice.paid via
+  // subscription_details.metadata) AND the session metadata (the
+  // webhook-ordering-race fallback, mirroring ref_code). FIN-1 block
+  // attribution rides alongside ref_code. Stripe caps metadata at 50 keys /
+  // 500 chars-per-value; ref_code + the 6 block keys are well within.
+  const checkoutMetadata: Record<string, string> = {
+    ...(refCode ? { ref_code: refCode } : {}),
+    ...(blockAttributionMetadata ?? {}),
+  };
+  const hasCheckoutMetadata = Object.keys(checkoutMetadata).length > 0;
+
+  const session = await stripe.checkout.sessions.create({
+    customer: customerId,
+    mode: 'subscription',
+    // A bank debit takes days to clear, but the membership goes active on checkout, so a
+    // bounced first payment has already granted the tier. Link is left out: it can pay from a bank.
+    payment_method_types: ['card'],
+    line_items: lineItems,
+    success_url: `${baseUrl}/payment/success?cid=${customerId.slice(-8)}`,
+    cancel_url: `${baseUrl}/pricing?canceled=true`,
+    allow_promotion_codes: true,
+    // Inline referral-code field so users can apply a code without leaving
+    // Stripe's checkout page. The cookie-driven `refCode` already lands on
+    // subscription metadata; the custom_fields entry takes precedence in the
+    // checkout.session.completed webhook handler.
+    custom_fields: [
+      {
+        key: 'ref_code',
+        label: { type: 'custom', custom: 'Referral code (optional)' },
+        type: 'text',
+        optional: true,
+      },
+    ],
+    ...(hasCheckoutMetadata
+      ? { subscription_data: { metadata: checkoutMetadata }, metadata: checkoutMetadata }
+      : {}),
+  });
+
+  return { sessionId: session.id, url: session.url };
+};
+
+// export const createPortalSession = async ({ customerId }: { customerId: string }) => {
+//   const stripe = await getServerStripe();
+//   if (!stripe) throw throwBadRequestError('Stripe is not available');
+//   const session = await stripe.billingPortal.sessions.create({
+//     customer: customerId,
+//     return_url: `${baseUrl}/pricing`,
+//   });
+
+//   return { url: session.url };
+// };
+
+export const createDonateSession = async ({
+  customerId,
+  user,
+  returnUrl,
+}: {
+  customerId?: string;
+  user: Schema.CreateCustomerInput;
+  returnUrl: string;
+}) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+
+  if (!customerId) {
+    customerId = await createCustomer(user);
+  }
+
+  const session = await stripe.checkout.sessions.create({
+    customer: customerId,
+    cancel_url: returnUrl,
+    line_items: [{ price: env.STRIPE_DONATE_ID, quantity: 1 }],
+    mode: 'payment',
+    submit_type: 'donate',
+    success_url: `${baseUrl}/payment/success?type=donation&cid=${customerId.slice(-8)}`,
+  });
+
+  return { sessionId: session.id, url: session.url };
+};
+
+// Every portal session uses this configuration, so its payment-method settings decide what a
+// member can add from the portal. Unset, Stripe uses the account's default configuration.
+const portalConfiguration = () =>
+  env.STRIPE_BILLING_PORTAL_CONFIGURATION_ID
+    ? { configuration: env.STRIPE_BILLING_PORTAL_CONFIGURATION_ID }
+    : {};
+
+export const createManageSubscriptionSession = async ({ customerId }: { customerId: string }) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+
+  const session = await stripe.billingPortal.sessions.create({
+    ...portalConfiguration(),
+    customer: customerId,
+    return_url: `${baseUrl}/user/membership`,
+  });
+
+  return { url: session.url };
+};
+
+export const createSubscriptionChangeSession = async ({
+  customerId,
+  subscriptionId,
+  priceId,
+  subscriptionItemId,
+}: {
+  customerId: string;
+  subscriptionId: string;
+  subscriptionItemId: string;
+  priceId: string;
+}) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+
+  const session = await stripe.billingPortal.sessions.create({
+    ...portalConfiguration(),
+    customer: customerId,
+    return_url: `${baseUrl}/user/account`,
+    flow_data: {
+      // @ts-ignore This is valid as per stripe's documentation
+      type: 'subscription_update_confirm',
+      subscription_update_confirm: {
+        subscription: subscriptionId,
+        items: [
+          {
+            id: subscriptionItemId,
+            quantity: 1,
+            price: priceId,
+          },
+        ],
+      },
+      after_completion: {
+        type: 'redirect',
+        redirect: {
+          return_url: `${baseUrl}/payment/success?cid=${customerId.slice(-8)}`,
+        },
+      },
+    },
+  });
+
+  return { url: session.url };
+};
+
+export const createCancelSubscriptionSession = async ({ customerId }: { customerId: string }) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+
+  // Check to see if this user has a subscription with Stripe
+  const { data: subscriptions } = await stripe.subscriptions.list({
+    customer: customerId,
+  });
+
+  const activeSubscription = subscriptions.find((x) => x.status !== 'canceled');
+  if (!activeSubscription) {
+    throw throwBadRequestError(`No active subscription found`);
+  }
+
+  const session = await stripe.billingPortal.sessions.create({
+    ...portalConfiguration(),
+    customer: customerId,
+    return_url: `${baseUrl}/user/account`,
+    flow_data: {
+      // @ts-ignore This is valid as per stripe's documentation
+      type: 'subscription_cancel',
+      subscription_cancel: {
+        subscription: activeSubscription.id,
+      },
+    },
+  });
+
+  return { url: session.url };
+};
+
+export const cancelSubscriptionWithFallback = async ({
+  customerId,
+  userId,
+}: {
+  customerId: string;
+  userId: number;
+}) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+
+  try {
+    const result = await createCancelSubscriptionSession({ customerId });
+    return { type: 'redirect' as const, url: result.url };
+  } catch (portalError) {
+    // Only fall back for Stripe/portal errors, not for "no subscription found"
+    const errorMessage = portalError instanceof Error ? portalError.message : String(portalError);
+    if (errorMessage.includes('No active subscription')) {
+      throw portalError;
+    }
+
+    log('Portal cancellation failed, attempting direct cancellation:', portalError);
+
+    // Verify the subscription exists in DB before direct cancel. All non-canceled
+    // Stripe subscription statuses are safe to cancel via the API: Stripe sets
+    // auto_advance=false on finalized invoices (no further charges) and any open
+    // invoices simply remain uncollected. There's no revenue to protect here —
+    // `unpaid` means Smart Retries already gave up, and `incomplete` means the
+    // initial payment never succeeded.
+    const subscription = await dbWrite.customerSubscription.findFirst({
+      where: {
+        userId,
+        product: { provider: 'Stripe' },
+        status: { in: ['active', 'past_due', 'trialing', 'incomplete', 'unpaid'] },
+      },
+      select: { id: true },
+    });
+
+    if (!subscription) {
+      throw throwBadRequestError(
+        'Unable to cancel subscription. Please contact support for assistance.'
+      );
+    }
+
+    await deleteStripeSubscription(stripe, subscription.id);
+
+    // Optimistically delete the DB record so the UI reflects the cancellation
+    // immediately rather than waiting for the webhook. The webhook handler
+    // (customer.subscription.deleted) is idempotent and handles missing records.
+    await dbWrite.customerSubscription.delete({ where: { id: subscription.id } }).catch(() => {
+      // Record may already be deleted by a concurrent webhook — safe to ignore
+    });
+    await invalidateSubscriptionCaches(userId);
+
+    return { type: 'direct' as const };
+  }
+};
+
+export const upsertSubscription = async (
+  subscription: Stripe.Subscription,
+  customerId: string,
+  eventDate: Date,
+  eventType: string
+) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+
+  const isUpdatingSubscription = eventType === 'customer.subscription.updated';
+  if (isUpdatingSubscription) {
+    // We need to wait a bit to avoid race conditions
+    await sleep(5000);
+  }
+
+  const user = await dbWrite.user.findFirst({
+    where: { customerId: customerId },
+    select: {
+      id: true,
+      customerId: true,
+      subscriptions: {
+        where: {
+          // Stripe only deals with green but user may have multiple subscriptions for different colors
+          buzzType: 'green',
+        },
+        select: { id: true, updatedAt: true, status: true },
+      },
+    },
+  });
+
+  if (!user) throw throwNotFoundError(`User with customerId: ${customerId} not found`);
+
+  const mainSubscription = user.subscriptions[0];
+  const userHasSubscription = !!mainSubscription;
+  const isSameSubscriptionItem = userHasSubscription && mainSubscription?.id === subscription.id;
+  const isCreatingSubscription = eventType === 'customer.subscription.created';
+  const isCancelingSubscription = eventType === 'customer.subscription.deleted';
+
+  const startingNewSubscription =
+    isCreatingSubscription && userHasSubscription && !isSameSubscriptionItem;
+
+  log('Subscription event:', eventType);
+
+  if (isCancelingSubscription && subscription.cancel_at === null) {
+    // immediate cancel:
+    if (!mainSubscription) {
+      log('Subscription already deleted (e.g., by direct cancellation fallback)');
+      return;
+    }
+    log('Subscription canceled immediately');
+    await dbWrite.customerSubscription.delete({ where: { id: mainSubscription.id } });
+    await invalidateSubscriptionCaches(user.id);
+    return;
+  }
+
+  if (startingNewSubscription) {
+    log('Subscription id changed, deleting old subscription');
+    if (mainSubscription) {
+      await dbWrite.customerSubscription.delete({ where: { id: mainSubscription.id } });
+    }
+  } else if (userHasSubscription && isCreatingSubscription) {
+    log('Subscription already up to date');
+    // Webhook redelivery / duplicate event. The DB row is fine, but downstream
+    // caches (session, multipliers) may still be stale from a prior failed
+    // invalidation — re-bust them defensively so a redelivered event is a
+    // legitimate recovery path.
+    await invalidateSubscriptionCaches(user.id);
+    return;
+  }
+
+  // Get product to determine buzzType
+  const productId = subscription.items.data[0].price.product as string;
+  const product = await dbRead.product.findFirst({
+    where: { id: productId },
+  });
+
+  const productMeta = product?.metadata as any;
+  const buzzType = (productMeta?.buzzType ?? 'green') as string;
+
+  const data = {
+    id: subscription.id,
+    userId: user.id,
+    buzzType,
+    metadata: subscription.metadata,
+    status: subscription.status,
+    // as far as I can tell, there are never multiple items in this array
+    priceId: subscription.items.data[0].price.id,
+    productId,
+    cancelAtPeriodEnd: subscription.cancel_at_period_end,
+    cancelAt: subscription.cancel_at ? toDateTime(subscription.cancel_at) : null,
+    canceledAt: subscription.canceled_at ? toDateTime(subscription.canceled_at) : null,
+    currentPeriodStart: toDateTime(subscription.current_period_start),
+    currentPeriodEnd: toDateTime(subscription.current_period_end),
+    createdAt: toDateTime(subscription.created),
+    endedAt: subscription.ended_at ? toDateTime(subscription.ended_at) : null,
+    updatedAt: eventDate,
+  };
+
+  await dbWrite.$transaction([
+    dbWrite.customerSubscription.upsert({
+      where: {
+        userId_buzzType: {
+          userId: user.id,
+          buzzType,
+        },
+      },
+      update: data,
+      create: data,
+    }),
+  ]);
+
+  // This upsert is keyed on the CASH colour slot, so it leaves any Buzz-purchased
+  // membership live in its own slot. Tier resolution takes the highest across all
+  // subscriptions, so a leftover Buzz gold would keep granting gold to someone now paying
+  // for bronze. End it once the paid one is real.
+  if (['active', 'trialing'].includes(data.status)) {
+    const { supersedeBuzzMembershipForPaidSubscription } = await import(
+      '~/server/services/subscriptions.service'
+    );
+    await supersedeBuzzMembershipForPaidSubscription({ userId: user.id });
+  }
+
+  const userVault = await dbRead.vault.findFirst({
+    where: { userId: user.id },
+  });
+
+  // Product already fetched above for buzzType
+
+  if (data.status === 'canceled' && userVault) {
+    await dbWrite.vault.update({
+      where: { userId: user.id },
+      data: {
+        storageKb: 0, // Reset storage to 0
+      },
+    });
+  } else if (data.status === 'active') {
+    const parsedMeta = subscriptionProductMetadataSchema.safeParse(product?.metadata);
+    const vault = userVault ? userVault : await getOrCreateVault({ userId: user.id });
+    if (parsedMeta.success && vault.storageKb !== parsedMeta.data.vaultSizeKb) {
+      await dbWrite.vault.update({
+        where: { userId: vault.userId },
+        data: {
+          storageKb: parsedMeta.data.vaultSizeKb,
+        },
+      });
+    }
+  }
+
+  await invalidateSubscriptionCaches(user.id);
+};
+
+export const toDateTime = (secs: number) => new Date(secs * 1000);
+
+export const upsertProductRecord = async (product: Stripe.Product) => {
+  const productData = {
+    id: product.id,
+    active: product.active,
+    name: product.name,
+    description: product.description ?? null,
+    metadata: product.metadata,
+    defaultPriceId: product.default_price as string | null,
+  };
+
+  await dbWrite.product.upsert({
+    where: { id: product.id },
+    update: productData,
+    create: productData,
+  });
+
+  return productData;
+};
+
+export const upsertPriceRecord = async (price: Stripe.Price) => {
+  const priceData = {
+    id: price.id,
+    productId: typeof price.product === 'string' ? price.product : '',
+    active: price.active,
+    currency: price.currency,
+    description: price.nickname ?? undefined,
+    type: price.type,
+    unitAmount: price.unit_amount,
+    interval: price.recurring?.interval,
+    intervalCount: price.recurring?.interval_count,
+    metadata: price.metadata,
+  };
+  await dbWrite.price.upsert({
+    where: { id: price.id },
+    update: priceData,
+    create: priceData,
+  });
+  return priceData;
+};
+
+export const initStripePrices = async () => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+  const { data: prices } = await stripe.prices.list();
+  await Promise.all(
+    prices.map(async (price) => {
+      await upsertPriceRecord(price);
+    })
+  );
+};
+
+export const initStripeProducts = async () => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+  const { data: products } = await stripe.products.list();
+  await Promise.all(
+    products.map(async (product) => {
+      await upsertProductRecord(product);
+    })
+  );
+};
+
+export const manageCheckoutPayment = async (sessionId: string, customerId: string) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+  const user = await dbWrite.user.findUniqueOrThrow({
+    where: { customerId },
+    select: { id: true, customerId: true },
+  });
+  const { line_items, payment_status } = await stripe.checkout.sessions.retrieve(sessionId, {
+    expand: ['line_items'],
+  });
+
+  const purchases =
+    line_items?.data.map((data) => ({
+      userId: user.id,
+      priceId: data.price?.id,
+      productId: data.price?.product as string | undefined,
+      status: payment_status,
+    })) ?? [];
+
+  if (purchases.length > 0) {
+    await dbWrite.purchase.createMany({ data: purchases });
+  }
+};
+
+export const manageInvoicePaid = async (invoice: Stripe.Invoice) => {
+  // Check if user exists and has a customerId
+  // Use write db to avoid replication lag between webhook requests
+  const user = await dbWrite.user.findUniqueOrThrow({
+    where: { customerId: invoice.customer as string },
+    select: { id: true, customerId: true },
+  });
+
+  if (user && !user.customerId) {
+    // Since we're handling an invoice, we assume that the user
+    // is already created in stripe. We just update in our records
+    await dbWrite.user.update({
+      where: { id: user.id },
+      data: { customerId: invoice.customer as string },
+    });
+
+    const { userUpdateCounter } = await import('~/server/prom/client');
+    userUpdateCounter?.inc({ location: 'stripe.service:handleInvoicePaid' });
+  }
+
+  const purchases = invoice.lines.data.map((data) => ({
+    userId: user.id,
+    priceId: data.price?.id,
+    productId: data.price?.product as string | undefined,
+    status: invoice.status,
+  }));
+
+  await dbWrite.purchase.createMany({ data: purchases });
+
+  // Don't check for subscription active because there is a chance it hasn't been updated yet
+  if (
+    invoice.subscription &&
+    user &&
+    invoice.billing_reason &&
+    ['subscription_cycle', 'subscription_create', 'subscription_update'].includes(
+      invoice.billing_reason
+    )
+  ) {
+    const products = (await dbRead.product.findMany()).filter(
+      (p) => !!(p.metadata as any)?.[env.TIER_METADATA_KEY]
+    );
+    // A trial_end push bills the plan at $0, which sells no month. Line amounts are before
+    // discounts, so a gifted or comped month still counts. On a plan switch the renewed plan is the
+    // non-proration line; the old plan's credit and the new plan's prorations don't decide it.
+    // Not amount_paid: a balance-paid renewal has 0 there.
+    const tierLines = invoice.lines.data.filter((l) =>
+      products.some((p) => p.id === l.price?.product)
+    );
+    const billedLine = tierLines.find((l) => !l.proration && l.amount > 0);
+    const billedMonth = !!billedLine;
+    const billedProduct = products.find(
+      (p) => p.id === (billedLine ?? tierLines[0])?.price?.product
+    );
+
+    if (!billedProduct) {
+      return;
+    }
+
+    const billedProductMeta = (billedProduct?.metadata ?? {}) as SubscriptionProductMetadata;
+    const mainPurchase = purchases.find((p) => p.productId === billedProduct?.id);
+
+    if (!mainPurchase) {
+      // Give you no buzz. You no pay.
+      return;
+    }
+
+    if (billedMonth)
+      await withRetries(() =>
+        createBuzzTransaction({
+          fromAccountId: 0,
+          toAccountId: user.id,
+          toAccountType: (billedProductMeta.buzzType as any) ?? 'yellow', // Default to yellow if not specified
+          type: TransactionType.Purchase,
+          externalTransactionId: invoice.id,
+          amount: billedProductMeta.monthlyBuzz ?? 3000, // assume a min of 3000.
+          description: `Membership bonus`,
+          details: { invoiceId: invoice.id },
+        })
+      ).catch(handleLogError);
+
+    const { bindReferralCodeForUser, recordMembershipPaymentReward } = await import(
+      '~/server/services/referral.service'
+    );
+
+    const subscriptionMetadata =
+      (invoice as any).subscription_details?.metadata ?? (invoice as any).metadata ?? {};
+    let refCode: string | undefined =
+      typeof subscriptionMetadata.ref_code === 'string' ? subscriptionMetadata.ref_code : undefined;
+    let refCodeSource: 'metadata' | 'fallback-session' | 'none' = refCode ? 'metadata' : 'none';
+    // Stripe doesn't guarantee webhook ordering. invoice.paid for a brand-new
+    // subscription can land before checkout.session.completed has had a chance
+    // to copy the ref_code custom_field onto the Subscription metadata. Fall
+    // back to fetching the parent Checkout Session and reading the field
+    // directly so we never lose a manually-entered code on the first invoice.
+    if (!refCode && invoice.subscription) {
+      const subId =
+        typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription.id;
+      try {
+        const stripeClient = await getServerStripe();
+        if (stripeClient) {
+          const sessions = await stripeClient.checkout.sessions.list({
+            subscription: subId,
+            limit: 1,
+          });
+          const customField = sessions.data[0]?.custom_fields?.find((f) => f.key === 'ref_code');
+          const fromField = customField?.text?.value?.trim().toUpperCase();
+          if (fromField) {
+            refCode = fromField;
+            refCodeSource = 'fallback-session';
+          }
+        }
+      } catch (err) {
+        handleLogError(err as Error);
+      }
+    }
+    if (refCode) {
+      await bindReferralCodeForUser(user.id, refCode).catch(handleLogError);
+      // Trace which path supplied the ref_code so we can spot when the
+      // metadata ordering breaks (and verify the fallback is doing its job).
+      logToAxiom(
+        {
+          name: 'invoice-paid-ref-code',
+          refereeId: user.id,
+          invoiceId: invoice.id,
+          refCode,
+          source: refCodeSource,
+        },
+        'webhooks'
+      ).catch(() => null);
+    }
+
+    const stripePaymentIntentId =
+      typeof invoice.payment_intent === 'string'
+        ? invoice.payment_intent
+        : invoice.payment_intent?.id ?? undefined;
+    const stripeChargeId =
+      typeof invoice.charge === 'string' ? invoice.charge : invoice.charge?.id ?? undefined;
+
+    if (billedMonth)
+      await recordMembershipPaymentReward({
+        refereeId: user.id,
+        tier: billedProductMeta.tier,
+        monthlyBuzzAmount: billedProductMeta.monthlyBuzz ?? 0,
+        sourceEventId: invoice.id,
+        payment: {
+          paymentProvider: 'Stripe',
+          stripeInvoiceId: invoice.id,
+          stripePaymentIntentId,
+          stripeChargeId,
+        },
+      }).catch(handleLogError);
+
+    // -----------------------------------------------------------------
+    // W3 flow C — App Blocks MEMBERSHIP attribution. If this membership
+    // purchase was initiated from inside a block, the FIN-1-derived block
+    // attribution was stamped onto the subscription metadata at checkout
+    // (createSubscribeSession). Read it back and write ONE attribution row
+    // per PAID invoice (RENEWALS-PAY: subscription_create AND
+    // subscription_cycle both accrue a share).
+    //
+    // Proration policy: gate the attribution write to billing_reason IN
+    // (subscription_create, subscription_cycle) — EXCLUDE subscription_update.
+    // A mid-cycle upgrade emits a `subscription_update` PRORATION invoice
+    // (the upgrade delta for the rest of the period) AND, at the period
+    // boundary, a `subscription_cycle` invoice for the full new price. The
+    // UNIQUE(invoice_id, app_block_id) only dedups the SAME invoice; the
+    // proration and the cycle invoice are DISTINCT invoice_ids covering
+    // OVERLAPPING value, so attributing both would over-accrue (proration
+    // delta + full cycle) for that period. We therefore do NOT separately
+    // attribute proration deltas — the period's subscription_cycle invoice
+    // captures its value. (The buzz grant / recordMembershipPaymentReward /
+    // ref_code logic above is intentionally LEFT firing for subscription_update
+    // so an upgrade still grants Buzz / records the membership reward; only
+    // this attribution write is gated.) Revisit if per-period proration
+    // sharing is ever wanted — the alternative is a per-(subscription_id,
+    // period_start) dedup that attributes the delta and reconciles against the
+    // cycle invoice instead of skipping subscription_update.
+    //
+    // Best-effort: a failed attribution write MUST NOT break membership
+    // provisioning (the buzz grant + reward above already happened). The
+    // (invoice_id, app_block_id) UNIQUE makes a webhook retry idempotent.
+    // -----------------------------------------------------------------
+    const ATTRIBUTABLE_BILLING_REASONS = ['subscription_create', 'subscription_cycle'] as const;
+    const isAttributableBillingReason =
+      !!invoice.billing_reason &&
+      (ATTRIBUTABLE_BILLING_REASONS as readonly string[]).includes(invoice.billing_reason);
+    // $0 invoices (proration fully covered by credit balance, etc.) carry no
+    // NEW money to share — skip the write to avoid creating benign-but-noisy
+    // pending zero-everything rows that the confirm-pending cron promotes
+    // forever. amount_paid is the correct basis (you only share new money).
+    const grossUsdCents = invoice.amount_paid ?? invoice.total ?? 0;
+    if (isAttributableBillingReason && grossUsdCents > 0 && billedMonth) {
+      try {
+        const blockAttribution = extractAttribution(
+          subscriptionMetadata as Record<string, string | number | null | undefined>
+        );
+        let resolvedAttribution = blockAttribution;
+        let attributionSource: 'metadata' | 'fallback-session' | 'none' = blockAttribution
+          ? 'metadata'
+          : 'none';
+
+        // Webhook-ordering race (same as ref_code): invoice.paid for a
+        // brand-new subscription can land before checkout.session.completed
+        // copied the metadata onto the Subscription. Fall back to the parent
+        // Checkout Session's metadata so the FIRST invoice isn't lost.
+        //
+        // SCOPED to subscription_create: the race only exists for a
+        // subscription's FIRST invoice. By the time a renewal
+        // (subscription_cycle) fires, the metadata was stamped onto the
+        // Subscription at creation and is reliably present in
+        // subscription_details.metadata — so a renewal that resolves no
+        // attribution genuinely has none (a non-block membership), and the
+        // Checkout-Session lookup would be a guaranteed-empty Stripe API call
+        // on every renewal. Gating it here avoids that per-renewal round-trip.
+        if (
+          !resolvedAttribution &&
+          invoice.subscription &&
+          invoice.billing_reason === 'subscription_create'
+        ) {
+          const subId =
+            typeof invoice.subscription === 'string'
+              ? invoice.subscription
+              : invoice.subscription.id;
+          try {
+            const stripeClient = await getServerStripe();
+            if (stripeClient) {
+              const sessions = await stripeClient.checkout.sessions.list({
+                subscription: subId,
+                limit: 1,
+              });
+              const sessionMeta = sessions.data[0]?.metadata ?? undefined;
+              const fromSession = extractAttribution(
+                sessionMeta as Record<string, string | number | null | undefined> | undefined
+              );
+              if (fromSession) {
+                resolvedAttribution = fromSession;
+                attributionSource = 'fallback-session';
+              }
+            }
+          } catch (err) {
+            handleLogError(err as Error);
+          }
+        }
+
+        if (resolvedAttribution) {
+          // Pull the actual Stripe fee off the charge's balance transaction
+          // (same as the buzz-purchase path). Best-effort: a 0 fee just means
+          // the publisher gets a slightly higher (net===gross) share.
+          let providerFeeCents = 0;
+          if (stripeChargeId) {
+            try {
+              const stripeClient = await getServerStripe();
+              if (stripeClient) {
+                const charge = await stripeClient.charges.retrieve(stripeChargeId, {
+                  expand: ['balance_transaction'],
+                });
+                const balanceTx = charge.balance_transaction;
+                if (balanceTx && typeof balanceTx !== 'string') {
+                  providerFeeCents = balanceTx.fee ?? 0;
+                }
+              }
+            } catch {
+              // best-effort; leave fee at 0
+            }
+          }
+
+          const line = invoice.lines.data.find((l) => l.price?.product === billedProduct?.id);
+          const periodStart = line?.period?.start ? new Date(line.period.start * 1000) : null;
+          const periodEnd = line?.period?.end ? new Date(line.period.end * 1000) : null;
+
+          const { recordSubscriptionAttribution } = await import(
+            '~/server/services/blocks/buzz-attribution.service'
+          );
+          await recordSubscriptionAttribution({
+            userId: user.id,
+            buzzAmount: billedProductMeta.monthlyBuzz ?? 0,
+            buzzType: (billedProductMeta.buzzType as string) ?? 'yellow',
+            usdAmountCents: grossUsdCents,
+            providerFeeCents,
+            paymentProvider: 'stripe',
+            invoiceId: invoice.id,
+            subscriptionId:
+              typeof invoice.subscription === 'string'
+                ? invoice.subscription
+                : invoice.subscription?.id ?? null,
+            billingReason: invoice.billing_reason ?? null,
+            periodStart,
+            periodEnd,
+            tier: billedProductMeta.tier ?? null,
+            attribution: resolvedAttribution,
+          });
+
+          logToAxiom(
+            {
+              name: 'invoice-paid-block-attribution',
+              refereeId: user.id,
+              invoiceId: invoice.id,
+              appId: resolvedAttribution.appId,
+              appBlockId: resolvedAttribution.appBlockId,
+              billingReason: invoice.billing_reason,
+              source: attributionSource,
+            },
+            'webhooks'
+          ).catch(() => null);
+        }
+      } catch (attrErr) {
+        // Never fail membership provisioning on an attribution write.
+        logToAxiom(
+          {
+            name: 'invoice-paid-block-attribution',
+            type: 'error',
+            refereeId: user.id,
+            invoiceId: invoice.id,
+            message: 'block subscription attribution write failed',
+            error: (attrErr as Error)?.message,
+          },
+          'webhooks'
+        ).catch(() => null);
+      }
+    }
+
+    // Renewals (subscription_cycle) often arrive without a paired
+    // subscription.updated event, so the session/multiplier caches won't be
+    // refreshed by the upsertSubscription path. Bust here so the user's tier
+    // and Blue-Buzz multiplier reflect the just-renewed state.
+    await invalidateSubscriptionCaches(user.id);
+  }
+};
+
+/**
+ * Stripe refuses to delete an `incomplete` subscription while its first-payment Checkout Session
+ * is open (a declined first charge leaves it open for a retry). Only after that refusal, expire the
+ * subscription's open sessions and delete once more. An open session means nothing was collected,
+ * so a paid subscription is never touched: its del does not fail this way, and its sessions are
+ * `complete`.
+ */
+const deleteStripeSubscription = async (
+  stripe: Stripe,
+  subscriptionId: string,
+  // Leave undefined rather than `{}`: stripe-node rejects an empty options object as an unknown
+  // argument ("Stripe: Unknown arguments") before sending anything.
+  options?: Stripe.RequestOptions
+) => {
+  try {
+    await stripe.subscriptions.del(subscriptionId, {}, options);
+    return;
+  } catch (error) {
+    // `rawType`, not `type`: `type` is the error's class name, which a minified bundle can mangle.
+    if ((error as { rawType?: string })?.rawType !== 'invalid_request_error') throw error;
+    // The SDK's list params have no `status` filter. A failed lookup surfaces the original error,
+    // which callers classify (the GDPR scrub reads `resource_missing` as already cancelled).
+    const sessions = await stripe.checkout.sessions
+      .list({ subscription: subscriptionId, limit: 10 }, options)
+      .catch(() => null);
+    const open =
+      sessions?.data.filter(
+        (session) => session.status === 'open' && session.subscription === subscriptionId
+      ) ?? [];
+    if (!open.length) throw error;
+    for (const session of open) await stripe.checkout.sessions.expire(session.id, {}, options);
+  }
+
+  try {
+    await stripe.subscriptions.del(subscriptionId, {}, options);
+  } catch (error) {
+    // Expiring the session may have ended the subscription already.
+    const live = await stripe.subscriptions.retrieve(subscriptionId, {}, options).catch(() => null);
+    if (live && ['canceled', 'incomplete_expired'].includes(live.status)) return;
+    throw error;
+  }
+};
+
+export const cancelSubscription = async ({
+  userId,
+  subscriptionId,
+  atPeriodEnd,
+  removeRecord,
+}: {
+  userId?: number;
+  subscriptionId?: string;
+  // When set, schedule the cancellation for the end of the paid period
+  // (cancel_at_period_end) instead of ending it immediately. Used for ban /
+  // restriction flows so the user keeps what they paid for and the action is
+  // reversible via reinstateSubscription.
+  atPeriodEnd?: boolean;
+  // Delete our CustomerSubscription row once Stripe has confirmed the cancel. Only after:
+  // every cancel path finds the subscription through that row, so deleting it first turns a
+  // failed cancel into a silent no-op that keeps billing.
+  removeRecord?: boolean;
+}) => {
+  if (!subscriptionId && userId) {
+    const subscription = await dbWrite.customerSubscription.findFirst({
+      where: {
+        userId,
+        product: {
+          provider: 'Stripe',
+        },
+        status: {
+          in: ['active', 'past_due', 'trialing'],
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+    if (!subscription) return;
+    subscriptionId = subscription.id;
+  }
+
+  if (!subscriptionId) return;
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+
+  if (atPeriodEnd) {
+    // A cancellation already due by period end is the member's own (or a gift's last month): leave
+    // it and don't mark it, or reinstating would resume a membership they chose to end.
+    const live = await stripe.subscriptions.retrieve(subscriptionId);
+    if (live.cancel_at_period_end) return;
+    if (live.cancel_at && live.cancel_at <= live.current_period_end) return;
+    const cancelled = await stripe.subscriptions.update(subscriptionId, {
+      cancel_at_period_end: true,
+      cancellation_details: { comment: MODERATION_CANCELLATION },
+      // Always written: a date left from an earlier cut would make reinstate treat this as a gift.
+      metadata: { [MODERATION_PREV_CANCEL_AT]: live.cancel_at ? String(live.cancel_at) : '' },
+    });
+    // canceled_at exists only once the cancel is written, hence a second update. If it fails, the
+    // cancel stands unmarked and is never resumed.
+    if (cancelled.canceled_at) {
+      await stripe.subscriptions.update(subscriptionId, {
+        metadata: { [MODERATION_CANCEL_MARK]: String(cancelled.canceled_at) },
+      });
+    }
+    return;
+  }
+
+  // The shared client retries nothing (stripe-node's default is 0), so one transient error
+  // would otherwise leave a deleted account billing. The timeout bounds the retries: at the
+  // default 80s per attempt, three attempts outlast the gateway and a completed deletion 504s.
+  await deleteStripeSubscription(
+    stripe,
+    subscriptionId,
+    removeRecord ? { maxNetworkRetries: 2, timeout: 10_000 } : undefined
+  );
+  if (!removeRecord) return;
+
+  // deleteMany: the customer.subscription.deleted webhook may have removed the row already.
+  await dbWrite.customerSubscription.deleteMany({ where: { id: subscriptionId } });
+  if (userId) await invalidateSubscriptionCaches(userId);
+};
+
+// Reverses a cancel_at_period_end cancellation that a ban / restriction flow made, once
+// the account is no longer banned or muted. A cancellation without our mark stays: the
+// member's own, or one we made before the mark existed (they renew themselves rather
+// than being billed against a cancel they may have chosen).
+export const reinstateSubscription = async ({ userId }: { userId: number }) => {
+  const user = await dbWrite.user.findUnique({
+    where: { id: userId },
+    select: { bannedAt: true, muted: true },
+  });
+  if (!user || user.bannedAt || user.muted) return;
+
+  const subscription = await dbWrite.customerSubscription.findFirst({
+    where: {
+      userId,
+      product: { provider: 'Stripe' },
+      status: { in: ['active', 'past_due', 'trialing'] },
+    },
+    // A lagging row can still say false, so this only prefers the cancelling row; Stripe decides.
+    orderBy: [{ cancelAtPeriodEnd: 'desc' }, { createdAt: 'desc' }],
+    select: { id: true },
+  });
+  if (!subscription) return;
+
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+
+  // Stripe's copy decides, not our row: the row lags the webhook and does not carry the mark.
+  const live = await stripe.subscriptions.retrieve(subscription.id);
+  if (!live.cancel_at_period_end || !live.canceled_at) return;
+  if (live.metadata?.[MODERATION_CANCEL_MARK] !== String(live.canceled_at)) return;
+  const unmark = { [MODERATION_CANCEL_MARK]: '', [MODERATION_PREV_CANCEL_AT]: '' };
+
+  const prevCancelAt = Number(live.metadata?.[MODERATION_PREV_CANCEL_AT]);
+  if (prevCancelAt) {
+    // A gift: restore its own end date. Clearing the cancel would renew it into paid billing.
+    if (prevCancelAt <= live.current_period_end) return;
+    await stripe.subscriptions.update(subscription.id, {
+      cancel_at: prevCancelAt,
+      proration_behavior: 'none',
+      // Unmarked, the gift's own last-period cancel (cap true) is never resumed into paid.
+      metadata: unmark,
+    });
+    return;
+  }
+
+  await stripe.subscriptions.update(subscription.id, {
+    cancel_at_period_end: false,
+    metadata: unmark,
+  });
+};
+
+// NOTE: The Price rows returned here are the source of truth for the buzz
+// purchase UI AND for the actual charge (via `getPaymentIntent`, which uses
+// `unitAmount` directly). Stripe's own Price catalog is intentionally NOT kept
+// in sync with these rows — some buzz Price IDs are synthetic (e.g.
+// `price_civitai_buzz_25`) and won't exist in Stripe. Don't reintroduce a flow
+// that passes these IDs back to Stripe without first aligning the catalog.
+export const getBuzzPackages = async () => {
+  const products = await dbRead.product.findMany({
+    where: { active: true, metadata: { path: ['tier'], equals: 'buzz' } },
+    select: {
+      id: true,
+      name: true,
+      description: true,
+      defaultPriceId: true,
+      metadata: true,
+      prices: {
+        where: { active: true },
+        orderBy: { unitAmount: { sort: 'asc', nulls: 'last' } },
+        select: {
+          id: true,
+          description: true,
+          unitAmount: true,
+          currency: true,
+          metadata: true,
+        },
+      },
+    },
+  });
+  // A sandbox copy of the Buzz product holds only Stripe's real prices, not the synthetic rows
+  // above, and the charge never uses a price id, so the live row serves every key mode.
+  const [buzzProduct] = products.filter((product) => !isSandboxCopy(product.metadata));
+
+  return buzzProduct.prices.map(({ metadata, description, ...price }) => {
+    const meta = Schema.buzzPriceMetadataSchema.safeParse(metadata);
+
+    return {
+      ...price,
+      name: description,
+      buzzAmount: meta.success ? meta.data.buzzAmount : null,
+      description: meta.success ? meta.data.bonusDescription : null,
+    };
+  });
+};
+
+// Buzz is credited the moment the PaymentIntent succeeds, and a bank debit can be returned days
+// later, so the methods are fixed here rather than left to the dashboard or the client.
+// Cash App Pay only takes USD.
+const buzzPaymentMethodTypes = (currency: Currency) =>
+  currency === Currency.USD ? ['card', 'link', 'cashapp'] : ['card', 'link'];
+
+export const getPaymentIntent = async ({
+  unitAmount,
+  currency = Currency.USD,
+  metadata,
+  customerId,
+  user,
+  domain,
+  setupFuturePayment = true,
+}: Schema.PaymentIntentCreationSchema & {
+  user: { id: number; email: string };
+  customerId?: string;
+  domain: ColorDomain;
+}) => {
+  // TODO: If a user doesn't exist, create one. Initially, this will be protected, but ideally, we should create the user on our end
+  if (!customerId) {
+    customerId = await createCustomer(user);
+  }
+
+  if (unitAmount < buzzConstants.minStripeChargeAmount) {
+    throw throwBadRequestError(
+      `Minimum purchase amount is $${formatPriceForDisplay(
+        buzzConstants.minStripeChargeAmount / 100
+      )}`
+    );
+  }
+
+  if (unitAmount > buzzConstants.maxChargeAmount) {
+    throw throwBadRequestError(
+      `Maximum purchase amount is $${formatPriceForDisplay(buzzConstants.maxChargeAmount / 100)}`
+    );
+  }
+
+  if (unitAmount !== metadata.buzzAmount / 10) {
+    // Safeguard against tampering with the amount on the client side.
+    //
+    // Typed rather than a bare `Error`: `getTRPCErrorFromUnknown` maps a plain Error to
+    // INTERNAL_SERVER_ERROR, so rejected input on this route answered with a 500 — the same
+    // defect class as the fractional amount above. This is an exposed authenticated
+    // procedure. The condition is unchanged; only its type.
+    //
+    // 🔴 The demotion costs this guard its only COUNTER, which is why the explicit log
+    // below is not optional. `recordTrpcError` (`server/prom/http-errors.ts`) increments
+    // `civitai_app_http_errors_total` only for `status >= 500`, and the central error log
+    // tags a 4xx `type:'info'` — so as a BAD_REQUEST this fires no metric and leaves the
+    // error stream entirely. A scripted probe hunting for a window where the guard is
+    // bypassable would otherwise be invisible.
+    //
+    // 🔴 Named `-mismatch`, NOT `-tamper`, and deliberately so. Tampering is the motivating case
+    // but it is not the only way to arrive here: `buzzPriceMetadataSchema.buzzAmount` is an
+    // INDEPENDENT value with a sibling `bonusDescription`, and the form submits
+    // `selectedPrice.buzzAmount ?? unitAmount * 10` — so a Stripe buzz Price configured with bonus
+    // Buzz (charge 1000, credit 11000) trips this condition from an ordinary package click. No
+    // such Price exists today (all five live buzz Prices carry empty metadata, checked
+    // 2026-09-19), so this is latent rather than active; but naming the event after the malicious
+    // reading would attach the word "tamper" — and an innocent buyer's userId — to whoever
+    // configures the next bonus package.
+    logToAxiom(
+      {
+        name: 'buzz-purchase-amount-mismatch',
+        type: 'warning',
+        message: 'rejected a buzz purchase whose unitAmount did not match metadata.buzzAmount',
+        userId: user.id,
+        submittedUnitAmount: unitAmount,
+        submittedBuzzAmount: metadata.buzzAmount,
+        expectedUnitAmount: metadata.buzzAmount / 10,
+      },
+      'webhooks'
+    ).catch(() => null);
+
+    throw throwBadRequestError(
+      'There was an error while creating your order. Please try again later.'
+    );
+  }
+
+  // FIN-1: App Blocks revenue attribution is client-forgeable end-to-end —
+  // the browser stamps blockAppId/blockInstanceId/blockScope/etc into this
+  // metadata, and the Stripe webhook later credits a publisher's revenue
+  // share off those fields. This is the only server chokepoint that still
+  // holds the authenticated session (`user.id`), so we re-validate /
+  // re-derive every block-attribution field here against the real buyer.
+  // Forged attributions are STRIPPED (purchase proceeds un-attributed);
+  // a spender spoof (metadata.userId != session user) is rejected. See
+  // attribution-validator.service.ts for the full threat model.
+  const validatedMetadata = await validateBuzzPurchaseAttribution({
+    metadata,
+    sessionUserId: user.id,
+  });
+
+  // The browser stamps `metadata.buzzType` and the webhook credits whatever colour it finds
+  // there, so a modified client could route a real-money purchase into a currency it didn't
+  // buy — including `blue`, the free one. Re-derive it here, the last point that still knows
+  // which domain the request came from, and overwrite the client's value.
+  const buzzType = deriveDomainBuzzType(domain);
+  if (metadata.buzzType && metadata.buzzType !== buzzType) {
+    logToAxiom(
+      {
+        name: 'buzz-purchase-currency',
+        type: 'warning',
+        message: 'overrode client-supplied buzzType with the domain-derived currency',
+        userId: user.id,
+        domain,
+        clientBuzzType: metadata.buzzType,
+        derivedBuzzType: buzzType,
+      },
+      'webhooks'
+    ).catch(() => null);
+  }
+
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount: unitAmount,
+    currency,
+    customer: customerId,
+    metadata: { ...(validatedMetadata as MetadataParam), buzzType },
+    payment_method_types: buzzPaymentMethodTypes(currency),
+    setup_future_usage: setupFuturePayment ? 'off_session' : undefined,
+  });
+
+  return {
+    clientSecret: paymentIntent.client_secret,
+    paymentMethodTypes: paymentIntent.payment_method_types,
+  };
+};
+
+export const getPaymentIntentsForBuzz = async ({
+  userId,
+  startingAt,
+  endingAt,
+}: Schema.GetPaymentIntentsForBuzzSchema) => {
+  let customer: string | undefined;
+  if (userId) {
+    const user = await dbRead.user.findUnique({
+      where: { id: userId },
+      select: { customerId: true },
+    });
+
+    if (!user) throw new Error(`No user with id ${userId}`);
+
+    customer = user.customerId ?? undefined; // undefined is required for the stripe api
+  }
+
+  // Converting to unix timestamps because that's what the stripe api expects
+  const unixStartingAt = startingAt ? Math.floor(startingAt.getTime() / 1000) : undefined;
+  const unixEndingAt = endingAt ? Math.floor(endingAt.getTime() / 1000) : undefined;
+
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+  const paymentIntents = await stripe.paymentIntents.list({
+    customer,
+    limit: 100, // max limit is 100
+    created:
+      unixStartingAt || unixEndingAt ? { gte: unixStartingAt, lte: unixEndingAt } : undefined,
+  });
+
+  const pendingPayments = paymentIntents.data.filter(
+    (intent) =>
+      intent.status === 'succeeded' &&
+      intent.metadata.type === 'buzzPurchase' &&
+      !intent.metadata.transactionId
+  );
+  // Without a recorded buyer there is no one to verify the credit against, so these are left to
+  // an engineer rather than credited to whoever the query names.
+  const legacyPaymentIntentIds = pendingPayments
+    .filter((intent) => !intent.metadata.userId)
+    .map((intent) => intent.id);
+  for (const stripePaymentIntentId of legacyPaymentIntentIds) {
+    logToAxiom(
+      {
+        name: 'buzz-purchase-completion-rejected',
+        type: 'warning',
+        reason: 'legacy purchase without userId',
+        userId,
+        stripePaymentIntentId,
+      },
+      'webhooks'
+    ).catch(() => null);
+  }
+  const batches = chunk(
+    pendingPayments.filter((intent) => intent.metadata.userId),
+    10
+  );
+
+  const processedPurchases: Array<{ transactionId: string }> = [];
+  const failedPaymentIntentIds: string[] = [];
+  for (const batch of batches) {
+    const results = await Promise.allSettled(
+      batch.map((intent) => {
+        const metadata = intent.metadata as Schema.PaymentIntentMetadataSchema;
+
+        return completeStripeBuzzTransaction({
+          amount: metadata.buzzAmount,
+          stripePaymentIntentId: intent.id,
+          userId: metadata.userId,
+        });
+      })
+    );
+    results.forEach((result, i) => {
+      if (result.status === 'fulfilled') processedPurchases.push(result.value);
+      else failedPaymentIntentIds.push(batch[i].id);
+    });
+  }
+
+  return { processed: processedPurchases, legacyPaymentIntentIds, failedPaymentIntentIds };
+};
+
+export const getSetupIntent = async ({
+  paymentMethodTypes,
+  customerId,
+  user,
+}: Schema.SetupIntentCreateSchema & {
+  user: { id: number; email: string };
+  customerId?: string;
+}) => {
+  if (!customerId) {
+    customerId = await createCustomer(user);
+  }
+
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+  const setupIntent = await stripe.setupIntents.create({
+    automatic_payment_methods: !paymentMethodTypes
+      ? {
+          enabled: true,
+        }
+      : undefined,
+    customer: customerId,
+    payment_method_types: paymentMethodTypes || undefined,
+  });
+
+  return {
+    clientSecret: setupIntent.client_secret,
+  };
+};
+
+export const getCustomerPaymentMethods = async (customerId: string) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+  const paymentMethods = await stripe.paymentMethods.list({
+    customer: customerId,
+  });
+
+  return paymentMethods.data;
+};
+
+export const deleteCustomerPaymentMethod = async ({
+  paymentMethodId,
+  userId,
+  isModerator,
+}: PaymentMethodDeleteInput & {
+  userId: number;
+  isModerator: boolean;
+}) => {
+  const stripe = await getServerStripe();
+  if (!stripe) throw throwBadRequestError('Stripe is not available');
+  const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
+
+  if (!paymentMethod) {
+    throwBadRequestError(`No payment method with id ${paymentMethodId}`);
+  }
+
+  const user = await dbWrite.user.findUnique({
+    where: { id: userId },
+    select: { customerId: true },
+  });
+
+  if (!user && !isModerator) throw throwBadRequestError(`No user with id ${userId}`);
+
+  if (user?.customerId !== paymentMethod.customer && !isModerator) {
+    throw throwAuthorizationError(`Payment method does not belong to user with id ${userId}`);
+  }
+
+  return await stripe.paymentMethods.detach(paymentMethodId);
+};

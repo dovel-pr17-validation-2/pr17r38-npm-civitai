@@ -1,0 +1,114 @@
+import type { ButtonProps } from '@mantine/core';
+import { useRouter } from 'next/router';
+import { isSortAvailable, resolveFeedSort } from '~/components/Filters/sort-availability';
+import { useSortAvailability } from '~/components/Filters/useSortAvailability';
+import { SelectMenuV2 } from '~/components/SelectMenu/SelectMenu';
+import type { FilterSubTypes } from '~/providers/FiltersProvider';
+import { useFiltersContext, useSetFilters } from '~/providers/FiltersProvider';
+import {
+  ArticleSort,
+  ArticleSortHidden,
+  BountySort,
+  BuzzWithdrawalRequestSort,
+  CollectionSort,
+  CrucibleSort,
+  GenerationSort,
+  ImageSort,
+  ImageSortHidden,
+  ModelSort,
+  ModelSortHidden,
+  PostSort,
+  PostSortHidden,
+  ThreadSort,
+  ToolSort,
+} from '~/server/common/enums';
+import { removeEmpty } from '~/utils/object-helpers';
+
+type SortFilterComponentProps = {
+  type: Exclude<FilterSubTypes, 'changelogs' | 'auctions'>;
+  ignoreNsfwLevel?: boolean;
+  options?: { label: SortOption; value: SortOption }[];
+  /** Only the sort icon, for a tight row. */
+  iconOnly?: boolean;
+} & Omit<ButtonProps, 'children' | 'type' | 'style'>;
+
+type SortFilterProps = StatefulProps | DumbProps;
+
+const sortOptions = {
+  models: Object.values(ModelSort).filter((x) => !Object.values(ModelSortHidden).includes(x)),
+  posts: Object.values(PostSort).filter((x) => !Object.values(PostSortHidden).includes(x)),
+  images: Object.values(ImageSort).filter((x) => !Object.values(ImageSortHidden).includes(x)),
+  modelImages: Object.values(ImageSort).filter((x) => !Object.values(ImageSortHidden).includes(x)),
+  articles: Object.values(ArticleSort).filter((x) => !Object.values(ArticleSortHidden).includes(x)),
+  collections: Object.values(CollectionSort),
+  bounties: Object.values(BountySort),
+  videos: Object.values(ImageSort).filter((x) => !Object.values(ImageSortHidden).includes(x)),
+  threads: Object.values(ThreadSort),
+  generation: Object.values(GenerationSort),
+  tools: Object.values(ToolSort),
+  buzzWithdrawalRequests: Object.values(BuzzWithdrawalRequestSort),
+  crucibles: Object.values(CrucibleSort),
+};
+
+export function SortFilter(props: SortFilterProps) {
+  if ('value' in props) return <DumbSortFilter {...props} />;
+  return <StatefulSortFilter {...props} type={props.type} />;
+}
+
+type SortOption =
+  | ModelSort
+  | PostSort
+  | ImageSort
+  | ArticleSort
+  | CollectionSort
+  | BountySort
+  | GenerationSort
+  | ThreadSort
+  | ToolSort
+  | BuzzWithdrawalRequestSort
+  | CrucibleSort;
+
+type DumbProps = {
+  // Dumb props should work without needing to create a full filter attribute.
+  value: SortOption;
+  onChange: (value: SortOption) => void;
+} & SortFilterComponentProps;
+
+function DumbSortFilter({ type, value, onChange, ignoreNsfwLevel, options, ...props }: DumbProps) {
+  const availability = useSortAvailability();
+  // The menu below drops what this viewer may not sort by, so a value outside it
+  // would label the control with a sort its own menu will not offer.
+  const resolved = resolveFeedSort({ type, value }, { ...availability, ignoreNsfwLevel });
+
+  return (
+    <SelectMenuV2
+      label={props.iconOnly ? `Sort: ${resolved}` : resolved}
+      onClick={onChange}
+      value={resolved}
+      options={(options ?? sortOptions[type].map((x) => ({ label: x, value: x }))).filter((x) =>
+        isSortAvailable({ type, value: x.value }, { ...availability, ignoreNsfwLevel })
+      )}
+      {...props}
+    />
+  );
+}
+
+type StatefulProps = SortFilterComponentProps;
+
+function StatefulSortFilter({ type, ...props }: StatefulProps) {
+  const { query, pathname, replace } = useRouter();
+  const globalSort = useFiltersContext((state) => state[type].sort);
+  const querySort = query.sort as typeof globalSort | undefined;
+
+  const setFilters = useSetFilters(type);
+  const setSort = (sort: typeof globalSort) => {
+    if (querySort && querySort !== sort)
+      replace({ pathname, query: removeEmpty({ ...query, sort: undefined }) }, undefined, {
+        shallow: true,
+      });
+    setFilters({ sort: sort as any });
+  };
+
+  const sort = querySort ? querySort : globalSort;
+  return <DumbSortFilter type={type} value={sort} onChange={setSort} {...props} />;
+}

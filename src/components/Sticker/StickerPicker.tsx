@@ -1,0 +1,251 @@
+import { Loader, ScrollArea, Tabs, Text, TextInput, UnstyledButton } from '@mantine/core';
+import { Popover } from '~/components/MantineOverlays';
+import { IconMoodSmile } from '@tabler/icons-react';
+import clsx from 'clsx';
+import type { MouseEvent as ReactMouseEvent, ReactElement } from 'react';
+import { cloneElement, isValidElement, useMemo, useState } from 'react';
+import type { ResolvedSticker } from '~/components/Sticker/sticker.util';
+import { useOwnedSticker } from '~/components/Sticker/sticker.util';
+import { StickerPickerTile } from '~/components/Sticker/StickerPickerTile';
+import { StickerTopUp } from '~/components/Sticker/StickerTopUp';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { useHoverCapable } from '~/components/UserAvatar/UserHoverCard';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import type { StickerSurface } from '~/shared/utils/sticker-token';
+import { STICKER_SURFACES, rankStickerMatch } from '~/shared/utils/sticker-token';
+import { BASE_EMOJI } from '~/shared/constants/base-emoji';
+import { trpc } from '~/utils/trpc';
+
+/**
+ * Opening the picker must not move focus out of the composer. Two things break
+ * when it does: the caret is lost, so the sticker lands wherever `focus()` puts
+ * it rather than where the author was typing; and a composer validating on blur
+ * would fire "Cannot be empty" the moment the picker is clicked, then keep showing
+ * it — pre-submit, React Hook Form doesn't re-validate on change.
+ */
+const keepComposerFocus = (e: ReactMouseEvent) => e.preventDefault();
+
+/** Both tabs share one height so the panel never resizes under the pointer. */
+const PICKER_BODY_HEIGHT = 'h-[280px]';
+
+export function StickerPicker({
+  onSelect,
+  onSelectEmoji,
+  surface = 'comment',
+  target,
+  disabled,
+  position = 'top-end',
+}: {
+  onSelect: (sticker: ResolvedSticker) => void;
+  /** Supplying this adds the free base-emoji tab; surfaces without it stay sticker-only. */
+  onSelectEmoji?: (char: string) => void;
+  /** Balances are only meaningful where placements are charged. */
+  surface?: StickerSurface;
+  target?: React.ReactNode;
+  disabled?: boolean;
+  position?: 'top' | 'top-end' | 'top-start' | 'bottom' | 'bottom-end' | 'bottom-start';
+}) {
+  const features = useFeatureFlags();
+  const hoverCapable = useHoverCapable();
+  const [opened, setOpened] = useState(false);
+  const [query, setQuery] = useState('');
+  const [tab, setTab] = useState<'emoji' | 'sticker'>('emoji');
+  // The sticker the author just tried to place with nothing left. Offering the
+  // top-up here is the whole point — a link to the shop loses the composer.
+  const [topUp, setTopUp] = useState<ResolvedSticker | null>(null);
+  const { sticker, isLoading } = useOwnedSticker();
+  // DMs are free, so a "3 left" badge there would be actively misleading.
+  const showBalances = STICKER_SURFACES[surface].consumes;
+  const { data: balanceRows } = trpc.cosmetic.getStickerBalances.useQuery(undefined, {
+    enabled: !!features.stickers && showBalances,
+  });
+  // Distinguishes "unlimited" (row present, remaining null) from "not loaded
+  // yet" (no row) — they render differently and used to look identical.
+  const balancesLoaded = showBalances && !!balanceRows;
+  const balances = useMemo(
+    () => new Map((showBalances ? balanceRows ?? [] : []).map((b) => [b.cosmeticId, b.remaining])),
+    [balanceRows, showBalances]
+  );
+
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return sticker;
+    return sticker.filter((x) => rankStickerMatch(needle, x.slug, x.name) !== null);
+  }, [sticker, query]);
+
+  const withEmoji = !!onSelectEmoji;
+  const emoji = useMemo(() => {
+    const needle = query.trim().toLowerCase().replace(/^:|:$/g, '');
+    if (!needle) return BASE_EMOJI;
+    return BASE_EMOJI.filter((e) => rankStickerMatch(needle, e.slug, e.keywords) !== null);
+  }, [query]);
+
+  // Gated at the single mount point every surface shares, so chat and the RTE
+  // toolbar can't drift. Rendering is unaffected — that lives in <Sticker>.
+  // Base emoji are free, so an emoji-capable surface stays available with
+  // stickers switched off.
+  if (!features.stickers && !withEmoji) return null;
+
+  return (
+    // Explicit because ThemeProvider turns portalling OFF for every Popover in
+    // the app, and every surface mounting this picker clips: the image page's
+    // comment column is a ScrollArea. Drop this and the dropdown is cut off
+    // again — a clip no z-index can reach.
+    <Popover
+      opened={opened}
+      onChange={setOpened}
+      position={position}
+      withArrow
+      shadow="md"
+      withinPortal
+    >
+      <Popover.Target>
+        {/* A supplied target is usually already a button (e.g. an RTE toolbar
+            control), so clone the toggle onto it rather than wrapping — nesting
+            buttons is invalid markup and breaks keyboard activation. */}
+        {isValidElement(target) ? (
+          cloneElement(
+            target as ReactElement<{
+              onClick?: () => void;
+              onMouseDown?: (e: ReactMouseEvent) => void;
+            }>,
+            { onClick: () => setOpened((o) => !o), onMouseDown: keepComposerFocus }
+          )
+        ) : (
+          <LegacyActionIcon
+            variant="subtle"
+            color="gray"
+            disabled={disabled}
+            aria-label="Insert sticker"
+            onClick={() => setOpened((o) => !o)}
+            onMouseDown={keepComposerFocus}
+          >
+            <IconMoodSmile />
+          </LegacyActionIcon>
+        )}
+      </Popover.Target>
+      <Popover.Dropdown p="xs">
+        {topUp ? (
+          <div className="w-64">
+            <StickerTopUp
+              sticker={topUp}
+              onCancel={() => setTopUp(null)}
+              // They clicked the sticker to place it and hit the wall; having
+              // paid, they shouldn't have to find it again.
+              onPurchased={() => {
+                onSelect(topUp);
+                setTopUp(null);
+                setOpened(false);
+                setQuery('');
+              }}
+            />
+          </div>
+        ) : (
+          <div className="flex w-80 max-w-[calc(100vw-4rem)] flex-col gap-2">
+            <TextInput
+              size="xs"
+              placeholder={withEmoji ? 'Search' : 'Search sticker'}
+              value={query}
+              onChange={(e) => setQuery(e.currentTarget.value)}
+            />
+            {withEmoji && (
+              <Tabs value={tab} onChange={(v) => setTab(v === 'sticker' ? 'sticker' : 'emoji')}>
+                <Tabs.List grow>
+                  <Tabs.Tab value="emoji">Emoji</Tabs.Tab>
+                  {features.stickers && <Tabs.Tab value="sticker">Stickers</Tabs.Tab>}
+                </Tabs.List>
+              </Tabs>
+            )}
+            {/* The panel is a fixed box whatever is in it. Sized to content, it
+                stood tall for the 64 base emoji and short for a handful of
+                stickers, so switching tabs resized the popover under the
+                pointer — and an empty search collapsed it further. */}
+            <div className={clsx(PICKER_BODY_HEIGHT, 'flex flex-col')}>
+              {withEmoji && tab === 'emoji' ? (
+                !emoji.length ? (
+                  <Text size="xs" c="dimmed" ta="center" className="my-auto">
+                    No matches
+                  </Text>
+                ) : (
+                  <ScrollArea h="100%" type="auto">
+                    <div className="grid grid-cols-8 gap-1">
+                      {emoji.map((item) => (
+                        <UnstyledButton
+                          key={item.slug}
+                          title={`:${item.slug}:`}
+                          aria-label={item.slug}
+                          className="flex items-center justify-center rounded p-1 text-xl leading-none hover:bg-gray-2 dark:hover:bg-dark-5"
+                          onClick={() => {
+                            onSelectEmoji?.(item.char);
+                            setOpened(false);
+                            setQuery('');
+                          }}
+                        >
+                          {item.char}
+                        </UnstyledButton>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                )
+              ) : (
+                <>
+                  {isLoading ? (
+                    <div className="my-auto flex justify-center">
+                      <Loader size="sm" />
+                    </div>
+                  ) : !sticker.length ? (
+                    <Text size="xs" c="dimmed" ta="center" className="my-auto">
+                      You don&apos;t own any stickers yet. Grab some in the shop.
+                    </Text>
+                  ) : !filtered.length ? (
+                    <Text size="xs" c="dimmed" ta="center" className="my-auto">
+                      No matches
+                    </Text>
+                  ) : (
+                    <>
+                      <div className="min-h-0 flex-1">
+                        <ScrollArea h="100%" type="auto" offsetScrollbars>
+                          <div className="grid grid-cols-4 gap-1">
+                            {filtered.map((item) => {
+                              const remaining = balancesLoaded
+                                ? balances.get(item.id) ?? null
+                                : undefined;
+                              return (
+                                <StickerPickerTile
+                                  key={item.id}
+                                  sticker={item}
+                                  remaining={remaining}
+                                  showCreator={surface !== 'chat'}
+                                  onPick={() => {
+                                    // Exhausted opens the top-up rather than doing nothing:
+                                    // a dead button is where the author leaves.
+                                    if (remaining === 0) {
+                                      setTopUp(item);
+                                      return;
+                                    }
+                                    onSelect(item);
+                                    setOpened(false);
+                                    setQuery('');
+                                  }}
+                                />
+                              );
+                            })}
+                          </div>
+                        </ScrollArea>
+                      </div>
+                      {!hoverCapable && (
+                        <Text size="xs" c="dimmed" ta="center" className="pt-1">
+                          Press and hold a sticker to preview
+                        </Text>
+                      )}
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </Popover.Dropdown>
+    </Popover>
+  );
+}

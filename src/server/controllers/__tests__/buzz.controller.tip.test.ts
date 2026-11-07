@@ -1,0 +1,400 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * Ledger-backed idempotency for the App Blocks tip (audit 🟡-1).
+ *
+ * `createBuzzTipTransactionHandler` normally mints a fresh `uuid()` per call for the
+ * tip's `externalTransactionId`, bypassing the Buzz ledger's native idempotency (a
+ * duplicate `externalTransactionId` is a benign "money already moved" conflict). When
+ * the App Blocks tip endpoint threads a client `idempotencyKey`, the handler DERIVES
+ * the id deterministically (`block-tip:${fromUserId}:${key}-${toAccountId}`), so a
+ * retry AFTER the Redis sentinel has expired (a crash between charge and finalize)
+ * collides on the Postgres unique constraint = money moves ONCE.
+ *
+ * These tests exercise the REAL handler with a mocked `createBuzzTransactionMany`
+ * (the ledger boundary) that models the unique-constraint dedup, so the derivation +
+ * the money-moves-once property are verified for real.
+ */
+
+const { mockCreateMany, mockGetByExternalId, mockGetUserBuzzAccount, mockUpsertBuzzTip } =
+  vi.hoisted(() => ({
+    mockCreateMany: vi.fn(),
+    mockGetByExternalId: vi.fn(),
+    mockGetUserBuzzAccount: vi.fn(),
+    mockUpsertBuzzTip: vi.fn(),
+  }));
+
+vi.mock('~/server/services/buzz.service', () => ({
+  createBuzzTransactionMany: (...a: unknown[]) => mockCreateMany(...(a as [])),
+  getTransactionByExternalId: (...a: unknown[]) => mockGetByExternalId(...(a as [])),
+  getUserBuzzAccount: (...a: unknown[]) => mockGetUserBuzzAccount(...(a as [])),
+  upsertBuzzTip: (...a: unknown[]) => mockUpsertBuzzTip(...(a as [])),
+  // Unused by the tip path but imported by the controller module — stub so the
+  // module resolves without pulling the real buzz client (which connects on import).
+  completeStripeBuzzTransaction: vi.fn(),
+  getDailyCompensationRewardByUser: vi.fn(),
+  getMultipliersForUser: vi.fn(),
+  getTransactionsReport: vi.fn(),
+  getUserBuzzTransactions: vi.fn(),
+  getUserBuzzTransactionsMulti: vi.fn(),
+  previewMultiAccountTransaction: vi.fn(),
+}));
+
+vi.mock('~/server/services/user.service', () => ({ amIBlockedByUser: vi.fn(async () => false) }));
+const { mockGetEntityCollaborators } = vi.hoisted(() => ({
+  mockGetEntityCollaborators: vi.fn(),
+}));
+vi.mock('~/server/services/entity-collaborator.service', () => ({
+  getEntityCollaborators: (...a: unknown[]) => mockGetEntityCollaborators(...(a as [])),
+}));
+vi.mock('~/server/services/image.service', () => ({ getImageById: vi.fn(async () => null) }));
+
+// Hoisted so the 🔴-2 tests can assert these NON-idempotent side effects do not fire
+// for a transaction the ledger deduped.
+const { mockCreateNotification, mockUpdateEntityMetric } = vi.hoisted(() => ({
+  mockCreateNotification: vi.fn(),
+  mockUpdateEntityMetric: vi.fn(),
+}));
+vi.mock('~/server/services/notification.service', () => ({
+  createNotification: (...a: unknown[]) => mockCreateNotification(...(a as [])),
+}));
+vi.mock('~/server/utils/metric-helpers', () => ({
+  updateEntityMetric: (...a: unknown[]) => mockUpdateEntityMetric(...(a as [])),
+}));
+vi.mock('~/server/rewards/active/dailyBoost.reward', () => ({
+  dailyBoostReward: { apply: vi.fn() },
+}));
+
+import { createBuzzTipTransactionHandler } from '../buzz.controller';
+import { amIBlockedByUser } from '~/server/services/user.service';
+import { dbMock } from '~/__tests__/mocks/db.mock';
+const mockUserFindMany = dbMock.dbWrite.user.findMany;
+const mockUserFindUnique = dbMock.dbWrite.user.findUnique;
+
+/**
+ * How the batch endpoint reports a duplicate externalTransactionId (no money moves either way):
+ * - 'existing-id': listed in `transactions` with the EXISTING transaction id (today).
+ * - 'conflict': listed in `conflicts` (once Buzz stops pre-checking duplicates).
+ */
+type DuplicateShape = 'existing-id' | 'conflict';
+const DUPLICATE_SHAPES: DuplicateShape[] = ['existing-id', 'conflict'];
+
+// A ledger mock that dedupes on externalTransactionId — a duplicate id is NOT a new debit —
+// and answers lookups by externalTransactionId from the same state.
+function installLedger(shape: DuplicateShape = 'conflict') {
+  const moved = new Map<string, string>();
+  let debits = 0;
+  mockCreateMany.mockImplementation(async (txns: Array<{ externalTransactionId: string }>) => {
+    const transactions: string[] = [];
+    const conflicts: string[] = [];
+    for (const t of txns) {
+      const existing = moved.get(t.externalTransactionId);
+      if (existing) {
+        if (shape === 'conflict') conflicts.push(t.externalTransactionId);
+        else transactions.push(existing);
+      } else {
+        debits += 1;
+        moved.set(t.externalTransactionId, `tx_${debits}`);
+        transactions.push(`tx_${debits}`);
+      }
+    }
+    return { transactions, conflicts };
+  });
+  mockGetByExternalId.mockImplementation(async (externalId: string) =>
+    moved.has(externalId) ? { externalTransactionId: externalId } : null
+  );
+  return { debits: () => debits };
+}
+
+function ctxUser() {
+  // createdAt well past the 24h membership gate.
+  return { user: { id: 42, createdAt: new Date('2020-01-01T00:00:00Z') } } as never;
+}
+const baseInput = {
+  toAccountId: 5,
+  amount: 100,
+  fromAccountType: 'yellow' as const,
+  toAccountType: 'yellow' as const,
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockGetUserBuzzAccount.mockResolvedValue([{ balance: 1_000_000 }]);
+  mockUserFindMany.mockResolvedValue([]); // no banned targets
+  mockUserFindUnique.mockResolvedValue({ username: 'sender' });
+  mockUpsertBuzzTip.mockResolvedValue(undefined);
+  mockCreateNotification.mockResolvedValue(undefined);
+  mockUpdateEntityMetric.mockResolvedValue(undefined);
+  mockGetEntityCollaborators.mockResolvedValue([]);
+});
+
+describe('createBuzzTipTransactionHandler — ledger-backed idempotency (audit 🟡-1)', () => {
+  it('with a key: a same-key retry presents a DETERMINISTIC externalTransactionId → money moves ONCE', async () => {
+    const ledger = installLedger();
+    await createBuzzTipTransactionHandler({
+      input: baseInput,
+      ctx: ctxUser(),
+      idempotencyKey: 'idem-abc',
+    });
+    // Simulate the crash window: the Redis sentinel has expired, so the endpoint
+    // re-runs the handler with the SAME client key.
+    await createBuzzTipTransactionHandler({
+      input: baseInput,
+      ctx: ctxUser(),
+      idempotencyKey: 'idem-abc',
+    });
+
+    // 🔴 The load-bearing assertion: exactly ONE debit across the two calls — the 2nd
+    // collided on the ledger's unique externalTransactionId.
+    expect(ledger.debits()).toBe(1);
+    const ext1 = mockCreateMany.mock.calls[0][0][0].externalTransactionId;
+    const ext2 = mockCreateMany.mock.calls[1][0][0].externalTransactionId;
+    // Deterministic + delimiter-injective (block-tip:<fromUserId>:<key>-<toAccountId>).
+    expect(ext1).toBe('block-tip:42:idem-abc-5');
+    expect(ext2).toBe(ext1);
+  });
+
+  it("WITHOUT a key: each call mints a fresh uuid externalTransactionId (no ledger dedup — today's behavior)", async () => {
+    const ledger = installLedger();
+    await createBuzzTipTransactionHandler({ input: baseInput, ctx: ctxUser() });
+    await createBuzzTipTransactionHandler({ input: baseInput, ctx: ctxUser() });
+
+    const ext1 = mockCreateMany.mock.calls[0][0][0].externalTransactionId;
+    const ext2 = mockCreateMany.mock.calls[1][0][0].externalTransactionId;
+    // Non-deterministic uuid form (`tip-<uuid>---by-<fromUserId>-<toAccountId>`),
+    // DIFFERENT per call → two distinct debits (no ledger dedup).
+    expect(ext1).toMatch(/^tip-.+-by-42-5$/);
+    expect(ext1).not.toContain('block-tip');
+    expect(ext2).not.toBe(ext1);
+    expect(ledger.debits()).toBe(2);
+  });
+
+  it('with a key: the derived externalTransactionId carries the entity context via the sharedId key (still deterministic)', async () => {
+    installLedger();
+    await createBuzzTipTransactionHandler({
+      input: { ...baseInput, entityType: 'Image', entityId: 99 },
+      ctx: ctxUser(),
+      idempotencyKey: 'idem-xyz',
+    });
+    // The key-derived id ignores entityType/entityId (the client key already uniquely
+    // identifies the logical tip), so a retry with the same key collides regardless.
+    expect(mockCreateMany.mock.calls[0][0][0].externalTransactionId).toBe(
+      'block-tip:42:idem-xyz-5'
+    );
+  });
+});
+
+/**
+ * 🔴-2 — a ledger CONFLICT means the money already moved on an EARLIER call, so this
+ * call debited NOTHING. The three side effects (`upsertBuzzTip`, the `tip-received`
+ * notification, the Image Buzz metric) are all NON-idempotent, so firing them anyway
+ * credits a SECOND tip for money that moved once: a phantom tip.
+ *
+ * This state is ONLY reachable because of the deterministic `externalTransactionId`
+ * this PR introduced — with the legacy per-call `uuid()` id `conflicts` was always
+ * empty here. The prior test suite only asserted `debits() === 1`, which is exactly
+ * why the phantom side effects slipped through.
+ */
+describe.each(DUPLICATE_SHAPES)(
+  'createBuzzTipTransactionHandler — ledger CONFLICT side effects (audit 🔴-2), duplicate as %s',
+  (shape) => {
+    it('🔴 a deduped tip produces ZERO additional side effects (no BuzzTip row, no notification, no metric)', async () => {
+      const ledger = installLedger(shape);
+      const input = { ...baseInput, entityType: 'Image' as const, entityId: 99 };
+
+      // First tip: money moves, side effects fire.
+      await createBuzzTipTransactionHandler({
+        input,
+        ctx: ctxUser(),
+        idempotencyKey: 'idem-dup',
+      });
+      expect(ledger.debits()).toBe(1);
+      expect(mockUpsertBuzzTip).toHaveBeenCalledTimes(1);
+      expect(mockUpdateEntityMetric).toHaveBeenCalledTimes(1);
+
+      vi.clearAllMocks();
+      mockUserFindMany.mockResolvedValue([]);
+      mockUserFindUnique.mockResolvedValue({ username: 'sender' });
+
+      // The reachable scenario from the audit: same key, same recipient, a DIFFERENT
+      // entityId (the derivation deliberately ignores the entity — see the test above),
+      // after the 10-min Redis sentinel expired. The ledger id is byte-identical → a
+      // conflict → ZERO Buzz moves. Without the fix, image 100 gets +100 Buzz, a
+      // BuzzTip row, and a 200.
+      const result = await createBuzzTipTransactionHandler({
+        input: { ...input, entityId: 100 },
+        ctx: ctxUser(),
+        idempotencyKey: 'idem-dup',
+      });
+
+      // 🔴 The load-bearing assertions: still exactly ONE debit, and NOTHING else fired.
+      expect(ledger.debits()).toBe(1);
+      expect(mockUpsertBuzzTip).not.toHaveBeenCalled();
+      expect(mockCreateNotification).not.toHaveBeenCalled();
+      expect(mockUpdateEntityMetric).not.toHaveBeenCalled();
+      // Reported up so the App Blocks tip endpoint can refund the daily-cap
+      // reservation it burned for Buzz that never moved.
+      expect(result.deduped).toBe(true);
+      expect(result.dedupedAmount).toBe(100);
+    });
+
+    it('🔴 a deduped ENTITY-LESS tip fires no `tip-received` notification (uuid key gives it no dedup)', async () => {
+      const ledger = installLedger(shape);
+      // No entityType/entityId → the notification branch.
+      await createBuzzTipTransactionHandler({
+        input: baseInput,
+        ctx: ctxUser(),
+        idempotencyKey: 'idem-note',
+      });
+      expect(mockCreateNotification).toHaveBeenCalledTimes(1);
+
+      vi.clearAllMocks();
+      mockUserFindMany.mockResolvedValue([]);
+      mockUserFindUnique.mockResolvedValue({ username: 'sender' });
+
+      await createBuzzTipTransactionHandler({
+        input: baseInput,
+        ctx: ctxUser(),
+        idempotencyKey: 'idem-note',
+      });
+      expect(ledger.debits()).toBe(1);
+      // The notification key is `tip-received:${uuid()}` — it has NO dedup of its own,
+      // so nothing else would have stopped a second "you received a tip".
+      expect(mockCreateNotification).not.toHaveBeenCalled();
+    });
+
+    it('CONTROL: a normally-settled tip still fires every side effect and reports no dedupe', async () => {
+      installLedger(shape);
+      const result = await createBuzzTipTransactionHandler({
+        input: { ...baseInput, entityType: 'Image' as const, entityId: 99 },
+        ctx: ctxUser(),
+        idempotencyKey: 'idem-fresh',
+      });
+      expect(mockUpsertBuzzTip).toHaveBeenCalledTimes(1);
+      expect(mockUpdateEntityMetric).toHaveBeenCalledTimes(1);
+      expect(result.deduped).toBe(false);
+      expect(result.dedupedAmount).toBe(0);
+    });
+
+    it('the metric + BuzzTip amount tracks only what SETTLED, not what was attempted', async () => {
+      installLedger(shape);
+      await createBuzzTipTransactionHandler({
+        input: { ...baseInput, entityType: 'Image' as const, entityId: 99 },
+        ctx: ctxUser(),
+        idempotencyKey: 'idem-amt',
+      });
+      expect(mockUpdateEntityMetric).toHaveBeenCalledWith(
+        expect.objectContaining({ metricType: 'Buzz', amount: 100 })
+      );
+      expect(mockUpsertBuzzTip).toHaveBeenCalledWith(expect.objectContaining({ amount: 100 }));
+    });
+    it('🔴 a partly replayed split tip records only the legs that moved on this call', async () => {
+      const ledger = installLedger(shape);
+      const input = { ...baseInput, entityType: 'Post' as const, entityId: 7 };
+      // First call: one recipient.
+      await createBuzzTipTransactionHandler({
+        input,
+        ctx: ctxUser(),
+        idempotencyKey: 'idem-split',
+      });
+      expect(ledger.debits()).toBe(1);
+
+      vi.clearAllMocks();
+      mockUserFindMany.mockResolvedValue([]);
+      mockUserFindUnique.mockResolvedValue({ username: 'sender' });
+      // Same key, and the post gained a collaborator: the first leg replays, the second is new.
+      mockGetEntityCollaborators.mockResolvedValue([{ user: { id: 6 } }]);
+      const result = await createBuzzTipTransactionHandler({
+        input,
+        ctx: ctxUser(),
+        idempotencyKey: 'idem-split',
+      });
+
+      expect(ledger.debits()).toBe(2);
+      // 100 split two ways = 50 per leg; only the new leg's 50 moved on this call.
+      expect(mockUpsertBuzzTip).toHaveBeenCalledTimes(1);
+      expect(mockUpsertBuzzTip).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 50, toAccountId: 6 })
+      );
+      expect(result.deduped).toBe(false);
+      expect(result.dedupedAmount).toBe(50);
+    });
+  }
+);
+
+describe('createBuzzTipTransactionHandler — block gate', () => {
+  // A tip is a write: a cache "not blocked" is confirmed on the primary, so a block that
+  // landed a moment ago is not let through by a stale cache entry.
+  it('checks the block with confirmOnPrimary and refuses a blocked sender', async () => {
+    installLedger();
+    vi.mocked(amIBlockedByUser).mockResolvedValueOnce(true);
+
+    await expect(
+      createBuzzTipTransactionHandler({ input: baseInput, ctx: ctxUser() })
+    ).rejects.toThrow('You cannot send Buzz to a user that has blocked you');
+    expect(amIBlockedByUser).toHaveBeenCalledWith({
+      userId: 42,
+      targetUserId: 5,
+      confirmOnPrimary: true,
+    });
+    expect(mockCreateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('createBuzzTipTransactionHandler — a model that is not commercially available', () => {
+  const mockVersionFindMany = dbMock.dbWrite.modelVersion.findMany;
+  const tipModel = () =>
+    createBuzzTipTransactionHandler({
+      input: { ...baseInput, entityType: 'Model', entityId: 77 },
+      ctx: ctxUser(),
+    });
+  const v = (baseModel: string, status = 'Published', availability = 'Public') => ({
+    baseModel,
+    status,
+    availability,
+  });
+
+  it.each([
+    ['all its versions are Flux.2 Klein 9B', [v('Flux.2 Klein 9B'), v('Flux.2 Klein 9B-base')]],
+    [
+      'its public versions are 9B and only a hidden draft is 4B',
+      [v('Flux.2 Klein 9B'), v('Flux.2 Klein 4B', 'Draft'), v('SDXL 1.0', 'Published', 'Private')],
+    ],
+    ['it has only hidden 9B versions', [v('Flux.2 Klein 9B', 'Draft')]],
+    ['all its versions are Flux.3 Klein', [v('Flux.3 Klein'), v('Flux.3 Klein-base')]],
+    ['its versions are Ideogram 4.0 and Qwen 2.1', [v('Ideogram 4.0'), v('Qwen 2.1')]],
+  ])('refuses a tip on a model when %s, and moves no Buzz', async (_, versions) => {
+    const ledger = installLedger();
+    mockVersionFindMany.mockResolvedValue(versions as never);
+    await expect(tipModel()).rejects.toThrow(
+      "This model isn't commercially available at the moment."
+    );
+    expect(mockVersionFindMany).toHaveBeenCalledWith({
+      where: { modelId: 77 },
+      select: { baseModel: true, status: true, availability: true },
+    });
+    expect(ledger.debits()).toBe(0);
+  });
+
+  it.each([
+    ['a Flux.2 Klein 4B model', [v('Flux.2 Klein 4B')]],
+    ['an SDXL model', [v('SDXL 1.0')]],
+    [
+      'a model with a public 9B and a public 4B version',
+      [v('Flux.2 Klein 9B'), v('Flux.2 Klein 4B')],
+    ],
+    ['a model with no versions found', []],
+  ])('still tips %s', async (_, versions) => {
+    const ledger = installLedger();
+    mockVersionFindMany.mockResolvedValue(versions as never);
+    await tipModel();
+    expect(ledger.debits()).toBe(1);
+  });
+
+  it('a profile tip with no entity never looks up versions', async () => {
+    const ledger = installLedger();
+    await createBuzzTipTransactionHandler({ input: baseInput, ctx: ctxUser() });
+    expect(mockVersionFindMany).not.toHaveBeenCalled();
+    expect(ledger.debits()).toBe(1);
+  });
+});

@@ -1,0 +1,61 @@
+.sidebar {
+  overflow-x: visible;
+  position: relative;
+  display: flex;
+  height: 100%;
+  align-items: stretch;
+  /* Reserve default width at SSR/first-paint so the flex sibling (#main) doesn't
+     start full-width and shift right on hydration. The useResize hook overrides
+     this with element.style.width (inline > stylesheet) once mounted.
+     Gated to >=720px (the useGenerationPanelFullScreen threshold: default width
+     400 + 320): below it the generator goes full-screen on mount, so reserving a
+     400px column at first paint would be wrong for mobile. Below the breakpoint
+     the var() falls back to `auto`. */
+  @media (min-width: 720px) {
+    width: var(--sidebar-default-width, auto);
+  }
+}
+
+.resizer {
+  cursor: ew-resize;
+  position: absolute;
+  top: 0;
+  height: 100%;
+  width: 5px;
+  z-index: 100;
+
+  &:hover, &:active {
+    background-color: light-dark(
+      theme('colors.blue.6'),
+      theme('colors.blue.8')
+    );
+  }
+}
+
+.content {
+  container-name: sidebar;
+  container-type: inline-size;
+  flex: 1;
+  border-color: light-dark(
+    theme('colors.gray.4'),
+    theme('colors.dark.5')
+  ) !important;
+}
+
+.left {
+  .resizer {
+    left: -2px;
+  }
+  .content {
+    border-left: 1px solid;
+  }
+}
+
+.right {
+  .resizer {
+    right: -2px;
+  }
+  .content {
+    border-right: 1px solid;
+  }
+}

@@ -1,0 +1,722 @@
+import {
+  Badge,
+  Button,
+  Group,
+  Stack,
+  Text,
+  useComputedColorScheme,
+  useMantineTheme,
+} from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import {
+  IconBrush,
+  IconCheck,
+  IconDotsVertical,
+  IconDownload,
+  IconLock,
+  IconPlus,
+  IconThumbUp,
+  IconThumbUpFilled,
+} from '@tabler/icons-react';
+import clsx from 'clsx';
+import { useMemo, useState } from 'react';
+import { useShowsSfwFace } from '~/hooks/useShowsSfwFace';
+import { useHasCoarsePointer } from '~/hooks/useIsMobile';
+import { SheetSelect } from '~/components/generation_v2/inputs/SheetSelect';
+import { searchHitName } from '~/shared/utils/model-sfw-face';
+import cardClasses from '~/components/Cards/Cards.module.css';
+import type { Props as DescriptionTableProps } from '~/components/DescriptionTable/DescriptionTable';
+import { DescriptionTable } from '~/components/DescriptionTable/DescriptionTable';
+import { EdgeMedia } from '~/components/EdgeMedia/EdgeMedia';
+import { IconBadge } from '~/components/IconBadge/IconBadge';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { useResourceSelectContext } from '~/components/ImageGeneration/GenerationForm/ResourceSelectProvider';
+import { ImageGuard2 } from '~/components/ImageGuard/ImageGuard2';
+import { MediaHash } from '~/components/ImageHash/ImageHash';
+import { ModelHash } from '~/components/Model/ModelHash/ModelHash';
+import { ModelTypeBadge } from '~/components/Model/ModelTypeBadge/ModelTypeBadge';
+import { ModelURN, URNExplanation } from '~/components/Model/ModelURN/ModelURN';
+import { ModelVersionReview } from '~/components/Model/ModelVersions/ModelVersionReview';
+import { NextLink as Link } from '~/components/NextLink/NextLink';
+import { PermissionIndicator } from '~/components/PermissionIndicator/PermissionIndicator';
+import { useToggleFavoriteMutation } from '~/components/ResourceReview/resourceReview.utils';
+import type { TransformedModel } from '~/shared/search/models-transform';
+import { ThumbsUpIcon } from '~/components/ThumbsIcon/ThumbsIcon';
+import { TrainedWords } from '~/components/TrainedWords/TrainedWords';
+import { TwCard } from '~/components/TwCard/TwCard';
+import { TwCosmeticWrapper } from '~/components/TwCosmeticWrapper/TwCosmeticWrapper';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { Availability } from '~/shared/utils/prisma/enums';
+import { fetchGenerationData } from '~/store/generation-graph.store';
+import { getModelRecency } from '~/components/Cards/model-card.utils';
+import { formatDate } from '~/utils/date-helpers';
+import { showErrorNotification } from '~/utils/notifications';
+import { getDisplayName, getModelUrl } from '~/utils/string-helpers';
+import { trpc } from '~/utils/trpc';
+import { isDefined } from '~/utils/type-guards';
+import type { ResourceSelectSource } from '../resource-select.types';
+import { versionCanGenerate } from '~/shared/generation/coverage-fields';
+import { getResourceCompatibility } from '~/components/generation_v2/inputs/ResourceItemContent';
+import {
+  pickInitialVersionIndex,
+  pickVersionCover,
+  resolveSelectedIndex,
+} from '~/components/ImageGeneration/GenerationForm/resource-select.types';
+import {
+  pricingFilterKey,
+  versionSatisfiesPricingFilter,
+} from '~/shared/search/model-pricing-filter';
+import { ModelCardMenu, TopRightIcons } from './TopRightIcons';
+import {
+  LoadedMark,
+  useResidency,
+  ResourceResidencyStatus,
+} from '~/components/ResourceLoad/ResourceResidency';
+import { VersionPricingBadge } from './VersionPricingBadge';
+import { PartnerDisclosureIcons } from '~/components/generation_v2/PartnerDisclosureIcons';
+
+const IMAGE_CARD_WIDTH = 450;
+const COMPACT_IMAGE_WIDTH = 160;
+
+export function ResourceSelectCard({
+  data,
+  height,
+  selectSource,
+  coverageNext,
+  compact,
+  featuredVersionId,
+}: {
+  data: TransformedModel;
+  height?: number;
+  /** Row layout instead of the image card, for narrow viewports. */
+  compact?: boolean;
+  /** On the Featured tab, the version that was featured: the card opens on it. */
+  featuredVersionId?: number;
+  selectSource?: ResourceSelectSource;
+  coverageNext?: boolean;
+}) {
+  const {
+    onSelect,
+    role,
+    multiSelect,
+    isStaged,
+    addStaged,
+    removeStaged,
+    resources,
+    staged,
+    limit,
+    filters,
+  } = useResourceSelectContext();
+  const currentUser = useCurrentUser();
+  const [loading, setLoading] = useState(false);
+
+  const theme = useMantineTheme();
+  const colorScheme = useComputedColorScheme('dark');
+  const showSfwFace = useShowsSfwFace();
+  const modelName = searchHitName(data, showSfwFace);
+  // No image link on touch: a tap while scrolling opened the model page. The name is the link.
+  const imageLinks = !useHasCoarsePointer();
+
+  const versions = data.versions;
+  const initialIndex = useMemo(
+    () =>
+      pickInitialVersionIndex(versions, {
+        filter: filters,
+        satisfiesFilter: (v) => versionSatisfiesPricingFilter(v.pricing, filters),
+        isCompatible: (v) =>
+          role !== 'resource' ||
+          getResourceCompatibility(v.baseModel, data.type, { resources }) !== null,
+        preferred: featuredVersionId ? (v) => v.id === featuredVersionId : undefined,
+      }),
+    [versions, filters, role, data.type, resources, featuredVersionId]
+  );
+  const filterKey = pricingFilterKey(filters);
+  const [override, setOverride] = useState<{ key: string; index: number } | null>(null);
+  const _selectedIndex = resolveSelectedIndex({
+    override,
+    filterKey,
+    versionCount: versions.length,
+    initialIndex,
+  });
+  const setSelectedIndex = (index: number) => setOverride({ key: filterKey, index });
+  const selectedVersion = versions[_selectedIndex];
+  const image = pickVersionCover(
+    data.images,
+    versions,
+    selectedVersion
+  ) as (typeof data.images)[number];
+  const [flipped, setFlipped] = useState(false);
+
+  /**
+   * `take` commits the resource and closes the picker; `stage` adds it to the
+   * batch and leaves the picker open. Same fetch either way — only the
+   * destination differs.
+   */
+  const handleSelect = async (mode: 'take' | 'stage' = 'take') => {
+    const version = selectedVersion;
+    if (!version) return;
+    const { id } = version;
+
+    setLoading(true);
+    await fetchGenerationData({
+      type: 'modelVersion',
+      id,
+      generation: selectSource !== 'generation' ? false : undefined,
+    }).then((data) => {
+      // Find the specific resource that was requested by ID
+      const resource = data.resources.find((r) => r.id === id) ?? data.resources[0];
+      if (!resource) {
+        showErrorNotification({
+          error: new Error('Resource not found'),
+        });
+        return;
+      }
+      const previewImage = resource.image ?? image;
+      // `atLimit` was computed at render; two fast clicks near the cap both pass
+      // it and the second would be dropped by `addStaged` in silence. Every
+      // other rejection on this card says something, so this one does too.
+      if (mode === 'stage' && limit !== undefined && staged.length >= limit) {
+        showErrorNotification({
+          error: new Error(`You can add ${limit} more ${limit === 1 ? 'resource' : 'resources'}`),
+        });
+        return;
+      }
+      const commit = mode === 'stage' ? addStaged : onSelect;
+      if (selectSource !== 'generation') {
+        commit({ ...resource, image: previewImage });
+      } else {
+        if (resource?.canGenerate || resource?.substitute?.canGenerate)
+          commit({ ...resource, image: previewImage });
+        else
+          showErrorNotification({
+            error: new Error('This model is no longer available for generation'),
+          });
+      }
+    });
+    setLoading(false);
+  };
+
+  // Compatibility of the shown version against the form's current ecosystem —
+  // the same predicate the form's own resource list badges with.
+  const compatibility =
+    role === 'resource'
+      ? getResourceCompatibility(selectedVersion?.baseModel, data.type, { resources })
+      : 'full';
+  const incompatible = compatibility === null;
+  const isAdded = multiSelect && selectedVersion ? isStaged(selectedVersion.id) : false;
+  const atLimit = multiSelect && limit !== undefined && staged.length >= limit && !isAdded;
+  // Batch mode starts the moment something is staged. Until then the main
+  // button is the one-click path it has always been; once a batch exists,
+  // committing a single resource behind the user's back would discard it.
+  const batching = multiSelect && staged.length > 0;
+
+  // Read favorite state straight from the bookmarked-models query so the
+  // toggle's optimistic cache update drives the button — single source of truth,
+  // no prop drilling (which would churn the virtualized list's render fn).
+  const { data: bookmarkedModels } = trpc.user.getBookmarkedModels.useQuery(undefined, {
+    enabled: !!currentUser,
+  });
+  const isFavorite = !!bookmarkedModels?.includes(data.id);
+
+  const favoriteMutation = useToggleFavoriteMutation();
+  const handleToggleFavorite = ({ versionId, setTo }: { versionId?: number; setTo: boolean }) => {
+    if (favoriteMutation.isPending) return;
+    favoriteMutation.mutate({
+      modelId: data.id,
+      modelVersionId: versionId,
+      setTo,
+    });
+  };
+
+  const { isNew, isUpdated } = getModelRecency(data);
+
+  const originalAspectRatio = image.width && image.height ? image.width / image.height : 1;
+  const width = originalAspectRatio > 1 ? IMAGE_CARD_WIDTH * originalAspectRatio : IMAGE_CARD_WIDTH;
+  const media = (
+    <EdgeMedia
+      src={image.url}
+      name={image.name ?? image.id.toString()}
+      alt={image.name ?? undefined}
+      type={image.type}
+      width={compact ? COMPACT_IMAGE_WIDTH : width}
+      placeholder="empty"
+      className={cardClasses.image}
+      loading="lazy"
+    />
+  );
+  const modelUrl = getModelUrl({ modelId: data.id, modelName, modelVersionId: selectedVersion.id });
+  const isPrivate = data.availability === Availability.Private;
+
+  const nameLink = (
+    <Text
+      component={Link}
+      href={modelUrl}
+      target="_blank"
+      onClick={(e: React.MouseEvent) => e.stopPropagation()}
+      size="sm"
+      fw={700}
+      lh={compact ? 1.25 : 1}
+      data-testid="resource-select-name"
+      // `self-start`: in the full card's flex column, the default `align-items: stretch`
+      // would make the whole card width the link's hit area.
+      className={clsx(
+        'max-w-full self-start hover:underline',
+        compact ? 'line-clamp-2 break-words' : 'truncate'
+      )}
+    >
+      {modelName}
+    </Text>
+  );
+
+  const selectedPartnerIcons = (
+    <PartnerDisclosureIcons
+      partnerService={selectedVersion?.partnerService}
+      partnerTrains={selectedVersion?.partnerTrains}
+    />
+  );
+
+  const versionSelect = (
+    <SheetSelect
+      className="min-w-0 flex-1"
+      sheetTitle="Version"
+      size={compact ? 'xs' : undefined}
+      leftSection={
+        selectSource === 'generation' && selectedVersion?.generatorLoaded ? (
+          <LoadedMark readiness="ready" />
+        ) : undefined
+      }
+      leftSectionWidth={26}
+      leftSectionPointerEvents="none"
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+      readOnly={versions.length <= 1}
+      value={_selectedIndex?.toString()}
+      data={versions.map((version, index) => ({
+        label: version.name,
+        value: index.toString(),
+      }))}
+      renderOption={({ option }) => {
+        const version = versions[Number(option.value)];
+        return (
+          <Group gap={6} wrap="nowrap" className="min-w-0">
+            {selectSource === 'generation' && version?.generatorLoaded && (
+              <LoadedMark readiness="ready" />
+            )}
+            <span className="truncate">{option.label}</span>
+            <PartnerDisclosureIcons
+              partnerService={version?.partnerService}
+              partnerTrains={version?.partnerTrains}
+              size={14}
+            />
+          </Group>
+        );
+      }}
+      onChange={(index) => setSelectedIndex(Number(index ?? 0))}
+      styles={{
+        input: { cursor: versions.length <= 1 ? 'auto !important' : undefined },
+      }}
+    />
+  );
+
+  const compatibilityBadge =
+    compatibility === 'partial' ? (
+      <Badge color="yellow" variant="light" size="sm">
+        Partial support
+      </Badge>
+    ) : incompatible ? (
+      <Badge color="red" variant="light" size="sm">
+        Incompatible
+      </Badge>
+    ) : null;
+
+  // The batch control, separate from the primary action: adding one resource stays a single
+  // click, and building a set is opt-in rather than the toll everyone pays.
+  const stageButton = multiSelect && !incompatible && (
+    <Tooltip
+      label={isAdded ? 'Remove from selection' : 'Add to selection'}
+      position="top"
+      withArrow
+    >
+      <LegacyActionIcon
+        aria-label={isAdded ? 'Remove from selection' : 'Add to selection'}
+        aria-pressed={isAdded}
+        variant={isAdded ? 'filled' : 'default'}
+        size={compact ? 30 : undefined}
+        disabled={atLimit}
+        onClick={(e: React.MouseEvent) => {
+          e.preventDefault();
+          e.stopPropagation();
+          // Un-staging needs no round trip — the resource is in hand.
+          if (isAdded && selectedVersion) removeStaged(selectedVersion.id);
+          else handleSelect('stage');
+        }}
+      >
+        {isAdded ? <IconCheck size={16} /> : <IconPlus size={16} />}
+      </LegacyActionIcon>
+    </Tooltip>
+  );
+
+  const selectButton = (
+    <Button
+      loading={loading}
+      size={compact ? 'xs' : undefined}
+      disabled={incompatible || (batching && atLimit)}
+      variant={isAdded ? 'light' : 'filled'}
+      onClick={(e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!batching) return void handleSelect('take');
+        if (isAdded && selectedVersion) removeStaged(selectedVersion.id);
+        else handleSelect('stage');
+      }}
+    >
+      {batching ? (isAdded ? 'Added' : 'Add') : 'Select'}
+    </Button>
+  );
+
+  if (compact)
+    return (
+      <TwCosmeticWrapper cosmetic={data.cosmetic?.data} style={height ? { height } : undefined}>
+        <TwCard
+          direction="row"
+          className="h-full gap-3 p-2"
+          style={{ display: versions.length === 0 ? 'none' : undefined }}
+        >
+          <ImageGuard2 image={image} connectType="model" connectId={data.id} explain={false}>
+            {(safe) => (
+              <div className="relative w-20 shrink-0 overflow-hidden rounded">
+                {safe ? media : <MediaHash {...image} />}
+                <ImageGuard2.BlurToggle className="absolute left-1 top-1" />
+              </div>
+            )}
+          </ImageGuard2>
+          <div className="flex min-w-0 flex-1 flex-col gap-1.5 text-black dark:text-white">
+            <div className="flex items-start gap-1">
+              <div className="flex min-w-0 flex-1">{nameLink}</div>
+              {!!currentUser && (
+                <LegacyActionIcon
+                  variant="subtle"
+                  color={isFavorite ? 'green' : 'gray'}
+                  size="sm"
+                  aria-label={isFavorite ? 'Unlike' : 'Like'}
+                  aria-pressed={isFavorite}
+                  onClick={() => handleToggleFavorite({ setTo: !isFavorite })}
+                >
+                  {isFavorite ? <IconThumbUpFilled size={16} /> : <IconThumbUp size={16} />}
+                </LegacyActionIcon>
+              )}
+              <ModelCardMenu
+                data={data}
+                imageId={image.id}
+                target={
+                  <LegacyActionIcon variant="subtle" color="gray" size="sm" className="-mr-1">
+                    <IconDotsVertical size={16} />
+                  </LegacyActionIcon>
+                }
+              />
+            </div>
+            <div className="flex min-w-0 flex-wrap items-center gap-1">
+              <ModelTypeBadge type={data.type} baseModel={selectedVersion.baseModel} size="sm" />
+              <VersionPricingBadge pricing={selectedVersion.pricing} size="sm" />
+              {isPrivate && (
+                <Badge color="gray" variant="light" size="sm" leftSection={<IconLock size={12} />}>
+                  Private
+                </Badge>
+              )}
+              {compatibilityBadge}
+            </div>
+            <div className="mt-auto flex items-center gap-2">
+              {versionSelect}
+              {selectedPartnerIcons}
+              {stageButton}
+              {selectButton}
+            </div>
+          </div>
+        </TwCard>
+      </TwCosmeticWrapper>
+    );
+
+  return (
+    <TwCosmeticWrapper cosmetic={data.cosmetic?.data} style={height ? { height } : undefined}>
+      <TwCard
+        className={clsx(cardClasses.root, 'justify-between')}
+        style={{ display: versions.length === 0 ? 'none' : undefined }}
+      >
+        <>
+          {image &&
+            (!flipped ? (
+              <ImageGuard2 image={image} connectType="model" connectId={data.id}>
+                {(safe) => {
+                  return (
+                    <div className="relative overflow-hidden aspect-portrait">
+                      {safe && imageLinks ? (
+                        <Link href={modelUrl} target="_blank">
+                          {media}
+                        </Link>
+                      ) : safe ? (
+                        media
+                      ) : (
+                        <MediaHash {...image} />
+                      )}
+                      <div className="absolute left-2 top-2 flex items-center gap-1">
+                        <ImageGuard2.BlurToggle />
+                        <ModelTypeBadge
+                          className={clsx(cardClasses.infoChip, cardClasses.chip)}
+                          type={data.type}
+                          baseModel={data.version.baseModel}
+                        />
+
+                        {(isNew || isUpdated) && (
+                          <Badge
+                            className={cardClasses.chip}
+                            variant="filled"
+                            radius="xl"
+                            style={{
+                              backgroundColor: isUpdated ? '#1EBD8E' : theme.colors.blue[4],
+                            }}
+                          >
+                            <Text c="white" size="xs" tt="capitalize">
+                              {isUpdated ? 'Updated' : 'New'}
+                            </Text>
+                          </Badge>
+                        )}
+                      </div>
+                      <TopRightIcons data={data} setFlipped={setFlipped} imageId={image.id} />
+                      <Group className="absolute bottom-2 right-2 flex items-center gap-1">
+                        <VersionPricingBadge pricing={selectedVersion?.pricing} />
+                        {isPrivate && (
+                          <Tooltip
+                            label="This is a private model which requires permission to generate with."
+                            position="top"
+                            withArrow
+                            withinPortal
+                            multiline
+                            maw={250}
+                          >
+                            <Badge
+                              color="gray"
+                              variant="filled"
+                              h={30}
+                              w={30}
+                              className="flex items-center justify-center"
+                              p={0}
+                            >
+                              <IconLock size={16} />
+                            </Badge>
+                          </Tooltip>
+                        )}
+                        {!!currentUser && (
+                          <Tooltip
+                            label={isFavorite ? 'Unlike' : 'Like'}
+                            position="top"
+                            withArrow
+                            withinPortal
+                          >
+                            <Button
+                              onClick={() => handleToggleFavorite({ setTo: !isFavorite })}
+                              color={isFavorite ? 'green' : 'gray'}
+                              px={4}
+                              size="xs"
+                              variant={colorScheme === 'light' ? undefined : 'light'}
+                            >
+                              <ThumbsUpIcon color="#fff" filled={isFavorite} size={20} />
+                            </Button>
+                          </Tooltip>
+                        )}
+                      </Group>
+                    </div>
+                  );
+                }}
+              </ImageGuard2>
+            ) : (
+              <div className="relative overflow-auto aspect-portrait">
+                <ModelDetailsPanel
+                  data={data}
+                  selectedVersion={selectedVersion}
+                  selectSource={selectSource}
+                  coverageNext={coverageNext}
+                />
+                <TopRightIcons data={data} setFlipped={setFlipped} />
+              </div>
+            ))}
+
+          <div className="flex flex-col gap-2 p-3 text-black dark:text-white">
+            {nameLink}
+            <div className="flex items-center justify-between gap-2">
+              {versionSelect}
+              {selectedPartnerIcons}
+              {compatibilityBadge}
+              {stageButton}
+              {selectButton}
+            </div>
+          </div>
+        </>
+      </TwCard>
+    </TwCosmeticWrapper>
+  );
+}
+
+function ModelDetailsPanel({
+  data,
+  selectedVersion,
+  selectSource,
+  coverageNext,
+}: {
+  data: TransformedModel;
+  selectedVersion: TransformedModel['versions'][number];
+  selectSource?: ResourceSelectSource;
+  coverageNext?: boolean;
+}) {
+  const features = useFeatureFlags();
+  const residency = useResidency(selectedVersion.id);
+
+  const modelDetails: DescriptionTableProps['items'] = [
+    {
+      label: 'Type',
+      value: (
+        <Badge radius="sm" px={5}>
+          {getDisplayName(data.type)} {data.checkpointType}
+        </Badge>
+      ),
+    },
+    {
+      label: 'Stats',
+      value: (
+        <Group gap={4}>
+          <IconBadge radius="xs" icon={<IconDownload size={14} />}>
+            <Text>{(selectedVersion.metrics?.downloadCount ?? 0).toLocaleString()}</Text>
+          </IconBadge>
+          {versionCanGenerate(selectedVersion, coverageNext) && (
+            <IconBadge radius="xs" icon={<IconBrush size={14} />}>
+              <Text>{(selectedVersion.metrics?.generationCount ?? 0).toLocaleString()}</Text>
+            </IconBadge>
+          )}
+        </Group>
+      ),
+    },
+    {
+      label: 'Reviews',
+      value: (
+        <ModelVersionReview
+          modelId={data.id}
+          versionId={selectedVersion.id}
+          thumbsUpCount={selectedVersion.metrics?.thumbsUpCount ?? 0}
+          thumbsDownCount={selectedVersion.metrics?.thumbsDownCount ?? 0}
+        />
+      ),
+    },
+    {
+      label: 'Generation',
+      value: (
+        <ResourceResidencyStatus
+          modelVersionId={selectedVersion.id}
+          // The indexed field is readiness, so it can't tell resident from external; the component's
+          // own live read replaces this as soon as it answers.
+          readiness={selectedVersion.generatorLoaded ? 'ready' : 'cold'}
+        />
+      ),
+      visible: selectSource === 'generation' && !!residency,
+    },
+    { label: 'Created', value: formatDate(selectedVersion.createdAt) },
+    {
+      label: 'Base Model',
+      value:
+        selectedVersion.baseModel === 'ODOR' ? (
+          <Text component={Link} href="/product/odor" target="_blank">
+            {selectedVersion.baseModel}{' '}
+          </Text>
+        ) : (
+          <Text>
+            {selectedVersion.baseModel}{' '}
+            {selectedVersion.baseModelType && selectedVersion.baseModelType === 'Standard'
+              ? ''
+              : selectedVersion.baseModelType}
+          </Text>
+        ),
+    },
+    {
+      label: 'Training',
+      value: (
+        <Group gap={4}>
+          {selectedVersion.steps && (
+            <Badge size="sm" radius="sm" color="teal">
+              Steps: {selectedVersion.steps.toLocaleString()}
+            </Badge>
+          )}
+          {selectedVersion.epochs && (
+            <Badge size="sm" radius="sm" color="teal">
+              Epochs: {selectedVersion.epochs.toLocaleString()}
+            </Badge>
+          )}
+        </Group>
+      ),
+      visible: !!selectedVersion.steps || !!selectedVersion.epochs,
+    },
+    {
+      label: 'Usage Tips',
+      value: (
+        <Group gap={4}>
+          {selectedVersion.clipSkip && (
+            <Badge size="sm" radius="sm" color="cyan">
+              Clip Skip: {selectedVersion.clipSkip.toLocaleString()}
+            </Badge>
+          )}
+          {!!selectedVersion.settings?.strength && (
+            <Badge size="sm" radius="sm" color="cyan">
+              {`Strength: ${selectedVersion.settings.strength}`}
+            </Badge>
+          )}
+        </Group>
+      ),
+      visible: isDefined(selectedVersion.clipSkip) || isDefined(selectedVersion.settings?.strength),
+    },
+    {
+      label: 'Trigger Words',
+      visible: !!selectedVersion.trainedWords?.length,
+      value: <TrainedWords trainedWords={selectedVersion.trainedWords} type={data.type} />,
+    },
+    {
+      label: 'Hash',
+      value: <ModelHash hashes={selectedVersion.hashData ?? []} width={80} />,
+      visible: !!(selectedVersion.hashData ?? []).length,
+    },
+    {
+      label: (
+        <Group gap="xs">
+          <Text fw={500}>AIR</Text>
+          <URNExplanation size={20} />
+        </Group>
+      ),
+      value: (
+        <ModelURN
+          baseModel={selectedVersion.baseModel}
+          type={data.type}
+          modelId={data.id}
+          modelVersionId={selectedVersion.id}
+          withCopy={false}
+        />
+      ),
+      visible: features.air,
+    },
+    {
+      label: 'Restrictions',
+      value: <PermissionIndicator permissions={data.permissions} showNone={true} />,
+      visible: !!data.permissions,
+    },
+  ];
+
+  return (
+    <Stack className="size-full">
+      <DescriptionTable
+        title="Model Details"
+        items={modelDetails}
+        labelWidth="80px"
+        withBorder
+        fz="xs"
+      />
+    </Stack>
+  );
+}

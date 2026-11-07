@@ -1,0 +1,405 @@
+import { Air } from '@civitai/orchestration-client';
+import { truncate } from 'lodash-es';
+import slugify from 'slugify';
+
+import allowedUrls from '~/utils/allowed-third-party-urls.json';
+import { toJson } from '~/utils/json-helpers';
+
+function getUrlDomain(url: string) {
+  // convert url string into a URL object and extract just the domain, avoiding subdomains
+  // e.g. https://www.google.com/ -> google.com
+  return new URL(url).hostname.split('.').slice(-2).join('.');
+}
+
+export function splitUppercase(value: string, options?: { splitNumbers?: boolean }) {
+  return value
+    .trim()
+    .split(options?.splitNumbers ? /([A-Z][a-z]+|[0-9]+)/ : /([A-Z][a-z]+)/)
+    .map((word) => word.trim())
+    .filter(Boolean)
+    .join(' ');
+}
+
+const stripeCurrencyMap: Record<string, [string, number]> = {
+  usd: ['$', 100],
+  aud: ['$', 100],
+  cad: ['$', 100],
+  eur: ['€', 100],
+  gbp: ['£', 100],
+  jpy: ['¥', 1],
+  krw: ['₩', 1],
+};
+
+export function getStripeCurrencyDisplay(unitAmount: number, currency: string) {
+  const [symbol, divisor] = stripeCurrencyMap[currency.toLowerCase()] ?? ['$', 100];
+
+  const hasDecimals = (unitAmount / divisor).toFixed(2).split('.')[1] !== '00';
+
+  return (
+    symbol +
+    (unitAmount / divisor).toLocaleString(undefined, { minimumFractionDigits: hasDecimals ? 2 : 0 })
+  );
+}
+
+const nameOverrides: Record<string, string> = {
+  LoCon: 'LyCORIS',
+  LORA: 'LoRA',
+  DoRA: 'DoRA',
+  scheduler: 'Scheduler',
+  TextualInversion: 'Embedding',
+  ComfyWorkflows: 'ComfyUI Workflows',
+  MotionModule: 'Motion',
+  BenefactorsOnly: 'Supporters Only',
+  ModelVersion: 'Model Version',
+  ClubMembership: 'Club Membership',
+  Redeemable: 'Redeemed Code',
+  'PixArt E': 'PixArt Σ',
+  'PixArt a': 'PixArt α',
+  ProfileDecoration: 'Avatar Decoration',
+  CogVideoX: 'CogVideoX',
+  minimax: 'Hailuo by MiniMax',
+  MiniMaxH3: 'MiniMax H3',
+  NoobAI: 'NoobAI',
+  InternalValue: 'Internal Value',
+  ACH: 'ACH',
+  HiDream: 'HiDream',
+  'Wan Video': 'WAN Video',
+  commentV2: 'Comment',
+  CommentV2: 'Comment',
+  // Crypto network display names (NowPayments API returns varying codes)
+  base: 'Base',
+  eth: 'Ethereum',
+  ethereum: 'Ethereum',
+  trx: 'Tron',
+  tron: 'Tron',
+  sol: 'Solana',
+  solana: 'Solana',
+  bsc: 'BNB Chain',
+  matic: 'Polygon',
+  polygon: 'Polygon',
+  avaxc: 'Avalanche',
+  avalanche: 'Avalanche',
+  arb: 'Arbitrum',
+  arbitrum: 'Arbitrum',
+  op: 'Optimism',
+  optimism: 'Optimism',
+  UNet: 'UNet',
+  CLIPVision: 'CLIP Vision',
+  VisionLanguage: 'VLM',
+  CLIP: 'CLIP',
+  LLM: 'LLM',
+  ControlNet: 'ControlNet',
+  // ReportEntity enum value `'model3d'` would otherwise auto-split to
+  // "model 3 d" / "3 D Models". Same story for the review variant.
+  model3d: '3D Model',
+  Model3D: '3D Model',
+  model3dReview: '3D Model Review',
+  Model3DReview: '3D Model Review',
+  '3d-models': '3D Models',
+};
+
+export function getDisplayName(
+  value: string,
+  options?: { splitNumbers?: boolean; overwrites?: Record<string, string> }
+) {
+  const { splitNumbers = true } = options ?? {};
+  if (!value) return '';
+
+  return (
+    options?.overwrites?.[value] ?? nameOverrides[value] ?? splitUppercase(value, { splitNumbers })
+  );
+}
+
+export function getInitials(value: string) {
+  return value
+    .match(/(^\S\S?|\b\S)?/g)
+    ?.join('')
+    .match(/(^\S|\S$)?/g)
+    ?.join('')
+    .toUpperCase();
+}
+
+const tokenCharacters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+const tokenCharactersLength = tokenCharacters.length;
+
+export function generateToken(length: number) {
+  let result = '';
+  for (let i = 0; i < length; i++)
+    result += tokenCharacters.charAt(Math.floor(Math.random() * tokenCharactersLength));
+  return result;
+}
+
+// camelcase but keep all caps words as is
+export function camelCase(str: string) {
+  return str
+    .split(/[\s_-]+/)
+    .map((word, index) => {
+      if (index === 0) return word.toLowerCase();
+      else if (word.toUpperCase() === word) return word;
+      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+    })
+    .join('');
+}
+
+export function filenamize(value: string, length = 20) {
+  value = value.replace(/[']/gi, '').replace(/[^a-z0-9]/gi, '_');
+  // adjust length to be length + number of _ in value
+  const underscoreCount = (value.match(/_/g) || []).length;
+  length = length + underscoreCount;
+  return camelCase(truncate(value, { length, separator: '_', omission: '' }));
+}
+
+/**
+ * Replace the middle of a string with a FIXED run of characters — never one per hidden character,
+ * which leaks the original's length to anyone reading a shared screen or a stream.
+ *
+ * Keeps `start` characters from the front and `end` from the back. When the kept ends already
+ * cover the whole string there is nothing left to hide, so it returns the mask alone rather than
+ * handing back the input untouched.
+ */
+export function maskString(
+  value: string,
+  { start = 0, end = 0, mask = '•••••' }: { start?: number; end?: number; mask?: string } = {}
+) {
+  if (!value) return '';
+
+  const head = Math.max(0, start);
+  const tail = Math.max(0, end);
+  if (head + tail >= value.length) return mask;
+
+  return `${value.slice(0, head)}${mask}${tail > 0 ? value.slice(value.length - tail) : ''}`;
+}
+
+/**
+ * Hides the local part but keeps the domain, so the account stays recognisable to its owner.
+ *
+ * A local part short enough that keeping its first character would reveal the whole address falls
+ * back to masking everything: showing `a•••••@example.com` conceals nothing while looking as if it
+ * does, which is worse than an obviously-hidden value.
+ */
+export function maskEmail(email: string) {
+  const at = email.lastIndexOf('@');
+  if (at <= 0) return maskString(email);
+
+  return maskString(email, { start: 1, end: email.length - at });
+}
+
+export function replaceInsensitive(value: string, search: string, replace: string) {
+  const escaped = search.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+  return value.replace(new RegExp(escaped, 'gi'), replace);
+}
+
+/**
+ * @see https://stackoverflow.com/a/12900504
+ */
+export function getFileExtension(value: string) {
+  return value.slice(((value.lastIndexOf('.') - 1) >>> 0) + 2);
+}
+
+export function slugit(value: string) {
+  return slugify(value, { lower: true, strict: true });
+}
+
+/**
+ * `slugit` strips everything outside ASCII, so a name written only in CJK (or emoji)
+ * comes back empty. In a path that leaves `//` — use this wherever a slug is a path
+ * segment that must not be empty.
+ */
+export function slugitOr(value: string | null | undefined, fallback: string) {
+  return (value ? slugit(value) : '') || fallback;
+}
+
+/**
+ * Build a canonical model detail URL. Includes the slugified name when
+ * provided so links match the canonical form Google indexes; falls back
+ * gracefully when the name is missing/null/empty.
+ */
+export function getModelUrl({
+  modelId,
+  modelName,
+  modelVersionId,
+}: {
+  modelId: number;
+  modelName?: string | null;
+  modelVersionId?: number | null;
+}): string {
+  const slug = modelName ? slugit(modelName) : null;
+  const path = slug ? `/models/${modelId}/${slug}` : `/models/${modelId}`;
+  return modelVersionId ? `${path}?modelVersionId=${modelVersionId}` : path;
+}
+
+/**
+ * Build a canonical 3D-model detail URL. The `/3d-models/[id]/[[...slug]]`
+ * route ignores the slug segment (id is the source of truth), so this just
+ * appends the slugified name for pretty, index-friendly URLs. Falls back to
+ * the bare id path when the name is missing/empty.
+ */
+export function getModel3DUrl({ id, name }: { id: number; name?: string | null }): string {
+  const slug = name ? slugit(name) : null;
+  return slug ? `/3d-models/${id}/${slug}` : `/3d-models/${id}`;
+}
+
+/** Canonical article URL. A title with no slug-able characters gets the bare id path. */
+export function getArticleUrl({ id, title }: { id: number; title?: string | null }): string {
+  const slug = title ? slugit(title) : null;
+  return slug ? `/articles/${id}/${slug}` : `/articles/${id}`;
+}
+
+/**
+ * One HTML tag. `[^<>]` (not `[^>]`) so an unterminated run of `<` can't force quadratic
+ * backtracking (ReDoS) — a `<` always starts a fresh potential tag.
+ *
+ * Deliberately NOT exported. A shared module-scope regex carrying `g` is safe only while every
+ * consumer uses `String.replace`, which resets `lastIndex`; the first caller to reach for
+ * `.test()` or `.exec()` gets a guard that is inert on every other invocation. The two joins
+ * callers actually want are exported as functions instead.
+ */
+const HTML_TAG = /<[^<>]*>/g;
+
+/**
+ * Tags removed with nothing in their place, so `civitai.id<strong>5</strong>92807.click` reads
+ * as one string. The comment blocklist needs this alongside `removeTags`: neither join alone is
+ * enough, because collapsing to a space defeats a pattern split mid-token, while joining with
+ * nothing glues `<p>a</p><p>b</p>` into `ab`.
+ */
+export function removeTagsCompact(str: string) {
+  if (!str) return '';
+  return str.replace(HTML_TAG, '');
+}
+
+/**
+ * @see https://www.geeksforgeeks.org/how-to-strip-out-html-tags-from-a-string-using-javascript/
+ */
+export function removeTags(str: string) {
+  if (!str) return '';
+
+  const stringWithoutTags = str.replace(HTML_TAG, ' ');
+
+  // Replace multiple spaces with a single space
+  const stringWithoutExtraSpaces = stringWithoutTags.replace(/\s+/g, ' ');
+
+  // Trim the resulting string to remove leading/trailing spaces
+  return stringWithoutExtraSpaces.trim();
+}
+
+export function stripLeadingWhitespace(str: string) {
+  return str.replace(/^[ \t]+/gm, '');
+}
+
+export function postgresSlugify(str?: string) {
+  if (!str) return '';
+
+  return str
+    .replace(' ', '_')
+    .replace(/[^a-zA-Z0-9_]/g, '')
+    .toLowerCase();
+}
+
+export function titleCase(val: string) {
+  return val[0].toUpperCase() + val.slice(1).toLowerCase();
+}
+
+export function isUUID(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+export const validateThirdPartyUrl = (url: string) => {
+  const toValidate = getUrlDomain(url);
+  return allowedUrls.map(getUrlDomain).includes(toValidate);
+};
+
+export function hashify(str: string) {
+  let hash = 0;
+  for (let i = 0, len = str.length; i < len; i++) {
+    const chr = str.charCodeAt(i);
+    hash = (hash << 5) - hash + chr;
+    hash |= 0; // Convert to 32bit integer
+  }
+  return hash;
+}
+
+export function hashifyObject(obj: any) {
+  if (!obj) return '';
+  const str = toJson(obj);
+  return hashify(str);
+}
+
+export function trimNonAlphanumeric(str: string | null | undefined) {
+  return str?.replace(/^[^\w]+|[^\w]+$/g, '');
+}
+
+export function parseAIR(identifier: string) {
+  const { id, version, ...value } = Air.parse(identifier);
+  return { ...value, model: Number(id), version: Number(version) };
+}
+
+export function parseAIRSafe(identifier: string | undefined) {
+  if (identifier === undefined) return identifier;
+  const match = Air.parseSafe(identifier);
+  if (!match) return match;
+
+  const { id, version, ...value } = match;
+  return { ...value, model: Number(id), version: Number(version) };
+}
+
+export function isAir(identifier: string) {
+  return Air.isAir(identifier);
+}
+
+export function safeDecodeURIComponent(str: string) {
+  try {
+    return decodeURIComponent(str);
+  } catch {
+    return str;
+  }
+}
+
+export function getRandomId() {
+  return Math.random().toString(36).substring(2, 11);
+}
+
+export function toPascalCase(str: string) {
+  // Split the string by any sequence of non-alphanumeric characters
+  const words = str.split(/[^a-zA-Z0-9]+/);
+
+  // Capitalize the first letter of each word
+  const pascalCaseWords = words.map((word) => {
+    if (!isNaN(parseInt(word[0]))) {
+      // If the word starts with a digit, keep the entire word as is
+      return word.toUpperCase();
+    }
+    return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+  });
+
+  // Join the words back together with a space
+  return pascalCaseWords.join(' ');
+}
+
+export function capitalize(str: string) {
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+/** "the Flux model", but "The Weirdies model" rather than "the The Weirdies model". */
+export function withDefiniteArticle(name: string, article: 'the' | 'The' = 'the') {
+  if (!/^the\s/i.test(name)) return `${article} ${name}`;
+  return article === 'The' ? capitalize(name) : name;
+}
+
+export function toKebabCase(str: string) {
+  return str
+    .split('')
+    .map((letter, idx) => {
+      return letter.toUpperCase() === letter
+        ? `${idx !== 0 ? '-' : ''}${letter.toLowerCase()}`
+        : letter;
+    })
+    .join('');
+}
+
+/**
+ * Removes NUL and replaces lone surrogates, which Postgres rejects in text and jsonb. It scrubs rather
+ * than rejects, unlike the validators in `platform-feedback.schema.ts` and `apps/doc-store.ts`.
+ */
+export function sanitizeForPostgres(value: string) {
+  return value.replace(/\u0000/g, '').toWellFormed();
+}

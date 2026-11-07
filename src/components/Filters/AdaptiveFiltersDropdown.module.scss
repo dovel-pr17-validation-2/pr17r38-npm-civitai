@@ -1,0 +1,18 @@
+.opened {
+  transform: rotate(180deg);
+  transition: transform 200ms ease;
+}
+
+.actionButton {
+  @container (max-width: theme('screens.sm')) {
+    width: 100%;
+  }
+}
+
+.indicatorRoot {
+  line-height: 1;
+}
+
+.indicatorIndicator {
+  line-height: 1.6;
+}

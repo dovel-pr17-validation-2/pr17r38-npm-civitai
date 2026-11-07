@@ -1,0 +1,168 @@
+import type { ButtonProps } from '@mantine/core';
+import { Button, Group, Text } from '@mantine/core';
+import { Tooltip } from '~/components/MantineOverlays';
+import { IconBrush } from '@tabler/icons-react';
+import React from 'react';
+import { useGenerationPanelStore } from '~/store/generation-panel.store';
+import { generationGraphPanel } from '~/store/generation-graph.store';
+import { PaidAccessPriceBadge } from '~/components/Model/ModelVersions/PaidAccessPriceBadge';
+import { useTrackEvent } from '~/components/TrackView/track.utils';
+
+export function GenerateButton({
+  iconOnly,
+  mode = 'replace',
+  children,
+  generationPrice,
+  listedPrice,
+  acceptsBlueBuzz,
+  onPurchase,
+  onClick,
+  epochNumber,
+  versionId,
+  modelId,
+  wildcardSetId,
+  ...buttonProps
+}: Props) {
+  const { trackAction } = useTrackEvent();
+  // `generationPrice` is what THIS viewer must pay and turns the button into a purchase action.
+  // `listedPrice` is what buyers pay, shown to the owner/mod who already has access — it must never
+  // reach onClickHandler, or a creator clicking Generate on their own model would be asked to buy it.
+  const shownPrice = generationPrice ?? listedPrice;
+  const isListedOnly = generationPrice == null && listedPrice != null;
+
+  const opened = useGenerationPanelStore((state) => state.opened);
+  const onClickHandler = (e?: React.MouseEvent<HTMLElement>) => {
+    if (generationPrice) {
+      onPurchase?.();
+      return;
+    }
+    if (mode === 'toggle' && opened) return generationGraphPanel.close();
+
+    // Top-of-funnel telemetry — fire-and-forget. Joined downstream to
+    // orchestration.jobs by userId + ts to compute view→click→submit→job
+    // conversion. `source` comes from data-activity on the rendered button
+    // (create:model | create:model-stat | create:model-card | ...) so
+    // entry-points can be split without an extra prop on every caller.
+    //
+    // Only treat this as an entry-point click when the button targets a
+    // specific resource. The same component is reused as the form-submit
+    // button inside the generator panel (no versionId/wildcardSetId/modelId);
+    // that submit fires Generator_Submit from the form handler instead, so
+    // we'd double-count if we tracked Model_Create_Click here too.
+    const isEntryPoint = versionId != null || wildcardSetId != null || modelId != null;
+    if (isEntryPoint) {
+      const dataActivityProp = (buttonProps as Record<string, unknown>)['data-activity'];
+      const source =
+        e?.currentTarget?.dataset?.activity ??
+        (typeof dataActivityProp === 'string' ? dataActivityProp : undefined);
+      trackAction({
+        type: 'Model_Create_Click',
+        details: {
+          modelId,
+          modelVersionId: versionId,
+          source,
+        },
+      }).catch(() => undefined);
+    }
+
+    // Wildcards-type versions: short-circuit straight to the snippets node
+    // — no `getGenerationData` round-trip required, since a wildcard set
+    // doesn't need enriched resource data on the form side.
+    if (wildcardSetId != null) {
+      generationGraphPanel.open({ type: 'wildcard', wildcardSetId });
+    } else if (versionId != null) {
+      generationGraphPanel.open({ type: 'modelVersion', id: versionId, epoch: epochNumber });
+    } else {
+      generationGraphPanel.open();
+    }
+
+    onClick?.();
+  };
+
+  if (children)
+    return React.cloneElement(children, {
+      ...buttonProps,
+      onClick: onClickHandler,
+      style: { cursor: 'pointer' },
+    });
+
+  const purchaseIcon = (
+    <PaidAccessPriceBadge
+      price={shownPrice ?? 0}
+      acceptsBlueBuzz={acceptsBlueBuzz}
+      listedOnly={isListedOnly}
+      decimals={0}
+    />
+  );
+
+  const button = (
+    <Button
+      variant="filled"
+      className="overflow-visible"
+      {...buttonProps}
+      onClick={onClickHandler}
+      style={
+        iconOnly
+          ? { paddingRight: 0, paddingLeft: 0, width: 36, ...buttonProps.style }
+          : {
+              flex: 1,
+              // 12px of padding overflows Mantine's fixed height for the size, and only a flex parent
+              // stretching the button hides it. Callers can still override.
+              height: 'auto',
+              padding: '12px 20px',
+              background:
+                'linear-gradient(135deg, var(--mantine-color-blue-6), var(--mantine-color-blue-7))',
+              ...buttonProps.style,
+            }
+      }
+    >
+      {!!shownPrice && <>{purchaseIcon}</>}
+      {iconOnly ? (
+        <IconBrush size={24} />
+      ) : (
+        <Group gap={8} wrap="nowrap">
+          <IconBrush size={20} />
+          <Text inherit inline fw={600} className="hide-mobile">
+            Create
+          </Text>
+        </Group>
+      )}
+    </Button>
+  );
+
+  return iconOnly ? (
+    <Tooltip label="Start Generating" withArrow>
+      {button}
+    </Tooltip>
+  ) : (
+    button
+  );
+}
+
+type Props = Omit<ButtonProps, 'onClick' | 'children'> & {
+  iconOnly?: boolean;
+  mode?: 'toggle' | 'replace';
+  children?: React.ReactElement;
+  generationPrice?: number;
+  /** What buyers pay for generation. Informational only — never triggers the purchase flow. */
+  listedPrice?: number;
+  /** The paid-access terms accept Blue Buzz — colours the price chip to say so. */
+  acceptsBlueBuzz?: boolean;
+  onPurchase?: () => void;
+  onClick?: () => void;
+  epochNumber?: number;
+  versionId?: number;
+  /**
+   * Parent model id, when known by the caller. Used for funnel telemetry
+   * (Model_Create_Click event) so we can attribute clicks back to the
+   * model entry-point even when only versionId is on the button.
+   */
+  modelId?: number;
+  /**
+   * When set, the button opens the panel directly with this wildcard set
+   * id loaded into the snippets node. Takes precedence over `versionId`.
+   * Use for Wildcards-type model versions, where `model.getById` /
+   * `modelVersion.getById` stamps `wildcardSetId` on the version response.
+   */
+  wildcardSetId?: number;
+};

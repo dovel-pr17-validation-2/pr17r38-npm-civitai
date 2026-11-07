@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# deploy-chain.sh — live Tekton → Flux → Flagger deploy-chain status for civitai PROD.
+#
+# Reads LIVE cluster state (read-only gets only) on the DataPacket cluster.
+# Context: civit-datapacket. Namespaces: tekton-builds (build), flux-system (image
+# automation), civitai-dp-prod (Flagger canary + app).
+#
+# CRITICAL — prod is NOT keyed off the semver tag:
+#   * PROD  = release-branch push -> civitai-app-build-trigger -> ghcr.io/civitai/civitai-prod
+#             run names civitai-web-build-*  (branch label = "release")
+#   * The semver tag (vX.Y.Z) fires a DIFFERENT trigger -> ghcr.io/civitai/civitai-web
+#             run names civitai-web-tag-build-*  (branch label = "<tag>")  -> next/stage, NOT prod
+#   * Also excluded: civitai-web-main-build-* (branch=main), pr-preview-*, pr-check-*
+#   The prod run is identified ONLY by labels:
+#       pipeline=build-and-push,pipeline.jquad.rocks/git.repository.branch.name=release
+#
+# Usage:
+#   deploy-chain.sh status [<tag|sha>]   # snapshot of where the deploy is in the chain
+#   deploy-chain.sh watch  [<tag|sha>]   # poll until prod is fully on the new tag (or canary fails)
+#
+# No <tag|sha>  -> latest release-branch prod run.
+# <sha>         -> matches the prod run by git.repository.branch.commit label (full or short sha).
+# <tag>         -> resolves the release-branch HEAD via GitHub, then matches by commit (see note).
+
+set -uo pipefail
+
+CTX=civit-datapacket
+NS_BUILD=tekton-builds
+NS_FLUX=flux-system
+NS_APP=civitai-dp-prod
+IMAGE_REPO=ghcr.io/civitai/civitai-prod
+POLICY=civitai-prod-release
+PRIMARY_SSR=civitai-dp-prod-primary
+PRIMARY_API=civitai-dp-prod-api-primary
+CANARY_SSR=civitai-dp-prod
+CANARY_API=civitai-dp-prod-api
+PROD_SELECTOR='pipeline=build-and-push,pipeline.jquad.rocks/git.repository.branch.name=release'
+
+k() { kubectl --context "$CTX" "$@" 2>/dev/null; }
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# ---- resolve the prod PipelineRun name from an optional tag|sha arg --------------
+resolve_run() {
+  local arg="${1:-}"
+  if [ -z "$arg" ]; then
+    # latest release-branch run
+    k -n "$NS_BUILD" get pipelinerun -l "$PROD_SELECTOR" \
+      --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}'
+    return
+  fi
+
+  # If it's a run name already, use it.
+  if [[ "$arg" == civitai-web-build-* ]]; then
+    echo "$arg"; return
+  fi
+
+  # Decide tag vs sha. A semver tag looks like v5.0.1817 / 5.0.1817 (has a dot).
+  # A git sha is 7-40 hex chars, no dot. Only tags need GitHub release-HEAD resolution
+  # (the tag object points at the civitai-web/stage commit, NOT prod).
+  local sha="$arg"
+  if [[ "$arg" =~ ^v?[0-9]+\.[0-9] ]] && command -v gh >/dev/null 2>&1; then
+    # The tag object itself points at the civitai-web (stage) commit, NOT prod.
+    # Prod for a release maps to the release BRANCH head. Resolve that sha.
+    local rel
+    rel=$(gh api repos/civitai/civitai/git/refs/heads/release --jq '.object.sha' 2>/dev/null)
+    if [ -n "$rel" ]; then sha="$rel"; fi
+  fi
+
+  # Match prod run by commit label (try full sha, then prefix match across runs).
+  local run
+  run=$(k -n "$NS_BUILD" get pipelinerun \
+    -l "${PROD_SELECTOR},pipeline.jquad.rocks/git.repository.branch.commit=${sha}" \
+    --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
+  if [ -n "$run" ]; then echo "$run"; return; fi
+
+  # Prefix fallback: scan release runs for a commit label starting with the given sha.
+  k -n "$NS_BUILD" get pipelinerun -l "$PROD_SELECTOR" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.labels.pipeline\.jquad\.rocks/git\.repository\.branch\.commit}{"\n"}{end}' \
+    | awk -v s="$sha" '$2 ~ "^"s {n=$1} END{print n}'
+}
+
+short() { echo "${1:0:7}"; }
+
+run_commit() {
+  k -n "$NS_BUILD" get pipelinerun "$1" \
+    -o jsonpath='{.metadata.labels.pipeline\.jquad\.rocks/git\.repository\.branch\.commit}'
+}
+
+# True when image ($1), tagged <timestamp>-<sha>, carries short sha ($2). Anchored to
+# the tag's sha: an all-digit short sha can occur inside another release's timestamp.
+# The image policy accepts any sha length, so longer shas still match.
+tag_has_sha() { [[ "$2" =~ ^[0-9a-f]{7}$ ]] && [[ "$1" =~ -"$2"[0-9a-f]*$ ]]; }
+
+# True when Flux's latest image ($2) was built from the run's commit ($1).
+image_ready() { [ -n "$1" ] && tag_has_sha "$2" "$(short "$1")"; }
+
+# ---- phase 1: build -------------------------------------------------------------
+print_build() {
+  local run="$1"
+  local commit cond reason msg
+  commit=$(run_commit "$run")
+  reason=$(k -n "$NS_BUILD" get pipelinerun "$run" -o jsonpath='{.status.conditions[0].reason}')
+  msg=$(k -n "$NS_BUILD" get pipelinerun "$run" -o jsonpath='{.status.conditions[0].message}')
+
+  echo "=== [1] BUILD (prod / release branch) ==="
+  echo "  run:     $run"
+  echo "  commit:  $(short "$commit")  ($commit)"
+  echo "  status:  $reason — $msg"
+  echo "  tasks (notify-preparing -> github-create-deploy -> fetch-repository -> build-image -> migrations):"
+  k -n "$NS_BUILD" get taskrun -l "tekton.dev/pipelineRun=$run" \
+    --sort-by=.metadata.creationTimestamp \
+    -o custom-columns='  TASK:.metadata.labels.tekton\.dev/pipelineTask,STATUS:.status.conditions[0].reason' \
+    --no-headers 2>/dev/null | sed 's/^/  /'
+  echo "$commit"  # returned via stdout tail for callers
+}
+
+# ---- phase 2/3: image policy ----------------------------------------------------
+print_image() {
+  local latest
+  latest=$(k -n "$NS_FLUX" get imagepolicy "$POLICY" -o jsonpath='{.status.latestImage}')
+  echo "=== [2] IMAGE PICKED UP (Flux ImagePolicy $POLICY) ==="
+  echo "  latestImage: ${latest:-<none>}"
+  echo "$latest"
+}
+
+# ---- phase 4: canary ------------------------------------------------------------
+print_canary_one() {
+  local name="$1" label="$2"
+  local phase weight iter failed
+  phase=$(k -n "$NS_APP" get canary "$name" -o jsonpath='{.status.phase}')
+  weight=$(k -n "$NS_APP" get canary "$name" -o jsonpath='{.status.canaryWeight}')
+  iter=$(k -n "$NS_APP" get canary "$name" -o jsonpath='{.status.iterations}')
+  failed=$(k -n "$NS_APP" get canary "$name" -o jsonpath='{.status.failedChecks}')
+  printf "  %-4s %-18s phase=%-12s weight=%-3s iterations=%-2s failedChecks=%s\n" \
+    "$label" "$name" "${phase:-?}" "${weight:-0}" "${iter:-0}" "${failed:-0}"
+}
+
+print_canary() {
+  echo "=== [4] CANARY (Flagger, ns $NS_APP) ==="
+  print_canary_one "$CANARY_SSR" "SSR"
+  print_canary_one "$CANARY_API" "API"
+  echo "  recent rollback/warning events:"
+  k -n "$NS_APP" get events --field-selector type=Warning --sort-by=.lastTimestamp \
+    -o custom-columns='  TIME:.lastTimestamp,OBJ:.involvedObject.name,MSG:.message' --no-headers 2>/dev/null \
+    | grep -E "$CANARY_SSR|$CANARY_API" | tail -5 | sed 's/^/  /'
+}
+
+# ---- phase 5: primaries ---------------------------------------------------------
+print_primaries() {
+  local ssr api
+  ssr=$(k -n "$NS_APP" get deploy "$PRIMARY_SSR" -o jsonpath='{.spec.template.spec.containers[0].image}')
+  api=$(k -n "$NS_APP" get deploy "$PRIMARY_API" -o jsonpath='{.spec.template.spec.containers[0].image}')
+  echo "=== [5] PRIMARIES (100% prod — what users hit) ==="
+  echo "  SSR primary ($PRIMARY_SSR): ${ssr:-<none>}"
+  echo "  API primary ($PRIMARY_API): ${api:-<none>}  <- tRPC procedures go live here"
+  echo "$ssr|$api"
+}
+
+# ---- rollout across ALL app deployments -----------------------------------------
+# "Fully live" means every app deployment (image repo == civitai-prod) is on the
+# target sha AND fully rolled (updatedReplicas == desired == readyReplicas). The
+# Flagger promote flips a deployment's SPEC image minutes before its pods finish
+# the rolling update, so a procedure added in the new image is NOT_FOUND on the
+# not-yet-rolled pods. Never call a deploy "live" off the spec image alone.
+# Sets: ROLLOUT_DONE (1/0), ROLLOUT_DETAIL (per-deploy lines), ROLLOUT_LAG (laggards).
+app_rollout() {
+  local tshort="$1"
+  ROLLOUT_DONE=1; ROLLOUT_DETAIL=""; ROLLOUT_LAG=""
+  local name up des rdy img checked=0 saw_ssr=0 saw_api=0
+  while read -r name up des rdy img; do
+    [ -z "$name" ] && continue
+    case "$img" in "$IMAGE_REPO"*) ;; *) continue ;; esac   # app deployments only
+    [ "$up" = "<none>" ] && up=0; [ "$des" = "<none>" ] && des=0; [ "$rdy" = "<none>" ] && rdy=0
+    up=${up:-0}; des=${des:-0}; rdy=${rdy:-0}
+    # Skip scaled-to-0 deployments (Flagger canary shells at rest) — not a serving pool.
+    [ "$des" -eq 0 ] 2>/dev/null && continue
+    checked=$((checked + 1))
+    [ "$name" = "$PRIMARY_SSR" ] && saw_ssr=1
+    [ "$name" = "$PRIMARY_API" ] && saw_api=1
+    ROLLOUT_DETAIL+="    $name: ${up}/${des} updated, ${rdy} ready, ${img##*:}"$'\n'
+    if ! tag_has_sha "$img" "$tshort"; then
+      ROLLOUT_DONE=0; ROLLOUT_LAG+="$name(old image ${img##*:}) "
+    elif [ "$up" != "$des" ] || [ "$rdy" != "$des" ]; then
+      ROLLOUT_DONE=0; ROLLOUT_LAG+="$name(${up}/${des} rolled, ${rdy} ready) "
+    fi
+  done < <(k -n "$NS_APP" get deploy \
+    -o custom-columns='N:.metadata.name,U:.status.updatedReplicas,D:.spec.replicas,R:.status.readyReplicas,I:.spec.template.spec.containers[0].image' \
+    --no-headers)
+  # k() swallows kubectl errors, so a failed list reads as zero rows, which would
+  # otherwise leave ROLLOUT_DONE=1 with nothing checked.
+  if [ "$checked" -eq 0 ] || [ "$saw_ssr" = 0 ] || [ "$saw_api" = 0 ]; then
+    ROLLOUT_DONE=0; ROLLOUT_LAG+="(deployment list incomplete: $checked serving, primaries ssr=$saw_ssr api=$saw_api) "
+  fi
+}
+
+# ---- overall summary ------------------------------------------------------------
+# Args: build_reason, target_image, latest_image, ssr_prim, api_prim, canary_ssr_phase
+summarize() {
+  local breason="$1" target="$2" latest="$3" ssr="$4" api="$5" cphase="$6"
+  echo "=== SUMMARY: where in the chain + ETA ==="
+  if [[ "$breason" =~ Failed|Error|PipelineRunTimeout ]]; then
+    echo "  PHASE: BUILD FAILED ($breason). Inspect taskrun logs. STOP."
+    return
+  fi
+  # The target (this run's) image being in the policy means build-image + push +
+  # Flux scan all completed — even if trailing notify/github taskruns are still Running.
+  local img_ready=0
+  if image_ready "$target" "$latest"; then img_ready=1; fi
+
+  if [ "$img_ready" = 0 ]; then
+    if [ "$breason" = "Succeeded" ] || [ "$breason" = "Completed" ]; then
+      echo "  PHASE: BUILD DONE, awaiting Flux pickup. Policy still on ${latest##*:}. ETA ~1-6m."
+    else
+      echo "  PHASE: BUILDING ($breason). ETA ~15-25m for image, ~35-40m end-to-end."
+    fi
+    return
+  fi
+  # Canary rollback short-circuits everything.
+  case "$cphase" in
+    Failed|*ollback*)
+      echo "  PHASE: CANARY $cphase — ROLLED BACK. Prod stays on old image. STOP."
+      return ;;
+  esac
+
+  # image in policy — are ALL app deployments fully ROLLED onto it (not just spec)?
+  app_rollout "$(short "$target")"
+  local canary_ok=0
+  { [ "$cphase" = "Succeeded" ] || [ "$cphase" = "Initialized" ] || [ -z "$cphase" ]; } && canary_ok=1
+
+  if [ "$ROLLOUT_DONE" = 1 ] && [ "$canary_ok" = 1 ]; then
+    echo "  PHASE: FULLY ON PROD — every app deployment rolled onto $latest. Safe to announce live."
+    return
+  fi
+
+  # Spec image promoted but at least one service still cycling pods (or canary still
+  # stepping) -> NOT safe to tell anyone it's live yet.
+  echo "  PHASE: PROMOTED but ROLLING OUT — NOT fully live yet. Do NOT announce until every service is rolled."
+  echo "  laggards: ${ROLLOUT_LAG:-<none>}"
+  printf "%b" "$ROLLOUT_DETAIL"
+  case "$cphase" in
+    Progressing|Promoting|Finalising)
+      echo "  canary SSR=$cphase (still stepping 10->50% traffic). ETA ~4-10m." ;;
+    *)
+      echo "  canary=$cphase; primary pods finishing their rolling update. ETA ~2-8m." ;;
+  esac
+}
+
+cmd_status() {
+  local run; run=$(resolve_run "${1:-}")
+  [ -z "$run" ] && die "could not resolve a prod (release-branch) PipelineRun for '${1:-latest}'"
+  echo "############################################################"
+  echo "# CIVITAI PROD DEPLOY CHAIN — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "# (prod = release-branch -> civitai-prod; tag/main/pr builds excluded)"
+  echo "############################################################"
+
+  local bout; bout=$(print_build "$run"); echo "$bout" | sed '$d'
+  local commit; commit=$(echo "$bout" | tail -1)
+  local breason; breason=$(k -n "$NS_BUILD" get pipelinerun "$run" -o jsonpath='{.status.conditions[0].reason}')
+  echo
+  local iout; iout=$(print_image); echo "$iout" | sed '$d'
+  local latest; latest=$(echo "$iout" | tail -1)
+  echo
+  print_canary
+  local cphase; cphase=$(k -n "$NS_APP" get canary "$CANARY_SSR" -o jsonpath='{.status.phase}')
+  echo
+  local pout; pout=$(print_primaries); echo "$pout" | sed '$d'
+  local prim; prim=$(echo "$pout" | tail -1)
+  local ssr="${prim%%|*}" api="${prim##*|}"
+  echo
+  # target image = the policy image once build done & picked up; else infer from commit
+  summarize "$breason" "$commit" "$latest" "$ssr" "$api" "$cphase"
+}
+
+cmd_watch() {
+  local run; run=$(resolve_run "${1:-}")
+  [ -z "$run" ] && die "could not resolve a prod PipelineRun for '${1:-latest}'"
+  local commit; commit=$(run_commit "$run")
+  [ -z "$commit" ] && die "run $run has no commit label, so its image cannot be told from the previous release's"
+  echo "Watching prod deploy chain for run: $run commit $(short "$commit")  (Ctrl-C to stop)"
+  local last=""
+  while true; do
+    local breason cphase capi latest ssr api
+    breason=$(k -n "$NS_BUILD" get pipelinerun "$run" -o jsonpath='{.status.conditions[0].reason}')
+    latest=$(k -n "$NS_FLUX" get imagepolicy "$POLICY" -o jsonpath='{.status.latestImage}')
+    cphase=$(k -n "$NS_APP" get canary "$CANARY_SSR" -o jsonpath='{.status.phase}')
+    capi=$(k -n "$NS_APP" get canary "$CANARY_API" -o jsonpath='{.status.phase}')
+    ssr=$(k -n "$NS_APP" get deploy "$PRIMARY_SSR" -o jsonpath='{.spec.template.spec.containers[0].image}')
+    api=$(k -n "$NS_APP" get deploy "$PRIMARY_API" -o jsonpath='{.spec.template.spec.containers[0].image}')
+    local cw; cw=$(k -n "$NS_APP" get canary "$CANARY_SSR" -o jsonpath='{.status.canaryWeight}')
+    # Rollout progress: Flagger flips the primary SPEC image at promote-time, but
+    # the primary Deployment's pod rolling-update (updated->ready replicas) lags by
+    # minutes. A procedure added in the new image is NOT_FOUND on the not-yet-rolled
+    # pods, so "done" must mean rollout-complete, not just spec image == new tag.
+    local su sd sr2 au ad ar
+    read -r su sd sr2 < <(k -n "$NS_APP" get deploy "$PRIMARY_SSR" -o jsonpath='{.status.updatedReplicas} {.spec.replicas} {.status.readyReplicas}')
+    read -r au ad ar < <(k -n "$NS_APP" get deploy "$PRIMARY_API" -o jsonpath='{.status.updatedReplicas} {.spec.replicas} {.status.readyReplicas}')
+    local line="build=$breason policy=${latest##*:} canarySSR=$cphase(w=$cw) canaryAPI=$capi ssrPrim=${ssr##*:}(roll ${su:-0}/${sd:-?}) apiPrim=${api##*:}(roll ${au:-0}/${ad:-?})"
+    if [ "$line" != "$last" ]; then
+      echo "[$(date -u +%H:%M:%SZ)] $line"
+      last="$line"
+    fi
+    # exit conditions
+    if [[ "$breason" =~ Failed|Error|PipelineRunTimeout ]]; then
+      echo ">>> BUILD FAILED ($breason). Exiting."; exit 1
+    fi
+    if [[ "$cphase" =~ Failed ]] || [[ "$capi" =~ Failed ]]; then
+      echo ">>> CANARY FAILED/ROLLED BACK (SSR=$cphase API=$capi). Exiting."; exit 1
+    fi
+    # Before Flux picks up this run's image, every deployment is still fully rolled
+    # onto the PREVIOUS release, which is indistinguishable from done without the sha.
+    if image_ready "$commit" "$latest" \
+       && { [ "$cphase" = "Succeeded" ] || [ "$cphase" = "Initialized" ]; } \
+       && { [ "$capi" = "Succeeded" ] || [ "$capi" = "Initialized" ]; }; then
+      app_rollout "$(short "$commit")"
+      if [ "$ROLLOUT_DONE" = 1 ]; then
+        echo ">>> PROD FULLY ON $latest — every app deployment rolled onto $(short "$commit"). Done."; exit 0
+      fi
+    fi
+    sleep 30
+  done
+}
+
+ACTION="${1:-status}"; shift || true
+case "$ACTION" in
+  status) cmd_status "${1:-}" ;;
+  watch)  cmd_watch  "${1:-}" ;;
+  *) die "unknown action '$ACTION' (use: status | watch)" ;;
+esac

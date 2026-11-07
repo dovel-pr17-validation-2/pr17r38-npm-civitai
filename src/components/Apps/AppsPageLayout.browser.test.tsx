@@ -1,0 +1,145 @@
+import { describe, expect, test, vi } from 'vitest';
+import { page } from 'vitest/browser';
+// `test/` lives outside `src`, so the `~` alias doesn't reach it — relative import.
+import { renderWithProviders } from '../../../test/component-setup';
+// Type-only namespace import (NOT `typeof import('...')`, which
+// @typescript-eslint/consistent-type-imports rejects) so the spread below keeps
+// the real module's type.
+import type * as TrpcMod from '~/utils/trpc';
+
+/**
+ * Regression: the DOUBLE RULE under the `/apps` sub-nav.
+ *
+ * `AppsPageLayout` wrapped its header band in a `borderBottom` hairline, and
+ * Mantine's `Tabs.List` (inside the old `AppsSubNav`) already drew its OWN bottom
+ * border — so every `/apps` page rendered two parallel lines ~8px apart under
+ * the tabs. The band's rule is gone.
+ *
+ * ⚠️ THE "BOTH SIDES" CLAIM THIS HEADER MADE IS RETIRED, AND SAYING SO MATTERS MORE THAN
+ * DELETING IT. It read: "'the band has no border' alone would also pass if someone
+ * deleted the TABS' border instead (leaving no separator at all), so the tabs' rule is
+ * pinned as present in the same test." There is no tab strip any more and the rail draws
+ * no rule at all, so there is no second border for this file to pin — the separator the
+ * band relied on is gone by design, and PROXIMITY (the 16/32 pair below) is the whole
+ * replacement. The rail's own "draws no rule either" guard lives in
+ * `__tests__/appsPageLayout.test.ts`.
+ */
+
+// 🔴 The viewer MUST be one the rail renders for. `AppsPageLayout` hides the rail
+// entirely below two qualifying tabs, and the summary query is stubbed empty here, so
+// an anonymous / non-author viewer would render NO `<nav>` at all and every assertion
+// below would fail on a null lookup rather than on the geometry it is about. An author
+// (`appBlocksAuthor`) yields Marketplace + Create — the same two-tab bar this file was
+// written against.
+vi.mock('~/providers/FeatureFlagsProvider', () => ({
+  useFeatureFlags: () => ({ appBlocks: true, appBlocksAuthor: true }),
+}));
+vi.mock('~/providers/IsClientProvider', () => ({ useIsClient: () => true }));
+vi.mock('~/hooks/useCurrentUser', () => ({
+  useCurrentUser: () => ({ id: 1, username: 'author', isModerator: false }),
+}));
+// Spread the REAL module and override only `trpc` (local-rules/no-wholesale-
+// module-mock): a hand-written replacement silently breaks every importer the day
+// '~/utils/trpc' grows an export this factory omits — the whole FILE then fails to
+// load with 0 tests collected and no failing assertion.
+vi.mock('~/utils/trpc', async (importOriginal) => ({
+  ...(await importOriginal<typeof TrpcMod>()),
+  trpc: { blocks: { getNavSummary: { useQuery: () => ({ data: undefined }) } } },
+}));
+
+const { AppsPageLayout } = await import('./AppsPageLayout');
+
+/**
+ * The header band.
+ *
+ * 🔴 RESOLVED BY THE LAYOUT'S OWN MARKER SINCE THE TAB STRIP BECAME A RAIL, NOT BY
+ * `nav.parentElement`. The nav used to be the band's first child; it is in a SIBLING
+ * COLUMN now, so that walk would hand back the rail's sticky wrapper and every assertion
+ * below would be about the wrong element while still looking well-formed.
+ */
+function headerBand(): HTMLElement {
+  return document.querySelector('[data-apps-chrome="band"]') as HTMLElement;
+}
+
+/**
+ * ⚠️ The harness does NOT load `@mantine/core/styles.css` — component tests
+ * render against Mantine's INLINE per-instance styles only. So `getComputedStyle`
+ * cannot see anything a Mantine stylesheet rule supplies (`Tabs.List`'s own
+ * bottom border, `Stack`'s `gap` resolved from `--stack-gap`, …), and an
+ * assertion on those measures nothing. What IS observable here is exactly what
+ * the component wrote inline — which is where the removed border lived
+ * (`style={(theme) => ({ borderBottom: … })}`) and where the spacing tokens live
+ * (`--stack-gap`). The stylesheet-dependent half of the claim (the tabs still
+ * draw the one remaining rule) is pinned as a SOURCE guard in the blocking node
+ * suite instead — see `__tests__/appsPageLayout.test.ts`.
+ */
+describe('AppsPageLayout — exactly ONE rule under the tabs', () => {
+  test('the header band writes NO bottom border of its own (no-header page)', async () => {
+    renderWithProviders(
+      <AppsPageLayout>
+        <div data-testid="body">body</div>
+      </AppsPageLayout>
+    );
+    await expect.element(page.getByTestId('body')).toBeInTheDocument();
+
+    const band = headerBand();
+    // Guard the guard — a null band would make the assertion below vacuous.
+    expect(band).toBeTruthy();
+    // The removed rule was an INLINE style, so this is directly mutation-
+    // sensitive: restoring it puts `1px solid …` back on `style.borderBottom`.
+    expect(band.style.borderBottom).toBe('');
+    expect(band.style.borderBottomWidth).toBe('');
+  });
+
+  test('the same holds on a page WITH a header (title/actions render inside the band)', async () => {
+    renderWithProviders(
+      <AppsPageLayout
+        title="Your installed apps"
+        subtitle="Manage them"
+        actions={<button>Act</button>}
+      >
+        <div data-testid="body">body</div>
+      </AppsPageLayout>
+    );
+    await expect
+      .element(page.getByRole('heading', { name: 'Your installed apps' }))
+      .toBeInTheDocument();
+    expect(headerBand().style.borderBottom).toBe('');
+  });
+
+  test('SPACING: the band groups by PROXIMITY — tighter inside than to the body', async () => {
+    // With the rule gone, proximity is the whole replacement for the removed
+    // line, so it is asserted rather than assumed: `md` (16px) between the tabs
+    // and the title INSIDE the band, vs `xl` (32px) from the band to the content
+    // — a 2:1 contrast. It was `lg` (20px) first; a 1440 render showed that 20
+    // vs 16 is four pixels and groups nothing, so the outer gap was widened.
+    // Read off the inline `--stack-gap` custom properties Mantine writes, which
+    // survive the missing stylesheet.
+    renderWithProviders(
+      <AppsPageLayout title="Your installed apps">
+        <div data-testid="body">body</div>
+      </AppsPageLayout>
+    );
+    await expect.element(page.getByTestId('body')).toBeInTheDocument();
+
+    const band = headerBand();
+    // The band sits in a plain wrapper (hidden on a no-header page); the root Stack is its parent.
+    const outer = band.parentElement!.parentElement as HTMLElement;
+    expect(band.style.getPropertyValue('--stack-gap')).toBe('var(--mantine-spacing-md)');
+    expect(outer.style.getPropertyValue('--stack-gap')).toBe('var(--mantine-spacing-xl)');
+
+    // …and the band carries NO vertical padding of its own, so the header group
+    // hugs the tabs it belongs to instead of sitting equidistant.
+    //
+    // UPDATED (vertical-padding pass): the first line used to be
+    // `expect(band.style.paddingTop).not.toBe('')`, pinning the `pt="sm"` that
+    // has now been deliberately removed. That pad sat ABOVE the tabs — outside
+    // the tabs↔title relationship — so it never contributed to the grouping this
+    // test is about; the two `--stack-gap` assertions above are the grouping, and
+    // they are untouched. The `paddingBottom` assertion is UNCHANGED in force: a
+    // bottom pad here would sit between the title and the body and re-centre the
+    // title, which is the exact float the removed rule left behind.
+    expect(band.style.paddingTop).toBe('');
+    expect(band.style.paddingBottom).toBe('');
+  });
+});

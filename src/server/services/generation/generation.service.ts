@@ -1,0 +1,1973 @@
+import { isGenerationEligible } from '@civitai/shared/generation-eligibility';
+import { asResourceValue } from '~/shared/utils/resource.utils';
+import { stopsCreatorEarnings } from '~/server/common/constants';
+import {
+  LORA_STRENGTH_BOUNDS,
+  fluxKreaAir,
+  fluxUltraAir,
+  getBaseModelFromResources,
+  ponyV7Air,
+} from '~/shared/constants/generation.constants';
+import {
+  coverageAudience,
+  coverageColumn,
+  coveragePair,
+  coveredBy,
+  coveredForUser,
+  nextCoverageEnabled,
+} from '~/server/services/generation/coverage-source';
+import { Prisma } from '@prisma/client';
+import { type ModelVersionTerms } from '@civitai/buzz';
+import { uniqBy } from 'lodash-es';
+import type { SessionUser } from '~/types/session';
+import { dbRead, dbWrite } from '~/server/db/client';
+import { getDbWithoutLag, getDbWithoutLagBatch } from '~/server/db/db-lag-helpers';
+import { wanBaseModelGroupIdMap } from '~/shared/generation/version-ids';
+import { REDIS_SYS_KEYS, sysRedis, withSysReadDeadline } from '~/server/redis/client';
+import { logSysRedisFailOpen } from '~/server/redis/fail-open-log';
+import type { GetByIdInput } from '~/server/schema/base.schema';
+import type {
+  CheckResourcesCoverageSchema,
+  GenerationStatus,
+  GenerationStatusMode,
+  GetGenerationDataSchema,
+  ResolveImageMetaInput,
+  SetEvictableInput,
+  SetAdditionalResourceFeeWaivedInput,
+  SetPartnerDisclosureInput,
+} from '~/server/schema/generation.schema';
+import { generationStatusSchema } from '~/server/schema/generation.schema';
+import type { ImageMetaProps } from '~/server/schema/image.schema';
+import { assertImageVisibleToViewer } from '~/server/services/image-visibility.service';
+import {
+  type MediaViewer,
+  viewerCanSeeImageMedia,
+  viewerCanSeeSourceMedia,
+  withoutMediaReferences,
+} from '~/server/utils/image-media-visibility';
+import type { ModelFileCached } from '~/server/services/model-file.service';
+import { getFilesForModelVersionCache } from '~/server/services/model-file.service';
+import type { GenerationResourceDataModel } from '~/server/redis/resource-data.redis';
+import { resourceDataCache } from '~/server/redis/resource-data.redis';
+import { resolveModelFace, showsSfwFace } from '~/shared/utils/model-sfw-face';
+import { applyPaidAccessGating } from '~/server/services/generation/paid-access-gating';
+import { getFeaturedModels } from '~/server/services/model.service';
+import { bustMvCache, getLinkedVaeIds } from '~/server/services/model-version.service';
+import type { GenerationAlias, ModelVersionMeta } from '~/server/schema/model-version.schema';
+import { imagesForModelVersionsCache } from '~/server/services/image.service';
+import {
+  throwAuthorizationError,
+  throwBadRequestError,
+  throwNotFoundError,
+} from '~/server/utils/errorHandling';
+import { getTrainingFileEpochNumberDetails } from '~/server/utils/model-helpers';
+import { getGenerationFile } from '~/server/utils/resource-air';
+import { withSpan } from '~/server/utils/otel-helpers';
+import type { MediaType, ModelType } from '~/shared/utils/prisma/enums';
+import type { GenerationResource, GenerationResourceValue } from '~/shared/types/generation.types';
+
+import {
+  applicableRulesFor,
+  toGateRuleViews,
+  canGenerateBlockedTargets,
+  gateRuleSchema,
+  type CanGenerateBlockedTargets,
+  type GateRule,
+  type GateRuleView,
+} from '~/shared/generation/gates';
+import {
+  applicableMessagesFor,
+  generatorMessageSchema,
+  type GeneratorMessage,
+} from '~/shared/generation/messages';
+import { fromJson, toJson } from '~/utils/json-helpers';
+import { removeNulls } from '~/utils/object-helpers';
+import { parseAIR, stringifyAIR } from '~/shared/utils/air';
+import {
+  ModelVersionFlag,
+  getPartnerDisclosure,
+  isAdditionalResourceFeeWaived,
+  isEvictable,
+  isGenerationDisabled,
+} from '~/shared/constants/model-version-flags.constants';
+import { pickPreviewImage } from '~/shared/utils/resource-preview';
+import { isCreatorTipEligible } from '~/shared/utils/creator-tip';
+import { isDefined } from '~/utils/type-guards';
+import type { BaseModelGroup } from '~/shared/constants/basemodel.constants';
+import {
+  baseModelByName,
+  isBaseModelGenerationDisabled,
+  ecosystemById,
+  SELF_HOSTED_ECOSYSTEM_KEYS,
+} from '~/shared/constants/basemodel.constants';
+import { getVisibleSystemWildcardSetIdsByVersionId } from '~/server/services/generation/version-generation-state.service';
+import { FLIPT_FEATURE_FLAGS, isFlipt } from '~/server/flipt/client';
+import { isFliptOnForTesters } from '~/server/flipt/tester-segment';
+import {
+  getBaseModelEngine,
+  getBaseModelMediaType,
+  getEcosystem,
+  hasGenerationSupport,
+  getResourceGenerationSupport,
+} from '~/shared/constants/basemodel.constants';
+import { mapDataToGraphInput } from '~/server/services/orchestrator/legacy-metadata-mapper';
+import { cleanPrompt } from '~/utils/metadata/audit';
+
+type MetaCivitaiResource = { type?: string; weight?: number; modelVersionId: number };
+
+/**
+ * Build the initial resource list from image metadata: maps `civitaiResources`
+ * to `{ modelVersionId, strength }` and adds the Wan checkpoint implied by the
+ * baseModel. Relocated from the removed `normalize-meta.service` (the rest of
+ * that service's normalization is now handled by `mapDataToGraphInput` + the
+ * generation graph).
+ */
+function getMetaResources({
+  baseModel,
+  civitaiResources,
+}: {
+  baseModel?: string;
+  civitaiResources?: MetaCivitaiResource[];
+}) {
+  const resources =
+    civitaiResources?.map(({ weight, modelVersionId }) => ({
+      modelVersionId: Number(modelVersionId),
+      strength: weight,
+    })) ?? [];
+
+  // add missing resource by baseModel
+  const modelVersionId = baseModel
+    ? wanBaseModelGroupIdMap[baseModel as BaseModelGroup]
+    : undefined;
+  if (modelVersionId && !resources.find((x) => x.modelVersionId === modelVersionId)) {
+    resources.push({ modelVersionId, strength: undefined });
+  }
+  return resources;
+}
+
+export async function checkResourcesCoverage({ id }: CheckResourcesCoverageSchema) {
+  const db = await getDbWithoutLag('modelVersion', id);
+  const next = await nextCoverageEnabled();
+  const version = await db.modelVersion.findFirst({
+    where: { id },
+    select: {
+      flags: true,
+      generationCoverage: { select: { covered: true, coveredNext: true } },
+    },
+  });
+
+  return (
+    (version ? coveredBy(version, next) ?? false : false) &&
+    !isGenerationDisabled(version?.flags ?? 0)
+  );
+}
+
+export async function getGenerationStatus() {
+  // Fail open: a sysRedis outage shouldn't crash generation API calls.
+  let raw: string | null | undefined;
+  try {
+    // Wall-clock deadline so a silent sysRedis half-open can't park this read
+    // (runs in getGenerationConfig's Promise.all on every gen submit) ~11min.
+    raw = await withSysReadDeadline(
+      sysRedis.hGet(REDIS_SYS_KEYS.SYSTEM.FEATURES, REDIS_SYS_KEYS.GENERATION.STATUS)
+    );
+  } catch (err) {
+    logSysRedisFailOpen('defaults-firing', 'getGenerationStatus generation.service', err);
+    raw = undefined;
+  }
+  const status = generationStatusSchema.parse(JSON.parse(raw ?? '{}'));
+
+  return status as GenerationStatus;
+}
+
+export async function setGenerationStatus(input: {
+  mode: GenerationStatusMode;
+  message?: string | null;
+  updatedBy: { id: number; username: string };
+}) {
+  // Read raw and throw on sysRedis error. We MUST NOT use the fail-open
+  // getGenerationStatus() here: if its read failed open to '{}' and the
+  // subsequent hSet succeeded, schema defaults (charge: true, limits:
+  // defaultsByTier) would overwrite the real ops-tuned values. Fail-loud
+  // is the right behavior for admin writes — the admin sees the 500 and
+  // retries after sysRedis recovers.
+  const raw = await sysRedis.hGet(REDIS_SYS_KEYS.SYSTEM.FEATURES, REDIS_SYS_KEYS.GENERATION.STATUS);
+  const current = generationStatusSchema.parse(JSON.parse(raw ?? '{}'));
+  const stamp = {
+    id: input.updatedBy.id,
+    username: input.updatedBy.username,
+    at: new Date().toISOString(),
+  };
+  // Record the moderator when generation moves INTO a restricted mode
+  // (memberOnly/disabled). Returning to 'enabled' preserves the prior stamp —
+  // we don't care who re-enables.
+  const restricting = input.mode !== 'enabled' && input.mode !== current.mode;
+  const persisted = {
+    mode: input.mode,
+    // Persist the message independently of the mode: `undefined` (a mode-only
+    // save) keeps the stored message; `null`/string is an explicit edit.
+    message: input.message === undefined ? current.message : input.message,
+    updatedBy: restricting ? stamp : current.updatedBy,
+    // The self-hosted toggle is independent — carry it over untouched so a
+    // global-mode write doesn't reset it (this object is persisted verbatim,
+    // there's no spread of `current`).
+    selfHostedMode: current.selfHostedMode,
+    selfHostedUpdatedBy: current.selfHostedUpdatedBy,
+    limits: current.limits,
+    charge: current.charge,
+  };
+  await sysRedis.hSet(
+    REDIS_SYS_KEYS.SYSTEM.FEATURES,
+    REDIS_SYS_KEYS.GENERATION.STATUS,
+    JSON.stringify(persisted)
+  );
+  return generationStatusSchema.parse(persisted);
+}
+
+/**
+ * Self-hosted-toggle sibling of `setGenerationStatus`. Updates only the
+ * `selfHostedMode` (+ audit stamp) and carries the global fields over
+ * untouched. Same fail-loud rationale as `setGenerationStatus` (no fail-open
+ * read). The self-hosted toggle has no message of its own.
+ */
+export async function setSelfHostedGenerationStatus(input: {
+  mode: GenerationStatusMode;
+  updatedBy: { id: number; username: string };
+}) {
+  const raw = await sysRedis.hGet(REDIS_SYS_KEYS.SYSTEM.FEATURES, REDIS_SYS_KEYS.GENERATION.STATUS);
+  const current = generationStatusSchema.parse(JSON.parse(raw ?? '{}'));
+  const stamp = {
+    id: input.updatedBy.id,
+    username: input.updatedBy.username,
+    at: new Date().toISOString(),
+  };
+  const restricting = input.mode !== 'enabled' && input.mode !== current.selfHostedMode;
+  const persisted = {
+    // Preserve the global generation status untouched.
+    mode: current.mode,
+    message: current.message,
+    updatedBy: current.updatedBy,
+    // Update the self-hosted toggle.
+    selfHostedMode: input.mode,
+    selfHostedUpdatedBy: restricting ? stamp : current.selfHostedUpdatedBy,
+    limits: current.limits,
+    charge: current.charge,
+  };
+  await sysRedis.hSet(
+    REDIS_SYS_KEYS.SYSTEM.FEATURES,
+    REDIS_SYS_KEYS.GENERATION.STATUS,
+    JSON.stringify(persisted)
+  );
+  return generationStatusSchema.parse(persisted);
+}
+
+export type RemixOfProps = {
+  id?: number;
+  url?: string;
+  type: MediaType;
+  similarity?: number;
+  createdAt: Date;
+};
+/**
+ * Generation data returned from the API.
+ * Uses flat resources array + params format for storage compatibility.
+ * Clients should use splitResourcesByType() to route resources to graph nodes.
+ */
+export type GenerationData = {
+  type: MediaType;
+  remixOfId?: number;
+  remixOf?: RemixOfProps;
+  /** Flat array of all resources (checkpoint, LoRAs, VAE, etc.) */
+  resources: GenerationResourceValue[];
+  /** Generation parameters (prompt, seed, steps, etc.) */
+  params: Record<string, unknown>;
+};
+
+/** The image's recorded weight for each resource it used; the version default where it recorded none. */
+export function weightImageResources<T extends GenerationResource>(
+  data: T[],
+  imageResources: { modelVersionId?: number; strength?: number }[]
+) {
+  return data.map((item) =>
+    asResourceValue(item, imageResources.find((x) => x.modelVersionId === item.id)?.strength)
+  );
+}
+
+export const getGenerationData = async ({
+  query,
+  user,
+  browsingLevel,
+  mediaViewer,
+}: {
+  query: GetGenerationDataSchema;
+  user?: SessionUser;
+  browsingLevel?: number;
+  /** Who is asking, for whether a media item's own source media may be returned. */
+  mediaViewer: MediaViewer;
+}): Promise<GenerationData> => {
+  switch (query.type) {
+    case 'image':
+    case 'video':
+      return await getMediaGenerationData({
+        id: query.id,
+        user,
+        mediaViewer,
+        generation: query.generation,
+        withPreview: query.withPreview,
+        browsingLevel,
+      });
+    case 'modelVersion':
+      return await getModelVersionGenerationData({
+        versionIds: [{ id: query.id, epoch: query.epoch }],
+        user,
+        generation: query.generation,
+        withPreview: query.withPreview,
+        browsingLevel,
+      });
+    case 'modelVersions':
+      return await getModelVersionGenerationData({
+        user,
+        versionIds: query.ids,
+        generation: query.generation,
+        withPreview: query.withPreview,
+        browsingLevel,
+      });
+    default:
+      // 🔴 REACHABLE, and it is a CLIENT error: `getGenerationDataSchema` accepts
+      // `type: 'audio'` but this switch has no arm for it, so `?type=audio&id=1`
+      // lands here. `/api/generation/data` used to answer its whole catch with a
+      // 400, which made this a 400 by accident; now that the route delegates to
+      // `handleEndpointError`, a plain `Error` would be classified as a server
+      // fault and collapse into a generic 500. `throwBadRequestError` keeps BOTH
+      // the 400 and this exact text on the wire — the helper's 4xx arm passes a
+      // non-JSON message through as `{ message }`, byte-identical to before.
+      throw throwBadRequestError('unsupported generation data type');
+  }
+};
+
+/**
+ * Swaps any "cover" resources (those carrying an `aliasId` from
+ * `meta.generationAlias`) for their target version's resource, preserving the
+ * cover's strength. Used by the remix path, where image resources can include a
+ * cover version that should redirect to its alias target before generation. A
+ * target that no longer resolves is dropped (fail-closed). Results are deduped
+ * by id in case the image already referenced the target directly.
+ */
+export async function swapGenerationAliases(
+  resources: (GenerationResourceValue & { air: string })[],
+  opts: {
+    user?: { id?: number; isModerator?: boolean };
+    generation?: boolean;
+    withPreview?: boolean;
+    browsingLevel?: number;
+  }
+): Promise<(GenerationResourceValue & { air: string })[]> {
+  const aliasIds = [...new Set(resources.map((r) => r.aliasId).filter(isDefined))];
+  if (!aliasIds.length) return resources;
+
+  const targets = await getResourceData(aliasIds, opts);
+  const targetById = new Map(targets.map((t) => [t.id, t]));
+
+  const swapped = resources
+    .map((r) => {
+      if (r.aliasId == null) return r;
+      const target = targetById.get(r.aliasId);
+      if (!target) return null;
+      return asResourceValue(target, r.strength);
+    })
+    .filter(isDefined);
+
+  return uniqBy(swapped, 'id');
+}
+
+/**
+ * Shared pre-normalization for the remix / generate-from-image paths
+ * (`getMediaGenerationData` + `resolveImageMeta`):
+ * - clean prompts (the mapper passes prompt/negativePrompt through raw)
+ * - derive `process` from the legacy `type` field (the mapper keys workflow off `process`)
+ * - resolve the ecosystem from baseModel, falling back to the checkpoint resource
+ * - filter resources to the resolved ecosystem
+ * - map the result to generation-graph params
+ *
+ * The mapper + generation graph handle everything else (workflow, images,
+ * aspectRatio, and per-ecosystem version resolution — incl. Wan).
+ */
+function resolveGraphParamsFromImageMeta({
+  initialMeta,
+  baseModel,
+  engine,
+  allResources,
+  width,
+  height,
+}: {
+  initialMeta: ImageMetaProps;
+  baseModel: string | undefined;
+  engine: string | undefined;
+  allResources: GenerationResourceValue[];
+  width: number;
+  height: number;
+}): { resources: GenerationResourceValue[]; params: Record<string, unknown> } {
+  const metaRecord = initialMeta as Record<string, unknown>;
+  const cleanedPrompts = cleanPrompt({
+    prompt: initialMeta.prompt,
+    negativePrompt: initialMeta.negativePrompt,
+  });
+  const process =
+    typeof metaRecord.type === 'string'
+      ? (metaRecord.type as string)
+      : (metaRecord.process as string | undefined);
+
+  // If the ecosystem is 'other' or missing, try to infer from the checkpoint resource
+  let ecosystem =
+    (metaRecord.ecosystem as string | undefined) ??
+    (baseModel ? getEcosystem(baseModel)?.key : undefined);
+  if (!ecosystem || ecosystem === 'Other') {
+    const checkpoint = allResources.find((x) => x.model.type === 'Checkpoint');
+    if (checkpoint) {
+      ecosystem = getEcosystem(checkpoint.baseModel)?.key;
+    }
+  }
+
+  const resources = !ecosystem
+    ? allResources
+    : allResources.filter(
+        (x) => !!getResourceGenerationSupport(ecosystem!, x.baseModel, x.model.type)
+      );
+
+  // Drop raw resource fields (handled separately via `resources`) and the legacy
+  // `type` (consumed into `process`); the mapper strips the rest.
+  const { civitaiResources: _cr, resources: _res, type: _t, ...restMeta } = metaRecord;
+  const meta = {
+    ...restMeta,
+    ...cleanedPrompts,
+    baseModel,
+    engine,
+    ecosystem,
+    process,
+  } as Record<string, unknown>;
+  // Handle legacy 'Clip skip' field name (old image meta uses space-separated key)
+  const clipSkip = meta.clipSkip ?? meta['Clip skip'] ?? undefined;
+  const params = mapDataToGraphInput({ ...meta, width, height, clipSkip, engine }, resources);
+
+  return { resources, params };
+}
+
+/**
+ * Removes prompt text from image meta for `hideMeta` images. `hasMeta` only decides
+ * whether a remix button renders; it does not gate this read, which is reachable by
+ * image id from a public procedure — so the refusal has to happen here.
+ *
+ * Beyond the named fields: `comfy` carries the prompt verbatim in its text-encoder
+ * nodes, and meta is a passthrough object, so foreign tools can land prompt text
+ * under keys this file doesn't know. Non-string values under prompt-ish keys
+ * (`enablePromptEnhancer`, `promptStrength`) are settings, not prompt text.
+ */
+function stripHiddenPrompt(meta: ImageMetaProps): ImageMetaProps {
+  const { prompt: _prompt, negativePrompt: _negativePrompt, comfy: _comfy, ...rest } = meta;
+  for (const [key, value] of Object.entries(rest)) {
+    if (typeof value === 'string' && key.toLowerCase().includes('prompt'))
+      delete (rest as Record<string, unknown>)[key];
+  }
+  return rest as ImageMetaProps;
+}
+
+async function getMediaGenerationData({
+  id,
+  user,
+  mediaViewer,
+  generation,
+  withPreview = false,
+  browsingLevel,
+}: {
+  id: number;
+  user?: SessionUser;
+  mediaViewer: MediaViewer;
+  generation: boolean;
+  withPreview?: boolean;
+  browsingLevel?: number;
+}): Promise<GenerationData> {
+  const visible = await assertImageVisibleToViewer({
+    id,
+    userId: user?.id,
+    isModerator: user?.isModerator,
+  });
+  const showMedia = await viewerCanSeeImageMedia(mediaViewer, visible);
+
+  const media = await dbRead.image.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      type: true,
+      url: true,
+      meta: true,
+      hideMeta: true,
+      userId: true,
+      height: true,
+      width: true,
+      createdAt: true,
+    },
+  });
+  if (!media) throw throwNotFoundError();
+
+  const width = media.width ? media.width : 0;
+  const height = media.height ? media.height : 0;
+  const remixOf: RemixOfProps = {
+    id: media.id,
+    type: media.type,
+    url: showMedia ? media.url : undefined,
+    similarity: 1,
+    createdAt: media.createdAt,
+  };
+
+  const rawMeta = (media.meta ?? {}) as ImageMetaProps;
+  const showSourceMedia =
+    showMedia &&
+    (await viewerCanSeeSourceMedia(mediaViewer, { id, userId: visible.userId }, rawMeta));
+  const storedMeta = showSourceMedia ? rawMeta : withoutMediaReferences(rawMeta);
+  const canSeeHiddenPrompt = !!user && (user.isModerator || user.id === media.userId);
+  const initialMeta =
+    media.hideMeta && !canSeeHiddenPrompt ? stripHiddenPrompt(storedMeta) : storedMeta;
+  const imageResources = getMetaResources(initialMeta);
+
+  await dbRead.imageResourceNew
+    .findMany({
+      where: { imageId: id },
+      select: { modelVersionId: true, strength: true },
+    })
+    .then((res) => {
+      for (const { modelVersionId, strength } of res) {
+        const exists = imageResources.some((x) => x.modelVersionId === modelVersionId);
+        if (!exists)
+          imageResources.push({
+            modelVersionId,
+            strength: strength ? strength / 100 : undefined,
+          });
+      }
+    });
+  const versionIds = [...new Set(imageResources.map((x) => x.modelVersionId).filter(isDefined))];
+  const allResources = await getResourceData(versionIds, {
+    user,
+    generation,
+    withPreview,
+    browsingLevel,
+  })
+    .then((data) => weightImageResources(data, imageResources))
+    // Redirect any cover resources to their alias target (carrying the image's
+    // recorded strength) before the data is used for the remix.
+    .then((data) => swapGenerationAliases(data, { user, generation, withPreview, browsingLevel }));
+  const baseModel = getBaseModelFromResources(
+    allResources.map((x) => ({ modelType: x.model.type, baseModel: x.baseModel }))
+  );
+
+  const type = baseModel ? getBaseModelMediaType(baseModel) ?? media.type : media.type;
+  const engine = initialMeta.engine ?? (baseModel ? getBaseModelEngine(baseModel) : undefined);
+
+  const { resources, params } = resolveGraphParamsFromImageMeta({
+    initialMeta,
+    baseModel,
+    engine,
+    allResources,
+    width,
+    height,
+  });
+
+  // Same reclassification as the `default:` arm of `getGenerationData`: the caller
+  // asked for generation data derived from a media item we cannot derive it from.
+  // A plain `Error` here would now be genericized into a 500 by
+  // `handleEndpointError`; `throwBadRequestError` preserves the pre-fix 400 and
+  // this exact message.
+  if (type === 'audio') throw throwBadRequestError('not implemented');
+
+  // Return flat resources array - clients use splitResourcesByType() to route to graph nodes
+  return {
+    type,
+    remixOfId: media.id, // TODO - remove
+    remixOf,
+    resources,
+    params,
+  };
+}
+
+/**
+ * Reads the optional `meta.generationAlias` redirect for a set of model
+ * versions, returning a map of sourceVersionId -> alias. Self-references are
+ * ignored. Used by the generator-open path (to load the target instead of the
+ * cover version) and by `resolveCanGenerateForVersions` (to derive the cover
+ * version's coverage from its target — fail-closed).
+ */
+async function getGenerationAliasMap(versionIds: number[]): Promise<Map<number, GenerationAlias>> {
+  const ids = [...new Set(versionIds)];
+  if (!ids.length) return new Map();
+  const rows = await dbRead.modelVersion.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, meta: true },
+  });
+  const map = new Map<number, GenerationAlias>();
+  for (const row of rows) {
+    const alias = (row.meta as ModelVersionMeta | null)?.generationAlias;
+    if (alias?.versionId && alias.versionId !== row.id) map.set(row.id, alias);
+  }
+  return map;
+}
+
+/**
+ * Expands versions into the gate inputs used for canGenerate, with generation
+ * aliases resolved: an aliased cover version is replaced by its target's gate
+ * fields while the result key stays the cover id. A missing target (deleted)
+ * falls back to the cover's own (uncovered) fields, which fail closed.
+ */
+async function resolveAliasGateVersions(
+  versions: ResolveCanGenerateVersion[],
+  aliasMap: Map<number, GenerationAlias>
+): Promise<{ key: number; gate: ResolveCanGenerateVersion }[]> {
+  if (!aliasMap.size) return versions.map((v) => ({ key: v.id, gate: v }));
+
+  const targetIds = [...new Set([...aliasMap.values()].map((a) => a.versionId))];
+  const rows = await dbRead.modelVersion.findMany({
+    where: { id: { in: targetIds } },
+    select: {
+      id: true,
+      status: true,
+      availability: true,
+      usageControl: true,
+      baseModel: true,
+      flags: true,
+      generationCoverage: { select: { covered: true, coveredNext: true } },
+      model: { select: { userId: true, type: true } },
+    },
+  });
+  const next = await nextCoverageEnabled();
+  const targetById = new Map<number, ResolveCanGenerateVersion>(
+    rows.map(({ generationCoverage, model, usageControl, ...rest }) => [
+      rest.id,
+      {
+        ...rest,
+        usageControl: usageControl ?? undefined,
+        ...coveragePair(generationCoverage, next),
+        modelUserId: model.userId,
+        modelType: model.type,
+      },
+    ])
+  );
+
+  return versions.map((v) => {
+    const alias = aliasMap.get(v.id);
+    const gate = alias ? targetById.get(alias.versionId) : undefined;
+    return { key: v.id, gate: gate ?? v };
+  });
+}
+
+const getModelVersionGenerationData = async ({
+  versionIds,
+  user,
+  generation,
+  withPreview = false,
+  browsingLevel,
+}: {
+  versionIds: { id: number; epoch?: number }[] | number[];
+  user?: SessionUser;
+  generation: boolean;
+  withPreview?: boolean;
+  browsingLevel?: number;
+}): Promise<GenerationData> => {
+  if (!versionIds.length) throw new Error('missing version ids');
+
+  // Normalize to objects so alias redirects can drop the requested epoch — the
+  // alias points at a published target, not a training checkpoint of the cover.
+  const requested =
+    typeof versionIds[0] === 'number'
+      ? (versionIds as number[]).map((id) => ({ id }))
+      : (versionIds as { id: number; epoch?: number }[]);
+
+  // Generation alias: opening a cover version loads its target version's
+  // resource instead (1:1 redirect). Any per-alias strength is applied after
+  // fetch. The Create button is gated on the target's coverage upstream
+  // (resolveCanGenerateForVersions), so a dead target can't be reached here.
+  const aliasMap = await getGenerationAliasMap(requested.map((x) => x.id));
+  const aliasStrengthByTarget = new Map<number, number>();
+  const resolvedVersionIds = requested.map((x) => {
+    const alias = aliasMap.get(x.id);
+    if (!alias) return x;
+    if (alias.strength != null) aliasStrengthByTarget.set(alias.versionId, alias.strength);
+    return { id: alias.versionId };
+  });
+
+  const resources = (
+    await getResourceData(resolvedVersionIds, { user, generation, withPreview, browsingLevel })
+  ).map((resource) => asResourceValue(resource, aliasStrengthByTarget.get(resource.id)));
+  const checkpoint = resources.find((x) => x.model.type === 'Checkpoint');
+  if (checkpoint) {
+    const vaeMap = await getLinkedVaeIds([checkpoint.id]);
+    const vaeVersionId = vaeMap.get(checkpoint.id);
+    if (vaeVersionId) {
+      const [vae] = await getResourceData([vaeVersionId], { user, generation });
+      if (vae) resources.push(asResourceValue(vae));
+    }
+  }
+
+  const deduped = uniqBy(resources, 'id');
+
+  // Build params from checkpoint settings
+  const params = mapDataToGraphInput(
+    {
+      clipSkip: checkpoint?.settings.clipSkip,
+    },
+    deduped
+  );
+
+  // Return flat resources array - clients use splitResourcesByType() to route to graph nodes
+  // mapDataToGraphInput returns `ecosystem` (not `baseModel`), so resolve the
+  // media type from the ecosystem key — getBaseModelMediaType accepts both.
+  return {
+    type: getBaseModelMediaType(params.ecosystem as string) ?? 'image',
+    resources: deduped,
+    params,
+  };
+};
+
+export async function getUnstableResources() {
+  // Wall-clock deadline: this runs in getGenerationConfig's Promise.all on
+  // every gen submit, so a silent sysRedis half-open would park the whole submit.
+  const cachedData = await withSysReadDeadline(
+    sysRedis.hGet(REDIS_SYS_KEYS.SYSTEM.FEATURES, 'generation:unstable-resources')
+  )
+    .then((data) => (data ? fromJson<number[]>(data) : ([] as number[])))
+    .catch((err) => {
+      // fallback to empty array if redis fails (DOWN or SLOW/deadline)
+      logSysRedisFailOpen('read-degraded', 'getUnstableResources', err);
+      return [] as number[];
+    });
+
+  return cachedData ?? [];
+}
+
+/**
+ * Whether the user passes the `generation-testing` Flipt flag — the `testers`
+ * tier of the gate rules. Mods always do; anonymous callers never do.
+ *
+ * 🔴 `userId` MUST be in the CONTEXT, not only in the entityId argument.
+ *
+ * A Flipt segment constraint is one of two kinds and they read different inputs:
+ * `ENTITY_ID_COMPARISON_TYPE` matches the entityId argument, and
+ * `STRING_COMPARISON_TYPE` matches a property of the evaluation CONTEXT. The
+ * `testers` segment this flag rolls out to is `ANY_MATCH_TYPE` over two
+ * `STRING_COMPARISON_TYPE` constraints — `isModerator = "true"` and `userId
+ * isoneof [...]` — so it reads the context and never the entityId.
+ *
+ * This used to pass `{ isModerator: 'false' }` alone, with the user's id only as
+ * the entityId. Both constraints then failed for every non-moderator: the
+ * hardcoded `isModerator` by construction, and `userId` because the property was
+ * absent. The flag's base `enabled` is `false`, so the function returned `false`
+ * for every non-moderator regardless of the tester list — silently, and
+ * indistinguishably from "this user is not a tester".
+ *
+ * Deliberately NOT `buildFliptContext(user)`: this call site is handed
+ * `{ id, isModerator }`, not a `SessionUser`, so that helper would emit DEFAULTED
+ * values for `tier`, `isMember`, `isInCreatorProgram` and `isEarlyAdopter`. A
+ * fabricated context is worse than a narrow one — it would let a `tier`- or
+ * cohort-scoped rollout match on values this caller never knew. Emit only what
+ * is actually known here.
+ */
+export async function resolveTestingAccess(user: {
+  id?: number;
+  isModerator?: boolean;
+}): Promise<boolean> {
+  return isFliptOnForTesters(FLIPT_FEATURE_FLAGS.GENERATION_TESTING, user);
+}
+
+type EntrySchema<T> = { safeParse(value: unknown): { success: boolean; data?: T } };
+
+/**
+ * Parse stored entries one at a time and drop the unreadable ones. A single
+ * entry a build doesn't understand — a presentation added by a newer deploy,
+ * say — must not silence the rest, least of all hidden and kill-switch rules.
+ */
+function parseEntries<T>(schema: EntrySchema<T>, values: unknown[]): T[] {
+  const entries: T[] = [];
+  for (const value of values) {
+    const parsed = schema.safeParse(value);
+    if (parsed.success && parsed.data) entries.push(parsed.data);
+  }
+  return entries;
+}
+
+type PerEntryHashKey =
+  | typeof REDIS_SYS_KEYS.GENERATION.GATE_RULES
+  | typeof REDIS_SYS_KEYS.GENERATION.MESSAGES;
+type PerEntryMarkerKey =
+  | typeof REDIS_SYS_KEYS.GENERATION.GATE_RULES_MIGRATED
+  | typeof REDIS_SYS_KEYS.GENERATION.MESSAGES_MIGRATED;
+
+const hasStringId = (value: unknown): value is { id: string } =>
+  !!value && typeof value === 'object' && typeof (value as { id?: unknown }).id === 'string';
+
+/**
+ * A config store kept as one sysRedis hash (field = entry id), migrated on first
+ * use from an older single JSON array in the features hash. The array is left in
+ * place as a backup and never read again once the marker is set.
+ */
+function perEntryStore<T extends { id: string }>({
+  hashKey,
+  markerKey,
+  legacyField,
+  schema,
+}: {
+  hashKey: PerEntryHashKey;
+  markerKey: PerEntryMarkerKey;
+  legacyField: string;
+  schema: EntrySchema<T>;
+}) {
+  // Copies raw entries, not parsed ones, so an entry only a newer build understands
+  // survives. `hSetNX` lets concurrent first runs agree, but a run after a delete
+  // re-adds the deleted entry from the legacy array — the marker is set last and
+  // must never be cleared.
+  const migrate = async () => {
+    const legacy = await sysRedis.hGet(REDIS_SYS_KEYS.SYSTEM.FEATURES, legacyField);
+    const raw = legacy ? fromJson<unknown[]>(legacy) : null;
+    const entries = Array.isArray(raw) ? raw.filter(hasStringId) : [];
+    await Promise.all(entries.map((entry) => sysRedis.hSetNX(hashKey, entry.id, toJson(entry))));
+    await sysRedis.set(markerKey, '1');
+  };
+  const ensureMigrated = async () => {
+    if (!(await sysRedis.get(markerKey))) await migrate();
+  };
+
+  return {
+    async read(): Promise<T[]> {
+      const [migrated, stored] = await Promise.all([
+        sysRedis.get(markerKey),
+        sysRedis.hGetAll(hashKey),
+      ]);
+      let values = stored;
+      if (!migrated) {
+        await migrate();
+        values = await sysRedis.hGetAll(hashKey);
+      }
+      return parseEntries(
+        schema,
+        Object.values(values).map((value) => fromJson(value))
+      );
+    },
+    async save(entry: T) {
+      await ensureMigrated();
+      await sysRedis.hSet(hashKey, entry.id, toJson(entry));
+    },
+    async remove(id: string) {
+      await ensureMigrated();
+      await sysRedis.hDel(hashKey, id);
+    },
+  };
+}
+
+const gateRuleStore = perEntryStore<GateRule>({
+  hashKey: REDIS_SYS_KEYS.GENERATION.GATE_RULES,
+  markerKey: REDIS_SYS_KEYS.GENERATION.GATE_RULES_MIGRATED,
+  legacyField: 'generation:gate-rules',
+  schema: gateRuleSchema,
+});
+
+const generatorMessageStore = perEntryStore<GeneratorMessage>({
+  hashKey: REDIS_SYS_KEYS.GENERATION.MESSAGES,
+  markerKey: REDIS_SYS_KEYS.GENERATION.MESSAGES_MIGRATED,
+  legacyField: 'generation:messages',
+  schema: generatorMessageSchema,
+});
+
+/**
+ * The operator-authored gate rules. Fail-open to `[]` so a bad or unreachable
+ * store never blocks generation.
+ */
+export async function getGateRules(): Promise<GateRule[]> {
+  // Wall-clock deadline: this runs in getGenerationConfig's Promise.all on every
+  // gen submit — a silent sysRedis half-open would park it.
+  return withSysReadDeadline(gateRuleStore.read()).catch((err) => {
+    logSysRedisFailOpen('read-degraded', 'getGateRules', err);
+    return [];
+  });
+}
+
+export async function saveGateRule(rule: GateRule): Promise<GateRule> {
+  const parsed = gateRuleSchema.parse(rule);
+  await gateRuleStore.save(parsed);
+  return parsed;
+}
+
+export const deleteGateRule = (id: string) => gateRuleStore.remove(id);
+
+/** Oldest first — the store is a hash, so it has no order of its own. */
+export async function getGeneratorMessages(): Promise<GeneratorMessage[]> {
+  const messages = await withSysReadDeadline(generatorMessageStore.read()).catch((err) => {
+    logSysRedisFailOpen('read-degraded', 'getGeneratorMessages', err);
+    return [] as GeneratorMessage[];
+  });
+  return messages.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+}
+
+export async function saveGeneratorMessage(message: GeneratorMessage) {
+  const parsed = generatorMessageSchema.parse(message);
+  const record = { ...parsed, createdAt: parsed.createdAt ?? Date.now() };
+  await generatorMessageStore.save(record);
+  return record;
+}
+
+export const deleteGeneratorMessage = (id: string) => generatorMessageStore.remove(id);
+
+export type GenerationConfig = {
+  unstableResources: number[];
+  /**
+   * Self-hosted ecosystem keys disabled FOR THIS USER, resolved against the
+   * `selfHostedMode` toggle + the user's membership/mod status. Shown-but-disabled
+   * in the picker. Empty when self-hosted generation is enabled for the user.
+   */
+  selfHostedDisabledEcosystems: string[];
+  /**
+   * The raw self-hosted toggle state, surfaced so the client can pick the
+   * right badge/alert copy ('memberOnly' → upsell, 'disabled' → unavailable).
+   */
+  selfHostedMode: GenerationStatusMode;
+  /** Applicable rules for THIS user, reduced to what the client renders (`toGateRuleViews`). */
+  gateRules: GateRuleView[];
+  /**
+   * Mod-authored messages for THIS user (audience-filtered server side, so copy
+   * aimed at one tier never ships in another's payload). Rendered above the
+   * submit row when the selection matches their targets.
+   */
+  generatorMessages: GeneratorMessage[];
+};
+
+/**
+ * Pure resolver for the self-hosted toggle. Returns the ecosystem keys the
+ * given user can't use right now. Shared by `getGenerationConfig` (client UI)
+ * and `buildGenerationContext` (server-side graph validation) so both agree.
+ *
+ *  - moderators always bypass → `[]`
+ *  - `disabled` → the full self-hosted set (off for everyone)
+ *  - `memberOnly` → the full set for non-members, `[]` for members
+ *  - `enabled` → `[]`
+ */
+export function getSelfHostedDisabledEcosystems({
+  selfHostedMode,
+  isMember,
+  isModerator,
+}: {
+  selfHostedMode: GenerationStatusMode;
+  isMember: boolean;
+  isModerator?: boolean;
+}): string[] {
+  if (isModerator) return [];
+  const blocked = selfHostedMode === 'disabled' || (selfHostedMode === 'memberOnly' && !isMember);
+  return blocked ? [...SELF_HOSTED_ECOSYSTEM_KEYS] : [];
+}
+
+/**
+ * Composed config returned to clients in a single round-trip. Bundles unstable
+ * resources (set by the `resource-gen-availability` cron), the self-hosted
+ * toggle state, and the user's applicable gate rules — everything the generator
+ * UI needs in one query.
+ */
+export async function getGenerationConfig(
+  user: { id?: number; isModerator?: boolean; tier?: string } = {}
+): Promise<GenerationConfig> {
+  const [unstableResources, hasTestingAccess, status, gateRules, generatorMessages] =
+    await Promise.all([
+      getUnstableResources(),
+      resolveTestingAccess(user),
+      getGenerationStatus(),
+      getGateRules(),
+      getGeneratorMessages(),
+    ]);
+  const selfHostedMode = status.selfHostedMode;
+  const isMember = (user.tier ?? 'free') !== 'free';
+  return {
+    unstableResources,
+    selfHostedMode,
+    selfHostedDisabledEcosystems: getSelfHostedDisabledEcosystems({
+      selfHostedMode,
+      isMember,
+      isModerator: user.isModerator,
+    }),
+    gateRules: toGateRuleViews(
+      applicableRulesFor(gateRules, {
+        isModerator: !!user.isModerator,
+        isMember,
+        hasTestingAccess,
+      })
+    ),
+    generatorMessages: applicableMessagesFor(generatorMessages, {
+      isMember,
+      tier: user.tier ?? 'free',
+    }),
+  };
+}
+
+async function updateModelVersionFlags(id: number, flags: Prisma.Sql) {
+  // One atomic statement, never a read-modify-write: `flags` holds several bits,
+  // and a round trip would clobber a concurrent write to the others.
+  const [updated] = await dbWrite.$queryRaw<{ modelId: number; flags: number }[]>(Prisma.sql`
+    UPDATE "ModelVersion"
+    SET flags = ${flags}
+    WHERE id = ${id}
+    RETURNING "modelId", flags
+  `);
+  if (!updated) throw throwNotFoundError(`No model version with id ${id}`);
+
+  // The flags are baked into cached version/model rows (resourceDataCache,
+  // dataForModelsCache, search index), so bust them the same way a coverage
+  // toggle does — otherwise the change wouldn't surface until TTL expiry.
+  await bustMvCache(id, updated.modelId);
+
+  return updated.flags;
+}
+
+export async function toggleGenerationDisabled({
+  id,
+  isModerator,
+}: GetByIdInput & { isModerator?: boolean }) {
+  if (!isModerator) throw throwAuthorizationError();
+  const flags = await updateModelVersionFlags(
+    id,
+    Prisma.sql`flags # ${ModelVersionFlag.GenerationDisabled}`
+  );
+  return { id, generationDisabled: isGenerationDisabled(flags) };
+}
+
+// Sets rather than toggles: a flip sent from a stale menu would un-pin a base model.
+export async function setEvictable({
+  id,
+  evictable,
+  isModerator,
+}: SetEvictableInput & { isModerator?: boolean }) {
+  if (!isModerator) throw throwAuthorizationError();
+  const flags = await updateModelVersionFlags(
+    id,
+    evictable
+      ? Prisma.sql`flags & ~(${ModelVersionFlag.NotEvictable}::int)`
+      : Prisma.sql`flags | ${ModelVersionFlag.NotEvictable}`
+  );
+  return { id, evictable: isEvictable(flags) };
+}
+
+export async function setAdditionalResourceFeeWaived({
+  id,
+  waived,
+  isModerator,
+}: SetAdditionalResourceFeeWaivedInput & { isModerator?: boolean }) {
+  if (!isModerator) throw throwAuthorizationError();
+  const flags = await updateModelVersionFlags(
+    id,
+    waived
+      ? Prisma.sql`flags | ${ModelVersionFlag.NoAdditionalResourceFee}`
+      : Prisma.sql`flags & ~(${ModelVersionFlag.NoAdditionalResourceFee}::int)`
+  );
+  return { id, waived: isAdditionalResourceFeeWaived(flags) };
+}
+
+export async function setPartnerDisclosure({
+  id,
+  partnerService,
+  partnerTrains,
+  isModerator,
+}: SetPartnerDisclosureInput & { isModerator?: boolean }) {
+  if (!isModerator) throw throwAuthorizationError();
+  if (partnerTrains && !partnerService)
+    throw throwBadRequestError('Partner trains requires partner service');
+  const mask = ModelVersionFlag.PartnerService | ModelVersionFlag.PartnerTrains;
+  const bits =
+    (partnerService ? ModelVersionFlag.PartnerService : 0) |
+    (partnerTrains ? ModelVersionFlag.PartnerTrains : 0);
+  const flags = await updateModelVersionFlags(
+    id,
+    Prisma.sql`(flags & ~(${mask}::int)) | ${bits}::int`
+  );
+  return { id, ...getPartnerDisclosure(flags) };
+}
+
+const FREE_RESOURCE_TYPES: ModelType[] = ['VAE', 'Checkpoint'];
+
+// The one rule both the orchestrator's charge (mini endpoint) and the generator's cost badge read.
+// Callers decide what a missing file size means; they disagree today.
+export function isAdditionalResourceFeeExempt({
+  modelType,
+  featured,
+  versionFlags,
+  fileSizeKB,
+}: {
+  modelType: ModelType;
+  featured: boolean;
+  versionFlags: number;
+  fileSizeKB?: number;
+}) {
+  return (
+    featured ||
+    isAdditionalResourceFeeWaived(versionFlags) ||
+    FREE_RESOURCE_TYPES.includes(modelType) ||
+    (!!fileSizeKB && fileSizeKB <= 10 * 1024)
+  );
+}
+
+export async function getShouldChargeForResources(
+  args: {
+    modelType: ModelType;
+    modelId: number;
+    fileSizeKB?: number;
+    versionFlags: number;
+  }[]
+) {
+  const featuredModels = await getFeaturedModels();
+  return args.reduce<Record<string, boolean>>(
+    (acc, { modelType, modelId, fileSizeKB, versionFlags }) => ({
+      ...acc,
+      [modelId]: fileSizeKB
+        ? !isAdditionalResourceFeeExempt({
+            modelType,
+            featured: featuredModels.some((fm) => fm.modelId === modelId),
+            versionFlags,
+            fileSizeKB,
+          })
+        : false,
+    }),
+    {}
+  );
+}
+
+const explicitCoveredModelAirs = [fluxUltraAir, ponyV7Air];
+const explicitCoveredModelVersionIds = explicitCoveredModelAirs.map((air) => parseAIR(air).version);
+
+/**
+ * The ecosystems / version IDs the gate rules HIDE for this user — the only state
+ * that hard-blocks `canGenerate`. Membership is intentionally ignored (no tier
+ * lookup): `isMember: true` drops member-restricted rules, leaving the
+ * moderator / tester / kill-switch rules, which need only the (already-resolved)
+ * testing-access flag + mod status.
+ */
+export async function getCanGenerateHiddenGates(user: {
+  id?: number;
+  isModerator?: boolean;
+}): Promise<CanGenerateBlockedTargets> {
+  const [rules, hasTestingAccess] = await Promise.all([getGateRules(), resolveTestingAccess(user)]);
+  return canGenerateBlockedTargets(
+    applicableRulesFor(rules, {
+      isModerator: !!user.isModerator,
+      isMember: true,
+      hasTestingAccess,
+    })
+  );
+}
+
+/**
+ * Single source of truth for deciding whether a resource can be used for
+ * generation. Mirrors the checks in `transformGenerationData` so callers
+ * outside of `getResourceData` (e.g. `getModelHandler`) can stay in sync.
+ */
+export function getResourceCanGenerate({
+  resource,
+  user,
+  hiddenGates,
+}: {
+  resource: {
+    id: number;
+    status: string;
+    availability: string;
+    usageControl?: string;
+    baseModel: string;
+    covered: boolean | null;
+    modelUserId: number;
+    flags: number;
+  };
+  user: { id?: number; isModerator?: boolean };
+  hiddenGates: CanGenerateBlockedTargets;
+}): boolean {
+  const isUnavailable = isGenerationDisabled(resource.flags);
+  const isOwnedByUser = !!user.id && user.id === resource.modelUserId;
+  const covered =
+    (resource.covered || explicitCoveredModelVersionIds.includes(resource.id)) && !isUnavailable;
+
+  const validGenerationStatuses = ['Draft', 'Training', 'Published'];
+  // Moderators additionally get 'Scheduled' so a release can be exercised end to
+  // end before its publish time - without it, a scheduled launch is untestable
+  // by anyone until the cron flips it.
+  const hasValidStatus =
+    validGenerationStatuses.includes(resource.status) ||
+    (resource.status === 'Scheduled' && !!user.isModerator);
+  const isPrivate =
+    resource.availability === 'Private' || ['Draft', 'Training'].includes(resource.status);
+
+  let canGenerate = !!(
+    covered &&
+    hasValidStatus &&
+    (!isPrivate || isOwnedByUser || user.isModerator)
+  );
+
+  if (resource.usageControl === 'InternalGeneration' && !user.isModerator) {
+    canGenerate = false;
+  }
+
+  if (isBaseModelGenerationDisabled(resource.baseModel)) canGenerate = false;
+
+  if (canGenerate) {
+    const baseModel = baseModelByName.get(resource.baseModel);
+    const ecosystemKey = baseModel ? ecosystemById.get(baseModel.ecosystemId)?.key : undefined;
+    if (
+      hiddenGates.versionIds.has(resource.id) ||
+      (ecosystemKey && hiddenGates.ecosystems.has(ecosystemKey))
+    ) {
+      canGenerate = false;
+    }
+  }
+
+  return canGenerate;
+}
+
+/**
+ * Resolve `canGenerate` for a batch of ModelVersions, routing through the
+ * appropriate gate per `modelType`:
+ *
+ *   - `Wildcards`-type versions: gated on a visible System-kind `WildcardSet`
+ *     (one batched query via `getVisibleSystemWildcardSetIdsByVersionId`),
+ *     since their baseModel isn't on the generation-supported list.
+ *   - Everything else: the standard `getResourceCanGenerate` + `isGenerationEligible` pair.
+ *
+ * Reads the disable-generation flag off each version's `flags` and fetches
+ * `ecosystemConfig` internally so call sites don't have to thread them through.
+ * Returns a Map keyed by `modelVersionId`;
+ * the `wildcardSetId` field is populated only for Wildcards-type entries
+ * whose set is visible at the current site context.
+ *
+ * Replaces the per-call-site "branch on model.type + maybe batch + override"
+ * boilerplate that the four canGenerate read paths used to repeat.
+ */
+export type ResolveCanGenerateVersion = {
+  id: number;
+  status: string;
+  availability: string;
+  usageControl?: string;
+  baseModel: string;
+  covered: boolean | null | undefined;
+  /** The LIVE rule's answer, which `isGenerationEligible` holds a locked ecosystem's checkpoints to. */
+  coveredLive: boolean | null | undefined;
+  modelUserId: number;
+  modelType: ModelType;
+  /** ModelVersion.flags — the GenerationDisabled bit gates canGenerate. */
+  flags: number;
+  /**
+   * Generation alias from `meta.generationAlias`, supplied by the caller (which
+   * already has the version's meta). When set, this version's canGenerate is
+   * derived from the target version instead — fail-closed.
+   */
+  modelVersionAlias?: GenerationAlias | null;
+};
+
+export type ResolveCanGenerateContext = {
+  user: { id?: number; isModerator?: boolean };
+  sfwOnly: boolean;
+  wildcardsEnabled: boolean;
+};
+
+export type VersionGenerationState = {
+  canGenerate: boolean;
+  wildcardSetId?: number;
+};
+
+export async function resolveCanGenerateForVersions(
+  versions: ResolveCanGenerateVersion[],
+  ctx: ResolveCanGenerateContext
+): Promise<Map<number, VersionGenerationState>> {
+  const wildcardVersionIds = ctx.wildcardsEnabled
+    ? versions.filter((v) => v.modelType === 'Wildcards').map((v) => v.id)
+    : [];
+
+  const needsStandardGate = versions.some((v) => v.modelType !== 'Wildcards');
+  const [visibleWildcardSetIdByVersionId, hiddenGates] = await Promise.all([
+    getVisibleSystemWildcardSetIdsByVersionId(wildcardVersionIds, { sfwOnly: ctx.sfwOnly }),
+    needsStandardGate
+      ? getCanGenerateHiddenGates(ctx.user)
+      : Promise.resolve<CanGenerateBlockedTargets>({
+          ecosystems: new Set(),
+          versionIds: new Set(),
+        }),
+  ]);
+
+  // Generation alias (Option B): evaluate a cover version using its target's
+  // gate fields while keeping the result keyed to the cover id, so the Create
+  // button fails closed when the target is deleted/unpublished/uncovered.
+  // Aliases come from `version.modelVersionAlias` (caller-supplied). One-level
+  // only — a target that is itself an alias is not followed.
+  const aliasMap = new Map<number, GenerationAlias>();
+  for (const v of versions) {
+    const alias = v.modelVersionAlias;
+    if (alias?.versionId && alias.versionId !== v.id) aliasMap.set(v.id, alias);
+  }
+  const gateVersions = await resolveAliasGateVersions(versions, aliasMap);
+
+  const result = new Map<number, VersionGenerationState>();
+  for (const { key, gate } of gateVersions) {
+    if (gate.modelType === 'Wildcards') {
+      // Wildcards baseModels aren't on the generation-supported list, so the
+      // standard gate always returns false for them. A visible System-kind
+      // set is the only way canGenerate can be true.
+      const wildcardSetId = visibleWildcardSetIdByVersionId.get(gate.id);
+      result.set(key, { canGenerate: wildcardSetId != null, wildcardSetId });
+    } else {
+      const canGenerate =
+        getResourceCanGenerate({
+          resource: {
+            id: gate.id,
+            status: gate.status,
+            availability: gate.availability,
+            usageControl: gate.usageControl,
+            baseModel: gate.baseModel,
+            covered: gate.covered ?? null,
+            modelUserId: gate.modelUserId,
+            flags: gate.flags,
+          },
+          user: ctx.user,
+          hiddenGates,
+        }) &&
+        isGenerationEligible({
+          covered: gate.covered,
+          coveredLive: gate.coveredLive,
+          baseModel: gate.baseModel,
+          modelType: gate.modelType,
+          flags: gate.flags,
+        });
+      result.set(key, { canGenerate });
+    }
+  }
+
+  return result;
+}
+
+export async function getResourceData(
+  versionIds: { id: number; epoch?: number }[] | number[],
+  {
+    user = {},
+    generation = false,
+    withPreview = false,
+    browsingLevel,
+  }: {
+    user?: { id?: number; isModerator?: boolean; tier?: string };
+    generation?: boolean;
+    withPreview?: boolean;
+    browsingLevel?: number;
+  } = {}
+): Promise<(GenerationResource & { air: string })[]> {
+  if (!versionIds.length) return [];
+  const args = (
+    typeof versionIds[0] === 'number' ? versionIds.map((id) => ({ id })) : versionIds
+  ) as { id: number; epoch?: number }[];
+
+  const { next, member } = await coverageAudience(user);
+
+  const showSfwFace = showsSfwFace(browsingLevel);
+
+  // Spans localize the gen-path park: getResourceData does these as SEQUENTIAL
+  // awaits, so wrapping each shows which prelim lookup dominates.
+  const featuredModels = await withSpan('gen:getResourceData:featured', () => getFeaturedModels());
+  const hiddenGates = await withSpan('gen:getResourceData:hiddenGates', () =>
+    getCanGenerateHiddenGates(user)
+  );
+
+  function transformGenerationData(
+    { settings, clipSkip, vaeId: _vaeId, ...item }: GenerationResourceDataModel,
+    epochNumber?: number
+  ) {
+    const isOwnedByUser = !!user.id && user.id === item.model.userId;
+    const hasAccess = !!(item.hasAccess || isOwnedByUser || user.isModerator);
+    const isPrivate =
+      item.availability === 'Private' || ['Draft', 'Training'].includes(item.status);
+
+    const covered = coveredForUser(item, next, {
+      member,
+      isCheckpoint: item.model.type === 'Checkpoint',
+    });
+    // 🔴 `getResourceCanGenerate` ALONE, deliberately — not the `isGenerationEligible` pair that
+    // `resolveCanGenerateForVersions` uses. This path receives every resource in the request, and the
+    // helper's third clause is the ecosystem's flat model-TYPE list, which the generator has never
+    // applied to additional resources: adding it refuses live-covered Wan/LTXV LoRAs, Flux.1 D DoRAs
+    // and LoCons with a hard "not available for generation", and breaks remix from every image that
+    // used one. The view's `other_type` disjunct covers those by design, so the two rules disagree
+    // permanently. Counts: docs/features/paid-model-loading-coverage.md.
+    //
+    // The cost is that a community checkpoint on a `modelLocked` ecosystem reads generatable here
+    // while the model page, the search index and `mini/[id]` refuse it. That is the silent
+    // substitution of issue #3520, which is counted rather than changed.
+    const canGenerate = getResourceCanGenerate({
+      resource: {
+        id: item.id,
+        status: item.status,
+        availability: item.availability,
+        usageControl: item.usageControl,
+        baseModel: item.baseModel,
+        covered,
+        modelUserId: item.model.userId,
+        flags: item.flags,
+      },
+      user,
+      hiddenGates,
+    });
+
+    // Drop these props so the client doesn't notify the user about them — they are irrelevant if
+    // the resource cannot be used for generation.
+    //
+    // 🔴 Build a NEW model object rather than `delete`-ing on `item.model`. `{ settings, ...item }`
+    // above clones only the TOP level, so `item.model` is still the object the resource cache
+    // handed us — and on the cache's fail-open path one origin lookup is single-flighted and its
+    // record shared by every caller that joined that window. `canGenerate` is a PER-USER decision,
+    // so mutating in place applies this user's gate outcome to a concurrent user's payload.
+    const { userFlags: ownerFlags, ...ownerModel } = item.model;
+    const ownerlessModel = resolveModelFace(ownerModel, showSfwFace);
+    let model = ownerlessModel;
+    if (!canGenerate) {
+      const { sfwOnly: _sfwOnly, minor: _minor, ...rest } = ownerlessModel;
+      model = rest;
+    }
+
+    return {
+      ...item,
+      model,
+      // Merged in after the cache read (see mergePaidAccess) from PaidAccess — NOT stored in the 1h
+      // resourceDataCache, whose TTL would serve stale gating terms after a config change.
+      paidAccess: null as { endsAt: Date | null; terms: ModelVersionTerms } | null,
+      settings: {
+        strength: {
+          min: settings?.minStrength ?? LORA_STRENGTH_BOUNDS.min,
+          max: settings?.maxStrength ?? LORA_STRENGTH_BOUNDS.max,
+          default: settings?.strength ?? 1,
+        },
+        ...(clipSkip != null && { clipSkip }),
+        ...(settings?.generation?.turboLora && {
+          turboLora: {
+            id: settings.generation.turboLora.id,
+            strength: settings.generation.turboLora.strength ?? undefined,
+          },
+        }),
+      },
+      ...(settings?.turbo && { turbo: true, recommendedSettings: settings.turbo }),
+      hasAccess,
+      canGenerate,
+      epochNumber,
+      isOwnedByUser,
+      isPrivate,
+      tipsEnabled:
+        !stopsCreatorEarnings(item.baseModel) &&
+        isCreatorTipEligible({ ownerId: item.model.userId, ownerFlags }),
+    };
+  }
+
+  async function getResourceDataSubstitutes(
+    resources: ReturnType<typeof transformGenerationData>[]
+  ) {
+    const resourcesThatRequireSubstitutes = resources.filter((x) => !x.covered || !x.hasAccess);
+    const modelIdsThatRequireSubstitutes = resourcesThatRequireSubstitutes.map((x) => x.model.id);
+
+    const substituteDb = await getDbWithoutLagBatch('model', modelIdsThatRequireSubstitutes);
+    const substituteIds = await substituteDb.modelVersion
+      .findMany({
+        where: {
+          // A version the staged rule covers would otherwise match itself.
+          id: { notIn: resourcesThatRequireSubstitutes.map((x) => x.id) },
+          status: 'Published',
+          generationCoverage: { [coverageColumn(next)]: true },
+          modelId: { in: modelIdsThatRequireSubstitutes },
+        },
+        orderBy: { index: { sort: 'asc', nulls: 'last' } },
+        select: { id: true, baseModel: true, modelId: true },
+      })
+      .then((data) =>
+        data
+          .filter((x) => {
+            const match = resources.find((resource) => resource.model.id === x.modelId);
+            return match?.baseModel === x.baseModel;
+          })
+          .map((x) => x.id)
+      );
+
+    return await resourceDataCache
+      .fetch(substituteIds)
+      .then((data) => data.map((item) => transformGenerationData(item)));
+  }
+
+  // The ids the viewer has actually PURCHASED generation access to (the EntityAccess side of the
+  // decision, which the pure gate can't know). One batched lookup; empty for anon.
+  async function getModelFiles(resources: ReturnType<typeof transformGenerationData>[]) {
+    const versionIds = resources.filter((x) => x.hasAccess).map((x) => x.id);
+    return await getFilesForModelVersionCache(versionIds);
+  }
+
+  function getEpochDetails(
+    resource: ReturnType<typeof transformGenerationData>,
+    modelFiles: ModelFileCached[]
+  ) {
+    if (resource.status !== 'Published') {
+      const trainingFile = modelFiles.find((f) => f.type === 'Training Data');
+      if (trainingFile) {
+        const details = getTrainingFileEpochNumberDetails(trainingFile, resource.epochNumber);
+        if (!details?.isExpired) {
+          return details;
+        }
+      }
+    }
+    delete resource.epochNumber;
+
+    return null;
+  }
+
+  function getModelFileProps(
+    resource: ReturnType<typeof transformGenerationData>,
+    modelFiles: ModelFileCached[]
+  ) {
+    const generationFile = getGenerationFile(modelFiles);
+    const fileSizeKB = generationFile?.sizeKB;
+    const additionalResourceCost = !isAdditionalResourceFeeExempt({
+      modelType: resource.model.type,
+      featured: featuredModels.some((x) => x.modelId === resource.model.id),
+      versionFlags: resource.flags,
+      fileSizeKB,
+    });
+
+    const epochDetails = getEpochDetails(resource, modelFiles);
+
+    return {
+      fileSizeKB: fileSizeKB ? Math.round(fileSizeKB) : undefined,
+      additionalResourceCost,
+      epochDetails,
+      generationFileType: generationFile?.type,
+    };
+  }
+
+  function bringItAllTogether(
+    resource: ReturnType<typeof transformGenerationData>,
+    modelFiles: ModelFileCached[]
+  ) {
+    const { fileSizeKB, additionalResourceCost, epochDetails, generationFileType } =
+      getModelFileProps(resource, modelFiles);
+    const air = stringifyAIR({
+      baseModel: resource.baseModel,
+      type: resource.model.type,
+      modelId: epochDetails ? epochDetails.jobId : resource.model.id,
+      id: epochDetails ? epochDetails.fileName : resource.id,
+      // Epoch resources are orchestrator-hosted; only a civitai source carries a file type.
+      fileType: epochDetails ? undefined : generationFileType,
+      source: epochDetails ? 'orchestrator' : 'civitai',
+    });
+
+    const { flags, ...rest } = resource;
+    return {
+      ...rest,
+      ...getPartnerDisclosure(flags),
+      fileSizeKB,
+      additionalResourceCost,
+      epochDetails,
+      air,
+    };
+  }
+
+  function getSubstituteData(
+    resource: ReturnType<typeof transformGenerationData>,
+    substitutes: ReturnType<typeof transformGenerationData>[],
+    modelFiles: ModelFileCached[]
+  ) {
+    const substitute = substitutes.find((x) => x.hasAccess && x.model.id === resource.model.id);
+    if (substitute) {
+      const { model, ...rest } = bringItAllTogether(substitute, modelFiles);
+      return removeNulls({ ...rest, ...getModelFileProps(substitute, modelFiles) });
+    }
+  }
+
+  // Expand cache results to produce one entry per unique (id, epoch) pair.
+  // The cache deduplicates by model version ID, but different epochs of the same
+  // model version need separate entries with their own epochDetails.
+  const uniqueIds = [...new Set(args.map((x) => x.id))];
+  // Span localizes the gen-path park: this is the main resource-data fetch
+  // (cache/DB lookup + substitutes + entity access + model files) — the
+  // dominant work in getResourceData. Wrapping the whole .fetch().then().then()
+  // chain so its total time shows as one sub-step.
+  const resources = await withSpan('gen:getResourceData:fetch', () =>
+    resourceDataCache
+      .fetch(uniqueIds)
+      .then((cachedResources) => {
+        const resourceById = new Map(cachedResources.map((r) => [r.id, r]));
+        return args
+          .map((arg) => {
+            const cached = resourceById.get(arg.id);
+            if (!cached) return null;
+            return transformGenerationData(cached, arg.epoch);
+          })
+          .filter(isDefined);
+      })
+      .then(async (resources) => {
+        const substitutes = await getResourceDataSubstitutes(resources);
+        const allResources = [...resources, ...substitutes];
+        // TODO - surface the number of remaining free trial generations.
+        await applyPaidAccessGating(allResources, user);
+
+        const modelFilesCached = await getModelFiles(allResources);
+
+        return resources.map((resource) => {
+          const modelFiles = modelFilesCached[resource.id]?.files ?? [];
+          const substitute = getSubstituteData(resource, substitutes, modelFiles);
+          return removeNulls({ ...bringItAllTogether(resource, modelFiles), substitute });
+        });
+      })
+  );
+
+  if (withPreview) {
+    const imageCache = await imagesForModelVersionsCache.fetch(resources.map((r) => r.id));
+    for (const resource of resources as (GenerationResource & { air: string })[]) {
+      const images = imageCache[resource.id]?.images ?? [];
+      const first = pickPreviewImage(images, browsingLevel);
+      if (first) {
+        resource.image = {
+          id: first.id,
+          url: first.url,
+          width: first.width,
+          height: first.height,
+          hash: first.hash,
+          type: first.type,
+          nsfwLevel: first.nsfwLevel,
+        };
+      }
+    }
+  }
+
+  // TODO - check if resource id is in "EcosystemCheckpoint" table
+  // Note: `hasGenerationSupport` returns false for Wildcards-type baseModels
+  // (Wildcards aren't generation resources), so the `generation: true` filter
+  // here strips them out unless the caller is asking for unfiltered data
+  // (e.g. the model detail page wants to render a Wildcards model's
+  // "Generate" button enabled when the wildcard set is visible).
+  //
+  // Aliased "cover" resources are kept even when their own baseModel isn't
+  // gen-supported: their generatability is derived from the alias target, and
+  // consumers swap them for that (gen-supported) target via
+  // `swapGenerationAliases`. Filtering here would strip the cover before the
+  // swap could happen.
+  const filtered = generation
+    ? resources.filter(
+        (resource) => hasGenerationSupport(resource.baseModel) || resource.aliasId != null
+      )
+    : resources;
+
+  return filtered;
+}
+
+// =============================================================================
+// Resolve Resources from Metadata
+// =============================================================================
+
+const EMPTY_HASH = 'e3b0c44298fc';
+
+/**
+ * Mirrors the role vocabularies and the excluded file types in get_image_resources.sql. Matching on
+ * hash value alone credits an image to whoever else happens to host the same bundled component file
+ * -- see that function's header for the incident. Change both together.
+ */
+const RESOURCE_ROLES = new Set([
+  'model',
+  'checkpoint',
+  'refinermodel',
+  'lora',
+  'lycoris',
+  'locon',
+  'dora',
+  'embed',
+  'embedding',
+  'textualinversion',
+  'used_embeddings',
+  'hypernet',
+]);
+const COMPONENT_ROLES = new Set([
+  'vae',
+  'refinervae',
+  'clip',
+  'clipvision',
+  'cliplmodel',
+  'unet',
+  'textencoder',
+  'text_encoder',
+  'upscaler',
+  'controlnet',
+  'qwenmodel',
+  'llamamodel',
+  'txxlmodel',
+  'seedvrmodel',
+]);
+const NON_RESOURCE_FILE_TYPES = [
+  'Training Data',
+  'Archive',
+  'Config',
+  'Workflow',
+  'VAE',
+  'Text Encoder',
+  'CLIPVision',
+];
+
+/** A role we cannot read is not a role we can reject -- see the hashes branch in the SQL. */
+const roleFromHashKey = (key: string) => {
+  const role = key.toLowerCase().split(':')[0];
+  return RESOURCE_ROLES.has(role) || COMPONENT_ROLES.has(role) ? role : undefined;
+};
+const isResourceRole = (role: string | undefined) => !role || RESOURCE_ROLES.has(role);
+
+type HashCandidate = {
+  hash: string;
+  name: string;
+  strength: number | null;
+};
+
+type ResolvedCandidate = {
+  modelVersionId: number;
+  strength: number | null;
+};
+
+/**
+ * Extract resource-identification fields from raw EXIF metadata.
+ * Returns a normalized shape for hash resolution + civitaiResources.
+ */
+function extractResourceInputFromMeta(metadata: Record<string, unknown>) {
+  const resources = metadata.resources as
+    | { name?: string; type?: string; hash?: string; weight?: number; modelVersionId?: number }[]
+    | undefined;
+  const hashes = metadata.hashes as Record<string, string> | undefined;
+  const modelHash = (metadata['Model hash'] ?? metadata.modelHash) as string | undefined;
+  const modelName = (metadata['Model'] ?? metadata.modelName) as string | undefined;
+  const civitaiResources = metadata.civitaiResources as
+    | { type?: string; weight?: number; modelVersionId: number }[]
+    | undefined;
+
+  // Merge resources with explicit modelVersionId into civitaiResources
+  const idResources = Array.isArray(resources)
+    ? resources
+        .filter((r): r is typeof r & { modelVersionId: number } => !!r.modelVersionId)
+        .map((r) => ({
+          type: r.type,
+          weight: r.weight ?? ((r as Record<string, unknown>).strength as number | undefined),
+          modelVersionId: r.modelVersionId,
+        }))
+    : [];
+  const allCivitaiResources = [...(civitaiResources ?? []), ...idResources];
+
+  return {
+    resources: Array.isArray(resources) ? resources.filter((r) => r.hash) : undefined,
+    hashes,
+    modelHash,
+    modelName,
+    civitaiResources: allCivitaiResources.length > 0 ? allCivitaiResources : undefined,
+  };
+}
+
+/**
+ * Mirrors `NULLIF(LOWER(x), '')` and the empty-content-hash exclusion in the SQL, in one place so
+ * the three stages cannot drift apart. Takes `unknown` because they never had the string the casts
+ * in extractResourceInputFromMeta claim: the procedure is public and its schema is
+ * `z.record(z.string(), z.unknown())`, so a value here is whatever the caller wrote.
+ */
+const normalizeHash = (raw: unknown): string | undefined => {
+  if (typeof raw !== 'string') return undefined;
+  const hash = raw.toLowerCase();
+  return hash && hash !== EMPTY_HASH ? hash : undefined;
+};
+
+/**
+ * Extract hash candidates from metadata (mirrors get_image_resources.sql stages 1-3).
+ */
+export function extractHashCandidates(
+  input: ReturnType<typeof extractResourceInputFromMeta>
+): HashCandidate[] {
+  const candidates: HashCandidate[] = [];
+
+  // Stage 1: meta.resources[] — resources with hashes
+  if (input.resources) {
+    for (const r of input.resources) {
+      if (r.name === 'vae') continue;
+      if (!isResourceRole(r.type?.toLowerCase())) continue;
+      const hash = normalizeHash(r.hash);
+      if (!hash) continue;
+      candidates.push({
+        hash,
+        name: r.name ?? r.type ?? 'unknown',
+        strength: r.weight != null ? Math.round(r.weight * 100) : null,
+      });
+    }
+  }
+
+  // Stage 2: meta.hashes — key-value pairs (e.g. {"lora:name": "abc123"})
+  if (input.hashes) {
+    for (const [key, value] of Object.entries(input.hashes)) {
+      if (key === 'vae') continue;
+      if (!isResourceRole(roleFromHashKey(key))) continue;
+      const hash = normalizeHash(value);
+      if (!hash) continue;
+      candidates.push({ hash, name: key, strength: null });
+    }
+  }
+
+  // Stage 3: Legacy 'Model hash' field (only if no hashes object)
+  if (!input.hashes) {
+    const hash = normalizeHash(input.modelHash);
+    if (hash) candidates.push({ hash, name: input.modelName ?? 'model', strength: null });
+  }
+
+  return candidates;
+}
+
+/**
+ * Resolve resources from raw image EXIF metadata and transform to graph-compatible params.
+ *
+ * Mirrors the logic of get_image_resources.sql for resource resolution, then applies
+ * the same pre-normalize → mapDataToGraphInput pipeline as getMediaGenerationData.
+ *
+ * Returns { resources, params } where params are ready for the generation graph.
+ */
+type HashMatch = {
+  versionPublished: boolean;
+  isOfficial: boolean;
+  versionDate: Date;
+  fileId: number;
+};
+
+/**
+ * Which of several files sharing one hash gets the credit. Mirrors
+ * get_image_resources.sql's
+ * `ORDER BY IIF(version_published,0,1), IIF(is_official,0,1), version_date, file_id`:
+ * published first, then OFFICIAL, then OLDEST, then lowest file id.
+ *
+ * Official outranks date because a hash is a statement about bytes: when the same bytes sit on an
+ * official version and on a community re-host, the official page is the true answer whoever
+ * uploaded first.
+ *
+ * Oldest, not newest, for everything below that. A hash shared across owners is in practice a
+ * re-upload of someone else's weights, so the earliest published copy is the closest thing to the
+ * original uploader; preferring the most recent hands every duplicated model to whoever posted it
+ * last. This read `>` until 2026-09-15, which meant the image page credited the original
+ * and the generator credited the re-uploader for the same file — the two are the same
+ * rule in two languages, and nothing compares them.
+ */
+export function prefersHashMatch(candidate: HashMatch, existing: HashMatch | undefined): boolean {
+  if (!existing) return true;
+  if (existing.versionPublished !== candidate.versionPublished) return candidate.versionPublished;
+  if (existing.isOfficial !== candidate.isOfficial) return candidate.isOfficial;
+  const existingDate = existing.versionDate.valueOf();
+  const candidateDate = candidate.versionDate.valueOf();
+  if (existingDate !== candidateDate) return candidateDate < existingDate;
+  return candidate.fileId < existing.fileId;
+}
+
+export async function resolveImageMeta({
+  input,
+  user,
+  browsingLevel,
+}: {
+  input: ResolveImageMetaInput;
+  user?: SessionUser;
+  browsingLevel?: number;
+}): Promise<{ resources: GenerationResourceValue[]; params: Record<string, unknown> }> {
+  const metadata = input.metadata;
+  const resourceInput = extractResourceInputFromMeta(metadata);
+  const resolved = new Map<number, ResolvedCandidate>();
+
+  // --- Hash resolution (stages 1-3) ---
+  const hashCandidates = extractHashCandidates(resourceInput);
+  const uniqueHashes = [...new Set(hashCandidates.map((c) => c.hash))];
+
+  if (uniqueHashes.length > 0) {
+    // Batch query: hash → ModelFileHash → ModelFile → ModelVersion
+    // Same JOIN chain as get_image_resources.sql lines 98-104
+    const hashResults = await dbRead.$queryRaw<
+      Array<{
+        hash: string;
+        modelVersionId: number;
+        fileId: number;
+        versionPublished: boolean;
+        isOfficial: boolean;
+        versionDate: Date;
+        excludeFromAutoDetection: boolean;
+      }>
+    >`
+      SELECT
+        LOWER(mfh.hash::text) AS hash,
+        mf."modelVersionId",
+        mf.id AS "fileId",
+        mv.status = 'Published' AS "versionPublished",
+        COALESCE(m."isOfficial", false) AS "isOfficial",
+        COALESCE(mv."publishedAt", mv."createdAt") AS "versionDate",
+        COALESCE(mv.meta->>'excludeFromAutoDetection', '') != '' AS "excludeFromAutoDetection"
+      FROM "ModelFileHash" mfh
+      JOIN "ModelFile" mf ON mf.id = mfh."fileId"
+      JOIN "ModelVersion" mv ON mv.id = mf."modelVersionId"
+      JOIN "Model" m ON m.id = mv."modelId"
+      WHERE mfh.hash IN (${Prisma.join(uniqueHashes)})
+        AND m.status NOT IN ('Deleted', 'Unpublished', 'UnpublishedViolation')
+        AND mf.type NOT IN (${Prisma.join(NON_RESOURCE_FILE_TYPES)})
+    `;
+
+    // Build a map of hash → best matching modelVersionId
+    const bestByHash = new Map<string, (typeof hashResults)[0]>();
+    for (const row of hashResults) {
+      if (row.excludeFromAutoDetection) continue;
+      if (prefersHashMatch(row, bestByHash.get(row.hash))) bestByHash.set(row.hash, row);
+    }
+
+    // Match hash candidates to resolved version IDs
+    for (const candidate of hashCandidates) {
+      const match = bestByHash.get(candidate.hash);
+      if (!match) continue;
+
+      const existing = resolved.get(match.modelVersionId);
+      // Prefer entries with strength info (mirrors SQL's IIF(strength IS NOT NULL,0,1))
+      if (!existing || (existing.strength == null && candidate.strength != null)) {
+        resolved.set(match.modelVersionId, {
+          modelVersionId: match.modelVersionId,
+          strength: candidate.strength,
+        });
+      }
+    }
+  }
+
+  // --- Direct civitaiResources (stage 4) ---
+  if (resourceInput.civitaiResources) {
+    for (const r of resourceInput.civitaiResources) {
+      if (!r.modelVersionId) continue;
+      const existing = resolved.get(r.modelVersionId);
+      const strength = r.weight != null ? Math.round(r.weight * 100) : null;
+      // civitaiResources are authoritative — override hash-only matches
+      if (!existing || (existing.strength == null && strength != null)) {
+        resolved.set(r.modelVersionId, { modelVersionId: r.modelVersionId, strength });
+      }
+    }
+  }
+
+  // --- Enrich via getResourceData() ---
+  let allResources: GenerationResourceValue[] = [];
+  if (resolved.size > 0) {
+    const versionIds = [...resolved.keys()];
+    allResources = (
+      await getResourceData(versionIds, { user, withPreview: true, browsingLevel })
+    ).map((resource) => {
+      const candidate = resolved.get(resource.id);
+      return asResourceValue(
+        resource,
+        candidate?.strength != null ? candidate.strength / 100 : undefined
+      );
+    });
+  }
+
+  // --- Normalize metadata + map to graph params (same pipeline as getMediaGenerationData) ---
+  const initialMeta = metadata as ImageMetaProps;
+  const baseModel = getBaseModelFromResources(
+    allResources.map((x) => ({ modelType: x.model.type, baseModel: x.baseModel }))
+  );
+  const engine = initialMeta.engine ?? (baseModel ? getBaseModelEngine(baseModel) : undefined);
+
+  const metaRecord = initialMeta as Record<string, unknown>;
+  const { resources, params } = resolveGraphParamsFromImageMeta({
+    initialMeta,
+    baseModel,
+    engine,
+    allResources,
+    width: (metaRecord.width as number) ?? 0,
+    height: (metaRecord.height as number) ?? 0,
+  });
+
+  return { resources, params };
+}

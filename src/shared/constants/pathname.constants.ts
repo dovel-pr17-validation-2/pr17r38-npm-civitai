@@ -1,0 +1,135 @@
+export function getMatchingPathname(url: string) {
+  const urlTokens = url.replace(/^\//, '').split('/');
+  let match: string | undefined;
+
+  for (const [pathname, tokens] of Object.entries(pathnamesTokens)) {
+    const exactMatch = urlTokens.every((token, index) => token === tokens[index]);
+    if (exactMatch) {
+      match = pathname;
+      break;
+    }
+
+    const softTokenLength = tokens.filter((part) => !part.includes('[[')).length;
+    const softMatch = urlTokens.every(
+      (token, index) =>
+        (tokens.length === urlTokens.length || softTokenLength === urlTokens.length) &&
+        (token === tokens[index] || tokens[index]?.startsWith('['))
+    );
+    if (softMatch) {
+      match = pathname;
+    }
+  }
+
+  return match ?? url;
+}
+
+// ⚠️ Comic routes are deliberately absent, and must stay absent until the comic view backfill has
+// run in prod. `getMatchingPathname` returns the url verbatim when nothing here matches, which is
+// the only reason `pageViews.pageId` holds literal `/comics/<id>/...` paths — and those paths are
+// the entire data source for the comic view backfill (civitai-scripts, backfill/comic-views.js,
+// which fails rather than writing a near-empty result). Adding `/comics/[id]/...`
+// here collapses them to one templated pageId and destroys the history that script reconstructs.
+const pathnamesTokens = [
+  '/moderator/test',
+  '/404',
+  '/air/confirm',
+  '/collections/[collectionId]/review',
+  '/creator-program',
+  '/content/dmca-notice',
+  '/content/dmca-counter-notice',
+  '/dmca/notice',
+  '/games/chopped',
+  '/home',
+  '/images',
+  '/models/[id]/edit',
+  '/models/[id]/model-versions/[versionId]/edit',
+  '/models',
+  '/payment/success',
+  '/posts',
+  '/product/odor',
+  '/product/vault',
+  '/search/articles',
+  '/search/bounties',
+  '/search/collections',
+  '/search/models',
+  '/search/users',
+  '/subscribe/[plan]',
+  '/support',
+  '/testing/demo',
+  '/testing/metadata-test',
+  '/user/[username]/[list]',
+  '/user/[username]/images',
+  '/user/[username]/models',
+  '/user/[username]/posts',
+  '/user/[username]/videos',
+  '/user/downloads',
+  '/user/notifications',
+  '/videos',
+  '/articles/[id]/edit',
+  '/articles',
+  '/bounties/[id]/edit',
+  '/articles/create',
+  '/articles/[id]/[[...slug]]',
+  '/bounties/[id]/entries/[entryId]/edit',
+  '/bounties/[id]/entries/create',
+  '/bounties/entries/[entryId]',
+  '/bounties/create',
+  '/bounties',
+  '/claim/buzz/[id]',
+  '/builds',
+  '/claim/cosmetic/[id]',
+  '/bounties/[id]/entries/[entryId]',
+  '/bounties/[id]/[[...slug]]',
+  '/collections/[collectionId]',
+  '/collections',
+  '/content/[[...slug]]',
+  '/discord/link-role',
+  '/comments/[id]',
+  '/comments/v2/[id]',
+  '/images/[imageId]',
+  '/',
+  '/generate',
+  '/intent/avatar',
+  '/intent/post',
+  '/login',
+  '/model-versions/[id]',
+  '/leaderboard/[id]',
+  '/models/[id]/model-versions/create',
+  '/models/[id]/model-versions/[versionId]/wizard',
+  '/models/[id]/wizard',
+  '/models/create',
+  '/models/license/[versionId]',
+  '/models/train',
+  '/events/[slug]',
+  '/models/[id]/reviews',
+  '/posts/[postId]/[[...postSlug]]',
+  '/posts/[postId]/edit',
+  '/payment/paddle',
+  '/newsroom',
+  '/posts/create',
+  '/product/link',
+  '/pricing',
+  '/purchase/buzz',
+  '/models/[id]/[[...slug]]',
+  '/reviews/[reviewId]',
+  '/search/images',
+  '/safety',
+  '/tag/[tagname]',
+  '/shop',
+  '/user/[username]/articles',
+  '/user/[username]/collections',
+  '/user/[username]',
+  '/user/account',
+  '/user/account/[[...section]]',
+  '/games/knights-of-new-order',
+  '/user/earn-potential',
+  '/user/[username]/manage-categories',
+  '/user/stripe-connect/onboard',
+  '/user/buzz-dashboard',
+  '/user/membership',
+  '/user/transactions',
+  '/user/vault',
+].reduce<Record<string, string[]>>(
+  (acc, url) => ({ ...acc, [url]: url.replace(/^\//, '').split('/') }),
+  {}
+);

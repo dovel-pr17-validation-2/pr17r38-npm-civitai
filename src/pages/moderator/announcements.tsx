@@ -1,0 +1,108 @@
+import { ActionIcon, Badge, Button, Pagination } from '@mantine/core';
+import { IconCopy, IconPencil, IconTrash } from '@tabler/icons-react';
+import { useRouter } from 'next/router';
+import * as z from 'zod';
+import { Announcement } from '~/components/Announcements/Announcement';
+import { AnnouncementEditModal } from '~/components/Announcements/AnnouncementEditModal';
+import { Page } from '~/components/AppLayout/Page';
+import { dialogStore } from '~/components/Dialog/dialogStore';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { PageLoader } from '~/components/PageLoader/PageLoader';
+import { PopConfirm } from '~/components/PopConfirm/PopConfirm';
+import type { UpsertAnnouncementSchema } from '~/server/schema/announcement.schema';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+import { trpc } from '~/utils/trpc';
+
+const schema = z.object({ page: z.coerce.number().default(1) });
+
+export function AnnouncementsPage() {
+  const router = useRouter();
+  const { page } = schema.parse(router.query);
+  const queryUtils = trpc.useUtils();
+
+  const { data, isLoading } = trpc.announcement.getAnnouncementsPaged.useQuery({ page });
+  const deleteMutation = trpc.announcement.deleteAnnouncement.useMutation({
+    onSuccess: () => {
+      queryUtils.announcement.getAnnouncementsPaged.invalidate();
+    },
+  });
+
+  function openEdit(announcement?: Partial<UpsertAnnouncementSchema>) {
+    dialogStore.trigger({
+      component: AnnouncementEditModal,
+      props: { announcement },
+    });
+  }
+
+  function handlePaginationChange(page: number) {
+    router.replace({ query: { ...router.query, page } }, undefined, { shallow: true });
+  }
+
+  if (isLoading) return <PageLoader />;
+
+  const now = Date.now();
+
+  return (
+    <div className="container flex flex-col gap-2">
+      <div className="flex justify-end">
+        <Button onClick={() => openEdit()}>Create New Announcement</Button>
+      </div>
+      {data?.items.map((announcement) => {
+        const startsAt = (announcement.startsAt ?? now).getTime();
+        const endsAt = (announcement.endsAt ?? new Date('2100-12-31')).getTime();
+        const active = startsAt <= now && now <= endsAt;
+
+        return (
+          <div key={announcement.id} style={!active ? { opacity: 0.5 } : undefined}>
+            <Announcement
+              announcement={announcement}
+              dismissible={false}
+              moderatorActions={
+                <div className="flex items-center gap-1">
+                  {announcement.targetUserCount > 0 && (
+                    <Badge color="violet">
+                      Targeted · {announcement.targetUserCount.toLocaleString()}
+                    </Badge>
+                  )}
+                  {announcement.disabled ? (
+                    <Badge color="red">Disabled</Badge>
+                  ) : active ? (
+                    <Badge>Active</Badge>
+                  ) : null}
+                  <LegacyActionIcon
+                    onClick={() => {
+                      const { id, startsAt, endsAt, ...rest } = announcement;
+                      openEdit(rest);
+                    }}
+                  >
+                    <IconCopy />
+                  </LegacyActionIcon>
+                  <LegacyActionIcon onClick={() => openEdit(announcement)}>
+                    <IconPencil />
+                  </LegacyActionIcon>
+                  <PopConfirm
+                    onConfirm={() => deleteMutation.mutate({ id: announcement.id })}
+                    withinPortal
+                  >
+                    <LegacyActionIcon loading={deleteMutation.isPending} color="red">
+                      <IconTrash />
+                    </LegacyActionIcon>
+                  </PopConfirm>
+                </div>
+              }
+            />
+          </div>
+        );
+      })}
+      {data && (
+        <div className="flex justify-end">
+          <Pagination value={page} total={data.totalPages} onChange={handlePaginationChange} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+export const getServerSideProps = createServerSideProps({ requireModerator: true });
+
+export default Page(AnnouncementsPage, { features: (features) => features.announcements });

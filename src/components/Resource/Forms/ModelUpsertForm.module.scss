@@ -1,0 +1,15 @@
+ .availabilityChip { 
+  height: auto;
+  overflow: hidden;
+  
+  > label {
+    width: 100%;
+    height: auto;
+    padding: 16px 0;
+
+    &[data-checked] {
+      border: 2px solid;
+      border-color: theme('colors.blue.5');
+    }
+  }
+} 

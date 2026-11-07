@@ -1,0 +1,541 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { Coinbase } from '~/server/http/coinbase/coinbase.schema';
+import { dbMock } from '~/__tests__/mocks/db.mock';
+
+// Use vi.hoisted so mocks are available inside vi.mock factories
+const { mockCoinbaseCaller, mockGrantBuzzPurchase, mockGrantCosmetics, mockEmailSend } = vi.hoisted(
+  () => ({
+    mockCoinbaseCaller: {
+      createCharge: vi.fn(),
+      isAPIHealthy: vi.fn(),
+    },
+    mockGrantBuzzPurchase: vi.fn().mockResolvedValue('tx_123'),
+    mockGrantCosmetics: vi.fn().mockResolvedValue(undefined),
+    mockEmailSend: vi.fn().mockResolvedValue(undefined),
+  })
+);
+
+// The two clients were already distinct here, so there is no alias to resolve: `product.findFirst`
+// (coinbase.service:75), `redeemableCode.findFirst` (:201) and `user.findUnique` (:263) are dbRead,
+// and the code is created inside `dbWrite.$transaction` (:243).
+//
+// ✅ The canonical `$transaction` is safe to inherit: the old fixture handed the callback
+// `{ redeemableCode: mockRedeemableCode }` where that object WAS `mockDbWrite.redeemableCode`, so
+// in-transaction and direct calls were already indistinguishable — and `tx.redeemableCode.create`
+// (:248) is the only tx member the service touches, so widening tx cannot satisfy anything new.
+const mockDbRead = dbMock.dbRead;
+const mockDbWrite = dbMock.dbWrite;
+
+// Mock modules
+vi.mock('~/server/notifications/client', () => ({
+  notifications: { createNotification: vi.fn(async () => undefined) },
+}));
+
+vi.mock('process', () => ({
+  env: {
+    NEXTAUTH_URL: 'https://civitai.com',
+  },
+}));
+
+vi.mock('~/server/http/coinbase/coinbase.caller', () => ({
+  default: mockCoinbaseCaller,
+  CoinbaseCaller: { verifyWebhookSignature: vi.fn() },
+}));
+
+vi.mock('~/server/services/buzz.service', () => ({
+  grantBuzzPurchase: mockGrantBuzzPurchase,
+}));
+
+vi.mock('~/server/services/cosmetic.service', () => ({
+  grantCosmetics: mockGrantCosmetics,
+}));
+
+vi.mock('~/server/common/constants', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('~/server/common/constants')>();
+  return {
+    ...actual,
+    COINBASE_FIXED_FEE: 0,
+    specialCosmeticRewards: { crypto: [] },
+  };
+});
+
+vi.mock('~/server/email/templates/redeemableCodePurchase.email', () => ({
+  redeemableCodePurchaseEmail: {
+    send: mockEmailSend,
+  },
+}));
+
+vi.mock('~/server/schema/subscriptions.schema', () => ({
+  subscriptionProductMetadataSchema: {
+    parse: vi.fn((x: any) => x),
+  },
+}));
+
+// Import after mocks
+import {
+  createBuzzOrder,
+  createCodeOrder,
+  processBuzzOrder,
+  processCodeOrder,
+} from '~/server/services/coinbase.service';
+
+// Helper to build a minimal webhook event data object.
+// Metadata is loosely typed to allow testing validation of incomplete/invalid inputs.
+type EventDataOverrides = Omit<
+  Partial<Coinbase.WebhookEventSchema['event']['data']>,
+  'metadata'
+> & {
+  metadata?: Record<string, unknown>;
+};
+
+function makeEventData(
+  overrides: EventDataOverrides = {}
+): Coinbase.WebhookEventSchema['event']['data'] {
+  return {
+    id: 'charge_abc',
+    metadata: {},
+    ...overrides,
+  } as Coinbase.WebhookEventSchema['event']['data'];
+}
+
+describe('coinbase.service', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-02-25T12:00:00Z'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // ---------------------------------------------------------------------------
+  // createCodeOrder
+  // ---------------------------------------------------------------------------
+  describe('createCodeOrder', () => {
+    const mockCharge = {
+      id: 'charge_123',
+      hosted_url: 'https://commerce.coinbase.com/charges/abc',
+    };
+
+    it('should create a buzz code order with correct price', async () => {
+      mockCoinbaseCaller.createCharge.mockResolvedValue(mockCharge);
+
+      const result = await createCodeOrder({
+        type: 'Buzz',
+        buzzAmount: 10000,
+        userId: 42,
+      });
+
+      expect(result).toBe(mockCharge);
+      expect(mockCoinbaseCaller.createCharge).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'Redeemable code purchase',
+          pricing_type: 'fixed_price',
+          local_price: {
+            amount: '10', // 10000 buzz / 10 = 1000 cents / 100 = $10
+            currency: 'USD',
+          },
+          metadata: expect.objectContaining({
+            userId: 42,
+            codeType: 'Buzz',
+            codeUnitValue: 10000,
+            codePriceId: undefined,
+          }),
+        })
+      );
+    });
+
+    it('should generate orderId with code- prefix for webhook routing', async () => {
+      mockCoinbaseCaller.createCharge.mockResolvedValue(mockCharge);
+
+      await createCodeOrder({ type: 'Buzz', buzzAmount: 10000, userId: 42 });
+
+      const call = mockCoinbaseCaller.createCharge.mock.calls[0][0];
+      expect(call.metadata.internalOrderId).toMatch(/^code-42-/);
+    });
+
+    it('should set redirect to coinbase-code success page', async () => {
+      mockCoinbaseCaller.createCharge.mockResolvedValue(mockCharge);
+
+      await createCodeOrder({ type: 'Buzz', buzzAmount: 10000, userId: 42 });
+
+      const call = mockCoinbaseCaller.createCharge.mock.calls[0][0];
+      expect(call.redirect_url).toContain('/payment/coinbase-code?');
+      expect(call.redirect_url).toContain('orderId=code-42-');
+    });
+
+    it('should create a membership code order by looking up price from DB', async () => {
+      mockDbRead.product.findFirst.mockResolvedValue({
+        id: 'prod_gold',
+        name: 'Gold Membership',
+        prices: [{ id: 'price_gold_monthly', unitAmount: 1500 }],
+      });
+      mockCoinbaseCaller.createCharge.mockResolvedValue(mockCharge);
+
+      const result = await createCodeOrder({
+        type: 'Membership',
+        tier: 'gold',
+        months: 3,
+        userId: 42,
+      });
+
+      expect(result).toBe(mockCharge);
+
+      // Should query for Civitai provider, active, matching tier
+      expect(mockDbRead.product.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            provider: 'Civitai',
+            active: true,
+            metadata: { path: ['tier'], equals: 'gold' },
+          }),
+        })
+      );
+
+      // Price should be unitAmount * months: 1500 * 3 = 4500 cents = $45
+      expect(mockCoinbaseCaller.createCharge).toHaveBeenCalledWith(
+        expect.objectContaining({
+          local_price: {
+            amount: '45', // 4500 / 100
+            currency: 'USD',
+          },
+          metadata: expect.objectContaining({
+            codeType: 'Membership',
+            codeUnitValue: 3,
+            codePriceId: 'price_gold_monthly',
+          }),
+        })
+      );
+    });
+
+    it('should throw when no active price is found for membership tier', async () => {
+      mockDbRead.product.findFirst.mockResolvedValue(null);
+
+      await expect(
+        createCodeOrder({ type: 'Membership', tier: 'gold', months: 3, userId: 42 })
+      ).rejects.toThrow('No active price found for gold membership');
+    });
+
+    it('should throw when product has no prices', async () => {
+      mockDbRead.product.findFirst.mockResolvedValue({
+        id: 'prod_gold',
+        name: 'Gold',
+        prices: [],
+      });
+
+      await expect(
+        createCodeOrder({ type: 'Membership', tier: 'gold', months: 3, userId: 42 })
+      ).rejects.toThrow('No active price found for gold membership');
+    });
+
+    it('should throw when coinbase charge creation fails', async () => {
+      mockCoinbaseCaller.createCharge.mockResolvedValue(null);
+
+      await expect(
+        createCodeOrder({ type: 'Buzz', buzzAmount: 10000, userId: 42 })
+      ).rejects.toThrow('Failed to create charge');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // processCodeOrder
+  // ---------------------------------------------------------------------------
+  describe('processCodeOrder', () => {
+    it('should create a Buzz redeemable code on confirmed charge', async () => {
+      mockDbRead.redeemableCode.findFirst.mockResolvedValue(null); // no duplicate
+      mockDbRead.user.findUnique.mockResolvedValue({ email: 'user@test.com', username: 'tester' });
+      mockDbWrite.redeemableCode.create.mockResolvedValue({});
+
+      const result = await processCodeOrder(
+        makeEventData({
+          metadata: {
+            internalOrderId: 'code-42-1708862400000',
+            codeType: 'Buzz',
+            codeUnitValue: 10000,
+          },
+        })
+      );
+
+      expect(result.userId).toBe(42);
+      expect(result.codeType).toBe('Buzz');
+      expect(result.codeUnitValue).toBe(10000);
+      // Code should be generated with CS- prefix
+      expect(result.code).toMatch(/^CS-/);
+
+      // Should create the redeemable code in a transaction
+      expect(mockDbWrite.redeemableCode.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          unitValue: 10000,
+          type: 'Buzz',
+          userId: 42,
+          metadata: { orderId: 'code-42-1708862400000' },
+        }),
+      });
+    });
+
+    it('should create a Membership redeemable code with priceId', async () => {
+      mockDbRead.redeemableCode.findFirst.mockResolvedValue(null);
+      mockDbRead.user.findUnique.mockResolvedValue({ email: 'user@test.com', username: 'tester' });
+      mockDbWrite.redeemableCode.create.mockResolvedValue({});
+
+      const result = await processCodeOrder(
+        makeEventData({
+          metadata: {
+            internalOrderId: 'code-42-1708862400000',
+            codeType: 'Membership',
+            codeUnitValue: 3,
+            codePriceId: 'price_gold_monthly',
+          },
+        })
+      );
+
+      expect(result.code).toMatch(/^MB-/);
+      expect(mockDbWrite.redeemableCode.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          unitValue: 3,
+          type: 'Membership',
+          priceId: 'price_gold_monthly',
+          userId: 42,
+        }),
+      });
+    });
+
+    it('draws each code from a cryptographic source, not Math.random', async () => {
+      const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+      mockDbRead.redeemableCode.findFirst.mockResolvedValue(null);
+      mockDbRead.user.findUnique.mockResolvedValue({ email: 'user@test.com', username: 'tester' });
+      mockDbWrite.redeemableCode.create.mockResolvedValue({});
+      const order = (internalOrderId: string) =>
+        processCodeOrder(
+          makeEventData({ metadata: { internalOrderId, codeType: 'Buzz', codeUnitValue: 10000 } })
+        );
+
+      try {
+        const first = await order('code-42-1708862400000');
+        const second = await order('code-42-1708862400001');
+
+        expect(first.code).toMatch(/^CS-[A-Z0-9]{4}-[A-Z0-9]{4}$/);
+        expect(second.code).not.toBe(first.code);
+      } finally {
+        random.mockRestore();
+      }
+    });
+
+    it('should send email to the purchaser after code creation', async () => {
+      mockDbRead.redeemableCode.findFirst.mockResolvedValue(null);
+      mockDbRead.user.findUnique.mockResolvedValue({
+        email: 'buyer@civitai.com',
+        username: 'BuzzBuyer',
+      });
+      mockDbWrite.redeemableCode.create.mockResolvedValue({});
+
+      await processCodeOrder(
+        makeEventData({
+          metadata: {
+            internalOrderId: 'code-42-1708862400000',
+            codeType: 'Buzz',
+            codeUnitValue: 25000,
+          },
+        })
+      );
+
+      expect(mockEmailSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          email: 'buyer@civitai.com',
+          username: 'BuzzBuyer',
+          type: 'Buzz',
+          unitValue: 25000,
+        })
+      );
+    });
+
+    it('should not fail if email send fails', async () => {
+      mockDbRead.redeemableCode.findFirst.mockResolvedValue(null);
+      mockDbRead.user.findUnique.mockResolvedValue({ email: 'user@test.com', username: 'tester' });
+      mockDbWrite.redeemableCode.create.mockResolvedValue({});
+      mockEmailSend.mockRejectedValueOnce(new Error('SMTP down'));
+
+      // Should not throw
+      const result = await processCodeOrder(
+        makeEventData({
+          metadata: {
+            internalOrderId: 'code-42-1708862400000',
+            codeType: 'Buzz',
+            codeUnitValue: 10000,
+          },
+        })
+      );
+
+      expect(result.code).toBeDefined();
+    });
+
+    it('should skip email if user has no email', async () => {
+      mockDbRead.redeemableCode.findFirst.mockResolvedValue(null);
+      mockDbRead.user.findUnique.mockResolvedValue({ email: null, username: 'noemail' });
+      mockDbWrite.redeemableCode.create.mockResolvedValue({});
+
+      await processCodeOrder(
+        makeEventData({
+          metadata: {
+            internalOrderId: 'code-42-1708862400000',
+            codeType: 'Buzz',
+            codeUnitValue: 10000,
+          },
+        })
+      );
+
+      expect(mockEmailSend).not.toHaveBeenCalled();
+    });
+
+    describe('idempotency', () => {
+      it('should return existing code for duplicate webhook (already processed)', async () => {
+        mockDbRead.redeemableCode.findFirst.mockResolvedValue({ code: 'CS-XXXX-YYYY' });
+
+        const result = await processCodeOrder(
+          makeEventData({
+            metadata: {
+              internalOrderId: 'code-42-1708862400000',
+              codeType: 'Buzz',
+              codeUnitValue: 10000,
+            },
+          })
+        );
+
+        expect(result.code).toBe('CS-XXXX-YYYY');
+        expect(result.message).toBe('Code order already processed');
+        // Should NOT create another code
+        expect(mockDbWrite.$transaction).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('validation', () => {
+      it('should throw when internalOrderId is missing', async () => {
+        await expect(processCodeOrder(makeEventData({ metadata: {} }))).rejects.toThrow(
+          'Missing required metadata'
+        );
+      });
+
+      it('should throw when userId cannot be parsed from orderId', async () => {
+        mockDbRead.redeemableCode.findFirst.mockResolvedValue(null);
+
+        await expect(
+          processCodeOrder(
+            makeEventData({
+              metadata: {
+                internalOrderId: 'code-notanumber-1708862400000',
+                codeType: 'Buzz',
+                codeUnitValue: 10000,
+              },
+            })
+          )
+        ).rejects.toThrow('Invalid userId');
+      });
+
+      it('should throw when codeType is missing', async () => {
+        mockDbRead.redeemableCode.findFirst.mockResolvedValue(null);
+
+        await expect(
+          processCodeOrder(
+            makeEventData({
+              metadata: {
+                internalOrderId: 'code-42-1708862400000',
+                codeUnitValue: 10000,
+              },
+            })
+          )
+        ).rejects.toThrow('Missing codeType or codeUnitValue');
+      });
+
+      it('should throw when codeUnitValue is missing', async () => {
+        mockDbRead.redeemableCode.findFirst.mockResolvedValue(null);
+
+        await expect(
+          processCodeOrder(
+            makeEventData({
+              metadata: {
+                internalOrderId: 'code-42-1708862400000',
+                codeType: 'Buzz',
+              },
+            })
+          )
+        ).rejects.toThrow('Missing codeType or codeUnitValue');
+      });
+
+      it('should throw when Membership order is missing codePriceId', async () => {
+        mockDbRead.redeemableCode.findFirst.mockResolvedValue(null);
+
+        await expect(
+          processCodeOrder(
+            makeEventData({
+              metadata: {
+                internalOrderId: 'code-42-1708862400000',
+                codeType: 'Membership',
+                codeUnitValue: 3,
+                // no codePriceId
+              },
+            })
+          )
+        ).rejects.toThrow('Membership code orders require a codePriceId');
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // createBuzzOrder (existing — quick sanity tests)
+  // ---------------------------------------------------------------------------
+  describe('createBuzzOrder', () => {
+    it('should reject tampered amounts', async () => {
+      await expect(
+        createBuzzOrder({ buzzAmount: 10000, unitAmount: 999, userId: 1 })
+      ).rejects.toThrow('There was an error while creating your order');
+    });
+
+    it('should create charge with correct pricing', async () => {
+      const mockCharge = { id: 'c1', hosted_url: 'https://coinbase.com/c1' };
+      mockCoinbaseCaller.createCharge.mockResolvedValue(mockCharge);
+
+      const result = await createBuzzOrder({
+        buzzAmount: 10000,
+        unitAmount: 1000,
+        userId: 1,
+      });
+
+      expect(result).toBe(mockCharge);
+      expect(mockCoinbaseCaller.createCharge).toHaveBeenCalledWith(
+        expect.objectContaining({
+          local_price: { amount: '10', currency: 'USD' },
+          metadata: expect.objectContaining({ buzzAmount: 10000, userId: 1 }),
+        })
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // processBuzzOrder (existing — quick sanity tests)
+  // ---------------------------------------------------------------------------
+  describe('processBuzzOrder', () => {
+    it('should grant buzz for valid event', async () => {
+      const result = await processBuzzOrder(
+        makeEventData({
+          metadata: {
+            internalOrderId: '42-10000-1000-1708862400000',
+          },
+        })
+      );
+
+      expect(result.userId).toBe(42);
+      expect(result.buzzAmount).toBe(10000);
+      expect(mockGrantBuzzPurchase).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 42, amount: 10000 })
+      );
+    });
+
+    it('rethrows the original error and grants nothing when metadata is missing', async () => {
+      await expect(processBuzzOrder(makeEventData({ metadata: {} }))).rejects.toThrow(
+        'Missing required metadata in Coinbase webhook event'
+      );
+      expect(mockGrantBuzzPurchase).not.toHaveBeenCalled();
+    });
+  });
+});

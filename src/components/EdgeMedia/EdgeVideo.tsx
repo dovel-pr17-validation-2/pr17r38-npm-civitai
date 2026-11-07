@@ -1,0 +1,581 @@
+import { ThemeIcon } from '@mantine/core';
+import { HoverCard } from '~/components/MantineOverlays';
+import {
+  IconMaximize,
+  IconMinimize,
+  IconPlayerPauseFilled,
+  IconPlayerPlayFilled,
+  IconVolume,
+  IconVolumeOff,
+} from '@tabler/icons-react';
+import type { MouseEventHandler } from 'react';
+import React, {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
+import { YoutubeEmbed } from '~/components/YoutubeEmbed/YoutubeEmbed';
+import { VimeoEmbed } from '../VimeoEmbed/VimeoEmbed';
+import { useLocalStorage, useTimeout } from '@mantine/hooks';
+import type { EdgeUrlProps } from '~/client-utils/cf-images-utils';
+import { useEdgeUrl } from '~/client-utils/cf-images-utils';
+import { useScrollAreaRef } from '~/components/ScrollArea/ScrollAreaContext';
+import clsx from 'clsx';
+import { setMediaDragData } from '~/components/EdgeMedia/media-drag-data';
+import styles from './EdgeVideo.module.scss';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { useDialogId } from '~/components/Dialog/dialogId';
+import { useDialogStore } from '~/components/Dialog/dialogStore';
+import { getVideoPosition, recordVideoPosition } from '~/store/video-playback.store';
+
+type VideoProps = Omit<
+  React.DetailedHTMLProps<React.VideoHTMLAttributes<HTMLVideoElement>, HTMLVideoElement>,
+  'height' | 'width' | 'src'
+> & {
+  src: string;
+  thumbnailUrl?: string | null;
+  wrapperProps?: React.ComponentPropsWithoutRef<'div'>;
+  contain?: boolean;
+  fadeIn?: boolean;
+  html5Controls?: boolean;
+  onMutedChange?: (muted: boolean) => void;
+  youtubeVideoId?: string;
+  vimeoVideoId?: string;
+  options?: Omit<EdgeUrlProps, 'src'>;
+  threshold?: number;
+  disableWebm?: boolean;
+  disablePoster?: boolean;
+  /** Database image ID — included in drag data so drop targets can look up metadata server-side */
+  imageId?: number;
+  /** Play after a second of hover when not autoplaying. */
+  hoverPlay?: boolean;
+  /** Mounted for preloading, not on screen: never plays, whatever the viewport says. */
+  standby?: boolean;
+};
+
+export type EdgeVideoRef = {
+  stop: () => void;
+};
+
+// `fullscreenchange` is a document-level event (no JSX prop for it), so we subscribe via
+// useSyncExternalStore instead of useEffect to read fullscreen state reactively.
+function subscribeFullscreen(callback: () => void) {
+  document.addEventListener('fullscreenchange', callback);
+  return () => document.removeEventListener('fullscreenchange', callback);
+}
+const getFullscreenSnapshot = () => typeof document !== 'undefined' && !!document.fullscreenElement;
+const getFullscreenServerSnapshot = () => false;
+
+// Safari needs special handling (forced width, eager preload). userAgent is stable, so compute once.
+const IN_SAFARI =
+  typeof navigator !== 'undefined' && /Version\/[\d.]+.*Safari/.test(navigator.userAgent);
+
+export const GLOBAL_VOLUME_KEY = 'global-volume';
+
+export const EdgeVideo = forwardRef<EdgeVideoRef, VideoProps>(
+  (
+    {
+      src,
+      options,
+      muted: initialMuted = true,
+      controls,
+      style,
+      wrapperProps,
+      contain,
+      fadeIn,
+      html5Controls = false,
+      onMutedChange,
+      youtubeVideoId,
+      vimeoVideoId,
+      threshold = 0.25,
+      thumbnailUrl,
+      disableWebm,
+      disablePoster,
+      imageId,
+      hoverPlay = true,
+      standby = false,
+      onLoad,
+      onError,
+      onLoadedData,
+      ...props
+    },
+    forwardedRef
+  ) => {
+    const ref = useRef<HTMLVideoElement | null>(null);
+    const containerRef = useRef<HTMLDivElement | null>(null);
+    const [muted, setMuted] = useState(initialMuted);
+    const [loaded, setLoaded] = useState(false);
+    const [showPlayIndicator, setShowPlayIndicator] = useState(false);
+    const [isPlaying, setIsPlaying] = useState(false);
+    const [autoplayFailed, setAutoplayFailed] = useState(false);
+    // The overlay marks a video that came up paused; once the viewer has toggled playback
+    // themselves, the control bar is the indicator.
+    const [userToggled, setUserToggled] = useState(false);
+    // hide the audio control for videos with no audio track. Detected reactively from
+    // the video's load/play events (hasAudio populates as metadata/decoded bytes become available).
+    const [hasAudioState, setHasAudioState] = useState(false);
+    const isFullscreen = useSyncExternalStore(
+      subscribeFullscreen,
+      getFullscreenSnapshot,
+      getFullscreenServerSnapshot
+    );
+    // The store is document-wide; fullscreen is requested on containerRef, so narrow it to
+    // this player before acting on it.
+    const isSelfFullscreen =
+      isFullscreen && !!containerRef.current && document.fullscreenElement === containerRef.current;
+    const [volume, setVolume] = useLocalStorage({
+      key: GLOBAL_VOLUME_KEY,
+      defaultValue: muted ? 0 : 0.5,
+    });
+
+    // Re-sync muted when the forcing prop flips or the persisted volume resolves to 0 (volume
+    // hydrates from localStorage after mount). Render-phase adjust replaces a prop-sync effect;
+    // `video.muted` follows via the JSX `muted={muted}` binding, so no imperative write is needed.
+    // Does not clobber a manual "mute but remember level" (muted=true while volume>0).
+    const shouldForceMute = initialMuted || volume === 0;
+    const [lastForceMute, setLastForceMute] = useState(shouldForceMute);
+    if (lastForceMute !== shouldForceMute) {
+      setLastForceMute(shouldForceMute);
+      setMuted(shouldForceMute);
+    }
+
+    useImperativeHandle(forwardedRef, () => ({
+      stop: () => {
+        if (ref.current) {
+          if (resumeId) recordVideoPosition(resumeId, ref.current.currentTime);
+          ref.current.pause();
+          ref.current.currentTime = 0;
+        }
+      },
+    }));
+
+    // mantine useTimeout auto-clears on unmount, so the indicator timer needs no cleanup effect.
+    const { start: startHideIndicator, clear: clearHideIndicator } = useTimeout(
+      () => setShowPlayIndicator(false),
+      500
+    );
+
+    const handleTogglePlayPause = useCallback(() => {
+      if (controls && !html5Controls && ref.current) {
+        if (ref.current.paused) {
+          ref.current.play();
+        } else {
+          ref.current.pause();
+        }
+
+        setUserToggled(true);
+        setShowPlayIndicator(true);
+        // clear() then start() restarts the hide timer on rapid re-toggles.
+        clearHideIndicator();
+        startHideIndicator();
+      }
+    }, [controls, html5Controls, startHideIndicator, clearHideIndicator]);
+
+    const handleToggleFullscreen = useCallback(() => {
+      const container = containerRef.current;
+      if (!container) return;
+
+      if (!document.fullscreenElement) {
+        container.requestFullscreen().catch((err: Error) => {
+          console.error(`Error attempting to enable fullscreen mode: ${err.message}`);
+        });
+      } else {
+        document.exitFullscreen();
+      }
+    }, []);
+
+    const detectAudio = useCallback(() => {
+      const video = ref.current;
+      if (!video) return;
+      // hasAudio() is monotonic per element (decoded byte count only grows, track list is stable),
+      // so re-running it across load/play events lets the control appear once audio is confirmed.
+      setHasAudioState(hasAudio(video));
+    }, []);
+
+    const markVideoReady = useCallback(() => {
+      if (!ref.current) return;
+      setLoaded(true);
+      detectAudio();
+    }, [detectAudio]);
+
+    const handleLoadedData = useCallback(
+      (e: React.SyntheticEvent<HTMLVideoElement>) => {
+        onLoadedData?.(e);
+        // Opacity is now driven declaratively by `loaded` (see the <video> style prop).
+        markVideoReady();
+      },
+      [onLoadedData, markVideoReady]
+    );
+
+    const handleToggleMuted = useCallback(() => {
+      const video = ref.current;
+      if (!video) return;
+
+      const nextMuted = !video.muted;
+      video.muted = nextMuted;
+      // Muting keeps the persisted level (the slider shows 0 via the muted-aware binding below).
+      // Unmuting restores it — bumped off 0 so there's actually something to hear.
+      if (!nextMuted) {
+        const restored = volume > 0 ? volume : 0.5;
+        video.volume = restored;
+        setVolume(restored);
+      }
+      setMuted(nextMuted);
+      onMutedChange?.(nextMuted);
+    }, [onMutedChange, setVolume, volume]);
+
+    const handleVolumeChange = useCallback(
+      (value: number) => {
+        const video = ref.current;
+        if (!video) return;
+
+        video.volume = value;
+        // Raising the slider must also unmute, otherwise scrubbing does nothing audible.
+        const nextMuted = value === 0;
+        video.muted = nextMuted;
+        setVolume(value);
+        setMuted(nextMuted);
+        // Notify parent so the external mute toggle stays in sync when the slider crosses 0.
+        onMutedChange?.(nextMuted);
+      },
+      [onMutedChange, setVolume]
+    );
+
+    const showCustomControls = loaded && controls && !html5Controls;
+    // Navigating post -> image detail mounts a second player for the same media, so playback
+    // position is carried across. Only real players qualify; silent looping previews in feeds
+    // have nothing meaningful to resume.
+    const resumeId = imageId && (controls || html5Controls) ? imageId : undefined;
+    // Drag-to-add is for control-less previews. Any controls (custom or native) take over pointer
+    // interaction — disable drag so scrubbing/volume don't get hijacked into a video drag.
+    const draggableEnabled = !!imageId && !controls && !html5Controls;
+
+    const { url: videoUrl } = useEdgeUrl(src, { ...options, anim: true });
+    const { url: coverUrl } = useEdgeUrl(thumbnailUrl ?? src, {
+      width: options?.width,
+      // A `thumbnailUrl` poster is an image uuid, so `useEdgeUrl`'s video rule misses it.
+      optimized: true,
+      skip: thumbnailUrl ? undefined : options?.skip,
+      anim: thumbnailUrl ? undefined : false,
+      transcode: thumbnailUrl ? undefined : true,
+      original: thumbnailUrl ? undefined : false,
+    });
+
+    // The <video> is server-rendered and starts loading before hydration; a cached file can fire
+    // every load event (and `playing`) before React attaches its listeners — Firefox does this
+    // routinely on reload. Those events are never replayed, so read the element's state on attach.
+    // `key={videoUrl}` attaches a fresh element for a new source, so per-element state starts over.
+    const setVideoRef = useCallback(
+      (video: HTMLVideoElement | null) => {
+        ref.current = video;
+        if (!video) return;
+        setLoaded(false);
+        setHasAudioState(false);
+        setAutoplayFailed(false);
+        setUserToggled(false);
+        if (video.readyState >= HTMLMediaElement.HAVE_METADATA) markVideoReady();
+        setIsPlaying(!video.paused);
+      },
+      [markVideoReady]
+    );
+
+    // `.volume` has no attribute, and React only sets the muted *attribute* (the initial default),
+    // not the live `.muted` property, so both are pushed imperatively. The element mirroring state
+    // is also what lets onVolumeChange tell a native-controls change apart from these writes.
+    // A 0 level is stored as muted instead.
+    useEffect(() => {
+      const video = ref.current;
+      if (!video) return;
+      video.muted = muted;
+      if (volume > 0) video.volume = volume;
+    }, [muted, volume, videoUrl]);
+
+    const node = useScrollAreaRef();
+
+    // ensure that video only plays when it is in the current view/dialog
+    // Not a depth captured at mount: a player that mounts under an already-open dialog (the page
+    // behind the image detail remounts on a remix click) would take that depth as its own.
+    const dialogId = useDialogId();
+    const isCurrentStack = useDialogStore((state) => {
+      const top = state.dialogs[state.dialogs.length - 1];
+      return dialogId === undefined ? !top : top?.id === dialogId;
+    });
+
+    const [canPlay, setCanPlay] = useState(false);
+    useEffect(() => {
+      const videoElem = ref.current;
+      if (!videoElem || !options?.anim || props.autoPlay) return;
+      const observer = new IntersectionObserver(
+        ([{ intersectionRatio }]) => {
+          setCanPlay(intersectionRatio >= threshold);
+        },
+        { root: node?.current, threshold: [threshold, 1 - threshold] }
+      );
+      observer.observe(videoElem);
+      return () => {
+        observer.unobserve(videoElem);
+        observer.disconnect();
+      };
+    }, [threshold, options?.anim, loaded, props.autoPlay]);
+
+    useEffect(() => {
+      const videoElem = ref.current;
+      if (!videoElem) return;
+      if (!standby && isCurrentStack && (canPlay || props.autoPlay)) {
+        // Coming back from the detail dialog, this element is still paused where it was left;
+        // the other player kept the position moving.
+        const resumeAt = resumeId ? getVideoPosition(resumeId) : undefined;
+        if (resumeAt !== undefined && Math.abs(resumeAt - videoElem.currentTime) > 0.5) {
+          videoElem.currentTime = resumeAt;
+        }
+        // Some iOS Safari versions return undefined from play() instead of a promise.
+        videoElem.play()?.catch(() => {
+          // Autoplay failed, user interaction required
+          setAutoplayFailed(true);
+        });
+      } else if (standby || !isCurrentStack || !isSelfFullscreen) {
+        // Fullscreen moves the element to the top layer, so it stops intersecting the
+        // observer's scroll-area root and canPlay goes false. Pausing on that would stop
+        // the video the moment it is maximized.
+        videoElem.pause();
+      }
+    }, [canPlay, isCurrentStack, standby, props.autoPlay, isSelfFullscreen, resumeId]);
+
+    const { start: handleMouseEnter, clear } = useTimeout(
+      (e: [React.MouseEvent<HTMLVideoElement>]) => {
+        const [event] = e;
+        (event.target as HTMLVideoElement).play();
+      },
+      1000
+    );
+
+    const handleMouseLeave: MouseEventHandler<HTMLVideoElement> = (e) => {
+      e.currentTarget.pause();
+      clear();
+    };
+
+    // Dark translucent buttons + white icons so the controls stay legible over bright media.
+    const controlButtonClass = 'z-10 border-0 !bg-black/50 !text-white hover:!bg-black/70';
+
+    const defaultPlayer = (
+      // extra div wrapper to prevent positioning errors of parent components that make their child absolute
+      <div
+        ref={containerRef}
+        {...wrapperProps}
+        onClick={(e) => {
+          // The post page wraps the media in a link, and fullscreen only repaints — clicks still
+          // bubble there and would route away mid-playback. preventDefault is needed alongside
+          // stopPropagation: the link's own handler is what suppresses the native navigation.
+          if (isSelfFullscreen) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+          wrapperProps?.onClick?.(e);
+        }}
+        className={clsx(
+          styles.iosScroll,
+          props.controlsList?.includes('nofullscreen') && styles.noFullscreenButton,
+          wrapperProps?.className ? wrapperProps?.className : 'h-full',
+          'relative flex flex-col items-center justify-center overflow-hidden'
+        )}
+      >
+        <video
+          key={videoUrl}
+          ref={setVideoRef}
+          // Drag is only enabled when no controls are shown (see draggableEnabled), so scrubbing/
+          // volume on custom or native controls can never get hijacked into a video drag.
+          draggable={draggableEnabled}
+          onDragStart={
+            draggableEnabled
+              ? (e) => {
+                  setMediaDragData(e.dataTransfer, {
+                    url: videoUrl,
+                    mediaId: imageId,
+                    type: 'video',
+                  });
+                }
+              : undefined
+          }
+          className={clsx(`block cursor-pointer ${contain ? 'h-full' : 'h-auto'}`)}
+          muted={muted}
+          style={{
+            ...style,
+            // Safari won't render full size without an explicit width ¯\_(ツ)_/¯ -Manuel
+            ...(IN_SAFARI ? { width: '100%' } : {}),
+            // fadeIn videos start transparent (the .fadeIn class supplies the transition) and
+            // reveal once loaded — declarative replacement for the old imperative opacity writes.
+            ...(fadeIn ? { opacity: loaded ? 1 : 0 } : {}),
+          }}
+          onLoadedMetadata={(e) => {
+            markVideoReady();
+            const resumeAt = resumeId ? getVideoPosition(resumeId) : undefined;
+            // Skip a position at the very end — that should start over, not resume a finished video.
+            if (resumeAt !== undefined && resumeAt < e.currentTarget.duration - 0.5) {
+              e.currentTarget.currentTime = resumeAt;
+            }
+          }}
+          onTimeUpdate={
+            resumeId ? (e) => recordVideoPosition(resumeId, e.currentTarget.currentTime) : undefined
+          }
+          onLoadedData={handleLoadedData}
+          onCanPlay={markVideoReady}
+          onLoad={onLoad}
+          controls={html5Controls}
+          onClick={handleTogglePlayPause}
+          onPlaying={() => {
+            setIsPlaying(true);
+            setAutoplayFailed(false);
+            detectAudio();
+          }}
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+          onVolumeChange={(e) => {
+            // Native controls own the element's volume/mute here (custom slider/toggle update state
+            // directly, so forwarding them would double-fire). Mirror BOTH volume and muted from the
+            // element — deriving muted from volume alone fights the native mute button, which mutes
+            // while keeping volume > 0.
+            if (!html5Controls) return;
+            const video = e.currentTarget;
+            const nextMuted = video.muted || video.volume === 0;
+            const volumeMoved = volume > 0 && Math.abs(video.volume - volume) > 0.001;
+            // Our own muted/volume syncs also fire this event; only a user change leaves the element
+            // out of step with state.
+            if (nextMuted === muted && !volumeMoved) return;
+            if (video.volume > 0) setVolume(video.volume);
+            setMuted(nextMuted);
+            onMutedChange?.(nextMuted);
+          }}
+          playsInline
+          onMouseOver={!options?.anim && hoverPlay ? handleMouseEnter : undefined}
+          onMouseLeave={!options?.anim && hoverPlay ? handleMouseLeave : undefined}
+          autoPlay={!!(options?.anim && disablePoster)}
+          loop
+          poster={!disablePoster ? coverUrl : undefined}
+          disablePictureInPicture
+          preload={IN_SAFARI ? 'auto' : controls && !html5Controls ? 'metadata' : 'none'}
+          onError={onError}
+          {...props}
+        >
+          {!disableWebm && <source src={videoUrl?.replace('.mp4', '.webm')} type="video/webm" />}
+          <source src={videoUrl} type="video/mp4" />
+        </video>
+        {(autoplayFailed ||
+          (!html5Controls &&
+            !isPlaying &&
+            (showCustomControls ? !userToggled : !options?.anim))) && (
+          <IconPlayerPlayFilled
+            className={clsx(styles.playButton, 'pointer-events-none z-10 absolute-center')}
+          />
+        )}
+        {showCustomControls && (
+          <div className={styles.controls}>
+            <LegacyActionIcon
+              onClick={handleTogglePlayPause}
+              className={controlButtonClass}
+              variant="light"
+              size="lg"
+              radius="xl"
+            >
+              {isPlaying ? <IconPlayerPauseFilled size={16} /> : <IconPlayerPlayFilled size={16} />}
+            </LegacyActionIcon>
+            <div className="flex flex-nowrap gap-4">
+              {hasAudioState && (
+                <HoverCard
+                  position="top"
+                  offset={2}
+                  openDelay={0}
+                  closeDelay={100}
+                  withinPortal={false}
+                >
+                  <HoverCard.Target>
+                    <LegacyActionIcon
+                      onClick={handleToggleMuted}
+                      className={controlButtonClass}
+                      variant="light"
+                      size="lg"
+                      radius="xl"
+                    >
+                      {muted || volume === 0 ? (
+                        <IconVolumeOff size={16} />
+                      ) : (
+                        <IconVolume size={16} />
+                      )}
+                    </LegacyActionIcon>
+                  </HoverCard.Target>
+                  <HoverCard.Dropdown
+                    className={styles.volumeDropdown}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onMouseDown={(e) => e.stopPropagation()}
+                  >
+                    <input
+                      type="range"
+                      aria-label="Volume"
+                      aria-orientation="vertical"
+                      className={styles.volumeSlider}
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={muted ? 0 : volume}
+                      onChange={(e) => handleVolumeChange(e.currentTarget.valueAsNumber)}
+                    />
+                  </HoverCard.Dropdown>
+                </HoverCard>
+              )}
+              <LegacyActionIcon
+                onClick={handleToggleFullscreen}
+                className={controlButtonClass}
+                variant="light"
+                size="lg"
+                radius="xl"
+              >
+                {isFullscreen ? <IconMinimize size={16} /> : <IconMaximize size={16} />}
+              </LegacyActionIcon>
+            </div>
+          </div>
+        )}
+        {showPlayIndicator && (
+          <ThemeIcon className={styles.playIndicator} size={64} radius="xl" color="dark">
+            {!isPlaying ? <IconPlayerPauseFilled /> : <IconPlayerPlayFilled />}
+          </ThemeIcon>
+        )}
+      </div>
+    );
+
+    if (youtubeVideoId) {
+      return (
+        <YoutubeEmbed className="block size-full" style={style} videoId={youtubeVideoId} autoPlay />
+      );
+    }
+
+    if (vimeoVideoId) {
+      return (
+        <VimeoEmbed
+          className="block size-full"
+          style={style}
+          videoId={vimeoVideoId}
+          autoplay
+          fallbackContent={defaultPlayer}
+        />
+      );
+    }
+
+    return defaultPlayer;
+  }
+);
+
+EdgeVideo.displayName = 'EdgeVideo';
+
+// Using `any` here because mozHasAudio, webkitAudioDecodedByteCount, and audioTracks are not
+// standardized on the HTMLVideoElement type
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const hasAudio = (video: any): boolean => {
+  return (
+    video.mozHasAudio ||
+    Boolean(video.webkitAudioDecodedByteCount) ||
+    Boolean(video.audioTracks && video.audioTracks.length)
+  );
+};

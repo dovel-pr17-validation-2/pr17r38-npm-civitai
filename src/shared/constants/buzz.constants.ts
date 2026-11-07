@@ -1,0 +1,241 @@
+import { BuzzClientAccount } from '@civitai/orchestration-client';
+import {
+  buzzApiAccountTypes,
+  clientToApiAccountType,
+  toApiType as buzzToApiType,
+  toClientType as buzzToClientType,
+  toApiTransaction as buzzToApiTransaction,
+} from '@civitai/buzz';
+import type {
+  BuzzApiAccountType,
+  BuzzAccountType,
+  BuzzSpendType,
+  BuzzCreatorProgramType,
+  BuzzCashType,
+  LegacyBuzzType,
+} from '@civitai/buzz';
+import type { ColorDomain } from '~/shared/constants/domain.constants';
+
+// The account-type model + friendly↔API name map now live in @civitai/buzz (browser-safe,
+// shared with the SvelteKit spokes). Re-exported here so existing imports keep working.
+export { buzzApiAccountTypes };
+export type {
+  BuzzApiAccountType,
+  BuzzAccountType,
+  BuzzSpendType,
+  BuzzCreatorProgramType,
+  BuzzCashType,
+  LegacyBuzzType,
+};
+
+export enum TransactionType {
+  Tip = 0,
+  Dues = 1,
+  Generation = 2,
+  Boost = 3,
+  Incentive = 4,
+  Reward = 5,
+  Purchase = 6,
+  Refund = 7,
+  Bounty = 8,
+  BountyEntry = 9,
+  Training = 10,
+  ChargeBack = 11,
+  Donation = 12,
+  ClubMembership = 13,
+  ClubMembershipRefund = 14,
+  ClubWithdrawal = 15,
+  ClubDeposit = 16,
+  Withdrawal = 17,
+  Redeemable = 18,
+  Sell = 19,
+  AuthorizedPurchase = 20,
+  Compensation = 21,
+  Appeal = 22,
+  Bank = 23,
+  Extract = 24,
+  Fee = 25,
+  Bid = 26,
+  LicenseFee = 27,
+  /**
+   * App Blocks per-generation author fee, both legs (viewer → platform conduit at
+   * submit, conduit → author at settlement).
+   *
+   * Three things a query against this rail has to know, none recoverable from the
+   * member:
+   *
+   * 🔴 PRE-CUTOVER ROWS CARRY `Fee` (25) AND ARE NOT BACK-FILLED — operator
+   * decision, no retroactive write to the Buzz ledger. For the whole history also
+   * match `Fee` + `description LIKE 'App author fee%'`, which is how the rail was
+   * disambiguated while it shared 25 with the placement-escrow legs.
+   *
+   * 🔴 IN CLICKHOUSE THESE ROWS READ AS `'unknown_28'`, NOT `'appAuthorFee'`.
+   * The ingest MV has no name for this member. `fromClickhouseTransactionType` and
+   * `clickhouseTransactionTypePredicate` in `buzz.service.ts` resolve every
+   * spelling; a hand-written `type = …` against this rail matches nothing.
+   *
+   * 🔴 REVERSALS ARE `Refund` + `'App author fee refund'`, not this member, so a
+   * query that sums this type alone overstates net by every reversal.
+   */
+  AppAuthorFee = 28,
+  /**
+   * Creator Services escrow, every leg: buyer → account 0 on hold, account 0 → seller on
+   * release, account 0 → buyer on refund.
+   *
+   * 🔴 IN CLICKHOUSE THESE ROWS READ AS `'unknown_29'`, as `AppAuthorFee` does. Use
+   * `clickhouseTransactionTypePredicate`, never a hand-written `type = …`.
+   */
+  ServiceEscrow = 29,
+}
+
+/** Ledger queries prefix-match stored rows on this, so changing it orphans every existing author-fee row. */
+export const APP_AUTHOR_FEE_DESCRIPTION = 'App author fee';
+
+/**
+ * Generation tips are paid as `Compensation`; this externalTransactionId prefix is the only thing that
+ * tells them apart from generation compensation. Creator Studio's earnings read matches it literally,
+ * and the bankable predicate counts tips by it, so renaming it makes tips already paid unbankable.
+ */
+export const GENERATION_TIP_TRANSACTION_PREFIX = 'generation-tip-';
+
+type BuzzTypeConfig =
+  | {
+      type: 'spend';
+      value: BuzzApiAccountType;
+      purchasable?: boolean;
+      bankable?: boolean;
+      nsfw?: boolean;
+      disabled?: boolean;
+    }
+  | { type: 'bank'; value: BuzzApiAccountType }
+  | { type: 'cash'; value: BuzzApiAccountType }
+  | { type: 'legacy'; value: BuzzApiAccountType };
+
+const createBuzzTypes = <T extends Record<BuzzSpendType, BuzzSpendType>>(args: T) => args;
+// acts as an enum for easy code tracking
+export const BuzzType = createBuzzTypes({
+  blue: 'blue',
+  green: 'green',
+  yellow: 'yellow',
+  red: 'red',
+});
+
+const BuzzClientAccountMap: Record<BuzzSpendType, BuzzClientAccount> = {
+  blue: BuzzClientAccount.BLUE,
+  green: BuzzClientAccount.GREEN,
+  yellow: BuzzClientAccount.YELLOW,
+  red: BuzzClientAccount.FAKE_RED,
+};
+
+// `value` is sourced from the package's canonical friendly→API map (single source, no drift);
+// the UX flags (nsfw/purchasable/bankable/disabled) stay app-side.
+const buzzTypeConfig: Record<BuzzAccountType, BuzzTypeConfig> = {
+  blue: { type: 'spend', value: clientToApiAccountType.blue },
+  green: { type: 'spend', value: clientToApiAccountType.green, bankable: true, purchasable: true },
+  yellow: {
+    type: 'spend',
+    value: clientToApiAccountType.yellow,
+    nsfw: true,
+    bankable: true,
+    purchasable: true,
+  },
+  red: {
+    type: 'spend',
+    value: clientToApiAccountType.red,
+    nsfw: true,
+    purchasable: true,
+    disabled: true,
+  },
+  creatorProgramBank: { type: 'bank', value: clientToApiAccountType.creatorProgramBank },
+  creatorProgramBankGreen: { type: 'bank', value: clientToApiAccountType.creatorProgramBankGreen },
+  cashPending: { type: 'cash', value: clientToApiAccountType.cashPending },
+  cashSettled: { type: 'cash', value: clientToApiAccountType.cashSettled },
+  club: { type: 'legacy', value: clientToApiAccountType.club },
+};
+
+export const buzzAccountTypes = Object.keys(buzzTypeConfig) as BuzzAccountType[];
+// CH-side accountType aliases that resolve to the cashSettled buzz account.
+export const CASH_SETTLED_ALIASES = new Set<string>(['CashSettled', 'cashSettled', 'cash-settled']);
+export const buzzSpendTypes = buzzAccountTypes.filter(
+  (type) => buzzTypeConfig[type].type === 'spend' && !buzzTypeConfig[type].disabled
+) as BuzzSpendType[];
+export const buzzBankTypes = buzzSpendTypes.filter((type) => {
+  const config = buzzTypeConfig[type];
+  return config.type === 'spend' && config.bankable;
+}) as BuzzSpendType[];
+/** Quoted list for `IN (...)` in the ClickHouse buzzTransactions queries. */
+export const buzzBankTypesSql = buzzBankTypes.map((type) => `'${type}'`).join(', ');
+export const buzzPurchaseTypes = buzzSpendTypes.filter((type) => {
+  const config = buzzTypeConfig[type];
+  return config.type === 'spend' && config.purchasable;
+});
+
+/** The currencies a real-money purchase can be credited in. Notably excludes `blue`, which is free. */
+export type PurchasableBuzzType = Extract<BuzzSpendType, 'green' | 'yellow'>;
+
+/**
+ * Which currency a real-money Buzz purchase made on `domain` is credited in. The browser applies the
+ * same rule when it builds the payment-intent metadata; the server re-derives it so a modified client
+ * can't pick a colour it didn't pay for.
+ */
+export function deriveDomainBuzzType(domain: ColorDomain): PurchasableBuzzType {
+  return domain === 'green' ? 'green' : 'yellow';
+}
+
+/**
+ * Narrow a buzz type read back off a payment provider's metadata bag. Provider metadata is
+ * stringly-typed on the wire, and intents created before the server started stamping `buzzType` may
+ * still carry whatever the client asked for — including `blue`, the free currency.
+ */
+export function coercePurchasedBuzzType(value: unknown): PurchasableBuzzType {
+  return value === 'green' ? 'green' : 'yellow';
+}
+
+export class BuzzTypes {
+  static getConfig(type: BuzzSpendType) {
+    return buzzTypeConfig[type];
+  }
+  static toApiType(type: BuzzAccountType): BuzzApiAccountType {
+    return buzzToApiType(type);
+  }
+  static toClientType(value: string): BuzzAccountType {
+    return buzzToClientType(value);
+  }
+  static toSpendType(value: string): BuzzSpendType {
+    const type = this.toClientType(value);
+    if (!buzzSpendTypes.includes(type as BuzzSpendType))
+      throw new Error(`unsupported buzz type: ${value}`);
+    return type as BuzzSpendType;
+  }
+  static toOrchestratorType(value: BuzzSpendType): BuzzClientAccount;
+  static toOrchestratorType(value: BuzzSpendType[]): BuzzClientAccount[];
+  static toOrchestratorType(
+    value: BuzzSpendType | BuzzSpendType[]
+  ): BuzzClientAccount | BuzzClientAccount[] {
+    if (Array.isArray(value)) return value.map((x) => BuzzClientAccountMap[x]);
+    return BuzzClientAccountMap[value];
+  }
+
+  static getApiTransaction<
+    T extends { fromAccountType?: BuzzAccountType; toAccountType?: BuzzAccountType }
+  >(transaction: T) {
+    return buzzToApiTransaction(transaction);
+  }
+}
+
+export const buzzConstants = {
+  minChargeAmount: 100, // $1.00
+  minStripeChargeAmount: 500, // $5.00
+  maxChargeAmount: 99999999, // $999,999.99
+  cutoffDate: new Date('2023-10-17T00:00:00.000Z'),
+  onboardingBonusAmount: 100,
+  referralBonusAmount: 500,
+  maxTipAmount: 100000000,
+  minTipAmount: 50,
+  maxEntityTip: 2000,
+  buzzDollarRatio: 1000,
+  platformFeeRate: 3000, // 30.00%. Divide by 10000
+  minBuzzWithdrawal: 100000,
+  maxBuzzWithdrawal: 100000000,
+  generationBuzzChargingStartDate: new Date('2024-04-04T00:00:00.000Z'),
+};

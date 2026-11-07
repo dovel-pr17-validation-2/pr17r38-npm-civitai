@@ -1,0 +1,1012 @@
+import React from 'react';
+import type {
+  TrainingDetailsBaseModel,
+  TrainingDetailsParams,
+} from '~/server/schema/model-version.schema';
+import {
+  AI_TOOLKIT_SAVE_EVERY,
+  engineTypes,
+  type EngineTypes,
+  loraTypes,
+  lrSchedulerTypes,
+  optimizerTypes,
+  type OptimizerTypes,
+} from '~/utils/training';
+
+// nb: keep these in line with what is set by the worker
+export const optimizerArgMap: { [key in OptimizerTypes]: string } = {
+  Adafactor: 'scale_parameter=False, relative_step=False, warmup_init=False',
+  AdamW8Bit: 'weight_decay=0.1',
+  Prodigy: 'weight_decay=0.5, decouple=True, betas=0.9,0.99, use_bias_correction=False',
+  Automagic: '(empty)',
+};
+export const optimizerArgMapFlux: { [key in OptimizerTypes]: { [key in EngineTypes]: string } } = {
+  Adafactor: {
+    kohya: optimizerArgMap.Adafactor,
+    musubi: '(empty)',
+    rapid: '(empty)',
+    'flux2-dev': '(empty)',
+    'flux2-dev-edit': '(empty)',
+    'ai-toolkit': '(empty)',
+  },
+  AdamW8Bit: {
+    kohya: 'weight_decay=0.01, eps=0.00000001, betas=(0.9, 0.999)',
+    musubi: '(empty)',
+    rapid: '(empty)',
+    'flux2-dev': '(empty)',
+    'flux2-dev-edit': '(empty)',
+    'ai-toolkit': '(empty)',
+  },
+  Prodigy: {
+    kohya: optimizerArgMap.Prodigy,
+    musubi: '(empty)',
+    rapid: '(empty)',
+    'flux2-dev': '(empty)',
+    'flux2-dev-edit': '(empty)',
+    'ai-toolkit': '(empty)',
+  },
+  Automagic: {
+    kohya: '(empty)',
+    musubi: '(empty)',
+    rapid: '(empty)',
+    'flux2-dev': '(empty)',
+    'flux2-dev-edit': '(empty)',
+    'ai-toolkit': '(empty)',
+  },
+};
+export const optimizerArgMapVideo: { [key in OptimizerTypes]: string } = {
+  Adafactor: '',
+  AdamW8Bit: '',
+  Prodigy: '',
+  Automagic: '',
+};
+
+type BaseTrainingSettingsType = {
+  name: keyof TrainingDetailsParams;
+  label: string;
+  hint: React.ReactNode;
+  disabled?: boolean;
+};
+
+// nb: could allow the other for either allowing custom or being strict
+type TypeTrainingBaseModel = TrainingDetailsBaseModel; // TrainingDetailsBaseModelList
+
+type SelectTrainingSettingsType = {
+  type: 'select';
+  options: readonly string[];
+  default: string;
+  overrides?: {
+    [key in TypeTrainingBaseModel]?: {
+      [key in EngineTypes | 'all']?: Partial<
+        Pick<BaseTrainingSettingsType, 'disabled' | 'hint'> &
+          Omit<SelectTrainingSettingsType, 'type' | 'overrides' | 'options'> // could allow options override
+      >;
+    };
+  };
+};
+type BoolTrainingSettingsType = {
+  type: 'bool';
+  default: boolean;
+  overrides?: {
+    [key in TypeTrainingBaseModel]?: {
+      [key in EngineTypes | 'all']?: Partial<
+        Pick<BaseTrainingSettingsType, 'disabled' | 'hint'> &
+          Omit<BoolTrainingSettingsType, 'type' | 'overrides'>
+      >;
+    };
+  };
+};
+export type NumberTrainingSettingsType = {
+  type: 'int' | 'number';
+  min: number;
+  max: number;
+  step: number;
+  default: number | undefined;
+  overrides?: {
+    [key in TypeTrainingBaseModel]?: {
+      [key in EngineTypes | 'all']?: Partial<
+        Pick<BaseTrainingSettingsType, 'disabled' | 'hint'> &
+          Omit<NumberTrainingSettingsType, 'type' | 'overrides' | 'step'> // could allow step override
+      >;
+    };
+  };
+};
+type StringTrainingSettingsType = {
+  type: 'string';
+  default: string;
+  overrides?: {
+    [key in TypeTrainingBaseModel]?: {
+      [key in EngineTypes | 'all']?: Partial<
+        Pick<BaseTrainingSettingsType, 'disabled' | 'hint'> &
+          Omit<StringTrainingSettingsType, 'type' | 'overrides'>
+      >;
+    };
+  };
+};
+
+export type TrainingSettingsType = BaseTrainingSettingsType &
+  (
+    | SelectTrainingSettingsType
+    | BoolTrainingSettingsType
+    | NumberTrainingSettingsType
+    | StringTrainingSettingsType
+  );
+
+export const trainingSettings: TrainingSettingsType[] = [
+  {
+    name: 'engine',
+    label: 'Engine',
+    hint: "The training script used. In most cases, you'll want Kohya.",
+    type: 'select',
+    default: 'kohya',
+    options: engineTypes,
+    disabled: true,
+    overrides: {
+      flux_dev: { all: { disabled: false } },
+      flux2_dev: { all: { disabled: true, default: 'flux2-dev' } },
+      // flux2_dev_edit: { all: { disabled: true, default: 'flux2-dev-edit' } }, // Disabled for now
+      chroma: { all: { disabled: false } },
+      hy_720_fp8: { all: { default: 'musubi' } },
+      wan_2_1_i2v_14b_720p: { all: { default: 'ai-toolkit' } },
+      wan_2_1_t2v_14b: { all: { default: 'ai-toolkit' } },
+      wan_2_2_t2v_a14b: { all: { default: 'ai-toolkit' } },
+      qwen_image: { all: { default: 'ai-toolkit' } },
+      zimageturbo: { all: { default: 'ai-toolkit' } },
+      zimagebase: { all: { default: 'ai-toolkit' } },
+      flux2klein_4b: { all: { default: 'ai-toolkit' } },
+      flux2klein_9b: { all: { default: 'ai-toolkit' } },
+      ltx2: { all: { default: 'ai-toolkit' } },
+      ltx23: { all: { default: 'ai-toolkit' } },
+      ltx25: { all: { default: 'ai-toolkit' } },
+      minimaxh3: { all: { default: 'ai-toolkit' } },
+      hidream_o1: { all: { default: 'ai-toolkit' } },
+      anima: { all: { default: 'ai-toolkit' } },
+      boogu: { all: { default: 'ai-toolkit' } },
+      ming: { all: { default: 'ai-toolkit' } },
+      qwen21: { all: { default: 'ai-toolkit' } },
+      krea2: { all: { default: 'ai-toolkit' } },
+      mageflow: { all: { default: 'ai-toolkit' } },
+      ideogram4: { all: { default: 'ai-toolkit' } },
+      acestep_15: { all: { default: 'ai-toolkit' } },
+      yue2: { all: { default: 'ai-toolkit' } },
+      acestep_15_xl_base: { all: { default: 'ai-toolkit' } },
+      acestep_15_xl_sft: { all: { default: 'ai-toolkit' } },
+    },
+  },
+  {
+    name: 'maxTrainEpochs',
+    label: 'Epochs',
+    hint: 'An epoch is one set of learning. By default, we will save a maximum of 20 epochs (evenly distributed), and they are all available for download.',
+    type: 'int',
+    default: 10,
+    min: 3,
+    max: 50,
+    step: 1,
+    overrides: {
+      sdxl: { all: { min: 1 } },
+      pony: { all: { min: 1 } },
+      illustrious: { all: { min: 1 } },
+      flux_dev: {
+        kohya: { default: 5 },
+        rapid: { default: 1, min: 1, max: 1 },
+        'ai-toolkit': { default: 5 },
+      },
+      flux2_dev: {
+        all: { default: 1, min: 1, max: 1 },
+      },
+      // flux2_dev_edit: { all: { default: 1, min: 1, max: 1 } }, // Disabled for now
+      chroma: {
+        all: { default: 5 },
+      },
+      qwen_image: {
+        all: { default: 5 },
+      },
+      hidream_o1: {
+        all: { default: 5 },
+      },
+      anima: {
+        all: { default: 5 },
+      },
+      boogu: {
+        all: { default: 5 },
+      },
+      ming: {
+        all: { default: 5 },
+      },
+      qwen21: {
+        all: { default: 5 },
+      },
+      // Krea 2 uses the standard 10 epochs (= base default) per the model owners' spec.
+      ltx2: {
+        all: { min: 1, max: 20 },
+      },
+      ltx23: {
+        all: { min: 1, max: 20 },
+      },
+      ltx25: {
+        all: { min: 1, max: 20 },
+      },
+      minimaxh3: {
+        all: { min: 1, max: 20 },
+      },
+      // sd3_medium: { all: { default: 5 } },
+      // sd3_large: { all: { default: 5 } },
+      hy_720_fp8: { all: { min: 1, max: 20 } },
+      wan_2_1_i2v_14b_720p: { all: { min: 1, max: 20 } },
+      wan_2_1_t2v_14b: { all: { min: 1, max: 20 } },
+      wan_2_2_t2v_a14b: { all: { min: 1, max: 20 } },
+      acestep_15: { all: { default: 5 } },
+      yue2: { all: { default: 5 } },
+      acestep_15_xl_base: { all: { default: 5 } },
+      acestep_15_xl_sft: { all: { default: 5 } },
+    },
+  },
+  {
+    name: 'numRepeats',
+    label: 'Num Repeats',
+    hint: 'Num Repeats defines how many times each individual image gets put into VRAM. As opposed to batch size, which is how many images are placed into VRAM at once.',
+    type: 'int',
+    default: undefined,
+    min: 1,
+    max: 5000,
+    step: 1,
+  },
+  {
+    name: 'trainBatchSize',
+    label: 'Train Batch Size',
+    hint: 'Batch size is the number of images that will be placed into VRAM at once. A batch size of 2 will train two images at a time, simultaneously.',
+    type: 'int',
+    // TODO [bw] this should have a default/max driven by the resolution they've selected (e.g. 512 -> 9, 768 -> 6, 1024 -> 4 basically cap lower than 4700)
+    default: 6,
+    min: 1,
+    max: 9,
+    step: 1,
+    overrides: {
+      realistic: { all: { default: 2, max: 2 } },
+      sdxl: { all: { default: 4, max: 4 } },
+      pony: { all: { default: 5, max: 5 } },
+      illustrious: { all: { default: 4, max: 4 } },
+      flux_dev: {
+        kohya: { default: 4, max: 4 },
+      },
+      chroma: {
+        all: { default: 4, max: 4 },
+      },
+      qwen_image: {
+        all: { default: 4, max: 4 },
+      },
+      zimageturbo: {
+        all: { default: 4, max: 4 },
+      },
+      zimagebase: {
+        all: { default: 4, max: 4 },
+      },
+      flux2klein_4b: {
+        all: { default: 4, max: 4 },
+      },
+      flux2klein_9b: {
+        all: { default: 4, max: 4 },
+      },
+      hidream_o1: {
+        all: { default: 4, max: 4 },
+      },
+      anima: {
+        all: { default: 4, max: 4 },
+      },
+      // Boogu batch size is fixed at 1 for this ecosystem (per @civitai/orchestration-client).
+      boogu: {
+        all: { default: 1, min: 1, max: 1 },
+      },
+      ming: {
+        all: { default: 1, min: 1, max: 1 },
+      },
+      qwen21: {
+        all: { default: 1, min: 1, max: 1 },
+      },
+      // Krea 2 batch size is fixed at 1 for this ecosystem (per @civitai/orchestration-client).
+      krea2: {
+        all: { default: 1, min: 1, max: 1 },
+      },
+      // Mage-Flow batch size is fixed at 1 for this ecosystem (per @civitai/orchestration-client).
+      mageflow: {
+        all: { default: 1, min: 1, max: 1 },
+      },
+      // Ideogram 4 batch size is fixed at 1 for this ecosystem (per @civitai/orchestration-client).
+      ideogram4: {
+        all: { default: 1, min: 1, max: 1 },
+      },
+      ltx2: { all: { default: 2, min: 1, max: 4 } },
+      ltx23: { all: { default: 2, min: 1, max: 4 } },
+      ltx25: { all: { default: 2, min: 1, max: 4 } },
+      // MiniMax H3 batch size is fixed at 1 for this ecosystem (per @civitai/orchestration-client).
+      minimaxh3: { all: { default: 1, min: 1, max: 1 } },
+      // sd3_medium: { all: { default: 4, max: 4 } },
+      // sd3_large: { all: { default: 4, max: 4 } },
+      hy_720_fp8: { all: { default: 2, min: 1, max: 4 } },
+      wan_2_1_i2v_14b_720p: { all: { default: 2, min: 1, max: 4 } },
+      wan_2_1_t2v_14b: { all: { default: 2, min: 1, max: 4 } },
+      wan_2_2_t2v_a14b: { all: { default: 2, min: 1, max: 4 } },
+      acestep_15: { all: { default: 1, min: 1, max: 4 } },
+      yue2: { all: { default: 1, min: 1, max: 1 } },
+      acestep_15_xl_base: { all: { default: 1, min: 1, max: 4 } },
+      acestep_15_xl_sft: { all: { default: 1, min: 1, max: 4 } },
+    },
+  },
+  {
+    name: 'targetSteps',
+    label: 'Steps',
+    hint: (
+      <>
+        The total number of training steps. With AI Toolkit this is the primary control over
+        training length and what pricing is based on &mdash; set it directly.
+        <br />
+        For other engines it is computed automatically from (epochs &times; # of images &times;
+        repeats / batch size). The maximum allowed is 10,000 steps.
+      </>
+    ),
+    type: 'int',
+    // Steps-based pricing prefill (AI Toolkit). For Kohya-style engines this default is
+    // immediately overwritten by the auto-calc in AdvancedSettings.
+    default: 2000,
+    min: 1,
+    max: 10000,
+    step: 1,
+    // Kept disabled by default (Kohya auto-computes); AdvancedSettings makes it editable
+    // for the AI Toolkit engine where steps is the primary, user-set length knob.
+    disabled: true,
+    overrides: {
+      yue2: { all: { default: 3000 } },
+      ltx2: { all: { default: 3000 } },
+      ltx23: { all: { default: 3000 } },
+      ltx25: { all: { default: 3000 } },
+      minimaxh3: { all: { default: 3000 } },
+      anima: { all: { default: 1500 } },
+      boogu: { all: { default: 3000 } },
+      ming: { all: { default: 3000 } },
+      qwen21: { all: { default: 3000 } },
+    },
+  },
+  {
+    name: 'saveEvery',
+    label: 'Save every',
+    hint: (
+      <>
+        How often (in steps) a checkpoint is saved. Each saved checkpoint is a downloadable epoch
+        you can pick from afterwards.
+        <br />
+        Lower values save more checkpoints (e.g. 3,000 steps saving every 250 produces 12). Has a
+        smaller effect on cost than Steps.
+      </>
+    ),
+    type: 'int',
+    // Default mirrors targetSteps / 10 checkpoints; the seeding effects recompute it per run.
+    // Bounds come from AI_TOOLKIT_SAVE_EVERY so the input and the seeds share one source.
+    default: AI_TOOLKIT_SAVE_EVERY.default,
+    min: AI_TOOLKIT_SAVE_EVERY.min,
+    max: AI_TOOLKIT_SAVE_EVERY.max,
+    step: AI_TOOLKIT_SAVE_EVERY.step,
+    overrides: {
+      yue2: { all: { default: 300 } },
+      ltx2: { all: { default: 300 } },
+      ltx23: { all: { default: 300 } },
+      ltx25: { all: { default: 300 } },
+      minimaxh3: { all: { default: 300 } },
+      anima: { all: { default: 150 } },
+      boogu: { all: { default: 300 } },
+      ming: { all: { default: 300 } },
+      qwen21: { all: { default: 300 } },
+    },
+  },
+  {
+    name: 'resolution',
+    label: 'Resolution',
+    hint: 'Specify the maximum resolution of training images. If the training images exceed the resolution specified here, they will be scaled down to this resolution.',
+    type: 'int',
+    default: 512,
+    min: 512,
+    max: 1024,
+    step: 64,
+    overrides: {
+      sdxl: { all: { min: 1024, max: 2048, default: 1024 } },
+      pony: { all: { min: 1024, max: 2048, default: 1024 } },
+      illustrious: { all: { min: 1024, max: 2048, default: 1024 } },
+      hy_720_fp8: { all: { disabled: true, default: 960, min: 960, max: 960 } }, // TODO 960x544
+      wan_2_1_i2v_14b_720p: { all: { disabled: true, default: 960, min: 960, max: 960 } }, // TODO 960x544
+      wan_2_1_t2v_14b: { all: { disabled: true, default: 960, min: 960, max: 960 } }, // TODO 960x544
+      wan_2_2_t2v_a14b: { all: { disabled: true, default: 960, min: 960, max: 960 } }, // TODO 960x544
+      zimageturbo: { all: { default: 1024 } },
+      zimagebase: { all: { default: 1024 } },
+      flux2klein_4b: { all: { default: 1024 } },
+      flux2klein_9b: { all: { default: 1024 } },
+      hidream_o1: { all: { default: 1024 } },
+      anima: { all: { default: 1024 } },
+      boogu: { all: { default: 1024 } },
+      ming: { all: { default: 1024 } },
+      qwen21: { all: { default: 1024 } },
+      krea2: { all: { default: 1024 } },
+      mageflow: { all: { default: 1024 } },
+      ideogram4: { all: { default: 1024 } },
+      ltx2: { all: { disabled: true, default: 960, min: 960, max: 960 } },
+      ltx23: { all: { disabled: true, default: 960, min: 960, max: 960 } },
+      ltx25: { all: { disabled: true, default: 960, min: 960, max: 960 } },
+      minimaxh3: { all: { disabled: true, default: 960, min: 960, max: 960 } },
+      // Audio has no spatial resolution — disable but keep a value the WhatIf schema accepts.
+      acestep_15: { all: { disabled: true, default: 512, min: 512, max: 512 } },
+      yue2: { all: { disabled: true, default: 512, min: 512, max: 512 } },
+      acestep_15_xl_base: { all: { disabled: true, default: 512, min: 512, max: 512 } },
+      acestep_15_xl_sft: { all: { disabled: true, default: 512, min: 512, max: 512 } },
+    },
+  },
+  {
+    name: 'loraType',
+    label: 'LoRA Type',
+    hint: 'Specifies the type of LoRA learning. Only standard LoRA is currently supported.',
+    type: 'select',
+    default: 'lora',
+    options: loraTypes,
+    disabled: true,
+  },
+  {
+    name: 'enableBucket',
+    label: 'Enable Bucket',
+    hint: 'Sorts images into buckets by size for the purposes of training. If your training images are all the same size, you can turn this option off, but leaving it on has no effect.',
+    type: 'bool',
+    default: true,
+  },
+  {
+    name: 'shuffleCaption',
+    label: 'Shuffle Tags',
+    hint: 'Randomly changes the order of your tags during training. The intent of shuffling is to improve learning. If you are using captions (sentences), this option has no meaning.',
+    type: 'bool',
+    default: false,
+    overrides: {
+      flux_dev: { all: { disabled: true } },
+      flux2_dev: { all: { disabled: true } },
+      // flux2_dev_edit: { all: { disabled: true } }, // Disabled for now
+      chroma: { all: { disabled: true } },
+      qwen_image: { all: { disabled: true } },
+      zimageturbo: { all: { disabled: true } },
+      zimagebase: { all: { disabled: true } },
+      flux2klein_4b: { all: { disabled: true } },
+      flux2klein_9b: { all: { disabled: true } },
+      ltx2: { all: { disabled: true } },
+      ltx23: { all: { disabled: true } },
+      ltx25: { all: { disabled: true } },
+      minimaxh3: { all: { disabled: true } },
+      // sd3_medium: { all: { disabled: true } },
+      // sd3_large: { all: { disabled: true } },
+      hy_720_fp8: { all: { disabled: true } },
+      wan_2_1_i2v_14b_720p: { all: { disabled: true } },
+      wan_2_1_t2v_14b: { all: { disabled: true } },
+      wan_2_2_t2v_a14b: { all: { disabled: true } },
+      hidream_o1: { all: { disabled: true } },
+      anima: { all: { disabled: true } },
+      boogu: { all: { disabled: true } },
+      ming: { all: { disabled: true } },
+      qwen21: { all: { disabled: true } },
+      krea2: { all: { disabled: true } },
+      mageflow: { all: { disabled: true } },
+      ideogram4: { all: { disabled: true } },
+      acestep_15: { all: { disabled: true } },
+      yue2: { all: { disabled: true } },
+      acestep_15_xl_base: { all: { disabled: true } },
+      acestep_15_xl_sft: { all: { disabled: true } },
+    },
+  },
+  {
+    name: 'keepTokens',
+    label: 'Keep Tokens',
+    hint: (
+      <>
+        If your training images have tags, you can randomly shuffle them (see &quot;Shuffle
+        Tags&quot; option for details). However, if you have words that you want to keep at the
+        beginning, you can use this option to specify how many to keep.
+        <br />
+        This option does nothing if the &quot;Shuffle Tags&quot; option is off.
+      </>
+    ),
+    type: 'int',
+    default: 0,
+    min: 0,
+    max: 3,
+    step: 1,
+    overrides: {
+      flux_dev: { all: { disabled: true } },
+      flux2_dev: { all: { disabled: true } },
+      // flux2_dev_edit: { all: { disabled: true } }, // Disabled for now
+      chroma: { all: { disabled: true } },
+      qwen_image: { all: { disabled: true } },
+      zimageturbo: { all: { disabled: true } },
+      zimagebase: { all: { disabled: true } },
+      flux2klein_4b: { all: { disabled: true } },
+      flux2klein_9b: { all: { disabled: true } },
+      ltx2: { all: { disabled: true } },
+      ltx23: { all: { disabled: true } },
+      ltx25: { all: { disabled: true } },
+      minimaxh3: { all: { disabled: true } },
+      // sd3_medium: { all: { disabled: true } },
+      // sd3_large: { all: { disabled: true } },
+      hy_720_fp8: { all: { disabled: true } },
+      wan_2_1_i2v_14b_720p: { all: { disabled: true } },
+      wan_2_1_t2v_14b: { all: { disabled: true } },
+      wan_2_2_t2v_a14b: { all: { disabled: true } },
+      hidream_o1: { all: { disabled: true } },
+      anima: { all: { disabled: true } },
+      boogu: { all: { disabled: true } },
+      ming: { all: { disabled: true } },
+      qwen21: { all: { disabled: true } },
+      krea2: { all: { disabled: true } },
+      mageflow: { all: { disabled: true } },
+      ideogram4: { all: { disabled: true } },
+      acestep_15: { all: { disabled: true } },
+      yue2: { all: { disabled: true } },
+      acestep_15_xl_base: { all: { disabled: true } },
+      acestep_15_xl_sft: { all: { disabled: true } },
+    },
+  },
+  {
+    name: 'clipSkip',
+    label: 'Clip Skip',
+    hint: 'Determines which layer\'s vector output will be used. There are 12 layers, and setting the skip will select "xth from the end" of the total layers. For anime, we use 2. For everything else, 1.',
+    type: 'int',
+    default: 1,
+    min: 1,
+    max: 4,
+    step: 1,
+    overrides: {
+      anime: { all: { default: 2 } },
+      hy_720_fp8: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      wan_2_1_i2v_14b_720p: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      wan_2_1_t2v_14b: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      wan_2_2_t2v_a14b: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      ltx2: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      ltx23: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      ltx25: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      minimaxh3: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      acestep_15: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      yue2: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      acestep_15_xl_base: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      acestep_15_xl_sft: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+    },
+  },
+  {
+    name: 'flipAugmentation',
+    label: 'Flip Augmentation',
+    hint: 'If this option is turned on, the image will be horizontally flipped randomly. It can learn left and right angles, which is useful when you want to learn symmetrical people and objects.',
+    type: 'bool',
+    default: false,
+    overrides: {
+      hy_720_fp8: { all: { disabled: true } },
+      wan_2_1_i2v_14b_720p: { all: { disabled: true } },
+      wan_2_1_t2v_14b: { all: { disabled: true } },
+      wan_2_2_t2v_a14b: { all: { disabled: true } },
+      ltx2: { all: { disabled: true } },
+      ltx23: { all: { disabled: true } },
+      ltx25: { all: { disabled: true } },
+      minimaxh3: { all: { disabled: true } },
+      acestep_15: { all: { disabled: true } },
+      yue2: { all: { disabled: true } },
+      acestep_15_xl_base: { all: { disabled: true } },
+      acestep_15_xl_sft: { all: { disabled: true } },
+    },
+  },
+  {
+    name: 'unetLR',
+    label: 'Unet LR',
+    hint: 'Sets the learning rate for U-Net. This is the learning rate when performing additional learning on each attention block (and other blocks depending on the setting) in U-Net.',
+    type: 'number',
+    default: 5e-4,
+    min: 0,
+    max: 1,
+    step: 1e-5,
+    overrides: {
+      // sd3_medium: { all: { default: 1e-5 } },
+      // sd3_large: { all: { default: 1e-5 } },
+      hy_720_fp8: { all: { default: 2e-4, min: 1e-4, max: 6e-4 } },
+      wan_2_1_i2v_14b_720p: { all: { default: 2e-4, min: 1e-4, max: 6e-4 } },
+      wan_2_1_t2v_14b: { all: { default: 2e-4, min: 1e-4, max: 6e-4 } },
+      wan_2_2_t2v_a14b: { all: { default: 2e-4, min: 1e-4, max: 6e-4 } },
+      ltx2: { all: { default: 2e-4, min: 1e-4, max: 6e-4 } },
+      ltx23: { all: { default: 1e-4, min: 1e-4, max: 6e-4 } },
+      ltx25: { all: { default: 1e-4, min: 1e-4, max: 6e-4 } },
+      minimaxh3: { all: { default: 1e-4, min: 1e-4, max: 6e-4 } },
+      zimageturbo: { all: { default: 1e-4 } },
+      zimagebase: { all: { default: 1e-6 } },
+      flux2klein_4b: { all: { default: 1e-4 } },
+      flux2klein_9b: { all: { default: 1e-4 } },
+      hidream_o1: { all: { default: 1e-4 } },
+      anima: { all: { default: 1e-4 } },
+      boogu: { all: { default: 1e-4 } },
+      ming: { all: { default: 1e-4 } },
+      qwen21: { all: { default: 1e-4 } },
+      krea2: { all: { default: 1e-4 } },
+      mageflow: { all: { default: 1e-4 } },
+      ideogram4: { all: { default: 1e-4 } },
+      acestep_15: { all: { default: 1e-4 } },
+      yue2: { all: { default: 1e-4 } },
+      acestep_15_xl_base: { all: { default: 1e-4 } },
+      acestep_15_xl_sft: { all: { default: 1e-4 } },
+    },
+  },
+  {
+    name: 'textEncoderLR',
+    label: 'Text Encoder LR',
+    hint: 'Sets the learning rate for the text encoder. The effect of additional training on text encoders affects the entire U-Net.',
+    type: 'number',
+    default: 5e-5,
+    min: 0,
+    max: 1,
+    step: 1e-5,
+    overrides: {
+      anime: { all: { default: 1e-4 } },
+      flux_dev: { all: { disabled: true, default: 0, max: 0 } },
+      flux2_dev: { all: { disabled: true, default: 0, max: 0 } },
+      // flux2_dev_edit: { all: { disabled: true, default: 0, max: 0 } }, // Disabled for now
+      chroma: { all: { disabled: true, default: 0, max: 0 } },
+      qwen_image: { all: { disabled: true, default: 0, max: 0 } },
+      zimageturbo: { all: { disabled: true, default: 0, max: 0 } },
+      zimagebase: { all: { disabled: true, default: 0, max: 0 } },
+      flux2klein_4b: { all: { disabled: true, default: 0, max: 0 } },
+      flux2klein_9b: { all: { disabled: true, default: 0, max: 0 } },
+      ltx2: { all: { disabled: true, default: 0, max: 0 } },
+      ltx23: { all: { disabled: true, default: 0, max: 0 } },
+      ltx25: { all: { disabled: true, default: 0, max: 0 } },
+      minimaxh3: { all: { disabled: true, default: 0, max: 0 } },
+      // sd3_medium: { all: { disabled: true, default: 0, max: 0 } },
+      // sd3_large: { all: { disabled: true, default: 0, max: 0 } },
+      hy_720_fp8: { all: { disabled: true, default: 0, max: 0 } },
+      wan_2_1_i2v_14b_720p: { all: { disabled: true, default: 0, max: 0 } },
+      wan_2_1_t2v_14b: { all: { disabled: true, default: 0, max: 0 } },
+      wan_2_2_t2v_a14b: { all: { disabled: true, default: 0, max: 0 } },
+      hidream_o1: { all: { disabled: true, default: 0, max: 0 } },
+      anima: { all: { disabled: true, default: 0, max: 0 } },
+      boogu: { all: { disabled: true, default: 0, max: 0 } },
+      ming: { all: { disabled: true, default: 0, max: 0 } },
+      qwen21: { all: { disabled: true, default: 0, max: 0 } },
+      krea2: { all: { disabled: true, default: 0, max: 0 } },
+      mageflow: { all: { disabled: true, default: 0, max: 0 } },
+      ideogram4: { all: { disabled: true, default: 0, max: 0 } },
+      acestep_15: { all: { disabled: true, default: 0, max: 0 } },
+      yue2: { all: { disabled: true, default: 0, max: 0 } },
+      acestep_15_xl_base: { all: { disabled: true, default: 0, max: 0 } },
+      acestep_15_xl_sft: { all: { disabled: true, default: 0, max: 0 } },
+    },
+  },
+  {
+    name: 'lrScheduler',
+    label: 'LR Scheduler',
+    hint: 'You can change the learning rate in the middle of learning. A scheduler is a setting for how to change the learning rate.',
+    type: 'select',
+    default: 'cosine_with_restarts',
+    options: lrSchedulerTypes,
+    overrides: {
+      sd_1_5: { 'ai-toolkit': { default: 'cosine' } },
+      anime: { 'ai-toolkit': { default: 'cosine' } },
+      semi: { 'ai-toolkit': { default: 'cosine' } },
+      realistic: { 'ai-toolkit': { default: 'cosine' } },
+      sdxl: { 'ai-toolkit': { default: 'cosine' } },
+      pony: { all: { default: 'cosine' } },
+      illustrious: { 'ai-toolkit': { default: 'cosine' } },
+      hy_720_fp8: { all: { default: 'constant' } },
+      wan_2_1_i2v_14b_720p: { all: { default: 'constant' } },
+      wan_2_1_t2v_14b: { all: { default: 'constant' } },
+      wan_2_2_t2v_a14b: { all: { default: 'constant' } },
+      ltx2: { all: { default: 'constant' } },
+      ltx23: { all: { default: 'cosine' } },
+      ltx25: { all: { default: 'cosine' } },
+      minimaxh3: { all: { default: 'constant' } },
+      zimageturbo: { all: { default: 'constant' } },
+      zimagebase: { all: { default: 'cosine' } },
+      flux2klein_4b: { all: { default: 'constant' } },
+      flux2klein_9b: { all: { default: 'constant' } },
+      hidream_o1: { all: { default: 'constant' } },
+      anima: { all: { default: 'constant' } },
+      boogu: { all: { default: 'constant' } },
+      ming: { all: { default: 'constant' } },
+      qwen21: { all: { default: 'constant' } },
+      krea2: { all: { default: 'constant' } },
+      mageflow: { all: { default: 'constant' } },
+      ideogram4: { all: { default: 'constant' } },
+      acestep_15: { all: { default: 'constant' } },
+      yue2: { all: { default: 'constant' } },
+      acestep_15_xl_base: { all: { default: 'constant' } },
+      acestep_15_xl_sft: { all: { default: 'constant' } },
+    },
+  },
+  {
+    // TODO [bw] actually conditional on lrScheduler, cosine_with_restarts/polynomial
+    name: 'lrSchedulerNumCycles',
+    label: 'LR Scheduler Cycles',
+    hint: 'This option specifies how many cycles the scheduler runs during training. It is only used when "cosine_with_restarts" or "polynomial" is used as the scheduler.',
+    type: 'int',
+    default: 3,
+    min: 1,
+    max: 4,
+    step: 1,
+    overrides: {
+      hy_720_fp8: { all: { default: 1 } },
+      wan_2_1_i2v_14b_720p: { all: { default: 1 } },
+      wan_2_1_t2v_14b: { all: { default: 1 } },
+      wan_2_2_t2v_a14b: { all: { default: 1 } },
+      ltx2: { all: { default: 1 } },
+      ltx23: { all: { default: 1 } },
+      ltx25: { all: { default: 1 } },
+      minimaxh3: { all: { default: 1 } },
+    },
+  },
+  {
+    name: 'minSnrGamma',
+    label: 'Min SNR Gamma',
+    hint: (
+      <>
+        Learning is performed by putting noise of various strengths on the training image, but
+        depending on the difference in strength of the noise on which it is placed, learning will be
+        stable by moving closer to or farther from the learning target.
+        <br />
+        Min SNR gamma was introduced to compensate for that. When learning images have little noise,
+        it may deviate greatly from the target, so try to suppress this jump.
+      </>
+    ),
+    type: 'int',
+    default: 5, // TODO maybe float
+    min: 0,
+    max: 20,
+    step: 1,
+    overrides: {
+      pony: { kohya: { default: 0 } },
+      flux_dev: { all: { disabled: true, default: 0, max: 0 } },
+      flux2_dev: { all: { disabled: true, default: 0, max: 0 } },
+      chroma: { all: { disabled: true, default: 0, max: 0 } },
+      qwen_image: { all: { disabled: true, default: 0, max: 0 } },
+      zimageturbo: { all: { disabled: true, default: 0, max: 0 } },
+      zimagebase: { all: { disabled: true, default: 0, max: 0 } },
+      flux2klein_4b: { all: { disabled: true, default: 0, max: 0 } },
+      flux2klein_9b: { all: { disabled: true, default: 0, max: 0 } },
+      hy_720_fp8: { all: { disabled: true, default: 0, max: 0 } },
+      wan_2_1_i2v_14b_720p: { all: { disabled: true, default: 0, max: 0 } },
+      wan_2_1_t2v_14b: { all: { disabled: true, default: 0, max: 0 } },
+      wan_2_2_t2v_a14b: { all: { disabled: true, default: 0, max: 0 } },
+      ltx2: { all: { disabled: true, default: 0, max: 0 } },
+      ltx23: { all: { disabled: true, default: 0, max: 0 } },
+      ltx25: { all: { disabled: true, default: 0, max: 0 } },
+      minimaxh3: { all: { disabled: true, default: 0, max: 0 } },
+      hidream_o1: { all: { disabled: true, default: 0, max: 0 } },
+      anima: { all: { disabled: true, default: 0, max: 0 } },
+      boogu: { all: { disabled: true, default: 0, max: 0 } },
+      ming: { all: { disabled: true, default: 0, max: 0 } },
+      qwen21: { all: { disabled: true, default: 0, max: 0 } },
+      krea2: { all: { disabled: true, default: 0, max: 0 } },
+      mageflow: { all: { disabled: true, default: 0, max: 0 } },
+      ideogram4: { all: { disabled: true, default: 0, max: 0 } },
+      acestep_15: { all: { disabled: true, default: 0, max: 0 } },
+      yue2: { all: { disabled: true, default: 0, max: 0 } },
+      acestep_15_xl_base: { all: { disabled: true, default: 0, max: 0 } },
+      acestep_15_xl_sft: { all: { disabled: true, default: 0, max: 0 } },
+    },
+  },
+  {
+    name: 'networkDim',
+    label: 'Network Dim',
+    hint: 'The larger the Dim setting, the more learning information can be stored, but the possibility of learning unnecessary information other than the learning target increases. A larger Dim also increases LoRA file size.',
+    type: 'int',
+    default: 32,
+    min: 1,
+    max: 128,
+    step: 1,
+    overrides: {
+      sdxl: { all: { max: 256 } },
+      pony: { all: { max: 256 } },
+      illustrious: { all: { max: 256 } },
+      anime: { all: { default: 16 } },
+      flux_dev: { kohya: { default: 2 } },
+      chroma: { all: { default: 2 } },
+      qwen_image: { all: { default: 2 } },
+      zimageturbo: { all: { default: 32 } },
+      zimagebase: { all: { default: 32 } },
+      flux2klein_4b: { all: { default: 32 } },
+      flux2klein_9b: { all: { default: 32 } },
+      hidream_o1: { all: { default: 32 } },
+      anima: { all: { default: 32 } },
+      boogu: { all: { default: 32 } },
+      ming: { all: { default: 32 } },
+      qwen21: { all: { default: 32 } },
+      krea2: { all: { default: 32 } },
+      mageflow: { all: { default: 32 } },
+      ideogram4: { all: { default: 32 } },
+      acestep_15: { all: { default: 32 } },
+      yue2: { all: { default: 32 } },
+      acestep_15_xl_base: { all: { default: 32 } },
+      acestep_15_xl_sft: { all: { default: 32 } },
+      // sd3_medium: { all: { default: 2 } },
+      // sd3_large: { all: { default: 2 } },
+    },
+  },
+  {
+    name: 'networkAlpha',
+    label: 'Network Alpha',
+    hint: (
+      <>
+        The smaller the Network alpha value, the larger the stored LoRA neural net weights. For
+        example, with an Alpha of 16 and a Dim of 32, the strength of the weight used is 16/32 =
+        0.5, meaning that the learning rate is only half as powerful as the Learning Rate setting.
+        <br />
+        If Alpha and Dim are the same number, the strength used will be 1 and will have no effect on
+        the learning rate.
+      </>
+    ),
+    type: 'int',
+    default: 16,
+    min: 1,
+    max: 128,
+    step: 1,
+    overrides: {
+      sd_1_5: { 'ai-toolkit': { default: 32 } },
+      semi: { 'ai-toolkit': { default: 32 } },
+      realistic: { 'ai-toolkit': { default: 32 } },
+      anime: { kohya: { default: 8 }, 'ai-toolkit': { default: 32 } },
+      sdxl: { all: { max: 256 }, 'ai-toolkit': { default: 32, max: 256 } },
+      pony: { all: { max: 256, default: 32 } },
+      illustrious: { all: { max: 256 }, 'ai-toolkit': { default: 32, max: 256 } },
+      hy_720_fp8: { all: { default: 1 } },
+      wan_2_1_i2v_14b_720p: { all: { default: 1 } },
+      wan_2_1_t2v_14b: { all: { default: 1 } },
+      wan_2_2_t2v_a14b: { all: { default: 1 } },
+      zimageturbo: { all: { default: 32 } },
+      zimagebase: { all: { default: 32 } },
+      flux2klein_4b: { all: { default: 32 } },
+      flux2klein_9b: { all: { default: 32 } },
+      ltx2: { all: { default: 1 } },
+      ltx23: { all: { default: 32 } },
+      ltx25: { all: { default: 32 } },
+      minimaxh3: { all: { default: 32 } },
+      hidream_o1: { all: { default: 32 } },
+      anima: { all: { default: 32 } },
+      boogu: { all: { default: 32 } },
+      ming: { all: { default: 32 } },
+      qwen21: { all: { default: 32 } },
+      krea2: { all: { default: 32 } },
+      mageflow: { all: { default: 32 } },
+      ideogram4: { all: { default: 32 } },
+      acestep_15: { all: { default: 32 } },
+      yue2: { all: { default: 32 } },
+      acestep_15_xl_base: { all: { default: 32 } },
+      acestep_15_xl_sft: { all: { default: 32 } },
+    },
+  },
+  {
+    name: 'noiseOffset',
+    label: 'Noise Offset',
+    hint: 'Adds noise to training images. 0 adds no noise at all. A value of 1 adds strong noise.',
+    type: 'number',
+    default: 0.1,
+    min: 0,
+    max: 1,
+    step: 0.01,
+    overrides: {
+      pony: { kohya: { default: 0.03 } },
+      hy_720_fp8: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      wan_2_1_i2v_14b_720p: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      wan_2_1_t2v_14b: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      wan_2_2_t2v_a14b: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      zimageturbo: { all: { default: 0 } },
+      zimagebase: { all: { default: 0 } },
+      flux2klein_4b: { all: { default: 0 } },
+      flux2klein_9b: { all: { default: 0 } },
+      ltx2: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      ltx23: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      ltx25: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      minimaxh3: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      hidream_o1: { all: { default: 0 } },
+      anima: { all: { default: 0 } },
+      boogu: { all: { default: 0 } },
+      ming: { all: { default: 0 } },
+      qwen21: { all: { default: 0 } },
+      krea2: { all: { default: 0 } },
+      mageflow: { all: { default: 0 } },
+      ideogram4: { all: { default: 0 } },
+      acestep_15: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      yue2: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      acestep_15_xl_base: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+      acestep_15_xl_sft: { all: { disabled: true, default: 0, min: 0, max: 0 } },
+    },
+  },
+  {
+    name: 'optimizerType',
+    label: 'Optimizer',
+    hint: (
+      <>
+        The optimizer determines how to update the neural net weights during training. Various
+        methods have been proposed for smart learning, but the most commonly used in LoRA learning
+        is &quot;AdamW8bit&quot;.
+        <br />
+        We will automatically generate the proper optimizer args depending on your choice.
+      </>
+    ),
+    type: 'select',
+    default: 'AdamW8Bit',
+    options: optimizerTypes,
+    overrides: {
+      sd_1_5: { 'ai-toolkit': { default: 'Adafactor' } },
+      sdxl: { kohya: { default: 'Adafactor' }, 'ai-toolkit': { default: 'Adafactor' } },
+      pony: { kohya: { default: 'Prodigy' }, 'ai-toolkit': { default: 'Adafactor' } },
+      illustrious: { kohya: { default: 'Adafactor' }, 'ai-toolkit': { default: 'Adafactor' } },
+      zimagebase: { all: { default: 'Automagic' } },
+    },
+  },
+  {
+    // this is only used for display
+    name: 'optimizerArgs',
+    label: 'Optimizer Args',
+    hint: 'Additional arguments can be passed to control the behavior of the selected optimizer. This is set automatically.',
+    type: 'string',
+    default: optimizerArgMap.AdamW8Bit,
+    disabled: true,
+    overrides: {
+      sdxl: {
+        kohya: { default: optimizerArgMap.Adafactor },
+        'ai-toolkit': { default: optimizerArgMap.AdamW8Bit },
+      },
+      pony: {
+        kohya: { default: optimizerArgMap.Prodigy },
+        'ai-toolkit': { default: optimizerArgMap.AdamW8Bit },
+      },
+      illustrious: {
+        kohya: { default: optimizerArgMap.Adafactor },
+        'ai-toolkit': { default: optimizerArgMap.AdamW8Bit },
+      },
+      flux_dev: {
+        kohya: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      chroma: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      qwen_image: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      zimageturbo: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      zimagebase: {
+        all: { default: optimizerArgMap.Automagic },
+      },
+      flux2klein_4b: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      flux2klein_9b: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      hidream_o1: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      anima: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      boogu: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      ming: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      qwen21: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      krea2: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      mageflow: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      ideogram4: {
+        all: { default: optimizerArgMapFlux.AdamW8Bit.kohya },
+      },
+      ltx2: { all: { default: optimizerArgMapVideo.AdamW8Bit } },
+      ltx23: { all: { default: optimizerArgMapVideo.AdamW8Bit } },
+      ltx25: { all: { default: optimizerArgMapVideo.AdamW8Bit } },
+      minimaxh3: { all: { default: optimizerArgMapVideo.AdamW8Bit } },
+      hy_720_fp8: { all: { default: optimizerArgMapVideo.AdamW8Bit } },
+      wan_2_1_i2v_14b_720p: { all: { default: optimizerArgMapVideo.AdamW8Bit } },
+      wan_2_1_t2v_14b: { all: { default: optimizerArgMapVideo.AdamW8Bit } },
+      wan_2_2_t2v_a14b: { all: { default: optimizerArgMapVideo.AdamW8Bit } },
+    },
+  },
+];

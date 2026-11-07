@@ -1,0 +1,483 @@
+import {
+  Alert,
+  Button,
+  Center,
+  Divider,
+  Group,
+  Input,
+  Loader,
+  Modal,
+  Select,
+  Stack,
+  Text,
+} from '@mantine/core';
+
+import { IconBolt, IconCalendar } from '@tabler/icons-react';
+import { NextLink } from '~/components/NextLink/NextLink';
+import { useRouter } from 'next/router';
+// 🔴 `~/env/client`, NOT `process` — which is what this was, uniquely among client components.
+// Next inlines the LITERAL text `process.env.NEXT_PUBLIC_*`; a destructured `env` binding is
+// not that text, so this read the browser's `process` shim and `joinUrl` below was `''`
+// unconditionally. `NEXT_PUBLIC_BASE_URL` is declared in `src/env/client-schema.ts`.
+import { env } from '~/env/client';
+import { useEffect, useState } from 'react';
+import { NotFound } from '~/components/AppLayout/NotFound';
+import {
+  collectionReadPrivacyData,
+  collectionTypeData,
+  collectionWritePrivacyData,
+  useCollection,
+  useMutateCollection,
+} from '~/components/Collections/collection.utils';
+import { CollectionInviteLink } from '~/components/Collections/CollectionInviteLink';
+import { useDialogContext } from '~/components/Dialog/DialogProvider';
+import { InfoPopover } from '~/components/InfoPopover/InfoPopover';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import {
+  Form,
+  InputBrowsingLevels,
+  InputCheckbox,
+  InputDatePicker,
+  InputMultiSelect,
+  InputNumber,
+  InputSelect,
+  InputSimpleImageUpload,
+  InputTags,
+  InputText,
+  InputTextArea,
+  useForm,
+} from '~/libs/form';
+import type { UpsertCollectionInput } from '~/server/schema/collection.schema';
+import { upsertCollectionInput } from '~/server/schema/collection.schema';
+import { baseModels } from '~/shared/constants/basemodel.constants';
+import {
+  CollectionMode,
+  CollectionType,
+  CollectionWriteConfiguration,
+  TagTarget,
+} from '~/shared/utils/prisma/enums';
+import { getDisplayName } from '~/utils/string-helpers';
+import { trpc } from '~/utils/trpc';
+import { isDefined } from '~/utils/type-guards';
+
+// An owner without a membership used to get no control here at all, which reads as "this
+// collection can't take submissions" rather than "this is a member feature". The disabled
+// select keeps the setting where they'd look for it.
+function SubmissionsMemberNotice({ write }: { write?: CollectionWriteConfiguration | null }) {
+  return (
+    <Input.Wrapper label="Who can add to this collection">
+      <Stack gap={8}>
+        <Select
+          data={Object.values(collectionWritePrivacyData)}
+          value={write ?? CollectionWriteConfiguration.Private}
+          disabled
+          readOnly
+        />
+        <Alert color="yellow" variant="light" icon={<IconBolt size={18} />} p="xs">
+          <Group justify="space-between" gap="md" wrap="nowrap">
+            <Text size="sm">
+              Opening a collection to submissions is a member feature. Upgrade to let other people
+              add to this collection.
+            </Text>
+            <Button component={NextLink} href="/pricing" size="compact-sm" className="shrink-0">
+              Get a membership
+            </Button>
+          </Group>
+        </Alert>
+      </Stack>
+    </Input.Wrapper>
+  );
+}
+
+// Keyed so a modal reused for another collection starts a fresh form instead of carrying edits over.
+export default function CollectionEditModal({ collectionId }: { collectionId?: number }) {
+  return <CollectionEditForm key={collectionId ?? 'new'} collectionId={collectionId} />;
+}
+
+function CollectionEditForm({ collectionId }: { collectionId?: number }) {
+  const router = useRouter();
+  const dialog = useDialogContext();
+  const queryUtils = trpc.useUtils();
+  const currentUser = useCurrentUser();
+  const isMember = !!currentUser?.tier && currentUser.tier !== 'free';
+
+  const {
+    collection,
+    permissions: queryPermissions,
+    isLoading: queryLoading,
+  } = useCollection(collectionId as number, {
+    enabled: !!collectionId,
+  });
+  const [youtubeAuthUrl, setYoutubeAuthUrl] = useState<string | null>(null);
+  const { getYoutubeAuthUrl, getYoutubeAuthUrlLoading } = useMutateCollection();
+
+  const isLoading = queryLoading && !!collectionId;
+
+  const form = useForm({
+    schema: upsertCollectionInput,
+    shouldUnregister: false,
+    defaultValues: {
+      type: CollectionType.Model,
+    },
+  });
+
+  const metadata = form.watch('metadata');
+
+  const upsertCollectionMutation = trpc.collection.upsert.useMutation();
+  const handleSubmit = (data: UpsertCollectionInput) => {
+    upsertCollectionMutation.mutate(
+      {
+        ...data,
+        // A cover hidden from this editor reads back as no cover; sending that would remove it.
+        image:
+          collection?.coverHidden && !form.formState.dirtyFields.image ? undefined : data.image,
+        mode: data.mode || null,
+        metadata: {
+          ...(data.metadata ?? {}),
+          // Ensures we NEVER send out 0.
+          forcedBrowsingLevel: data.metadata?.forcedBrowsingLevel || undefined,
+        },
+      },
+      {
+        onSuccess: async (collection) => {
+          await queryUtils.collection.getInfinite.invalidate();
+          if (collectionId) {
+            await queryUtils.collection.getById.invalidate({ id: collectionId });
+          } else {
+            // Redirect to collection page:
+            await queryUtils.collection.getAllUser.invalidate();
+            router.push(`/collections/${collection.id}`);
+          }
+
+          dialog.onClose();
+        },
+      }
+    );
+  };
+
+  useEffect(() => {
+    if (collection) {
+      const result = upsertCollectionInput.safeParse({
+        ...collection,
+        type: collection.type ?? CollectionType.Model,
+        mode: collection.mode,
+        metadata: collection.metadata ?? {},
+      });
+      // A refetch while the form is open must not drop what the editor already changed.
+      if (result.success) form.reset({ ...result.data }, { keepDirtyValues: true });
+      else console.error(result.error);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [collection]);
+
+  const getYoutubeUrlHandler = async () => {
+    if (!collection) {
+      return;
+    }
+
+    if (youtubeAuthUrl) {
+      window.location.href = youtubeAuthUrl;
+    } else {
+      const url = await getYoutubeAuthUrl({ id: collection.id as number });
+      setYoutubeAuthUrl(url);
+    }
+  };
+
+  const permissions = queryPermissions ?? { manage: false, write: false, isOwner: false };
+  const canEdit = !!collection && permissions.manage;
+  const isCreate = !collectionId;
+  const isOwner = isCreate || permissions.isOwner;
+  const canConfigurePrivacy = isOwner || !!currentUser?.isModerator;
+  const canOpenSubmissions = (isMember && isOwner) || !!currentUser?.isModerator;
+  const isImageCollection = collection?.type === CollectionType.Image;
+  // Matches the form's own normalization above, where a null type is read as Model.
+  const isModelCollection = (collection?.type ?? CollectionType.Model) === CollectionType.Model;
+  const isContestMode = collection?.mode === CollectionMode.Contest;
+  const joinUrl =
+    env.NEXT_PUBLIC_BASE_URL && collectionId
+      ? `${env.NEXT_PUBLIC_BASE_URL}/collections/${collectionId}/join`
+      : '';
+
+  return (
+    <Modal {...dialog} size="lg" title={isCreate ? 'Create collection' : 'Edit collection'}>
+      {isLoading ? (
+        <Center py="xl">
+          <Loader type="bars" />
+        </Center>
+      ) : canEdit || isCreate ? (
+        <Form form={form} onSubmit={handleSubmit}>
+          <Stack gap="sm">
+            <InputSimpleImageUpload name="image" label="Cover Image" />
+            <InputText
+              name="name"
+              label="Name"
+              placeholder="e.g.: Video Game Characters"
+              withAsterisk
+            />
+            <InputTextArea
+              name="description"
+              label="Description"
+              placeholder="e.g.: My favorite video game characters"
+              rows={3}
+              autosize
+            />
+            {(isOwner || currentUser?.isModerator) && (
+              <InputSelect
+                name="read"
+                label="Privacy"
+                data={Object.values(collectionReadPrivacyData)}
+              />
+            )}
+            {isCreate && (
+              <InputSelect
+                name="type"
+                label="Collection Type"
+                data={[
+                  ...Object.values(CollectionType).map((value) => ({
+                    value,
+                    label: collectionTypeData[value].label,
+                  })),
+                ]}
+                clearable
+              />
+            )}
+
+            {canOpenSubmissions ? (
+              <InputSelect
+                name="write"
+                label="Who can add to this collection"
+                data={Object.values(collectionWritePrivacyData)}
+              />
+            ) : (
+              canConfigurePrivacy && <SubmissionsMemberNotice write={collection?.write} />
+            )}
+
+            {currentUser?.isModerator && (
+              <>
+                <InputSelect
+                  name="mode"
+                  label="Mode"
+                  data={[
+                    ...Object.values(CollectionMode)
+                      .map((value) =>
+                        [CollectionMode.Bookmark].some((v) => v === value)
+                          ? undefined
+                          : {
+                              value,
+                              label: getDisplayName(value),
+                            }
+                      )
+                      .filter(isDefined),
+                  ]}
+                  clearable
+                />
+                {isContestMode && (
+                  <>
+                    <Divider label="Contest Details" />
+                    <InputCheckbox
+                      name="metadata.inviteUrlEnabled"
+                      label="Enable users to manage this collection by invite link"
+                      description="Makes it so that you can add managers to the collection by sharing a link with them."
+                    />
+                    {metadata?.inviteUrlEnabled && (
+                      <Stack gap={4}>
+                        <Text fw={500} size="sm">
+                          Here is your Invite Link:
+                        </Text>
+                        <CollectionInviteLink joinUrl={joinUrl} />
+                      </Stack>
+                    )}
+
+                    <InputText
+                      name="metadata.termsOfServicesUrl"
+                      label="Terms of Service"
+                      description="If added, an alert will be shown when creating an entry for this contest mentioning the user agrees to the terms of service."
+                    />
+
+                    <InputDatePicker
+                      name="metadata.endsAt"
+                      label="End Date"
+                      placeholder="Select an end date"
+                      leftSection={<IconCalendar size={16} />}
+                      clearable
+                    />
+                    <Text size="xs" c="dimmed">
+                      This is only used to stop recurring job updating the random indexes. We
+                      suggest you add this in to save some resources, but this value will not be
+                      shown to end-users.
+                    </Text>
+                    <InputDatePicker
+                      name="metadata.submissionStartDate"
+                      label="Submission Start Date"
+                      placeholder="Select an start date"
+                      leftSection={<IconCalendar size={16} />}
+                      clearable
+                    />
+                    <InputDatePicker
+                      name="metadata.submissionEndDate"
+                      label="Submission End Date"
+                      placeholder="Select an end date"
+                      leftSection={<IconCalendar size={16} />}
+                      clearable
+                    />
+                    {metadata?.submissionEndDate && (
+                      <InputCheckbox
+                        name="metadata.submissionsHiddenUntilEndDate"
+                        label="Hide entries until end date"
+                        description="Makes it so that other user entries are not visible until the end date is reached."
+                      />
+                    )}
+                    <InputNumber
+                      name="metadata.maxItemsPerUser"
+                      label="Max items per user"
+                      placeholder="Leave blank for unlimited"
+                      clearable
+                    />
+                    {/* The gate this drives runs only against model submissions, so on any other
+                        collection type the field is a control that silently does nothing. */}
+                    {isModelCollection && (
+                      <InputMultiSelect
+                        name="metadata.baseModels"
+                        label="Allowed base models"
+                        description="Model entries need a version on one of these base models. With a submission start date, the same version must also have been added during the submission period. Leave empty to allow all base models."
+                        placeholder="Leave empty to allow all base models"
+                        // Full list, not activeBaseModels — hidden base models are still valid
+                        // contest targets, and this field is moderator-only.
+                        data={baseModels}
+                        searchable
+                        clearable
+                      />
+                    )}
+                    {isImageCollection && (
+                      <InputCheckbox
+                        name="metadata.existingEntriesDisabled"
+                        label="Existing entries disabled"
+                        description="Makes it so that the + button takes you directly to the create flow, bypassing existing images selection. Users can still circumbent this by following the collection & selecting an image."
+                      />
+                    )}
+                    <InputDatePicker
+                      name="metadata.votingPeriodStart"
+                      label="When voting for this contest will start"
+                      description="This will lock the ratings on these entries. Use with care. Leaving this blank makes it so that they're always reactable."
+                      placeholder="Select a voting period start date"
+                      leftSection={<IconCalendar size={16} />}
+                      clearable
+                    />
+                    <InputTags
+                      name="tags"
+                      label={
+                        <Group gap={4} wrap="nowrap">
+                          <Input.Label>Tags</Input.Label>
+                          <InfoPopover type="hover" size="xs" iconProps={{ size: 14 }}>
+                            <Text>
+                              When submitting items to this collection, users will be able to tag
+                              their submission with one of the provided tag. This will make
+                              filtering and searching these entries much easier. At the moment, only
+                              1 tag per item is allowed.
+                            </Text>
+                          </InfoPopover>
+                        </Group>
+                      }
+                      target={[TagTarget.Collection]}
+                    />
+                    <InputCheckbox
+                      name="metadata.disableTagRequired"
+                      label="Tags are not required"
+                      description="If enabled, users will be able to submit items without a tag even when tags are setup."
+                    />
+                    {isImageCollection && (
+                      <InputCheckbox
+                        name="metadata.entriesRequireTitle"
+                        label="Entries require post title"
+                        description="If enabled, users will be required to add a title to their post before creating it on the collection."
+                      />
+                    )}
+                    {isImageCollection && (
+                      <InputCheckbox
+                        name="metadata.entriesRequireTools"
+                        label="Entries require tool selection"
+                        description="If enabled, users will be required to add at least 1 tool to each of the images uploaded."
+                      />
+                    )}
+                    <Divider label="Judging details" />
+                    {isImageCollection && (
+                      <InputCheckbox
+                        name="metadata.judgesApplyBrowsingLevel"
+                        label="Judges apply NSFW Rating"
+                        description="This will make it so that people with Manage permission on the collection apply NSFW rating to the submissions. Subsmissions made to this collection will not be publicly visible until they're rated."
+                      />
+                    )}
+                    {isImageCollection && (
+                      <InputCheckbox
+                        name="metadata.judgesCanScoreEntries"
+                        label="Judges can score entries"
+                        description="Judges / Moderators of this collection will be able to leave a 1-10 score on each entry in this collection."
+                      />
+                    )}
+                    <InputDatePicker
+                      name="metadata.votingPeriodStart"
+                      label="Sets a start date for Reactions on the entries"
+                      description="This will lock the reactions on these entries. Use with care, ideally only when the contest rely on reactions from users. Leaving this blank makes it so that they're always reactable."
+                      placeholder="Select a voting period start date"
+                      leftSection={<IconCalendar size={16} />}
+                      clearable
+                    />
+                    <InputBrowsingLevels
+                      name="metadata.forcedBrowsingLevel"
+                      label="Forced Browsing Level"
+                      description="Forces browsing level on this collection so that users will only see content based on this value regardless of their global settings."
+                    />
+                    {isImageCollection && (
+                      <>
+                        <Divider label="Youtube Support" />
+                        <Input.Wrapper
+                          label="Add Youtube Support"
+                          description="By enabling youtube support, videos that are longer than 30s will be uploaded to youtube and youtube will be used to play them on the site. Note channels are exclusive to the collection and cannot be used in other collections."
+                          descriptionProps={{ mb: 12 }}
+                        >
+                          {collection.metadata?.youtubeSupportEnabled ? (
+                            <Text size="sm" c="primary">
+                              Youtube support is enabled for this collection.
+                            </Text>
+                          ) : (
+                            <Button
+                              onClick={getYoutubeUrlHandler}
+                              loading={getYoutubeAuthUrlLoading}
+                            >
+                              {youtubeAuthUrl ? 'Sign in with Youtube' : 'Enable Youtube Support'}
+                            </Button>
+                          )}
+                        </Input.Wrapper>
+                      </>
+                    )}
+
+                    {/* {isImageCollection && (
+                      <>
+                        <Divider label="Vimeo Support" />
+                        <InputCheckbox
+                          name="metadata.vimeoSupportEnabled"
+                          label="Enables vimeo support for this collection"
+                          description="Approved videos longer than 30s will be uploaded to vimeo on an hourly basis."
+                        />
+                      </>
+                    )} */}
+                  </>
+                )}
+              </>
+            )}
+
+            <Divider label="Extras" />
+            <InputCheckbox name="nsfw" label="This collection contains mature content" mt="xs" />
+            <Group justify="flex-end">
+              <Button type="submit" loading={upsertCollectionMutation.isPending}>
+                Save
+              </Button>
+            </Group>
+          </Stack>
+        </Form>
+      ) : (
+        <NotFound />
+      )}
+    </Modal>
+  );
+}

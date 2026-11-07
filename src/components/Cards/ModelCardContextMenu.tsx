@@ -1,0 +1,232 @@
+import { Menu } from '~/components/MantineOverlays';
+import { IconBabyCarriage, IconShieldCheck, IconTagOff } from '@tabler/icons-react';
+import { ActionIconDotsVertical } from '~/components/Cards/components/ActionIconDotsVertical';
+import { AddArtFrameMenuItem } from '~/components/Decorations/AddArtFrameMenuItem';
+import { AddEventDecorationMenuItem } from '~/components/Decorations/AddEventDecorationMenuItem';
+import { openAddToCollectionModal } from '~/components/Dialog/triggers/add-to-collection';
+import { openBlockModelTagsModal } from '~/components/Dialog/triggers/block-model-tags';
+import { openReportModal } from '~/components/Dialog/triggers/report';
+import { BlockUserButton } from '~/components/HideUserButton/BlockUserButton';
+import { HideModelButton } from '~/components/HideModelButton/HideModelButton';
+import { HideUserButton } from '~/components/HideUserButton/HideUserButton';
+import { AddToCollectionMenuItem } from '~/components/MenuItems/AddToCollectionMenuItem';
+import { ReportMenuItem } from '~/components/MenuItems/ReportMenuItem';
+import { ToggleSearchableMenuItem } from '~/components/MenuItems/ToggleSearchableMenuItem';
+import { useModelCardContextMenu } from '~/components/Model/Actions/ModelCardContextMenu';
+import { ToggleMinorModel } from '~/components/Model/Actions/ToggleMinorModel';
+import { ToggleSfwOnlyModel } from '~/components/Model/Actions/ToggleSfwOnlyModel';
+import type { UseQueryModelReturn } from '~/components/Model/model.utils';
+import { AddToShowcaseMenuItem } from '~/components/Profile/AddToShowcaseMenuItem';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { useFeatureFlags } from '~/providers/FeatureFlagsProvider';
+import { ReportEntity } from '~/shared/utils/report-helpers';
+import { CollectionType, CosmeticEntity } from '~/shared/utils/prisma/enums';
+import { isDefined } from '~/utils/type-guards';
+import { moderatorModelLookupPath } from '~/shared/constants/moderator-app';
+import { ModeratorLookupMenuItem } from '~/components/Moderation/ModeratorLookupMenuItem';
+
+export function ModelCardContextMenu({ data }: { data: UseQueryModelReturn[number] }) {
+  const currentUser = useCurrentUser();
+  const features = useFeatureFlags();
+  const { setMenuItems } = useModelCardContextMenu();
+  const image = data.images[0];
+
+  const reportOption = {
+    key: 'report-model',
+    component: (
+      <ReportMenuItem
+        key="report-model"
+        loginReason="report-model"
+        onReport={() => openReportModal({ entityType: ReportEntity.Model, entityId: data.id })}
+      />
+    ),
+  };
+
+  const reportImageOption = image
+    ? {
+        key: 'report-image',
+        component: (
+          <ReportMenuItem
+            key="report-image"
+            label="Report image"
+            onReport={() =>
+              openReportModal({
+                entityType: ReportEntity.Image,
+                entityId: image.id,
+              })
+            }
+          />
+        ),
+      }
+    : null;
+
+  const blockTagsOption = {
+    key: 'block-tags',
+    component: (
+      <Menu.Item
+        key="block-tags"
+        leftSection={<IconTagOff size={14} stroke={1.5} />}
+        onClick={(e: React.MouseEvent<HTMLButtonElement>) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openBlockModelTagsModal({ props: { modelId: data.id } });
+        }}
+      >
+        {`Hide content with these tags`}
+      </Menu.Item>
+    ),
+  };
+
+  let contextMenuItems: { key: string; component: React.ReactNode }[] = [];
+  if (features.collections) {
+    contextMenuItems.push({
+      key: 'add-to-collection',
+      component: (
+        <AddToCollectionMenuItem
+          key="add-to-collection"
+          onClick={() =>
+            openAddToCollectionModal({ props: { modelId: data.id, type: CollectionType.Model } })
+          }
+        />
+      ),
+    });
+  }
+
+  if (currentUser?.id === data.user.id) {
+    contextMenuItems.push(
+      ...[
+        {
+          key: 'add-to-showcase',
+          component: (
+            <AddToShowcaseMenuItem key="add-to-showcase" entityType="Model" entityId={data.id} />
+          ),
+        },
+        {
+          key: 'add-art-frame',
+          component: (
+            <AddArtFrameMenuItem
+              key="add-art-frame"
+              entityType={CosmeticEntity.Model}
+              entityId={data.id}
+              image={data.images[0]}
+              currentCosmetic={data.cosmetic}
+            />
+          ),
+        },
+        {
+          key: 'add-event-decoration',
+          component: (
+            <AddEventDecorationMenuItem
+              key="add-event-decoration"
+              entityType={CosmeticEntity.Model}
+              entityId={data.id}
+              image={data.images[0]}
+              currentCosmetic={data.eventDecoration}
+            />
+          ),
+        },
+      ]
+    );
+  }
+
+  contextMenuItems.push({
+    key: 'toggle-searchable-menu-item',
+    component: (
+      <ToggleSearchableMenuItem
+        entityType="Model"
+        entityId={data.id}
+        key="toggle-searchable-menu-item"
+      />
+    ),
+  });
+
+  if (currentUser?.id !== data.user.id)
+    contextMenuItems.push(
+      ...[
+        {
+          key: 'hide-model',
+          component: <HideModelButton key="hide-model" as="menu-item" model={data} />,
+        },
+        {
+          key: 'hide-button',
+          component: <HideUserButton key="hide-button" as="menu-item" userId={data.user.id} />,
+        },
+        {
+          key: 'block-button',
+          component: <BlockUserButton key="block-button" as="menu-item" userId={data.user.id} />,
+        },
+        reportOption,
+        reportImageOption,
+      ].filter(isDefined)
+    );
+
+  if (currentUser) contextMenuItems.splice(2, 0, blockTagsOption);
+
+  if (currentUser?.isModerator) {
+    // Unshifted to the top rather than appended: the moderator items land after every user action, and
+    // the lookup is the one a moderator opens this menu FOR — it is the way out to the moderator app,
+    // not another action on the card. Moderator-gated, so nobody else's menu moves.
+    contextMenuItems.unshift({
+      key: 'lookup-model',
+      component: (
+        <ModeratorLookupMenuItem key="lookup-model" path={moderatorModelLookupPath(data.id)}>
+          Lookup Model
+        </ModeratorLookupMenuItem>
+      ),
+    });
+    contextMenuItems.push({
+      key: 'set-minor',
+      component: (
+        <ToggleMinorModel key="set-minor" modelId={data.id} minor={data.minor}>
+          {({ onClick }) => (
+            <Menu.Item
+              leftSection={<IconBabyCarriage size={14} stroke={1.5} />}
+              onClick={(e: React.MouseEvent<HTMLButtonElement>) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onClick();
+              }}
+            >
+              {data.minor ? 'Unset as Minor' : 'Set as Minor'}
+            </Menu.Item>
+          )}
+        </ToggleMinorModel>
+      ),
+    });
+    // Minor already forces (and locks) sfwOnly, so the toggle would only ever offer an
+    // "Unset" the server refuses.
+    if (!data.minor)
+      contextMenuItems.push({
+        key: 'set-sfw-only',
+        component: (
+          <ToggleSfwOnlyModel key="set-sfw-only" modelId={data.id} sfwOnly={data.sfwOnly}>
+            {({ onClick }) => (
+              <Menu.Item
+                leftSection={<IconShieldCheck size={14} stroke={1.5} />}
+                onClick={(e: React.MouseEvent<HTMLButtonElement>) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onClick();
+                }}
+              >
+                {data.sfwOnly ? 'Unset as SFW' : 'Set as SFW'}
+              </Menu.Item>
+            )}
+          </ToggleSfwOnlyModel>
+        ),
+      });
+  }
+
+  if (setMenuItems) {
+    contextMenuItems = setMenuItems(data, contextMenuItems);
+  }
+
+  return contextMenuItems.length ? (
+    <Menu position="left-start" withArrow offset={-5} withinPortal>
+      <Menu.Target>
+        <ActionIconDotsVertical />
+      </Menu.Target>
+      <Menu.Dropdown>{contextMenuItems.map((el) => el.component)}</Menu.Dropdown>
+    </Menu>
+  ) : null;
+}

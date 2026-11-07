@@ -1,0 +1,161 @@
+import { Container, Group, Stack, Title } from '@mantine/core';
+import { IconAlertTriangle } from '@tabler/icons-react';
+import { useRouter } from 'next/router';
+import React, { useEffect, useMemo, useState } from 'react';
+import { AlertWithIcon } from '~/components/AlertWithIcon/AlertWithIcon';
+import { Announcements } from '~/components/Announcements/Announcements';
+import { NotFound } from '~/components/AppLayout/NotFound';
+import { DismissibleAlert } from '~/components/DismissibleAlert/DismissibleAlert';
+import { FeatureIntroductionHelpButton } from '~/components/FeatureIntroduction/FeatureIntroduction';
+import { CustomMarkdown } from '~/components/Markdown/CustomMarkdown';
+import { PageLoader } from '~/components/PageLoader/PageLoader';
+import { WizardStepper } from '~/components/Stepper/WizardStepper';
+import { TrainingFormBasic } from '~/components/Training/Form/TrainingBasicInfo';
+import { basePath } from '~/components/Training/Form/TrainingCommon';
+import { TrainingFormImages } from '~/components/Training/Form/TrainingImages';
+import { TrainingFormSubmit } from '~/components/Training/Form/TrainingSubmit';
+import { SwitchToTrainingStudioAlert } from '~/components/Training/TrainingStudioSwitch';
+import { useTrainingServiceStatus } from '~/components/Training/training.utils';
+import { hashify } from '~/utils/string-helpers';
+import { trpc } from '~/utils/trpc';
+import { isNumber } from '~/utils/type-guards';
+
+type WizardState = {
+  step: number;
+};
+
+export const TrainStatusMessage = () => {
+  const status = useTrainingServiceStatus();
+  const messageHash = useMemo(
+    () => (status.message ? hashify(status.message).toString() : null),
+    [status.message]
+  );
+
+  return !status.available ? (
+    <AlertWithIcon color="yellow" icon={<IconAlertTriangle size={20} />} iconColor="yellow">
+      <CustomMarkdown allowedElements={['a', 'strong']} unwrapDisallowed>
+        {status.message ?? 'Training is currently disabled.'}
+      </CustomMarkdown>
+    </AlertWithIcon>
+  ) : status.available && status.message && messageHash ? (
+    <DismissibleAlert color="yellow" title="Status Alert" id={messageHash}>
+      <CustomMarkdown allowedElements={['a', 'strong']} unwrapDisallowed>
+        {status.message}
+      </CustomMarkdown>
+    </DismissibleAlert>
+  ) : (
+    <></>
+  );
+};
+
+export default function TrainWizard() {
+  const router = useRouter();
+
+  const { modelId, modelVersionId } = router.query;
+  const versionId = Number(modelVersionId);
+  const pathWithId = `${basePath}?modelId=${modelId}${
+    isNumber(versionId) && versionId > 0 ? `&modelVersionId=${versionId}` : ''
+  }`;
+  const isNew = router.pathname === basePath;
+  const [state, setState] = useState<WizardState>({ step: 1 });
+
+  const {
+    data: modelData,
+    isInitialLoading: modelLoading,
+    isError: modelError,
+  } = trpc.training.getModelBasic.useQuery({ id: Number(modelId) }, { enabled: !!modelId });
+
+  // The wizard steps all act on modelVersions[0]. When a specific version is requested
+  // (e.g. "Train Further" creates a new Pending version and links here with
+  // ?modelVersionId=...), pin that version to the front rather than guessing by order.
+  const model = useMemo(() => {
+    if (!modelData || !isNumber(versionId) || versionId <= 0) return modelData;
+    const target = modelData.modelVersions.find((mv) => mv.id === versionId);
+    if (!target) return modelData;
+    return {
+      ...modelData,
+      modelVersions: [target, ...modelData.modelVersions.filter((mv) => mv.id !== versionId)],
+    };
+  }, [modelData, versionId]);
+
+  const editing = !!model;
+  const hasFiles = model && model.modelVersions[0]?.files?.length > 0;
+
+  useEffect(() => {
+    if (!isNew) {
+      if (!hasFiles) router.replace(`${pathWithId}&step=2`, undefined, { shallow: true });
+      else router.replace(`${pathWithId}&step=3`, undefined, { shallow: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasFiles, pathWithId, isNew]);
+
+  useEffect(() => {
+    // set current step based on query param
+    if (state.step.toString() !== router.query.step) {
+      const rawStep = router.query.step;
+      const step = Number(rawStep);
+      const validStep = isNumber(step) && step >= 1 && step <= 4;
+
+      setState((current) => ({ ...current, step: validStep ? step : 1 }));
+    }
+  }, [isNew, router.query.step, state.step]);
+
+  return (
+    <Container size="md">
+      {modelLoading ? (
+        <PageLoader text="Loading resource..." />
+      ) : modelError ? (
+        <NotFound />
+      ) : (
+        <Stack pb="xl">
+          <Announcements type="training" />
+          <Group gap={8} wrap="nowrap">
+            <Title order={2}>Train a LoRA</Title>
+            <FeatureIntroductionHelpButton
+              feature="model-training"
+              contentSlug={['feature-introduction', 'model-training']}
+            />
+          </Group>
+          <TrainStatusMessage />
+          <SwitchToTrainingStudioAlert destination="/training-studio?view=new" />
+          <WizardStepper
+            active={state.step - 1}
+            onStepClick={(step) =>
+              router.replace(`${pathWithId}&step=${step + 1}`, undefined, {
+                shallow: true,
+              })
+            }
+          >
+            {/* == Step 1: Model type selection + name */}
+            <WizardStepper.Step label={editing ? 'Edit LoRA' : 'Create your LoRA'}>
+              <Stack>
+                <Title order={3}>{editing ? 'Edit LoRA' : 'Create your LoRA'}</Title>
+                <TrainingFormBasic model={model} />
+              </Stack>
+            </WizardStepper.Step>
+
+            {/* == Step 2: Upload images/zip, labeling */}
+            {/*
+              loading={uploading > 0}
+              color={error + aborted > 0 ? 'red' : undefined}
+            */}
+            <WizardStepper.Step label={hasFiles ? 'Edit training data' : 'Add training data'}>
+              <Stack>
+                <Title order={3}>{hasFiles ? 'Edit training data' : 'Add training data'}</Title>
+                {model ? <TrainingFormImages model={model} /> : <NotFound />}
+              </Stack>
+            </WizardStepper.Step>
+
+            {/* == Step 3: Review and submit for training */}
+            <WizardStepper.Step label="Review and Submit">
+              <Stack>
+                <Title order={3}>Review and Submit</Title>
+                {model ? <TrainingFormSubmit model={model} /> : <NotFound />}
+              </Stack>
+            </WizardStepper.Step>
+          </WizardStepper>
+        </Stack>
+      )}
+    </Container>
+  );
+}

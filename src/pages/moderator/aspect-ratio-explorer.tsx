@@ -1,0 +1,92 @@
+import { ActionIcon, Button, NumberInput, TextInput } from '@mantine/core';
+import { useLocalStorage } from '@mantine/hooks';
+import { IconX } from '@tabler/icons-react';
+import { useMemo, useState } from 'react';
+import { LegacyActionIcon } from '~/components/LegacyActionIcon/LegacyActionIcon';
+import { AspectRatio, AspectRatioMap } from '~/libs/generation/utils/AspectRatio';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+
+export default function AspectRatioExplorer() {
+  const [value, setValue] = useState('');
+  const [aspectRatios, setAspectRatios] = useLocalStorage({
+    key: 'aspect-ratio-explorer',
+    defaultValue: ['16:9', '3:2', '1:1'],
+  });
+  const [multiplier, setMultiplier] = useState<number | undefined>(64);
+  const [resolution, setResolution] = useState<number | undefined>(1024);
+
+  function addAspectRatio() {
+    const parsed = AspectRatio.parse(value);
+    if (parsed) setAspectRatios((state) => [...state, parsed]);
+  }
+
+  function removeAspectRatio(value: string) {
+    setAspectRatios((state) => state.filter((x) => x !== value));
+  }
+
+  const aspectRatioList = useMemo(() => {
+    if (!aspectRatios.length || !multiplier) return [];
+    return Object.entries(AspectRatioMap(aspectRatios, { multiplier }))
+      .map(([key, aspectRatio]) => ({ key, ...aspectRatio }))
+      .sort((a, b) => b.ratio - a.ratio);
+  }, [aspectRatios, multiplier]);
+
+  return (
+    <div className="container flex max-w-sm flex-col gap-3">
+      <div className="flex items-end gap-3">
+        <TextInput
+          label="Aspect Ratio"
+          value={value}
+          onChange={(e) => setValue(e.currentTarget.value)}
+        />
+        <Button onClick={addAspectRatio}>Add</Button>
+      </div>
+      <div className="flex gap-3">
+        <NumberInput
+          label="Multiplier"
+          value={multiplier}
+          onChange={(value) => setMultiplier(typeof value === 'number' ? value : undefined)}
+        />
+        <NumberInput
+          label="Resolution"
+          value={resolution}
+          onChange={(value) => setResolution(typeof value === 'number' ? value : undefined)}
+        />
+      </div>
+
+      {!!aspectRatioList.length && resolution && (
+        <ul>
+          {aspectRatioList.map((aspectRatio) => {
+            const key = aspectRatio.key;
+            try {
+              const { width, height } = aspectRatio.getSize(resolution);
+              return (
+                <li key={key} className="flex items-center justify-between">
+                  <span>
+                    {key} - {width}:{height}
+                  </span>
+                  <LegacyActionIcon color="red" onClick={() => removeAspectRatio(key)}>
+                    <IconX />
+                  </LegacyActionIcon>
+                </li>
+              );
+            } catch (e: any) {
+              return (
+                <li key={key} className="flex items-center justify-between">
+                  <span>
+                    {key} - {e.message}
+                  </span>
+                  <LegacyActionIcon color="red" onClick={() => removeAspectRatio(key)}>
+                    <IconX />
+                  </LegacyActionIcon>
+                </li>
+              );
+            }
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+export const getServerSideProps = createServerSideProps({ requireModerator: true });

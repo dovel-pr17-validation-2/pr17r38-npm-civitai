@@ -1,0 +1,175 @@
+import { Badge, Text } from '@mantine/core';
+import { memo } from 'react';
+import { OfficialArticleBadge } from '~/components/Article/OfficialArticleBadge';
+import cardClasses from '~/components/Cards/Cards.module.css';
+import { IconBolt, IconBookmark, IconEye, IconMessageCircle2 } from '@tabler/icons-react';
+import { slugit } from '~/utils/string-helpers';
+import { formatDate } from '~/utils/date-helpers';
+import type { ArticleGetAllRecord } from '~/server/services/article.service';
+import { ArticleContextMenu } from '~/components/Article/ArticleContextMenu';
+import {
+  InteractiveTipBuzzButton,
+  useBuzzTippingStore,
+} from '~/components/Buzz/InteractiveTipBuzzButton';
+import { AspectRatioImageCard } from '~/components/CardTemplates/AspectRatioImageCard';
+import { useElementInView } from '~/components/IntersectionObserver/ElementInView';
+import { AnimatedCount, Metrics } from '~/components/Metrics';
+import { UserAvatarSimple } from '~/components/UserAvatar/UserAvatarSimple';
+import { useCurrentUser } from '~/hooks/useCurrentUser';
+import { ArticleStatus } from '~/shared/utils/prisma/enums';
+import clsx from 'clsx';
+
+const articleStatusBadge: Partial<Record<ArticleStatus, { label: string; color: string }>> = {
+  [ArticleStatus.Draft]: { label: 'Draft', color: 'yellow' },
+  [ArticleStatus.Unpublished]: { label: 'Unpublished', color: 'red' },
+  [ArticleStatus.UnpublishedViolation]: { label: 'Violation', color: 'red' },
+};
+
+export const ArticleCard = memo(function ArticleCard({ data, aspectRatio }: Props) {
+  return <ArticleCardContent data={data} aspectRatio={aspectRatio} />;
+});
+
+function ArticleCardContent({ data, aspectRatio }: Props) {
+  const { id, title, coverImage, publishedAt, user, tags, status, nsfwLevel, isOfficial } = data;
+  // Show the article's aggregate nsfwLevel on the card (badge + blur), not just
+  // the cover image's own level. Content images or a moderator/user override can
+  // raise the article above the cover's rating; lifting here keeps every feed
+  // consistent without relying on each backend query to lift it onto coverImage.
+  const image = coverImage
+    ? { ...coverImage, nsfwLevel: Math.max(nsfwLevel ?? 0, coverImage.nsfwLevel ?? 0) }
+    : undefined;
+  const category = tags?.find((tag) => tag.isCategory);
+  const currentUser = useCurrentUser();
+  const canSeeStatus = !!currentUser && (currentUser.id === user.id || currentUser.isModerator);
+  const statusBadge = canSeeStatus && status ? articleStatusBadge[status] : null;
+
+  return (
+    <AspectRatioImageCard
+      impression={{ entityType: 'Article', entityId: id }}
+      href={`/articles/${id}/${slugit(title)}`}
+      alt={title}
+      aspectRatio={aspectRatio}
+      contentType="article"
+      contentId={id}
+      image={image}
+      cosmetic={data.cosmetic?.data}
+      eventDecoration={data.eventDecoration?.data}
+      eventDecorationOn={{ entityType: 'Article', entityId: id }}
+      header={
+        <div className="flex w-full justify-between">
+          <div className="flex items-center gap-1">
+            {/* Provenance leads: an official article is official before it is a guide. */}
+            {isOfficial && <OfficialArticleBadge className={cardClasses.chip} />}
+            {category && (
+              <Badge
+                size="sm"
+                variant="gradient"
+                gradient={{ from: 'cyan', to: 'blue' }}
+                className={cardClasses.chip}
+              >
+                {category.name}
+              </Badge>
+            )}
+            {statusBadge && (
+              <Badge
+                size="sm"
+                variant="light"
+                color={statusBadge.color}
+                className={cardClasses.chip}
+              >
+                {statusBadge.label}
+              </Badge>
+            )}
+          </div>
+          <ArticleContextMenu article={data} />
+        </div>
+      }
+      footer={
+        <div className="flex w-full flex-col gap-2">
+          <UserAvatarSimple {...user} />
+          <div>
+            {publishedAt && (
+              <Text className={cardClasses.dropShadow} size="xs" fw={500} inline>
+                {formatDate(publishedAt)}
+              </Text>
+            )}
+            {title && (
+              <Text className={cardClasses.dropShadow} size="xl" fw={700} lineClamp={2} lh={1.2}>
+                {title}
+              </Text>
+            )}
+          </div>
+          <ArticleStats data={data} />
+        </div>
+      }
+    />
+  );
+}
+
+function ArticleStats({ data }: { data: ArticleGetAllRecord }) {
+  const { id, user, stats } = data;
+  const inView = useElementInView();
+  const tippedAmount = useBuzzTippingStore({ entityType: 'Article', entityId: id });
+  return (
+    <Metrics
+      entityType="Article"
+      entityId={id}
+      initial={{
+        commentCount: stats?.commentCount ?? 0,
+        viewCount: stats?.viewCount ?? 0,
+        collectedCount: stats?.collectedCount ?? 0,
+        tippedAmountCount: stats?.tippedAmountCount ?? 0,
+      }}
+      useLive={inView !== false}
+    >
+      {(m) => (
+        <div className="flex items-center justify-between gap-1">
+          <Badge
+            className={clsx(cardClasses.statChip, cardClasses.chip)}
+            classNames={{ label: 'flex flex-nowrap gap-2' }}
+            variant="light"
+            radius="xl"
+          >
+            <div className="flex items-center gap-0.5">
+              <IconBookmark size={14} strokeWidth={2.5} />
+              <Text size="xs" lh={1} fw="bold">
+                <AnimatedCount value={m.collectedCount} />
+              </Text>
+            </div>
+            <div className="flex items-center gap-0.5">
+              <IconMessageCircle2 size={14} strokeWidth={2.5} />
+              <Text size="xs" lh={1} fw="bold">
+                <AnimatedCount value={m.commentCount} />
+              </Text>
+            </div>
+            <InteractiveTipBuzzButton toUserId={user.id} entityType={'Article'} entityId={id}>
+              <div className="flex items-center gap-0.5">
+                <IconBolt size={14} strokeWidth={2.5} />
+                <Text size="xs" lh={1} fw="bold">
+                  <AnimatedCount value={m.tippedAmountCount + tippedAmount} />
+                </Text>
+              </div>
+            </InteractiveTipBuzzButton>
+          </Badge>
+          <Badge
+            className={clsx(cardClasses.statChip, cardClasses.chip)}
+            variant="light"
+            radius="xl"
+          >
+            <div className="flex items-center gap-0.5">
+              <IconEye size={14} strokeWidth={2.5} />
+              <Text size="xs" lh={1} fw="bold">
+                <AnimatedCount value={m.viewCount} />
+              </Text>
+            </div>
+          </Badge>
+        </div>
+      )}
+    </Metrics>
+  );
+}
+
+type Props = {
+  data: ArticleGetAllRecord;
+  aspectRatio?: 'landscape' | 'portrait' | 'square';
+};

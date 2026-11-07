@@ -1,0 +1,149 @@
+// @ts-check
+import * as z from 'zod';
+import { isProd } from './other';
+
+/**
+ * Specify your client-side environment variables schema here.
+ * This way you can ensure the app isn't built with invalid env vars.
+ * To expose them to the client, prefix them with `NEXT_PUBLIC_`.
+ */
+export const clientSchema = z.object({
+  NEXT_PUBLIC_IMAGE_LOCATION: z.string().default(''),
+  NEXT_PUBLIC_CIVITAI_LINK: isProd ? z.url() : z.url().optional(),
+  NEXT_PUBLIC_GIT_HASH: z.string().optional(),
+  NEXT_PUBLIC_LOCAL_TRACKER_ENABLED: z.string().optional(),
+  NEXT_PUBLIC_LOCAL_ADS_ENABLED: z.string().optional(),
+  NEXT_PUBLIC_PICFINDER_WS_ENDPOINT: z.url().optional(),
+  NEXT_PUBLIC_PICFINDER_API_KEY: z.string().optional(),
+  NEXT_PUBLIC_SEARCH_HOST: z.url().optional(),
+  NEXT_PUBLIC_SEARCH_CLIENT_KEY: z.string().optional(),
+  NEXT_PUBLIC_SIGNALS_ENDPOINT: z.string().optional(),
+  // VAPID public key for web push (`applicationServerKey`). Must be the pair of the private key the
+  // notifications worker signs with, or every subscription minted here is undeliverable. Unset =
+  // push UI never offered.
+  NEXT_PUBLIC_VAPID_PUBLIC_KEY: z.string().optional(),
+  // '1' registers the service worker on a non-production build (production always registers).
+  NEXT_PUBLIC_ENABLE_SW_DEV: z.string().optional(),
+  NEXT_PUBLIC_MODERATOR_APP_URL: z.url().default('https://moderator.civitai.com'),
+  NEXT_PUBLIC_TRAINING_STUDIO_URL: z.url().default('https://training.civitai.com'),
+  // 🔴 The BROWSER-facing orchestrator origin, and deliberately NOT the server-side
+  // `ORCHESTRATOR_ENDPOINT`. That one is an in-cluster address
+  // (`http://orchestration-api.…svc.cluster.local:8080`), so handing it to client code yields a
+  // mixed-content warning and `ERR_NAME_NOT_RESOLVED` — which is exactly what the embedded Training
+  // Studio did until this existed. The web component calls the orchestrator DIRECTLY from the
+  // browser (docs/training-studio-web-component.md), so it needs the public origin. Keep the two
+  // separate: server code keeps using `ORCHESTRATOR_ENDPOINT`, browser code uses this.
+  //
+  // This default's HOST also appears in `CIVITAI_IMAGE_HOSTS`
+  // (src/components/AppBlocks/saveImageDownload.ts) — same hostname, different job: that one is the
+  // allowlist of hosts the App Blocks download bridge may FETCH from, this one is the base URL the
+  // browser CALLS. They are not interchangeable and must not be merged, but they are coupled: a
+  // blob URL minted by this origin has to be fetchable by that bridge, so changing the public
+  // orchestrator host means changing both. The coupling is asserted, not just described, in
+  // src/__tests__/pages/training-studio-embed-orchestrator-origin.test.ts.
+  NEXT_PUBLIC_ORCHESTRATOR_ENDPOINT: z.url().default('https://orchestration.civitai.com'),
+  NEXT_PUBLIC_GPTT_UUID: z.string().optional(),
+  NEXT_PUBLIC_GPTT_UUID_ALT: z.string().optional(),
+  NEXT_PUBLIC_GPTT_UUID_GREEN: z.string().optional(),
+  NEXT_PUBLIC_BASE_URL: z.string().optional(),
+  NEXT_PUBLIC_UI_HOMEPAGE_IMAGES: z.stringbool().default(true),
+  // An empty value reads as unset rather than as a parse error: the read below named
+  // the wrong variable until #4035, so a config carrying a valueless key had been
+  // inert and would otherwise start throwing out of `~/env/client`. Anything else
+  // unparseable still throws, as it does for every other stringbool here.
+  NEXT_PUBLIC_LOG_TRPC: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.stringbool().default(false)
+  ),
+  NEXT_PUBLIC_RECAPTCHA_KEY: z.string().optional(),
+  NEXT_PUBLIC_PAYPAL_CLIENT_ID: z.string().optional(),
+  NEXT_PUBLIC_CHOPPED_ENDPOINT: z.url().optional(),
+  NEXT_PUBLIC_PADDLE_TOKEN: z.string().optional(),
+  NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: z.string().optional(),
+  NEXT_PUBLIC_DEFAULT_PAYMENT_PROVIDER: z.enum(['Stripe', 'Paddle']).default('Stripe'),
+  NEXT_PUBLIC_CLOUDFLARE_TURNSTILE_SITEKEY: z.string().optional(),
+  NEXT_PUBLIC_CF_INVISIBLE_TURNSTILE_SITEKEY: z.string().optional(),
+  NEXT_PUBLIC_CF_MANAGED_TURNSTILE_SITEKEY: z.string().optional(),
+  // Auth proxy URL for PR previews - when set, OAuth flows redirect through this URL
+  // instead of handling locally (e.g., "https://auth.civitaic.com")
+  NEXT_PUBLIC_AUTH_PROXY_URL: z.string().optional(),
+  // (NEXT_PUBLIC_AUTH_HUB_URL removed: every client-initiated hub flow — login full-page + popup, account
+  // connect, discord-link — now routes through a same-origin main-app endpoint that builds the hub URL from
+  // the SERVER's AUTH_JWT_ISSUER, so the client no longer needs a build-time hub origin.)
+  // Faro RUM (frontend observability). ALL optional/defaulted so they are NOT
+  // required-in-prod (a required NEXT_PUBLIC_ var breaks fresh PR-preview builds).
+  // Shipped dark: even with the build-args set, Faro only inits when the runtime
+  // `faro` feature flag is also on.
+  NEXT_PUBLIC_FARO_ENABLED: z.stringbool().default(false),
+  NEXT_PUBLIC_FARO_COLLECTOR_URL: z.url().optional(), // e.g. https://faro.civitai.com/collect
+  // Browser-trace (OTel span) sampling ratio — wired into the tracer provider via
+  // SampledTracingInstrumentation. Independent of session sampling: lowering it reduces
+  // trace volume WITHOUT reducing error/web-vitals coverage.
+  NEXT_PUBLIC_FARO_TRACES_SAMPLE_RATE: z.string().default('0.1'),
+  // Session sampling ratio — gates ALL Faro signals (errors/web-vitals/events/sessions).
+  NEXT_PUBLIC_FARO_SESSION_SAMPLE_RATE: z.string().default('1.0'),
+  // Resource Timing decomposition (DNS/TCP/TLS/TTFB/download splits for same-origin `/api`
+  // requests, emitted as custom Faro measurements). Ships DARK — default OFF — so it can be
+  // ramped INDEPENDENTLY of the main RUM flag once volume is confirmed on a small cohort.
+  // Only takes effect when NEXT_PUBLIC_FARO_ENABLED + the `faro` flag are also on.
+  NEXT_PUBLIC_FARO_RESOURCE_TIMING_ENABLED: z.stringbool().default(false),
+  // Deploy-tunable volume knobs for the resource-timing gate (dial the ramp WITHOUT a rebuild;
+  // parsed to numbers with a safe fallback in resolveResourceTimingConfig). Default sample rate
+  // is 0.05 — deliberately low so the aggregate stays under Loki's 10 MB/s per-stream ceiling on
+  // the shared `source="faro-rum"` stream at 100k concurrent (0.25 would breach it ~84.5k). The
+  // per-window cap is the pathological-single-client belt.
+  NEXT_PUBLIC_FARO_RESOURCE_TIMING_SAMPLE_RATE: z.string().default('0.05'),
+  NEXT_PUBLIC_FARO_RESOURCE_TIMING_MAX_PER_WINDOW: z.string().default('8'),
+});
+
+/**
+ * You can't destruct `process.env` as a regular object, so you have to do
+ * it manually here. This is because Next.js evaluates this at build time,
+ * and only used environment variables are included in the build.
+ * @type {{ [k in keyof z.infer<typeof clientSchema>]: z.infer<typeof clientSchema>[k] | undefined }}
+ */
+export const clientEnv = {
+  NEXT_PUBLIC_IMAGE_LOCATION: process.env.NEXT_PUBLIC_IMAGE_LOCATION,
+  NEXT_PUBLIC_GIT_HASH: process.env.NEXT_PUBLIC_GIT_HASH,
+  NEXT_PUBLIC_LOCAL_TRACKER_ENABLED: process.env.NEXT_PUBLIC_LOCAL_TRACKER_ENABLED,
+  NEXT_PUBLIC_LOCAL_ADS_ENABLED: process.env.NEXT_PUBLIC_LOCAL_ADS_ENABLED,
+  NEXT_PUBLIC_CIVITAI_LINK: process.env.NEXT_PUBLIC_CIVITAI_LINK,
+  NEXT_PUBLIC_PICFINDER_WS_ENDPOINT: process.env.NEXT_PUBLIC_PICFINDER_WS_ENDPOINT,
+  NEXT_PUBLIC_PICFINDER_API_KEY: process.env.NEXT_PUBLIC_PICFINDER_API_KEY,
+  NEXT_PUBLIC_SEARCH_HOST: process.env.NEXT_PUBLIC_SEARCH_HOST,
+  NEXT_PUBLIC_SEARCH_CLIENT_KEY: process.env.NEXT_PUBLIC_SEARCH_CLIENT_KEY,
+  NEXT_PUBLIC_SIGNALS_ENDPOINT: process.env.NEXT_PUBLIC_SIGNALS_ENDPOINT,
+  NEXT_PUBLIC_VAPID_PUBLIC_KEY: process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY,
+  NEXT_PUBLIC_ENABLE_SW_DEV: process.env.NEXT_PUBLIC_ENABLE_SW_DEV,
+  NEXT_PUBLIC_MODERATOR_APP_URL: process.env.NEXT_PUBLIC_MODERATOR_APP_URL,
+  NEXT_PUBLIC_TRAINING_STUDIO_URL: process.env.NEXT_PUBLIC_TRAINING_STUDIO_URL,
+  NEXT_PUBLIC_ORCHESTRATOR_ENDPOINT: process.env.NEXT_PUBLIC_ORCHESTRATOR_ENDPOINT,
+  NEXT_PUBLIC_GPTT_UUID: process.env.NEXT_PUBLIC_GPTT_UUID,
+  NEXT_PUBLIC_GPTT_UUID_ALT: process.env.NEXT_PUBLIC_GPTT_UUID_ALT,
+  NEXT_PUBLIC_GPTT_UUID_GREEN: process.env.NEXT_PUBLIC_GPTT_UUID_GREEN,
+  NEXT_PUBLIC_BASE_URL: process.env.NEXT_PUBLIC_BASE_URL ?? process.env.NEXTAUTH_URL,
+  NEXT_PUBLIC_UI_HOMEPAGE_IMAGES: process.env.NEXT_PUBLIC_UI_HOMEPAGE_IMAGES,
+  NEXT_PUBLIC_LOG_TRPC: process.env.NEXT_PUBLIC_LOG_TRPC,
+  NEXT_PUBLIC_RECAPTCHA_KEY: process.env.NEXT_PUBLIC_RECAPTCHA_KEY,
+  NEXT_PUBLIC_PAYPAL_CLIENT_ID: process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID,
+  NEXT_PUBLIC_CHOPPED_ENDPOINT: process.env.NEXT_PUBLIC_CHOPPED_ENDPOINT,
+  NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY,
+  NEXT_PUBLIC_PADDLE_TOKEN: process.env.NEXT_PUBLIC_PADDLE_TOKEN,
+  // Default to Stripe in case the env var is not set
+  NEXT_PUBLIC_DEFAULT_PAYMENT_PROVIDER:
+    process.env.NEXT_PUBLIC_DEFAULT_PAYMENT_PROVIDER === 'Paddle' ? 'Paddle' : 'Stripe',
+  NEXT_PUBLIC_CLOUDFLARE_TURNSTILE_SITEKEY: process.env.NEXT_PUBLIC_CLOUDFLARE_TURNSTILE_SITEKEY,
+  NEXT_PUBLIC_CF_INVISIBLE_TURNSTILE_SITEKEY:
+    process.env.NEXT_PUBLIC_CF_INVISIBLE_TURNSTILE_SITEKEY,
+  NEXT_PUBLIC_CF_MANAGED_TURNSTILE_SITEKEY: process.env.NEXT_PUBLIC_CF_MANAGED_TURNSTILE_SITEKEY,
+  NEXT_PUBLIC_AUTH_PROXY_URL: process.env.NEXT_PUBLIC_AUTH_PROXY_URL,
+  NEXT_PUBLIC_FARO_ENABLED: process.env.NEXT_PUBLIC_FARO_ENABLED,
+  NEXT_PUBLIC_FARO_COLLECTOR_URL: process.env.NEXT_PUBLIC_FARO_COLLECTOR_URL,
+  NEXT_PUBLIC_FARO_TRACES_SAMPLE_RATE: process.env.NEXT_PUBLIC_FARO_TRACES_SAMPLE_RATE,
+  NEXT_PUBLIC_FARO_SESSION_SAMPLE_RATE: process.env.NEXT_PUBLIC_FARO_SESSION_SAMPLE_RATE,
+  NEXT_PUBLIC_FARO_RESOURCE_TIMING_ENABLED: process.env.NEXT_PUBLIC_FARO_RESOURCE_TIMING_ENABLED,
+  NEXT_PUBLIC_FARO_RESOURCE_TIMING_SAMPLE_RATE:
+    process.env.NEXT_PUBLIC_FARO_RESOURCE_TIMING_SAMPLE_RATE,
+  NEXT_PUBLIC_FARO_RESOURCE_TIMING_MAX_PER_WINDOW:
+    process.env.NEXT_PUBLIC_FARO_RESOURCE_TIMING_MAX_PER_WINDOW,
+};

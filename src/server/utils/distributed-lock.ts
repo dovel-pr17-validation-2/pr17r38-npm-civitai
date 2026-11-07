@@ -1,0 +1,137 @@
+import type { RedisKeyTemplateCache } from '~/server/redis/client';
+import { delIfValue } from '~/server/redis/atomic';
+import { redis, REDIS_KEYS } from '~/server/redis/client';
+import { env } from '~/env/server';
+import { handleLogError } from '~/server/utils/errorHandling';
+
+export interface DistributedLockOptions {
+  key: string;
+  ttl?: number; // TTL in seconds, default 5 on DP / 30 on DOKS
+  retryDelay?: number; // Retry delay in ms, default 100
+  maxRetries?: number; // Max retries, default 10
+  /**
+   * Extend the lock on a timer for as long as the holder is alive. Opt-in: without
+   * it the TTL is a hard deadline, so an operation that outruns its TTL keeps
+   * running while a second holder acquires the same lock and does the work twice.
+   * A dead holder stops renewing and the TTL still reclaims the lock.
+   */
+  autoRenew?: boolean;
+}
+
+export class DistributedLock {
+  private readonly lockKey: RedisKeyTemplateCache;
+  private readonly ttl: number;
+  private readonly retryDelay: number;
+  private readonly maxRetries: number;
+  private readonly autoRenew: boolean;
+  private renewTimer: NodeJS.Timeout | null = null;
+  private lockValue: string | null = null;
+
+  constructor(options: DistributedLockOptions) {
+    this.lockKey = `${REDIS_KEYS.CACHE_LOCKS}:${options.key}`;
+    this.ttl = options.ttl ?? (env.IS_DATAPACKET ? 5 : 30);
+    this.retryDelay = options.retryDelay ?? 100;
+    this.maxRetries = options.maxRetries ?? 10;
+    this.autoRenew = options.autoRenew ?? false;
+  }
+
+  /**
+   * Compare-and-extend: only the holder whose value still matches may push the
+   * expiry out, so a lock already reclaimed and retaken is never extended by its
+   * previous owner.
+   */
+  private startRenewal(): void {
+    if (!this.autoRenew || !redis) return;
+
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("pexpire", KEYS[1], ARGV[2])
+      else
+        return 0
+      end
+    `;
+
+    this.renewTimer = setInterval(() => {
+      if (!this.lockValue) return;
+      redis
+        .eval(script, {
+          keys: [this.lockKey],
+          arguments: [this.lockValue, String(this.ttl * 1000)],
+        })
+        .catch((error) => handleLogError(error as Error, `Failed to renew lock: ${this.lockKey}`));
+    }, Math.max((this.ttl * 1000) / 3, 1000));
+
+    // Renewal must never be the reason a process stays alive.
+    this.renewTimer.unref?.();
+  }
+
+  private stopRenewal(): void {
+    if (!this.renewTimer) return;
+    clearInterval(this.renewTimer);
+    this.renewTimer = null;
+  }
+
+  async acquire(): Promise<boolean> {
+    if (!redis) return false; // Fallback when Redis is not available
+
+    this.lockValue = `${Date.now()}-${Math.random()}`;
+
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        const result = await redis.set(this.lockKey, this.lockValue, {
+          PX: this.ttl * 1000,
+          NX: true,
+        });
+
+        if (result === 'OK') {
+          this.startRenewal();
+          return true;
+        }
+
+        if (attempt < this.maxRetries) {
+          await this.delay(this.retryDelay);
+        }
+      } catch (error) {
+        handleLogError(error as Error, `Failed to acquire lock: ${this.lockKey}`);
+        return false; // Fallback to prevent operation if Redis fails
+      }
+    }
+
+    return false;
+  }
+
+  async release(): Promise<void> {
+    this.stopRenewal();
+    if (!redis || !this.lockValue) return;
+
+    try {
+      await delIfValue(redis, this.lockKey, this.lockValue);
+    } catch (error) {
+      handleLogError(error as Error, `Failed to release lock: ${this.lockKey}`);
+    } finally {
+      this.lockValue = null;
+    }
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+
+export async function withDistributedLock<T>(
+  options: DistributedLockOptions,
+  operation: () => Promise<T>
+): Promise<T | null> {
+  const lock = new DistributedLock(options);
+
+  const acquired = await lock.acquire();
+  if (!acquired) {
+    return null; // Could not acquire lock
+  }
+
+  try {
+    return await operation();
+  } finally {
+    await lock.release();
+  }
+}

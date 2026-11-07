@@ -1,0 +1,178 @@
+import type { DragEndEvent, UniqueIdentifier } from '@dnd-kit/core';
+import { DndContext, PointerSensor, closestCenter, useSensor, useSensors } from '@dnd-kit/core';
+import { SortableContext, arrayMove, useSortable } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import { Button } from '@mantine/core';
+import { usePrevious } from '@mantine/hooks';
+import { IconArrowsMaximize, IconArrowsSort, IconCheck } from '@tabler/icons-react';
+import { isEqual } from 'lodash-es';
+import type { CSSProperties } from 'react';
+import { BrowsingLevelBadge } from '~/components/BrowsingLevel/BrowsingLevelBadge';
+import { ImageReactionCount } from '~/components/Post/EditV2/PostImageCards/ImageReactionCount';
+import { EdgeMedia } from '~/components/EdgeMedia/EdgeMedia';
+import { useImageStore } from '~/store/image.store';
+import { trpc } from '~/utils/trpc';
+import { isDefined } from '~/utils/type-guards';
+import type { ControlledImage } from '~/components/Post/EditV2/PostEditProvider';
+import { usePostEditStore } from '~/components/Post/EditV2/PostEditProvider';
+
+export function PostReorderImages() {
+  const [images, setImages] = usePostEditStore((state) => [
+    [...state.images]
+      .map((x) => (x.type === 'added' ? x.data : undefined))
+      .filter(isDefined)
+      .sort((a, b) => (a.index ?? 0) - (b.index ?? 0)),
+    state.setImages,
+  ]);
+
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
+
+  const items = images.filter((x) => x.id);
+
+  function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over) return;
+    if (active.id !== over.id) {
+      setImages((storeImages) => {
+        // Filter and sort the same way as the displayed images
+        const addedImages = storeImages
+          .filter((x) => x.type === 'added' && x.data.id)
+          .sort((a, b) => (a.data.index ?? 0) - (b.data.index ?? 0));
+
+        // Find indices in the sorted, filtered array (matching what's displayed)
+        const oldIndex = addedImages.findIndex((x) => x.data.url === active.id);
+        const newIndex = addedImages.findIndex((x) => x.data.url === over.id);
+
+        if (oldIndex === -1 || newIndex === -1) return storeImages;
+
+        // Reorder the added images
+        const reordered = arrayMove(addedImages, oldIndex, newIndex);
+
+        // Update indices for the reordered images
+        const updatedImages = reordered.map(
+          (image, index) =>
+            ({
+              type: image.type,
+              data: { ...image.data, index: index + 1 },
+            } as ControlledImage)
+        );
+
+        // Merge back with non-added images
+        const nonAddedImages = storeImages.filter((x) => x.type !== 'added' || !x.data.id);
+        return [...updatedImages, ...nonAddedImages];
+      });
+    }
+  }
+
+  return (
+    <>
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+        <SortableContext items={items.map((x) => x.url)}>
+          <div style={{ display: 'grid', gridTemplateColumns: `repeat(3, 1fr)`, gridGap: 10 }}>
+            {items.map((image) => (
+              <SortableImage key={image.id} image={image} sortableId={image.url} />
+            ))}
+          </div>
+        </SortableContext>
+      </DndContext>
+      <ReorderImagesButton />
+    </>
+  );
+}
+
+type ItemProps = {
+  image: Extract<ControlledImage, { type: 'added' }>['data'];
+  sortableId: UniqueIdentifier;
+};
+
+function SortableImage({ image, sortableId }: ItemProps) {
+  const { attributes, listeners, isDragging, setNodeRef, transform, transition } = useSortable({
+    id: sortableId,
+  });
+  const { nsfwLevel } = useImageStore(image);
+
+  const style: CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    cursor: isDragging ? 'grabbing' : 'pointer',
+    zIndex: isDragging ? 1 : undefined,
+    touchAction: 'none',
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      className="relative aspect-square overflow-hidden rounded-md"
+      style={style}
+      {...listeners}
+      {...attributes}
+    >
+      <EdgeMedia
+        src={image.url}
+        type={image.type}
+        width={450}
+        className="object-cover object-center"
+      />
+      <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/50 opacity-0 hover:opacity-100">
+        <IconArrowsMaximize
+          size={48}
+          stroke={1.5}
+          style={{ transform: 'rotate(45deg)' }}
+          color="white"
+        />
+      </div>
+      {!!nsfwLevel && (
+        <BrowsingLevelBadge
+          browsingLevel={nsfwLevel}
+          size="lg"
+          className="pointer-events-none absolute left-2 top-2 z-20"
+        />
+      )}
+      <ImageReactionCount
+        count={image.reactionCount}
+        className="pointer-events-none absolute bottom-2 left-2 z-20"
+      />
+    </div>
+  );
+}
+
+export function ReorderImagesButton() {
+  const queryUtils = trpc.useUtils();
+  const [post, images, isReordering, toggleReordering] = usePostEditStore((state) => [
+    state.post,
+    state.images,
+    state.isReordering,
+    state.toggleReordering,
+  ]);
+
+  const { mutate, isPending: isLoading } = trpc.post.reorderImages.useMutation({
+    async onSuccess() {
+      await queryUtils.model.getAll.invalidate();
+      await queryUtils.image.getInfinite.invalidate();
+    },
+  });
+  const previous = usePrevious(images);
+  const canReorder = !!images.every((x) => x.type === 'added');
+
+  const onClick = () => {
+    toggleReordering();
+    if (isReordering && !!previous && !isEqual(previous, images) && post) {
+      mutate({
+        id: post.id,
+        imageIds: images.map((x) => (x.type === 'added' ? x.data.id : undefined)).filter(isDefined),
+      });
+    }
+  };
+
+  return (
+    <Button
+      onClick={onClick}
+      disabled={!canReorder}
+      loading={isLoading}
+      variant={!isReordering ? 'outline' : undefined}
+      leftSection={!isReordering ? <IconArrowsSort /> : <IconCheck />}
+    >
+      {!isReordering ? 'Rearrange' : 'Done Rearranging'}
+    </Button>
+  );
+}

@@ -1,0 +1,807 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { NextApiRequest, NextApiResponse } from 'next';
+import type * as MeiliClient from '~/server/meilisearch/client';
+
+// 1. Hoisted mocks for API and Service dependencies
+const {
+  mockGetAllImages,
+  mockGetImagesFromFeedSearch,
+  mockImageMetaCacheFetch,
+  mockGetServerAuthSession,
+  mockGetFeatureFlags,
+  mockGetHeldGalleryLevel,
+} = vi.hoisted(() => ({
+  mockGetHeldGalleryLevel: vi.fn(),
+  mockGetAllImages: vi.fn(),
+  mockGetImagesFromFeedSearch: vi.fn(),
+  mockImageMetaCacheFetch: vi.fn(),
+  mockGetServerAuthSession: vi.fn(),
+  mockGetFeatureFlags: vi.fn(),
+}));
+
+vi.mock('~/server/services/image.service', () => ({
+  getAllImages: mockGetAllImages,
+  getImagesFromFeedSearch: mockGetImagesFromFeedSearch,
+  // The feed-service branch declines, so every request here reaches feed search as before.
+  getImagesFromFeedServiceForRest: async () => undefined,
+}));
+
+vi.mock('~/server/services/model.service', () => ({
+  getHeldGalleryLevel: mockGetHeldGalleryLevel,
+  getHeldLevelsByPost: async () => new Map(),
+}));
+
+vi.mock('~/server/redis/caches', () => ({
+  imageMetaCache: {
+    fetch: mockImageMetaCacheFetch,
+  },
+}));
+
+vi.mock('~/server/auth/get-server-auth-session', () => ({
+  getServerAuthSession: mockGetServerAuthSession,
+}));
+
+vi.mock('~/server/services/feature-flags.service', () => ({
+  getFeatureFlags: mockGetFeatureFlags,
+  buildFliptContext: vi.fn(),
+}));
+
+vi.mock('~/client-utils/edge-url', () => ({
+  getEdgeUrl: (url: string) => `https://cf-images.com/${url}`,
+}));
+
+vi.mock('~/server/utils/region-blocking', () => ({
+  getRegion: vi.fn().mockReturnValue('US'),
+  isRegionRestricted: vi.fn().mockReturnValue(false),
+}));
+
+// Keep the REAL isTransientMeiliError (+ the error classes it tests against) so
+// the handler's 500→503 classification branch runs its production logic; only
+// buildSearchActor is stubbed. importOriginal pulls the real module; env/prom
+// at its module load are tolerated (no real connection opens in test).
+vi.mock('~/server/meilisearch/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof MeiliClient>();
+  return {
+    ...actual,
+    buildSearchActor: vi.fn().mockReturnValue('mock-actor'),
+  };
+});
+
+vi.mock('request-ip', () => ({
+  default: { getClientIp: () => '127.0.0.1' },
+}));
+
+// Mock PublicEndpoint to be a simple passthrough wrapper.
+//
+// 🔴 Spread the ORIGINAL. This used to REPLACE the module, which was fine while
+// the route hand-rolled its own error envelope and silently became a
+// module-resolution failure ("No `handleEndpointError` export is defined") the
+// moment it started delegating (civitai#3845 TIER 1) — nine tests failing for a
+// reason unrelated to what they assert. `handleEndpointError` is now part of the
+// behaviour under test in the catch-path cases below.
+vi.mock('~/server/utils/endpoint-helpers', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  PublicEndpoint: (handler: any) => handler,
+}));
+
+// 2. Import the handler after the mocks are defined
+import { TRPCError } from '@trpc/server';
+import handler from '~/pages/api/v1/images/index';
+import { ImagesFeed } from '../../../../../event-engine-common/feeds';
+
+// 3. Helper to mock NextApiRequest/Response
+function createMocks({ query = {} }: { query?: Record<string, string | string[]> }) {
+  const req = {
+    method: 'GET',
+    headers: {},
+    query,
+  } as unknown as NextApiRequest;
+
+  let statusCode = 200;
+  let payload: any = undefined;
+  let ended = false;
+  const headers: Record<string, string> = {};
+
+  const res = {
+    headersSent: false,
+    setHeader(name: string, value: string) {
+      headers[name.toLowerCase()] = value;
+      return res;
+    },
+    getHeader(name: string) {
+      return headers[name.toLowerCase()];
+    },
+    status(code: number) {
+      statusCode = code;
+      return res;
+    },
+    json(body: any) {
+      payload = body;
+      return res;
+    },
+    end() {
+      ended = true;
+      return res;
+    },
+    _getStatusCode: () => statusCode,
+    _getJSONData: () => payload,
+    _getHeader: (name: string) => headers[name.toLowerCase()],
+    _ended: () => ended,
+  } as unknown as NextApiResponse & {
+    _getStatusCode: () => number;
+    _getJSONData: () => any;
+    _getHeader: (name: string) => string | undefined;
+    _ended: () => boolean;
+  };
+
+  return { req, res };
+}
+
+// 4. Test Suite
+describe('/api/v1/images API Handler', () => {
+  const mockImagesResult = {
+    items: [
+      {
+        id: 100,
+        url: 'test-uuid',
+        hash: 'U36kF+Z#',
+        width: 832,
+        height: 1216,
+        nsfwLevel: 1,
+        type: 'image',
+        createdAt: new Date('2026-03-04T16:10:46.428Z'),
+        postId: 27016856,
+        stats: {
+          cryCountAllTime: 4,
+          laughCountAllTime: 7,
+          likeCountAllTime: 154,
+          dislikeCountAllTime: 0,
+          heartCountAllTime: 47,
+          commentCountAllTime: 1,
+        },
+        user: {
+          username: 'forest919',
+        },
+        baseModel: 'Anima',
+        modelVersionIds: [2653283],
+        tags: [
+          { id: 1, name: 'anime' },
+          { id: 2, name: 'portrait' },
+        ],
+      },
+    ],
+    nextCursor: 'cursor_val',
+  };
+
+  const mockMetaResult = {
+    100: {
+      id: 100,
+      meta: {
+        Model: 'anima-preview',
+        cfgScale: 4,
+        prompt: 'masterpiece, best quality',
+      },
+    },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetServerAuthSession.mockResolvedValue(null);
+    mockGetFeatureFlags.mockReturnValue({ datapacketRead: false, canViewNsfw: false });
+    mockGetImagesFromFeedSearch.mockResolvedValue(mockImagesResult);
+    mockGetAllImages.mockResolvedValue(mockImagesResult);
+    mockImageMetaCacheFetch.mockResolvedValue(mockMetaResult);
+  });
+
+  describe('a held model or version', () => {
+    afterEach(() => mockGetHeldGalleryLevel.mockReset());
+
+    // A modelId request takes the DB path, a version request the feed search: both are checked.
+    const searchedLevel = () => {
+      const calls = [...mockGetAllImages.mock.calls, ...mockGetImagesFromFeedSearch.mock.calls];
+      expect(calls).toHaveLength(1);
+      return (calls[0][0] as { browsingLevel?: number }).browsingLevel;
+    };
+
+    it.each([
+      ['?modelId=', { modelId: '5' }],
+      ['?modelVersionId=', { modelVersionId: '50' }],
+      ['?postId=', { postId: '500' }],
+    ])('serves %s only at the held levels of what is asked for', async (_name, selector) => {
+      mockGetHeldGalleryLevel.mockResolvedValue(1);
+      const { req, res } = createMocks({ query: { ...selector, browsingLevel: '31' } });
+
+      await handler(req, res);
+
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockGetHeldGalleryLevel).toHaveBeenCalledWith(
+        expect.objectContaining(
+          Object.fromEntries(Object.entries(selector).map(([key, id]) => [key, Number(id)]))
+        )
+      );
+      expect(searchedLevel()).toBe(1);
+    });
+
+    it('returns an empty page, searching nothing, when no asked level is held', async () => {
+      mockGetHeldGalleryLevel.mockResolvedValue(1);
+      const { req, res } = createMocks({ query: { modelVersionId: '50', browsingLevel: '28' } });
+
+      await handler(req, res);
+
+      expect(res._getStatusCode()).toBe(200);
+      expect(res._getJSONData().items).toEqual([]);
+      expect(mockGetImagesFromFeedSearch).not.toHaveBeenCalled();
+      expect(mockGetAllImages).not.toHaveBeenCalled();
+    });
+
+    it('holds a moderator too', async () => {
+      mockGetServerAuthSession.mockResolvedValue({ user: { id: 1, isModerator: true } });
+      mockGetHeldGalleryLevel.mockResolvedValue(1);
+      const { req, res } = createMocks({ query: { modelVersionId: '50', browsingLevel: '31' } });
+
+      await handler(req, res);
+
+      expect(searchedLevel()).toBe(1);
+    });
+
+    it('leaves an unheld model at the level asked for', async () => {
+      mockGetHeldGalleryLevel.mockResolvedValue(undefined);
+      const { req, res } = createMocks({ query: { modelId: '5', browsingLevel: '31' } });
+
+      await handler(req, res);
+
+      expect(searchedLevel()).toBe(31);
+    });
+  });
+
+  it('should return meta: null by default (when withMeta is false) and NOT fetch from cache', async () => {
+    const { req, res } = createMocks({ query: { limit: '10' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].meta).toBeNull();
+    expect(mockImageMetaCacheFetch).not.toHaveBeenCalled();
+
+    // Verify search service call had withMeta = false to prevent search index filtering
+    expect(mockGetImagesFromFeedSearch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        withMeta: false,
+      })
+    );
+  });
+
+  it('should omit tags by default (when withTags is false)', async () => {
+    const { req, res } = createMocks({ query: { limit: '10' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].tags).toBeUndefined();
+    expect(mockGetImagesFromFeedSearch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: expect.not.arrayContaining(['tags']),
+      })
+    );
+  });
+
+  it('should return tags when withTags=true', async () => {
+    const { req, res } = createMocks({ query: { limit: '10', withTags: 'true' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].tags).toEqual([
+      { id: 1, name: 'anime' },
+      { id: 2, name: 'portrait' },
+    ]);
+    expect(mockGetImagesFromFeedSearch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: expect.arrayContaining(['tags']),
+      })
+    );
+  });
+
+  it('should return tags with withTags=true on legacy path', async () => {
+    const { req, res } = createMocks({ query: { imageId: '100', withTags: 'true' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].tags).toEqual([
+      { id: 1, name: 'anime' },
+      { id: 2, name: 'portrait' },
+    ]);
+    expect(mockGetAllImages).toHaveBeenCalledWith(
+      expect.objectContaining({
+        include: expect.arrayContaining(['tags']),
+      })
+    );
+  });
+
+  it('should return flat shape by default when withMeta=true on default search/feed query path', async () => {
+    const { req, res } = createMocks({ query: { limit: '10', withMeta: 'true' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].meta).toEqual({
+      Model: 'anima-preview',
+      cfgScale: 4,
+      prompt: 'masterpiece, best quality',
+    });
+    expect(mockGetImagesFromFeedSearch).toHaveBeenCalled();
+  });
+
+  it('should return nested wrapper shape by default when withMeta=true on legacy query path (e.g. imageId)', async () => {
+    const { req, res } = createMocks({ query: { imageId: '100', withMeta: 'true' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].meta).toEqual({
+      id: 100,
+      meta: {
+        Model: 'anima-preview',
+        cfgScale: 4,
+        prompt: 'masterpiece, best quality',
+      },
+    });
+    expect(mockGetAllImages).toHaveBeenCalled();
+  });
+
+  it('should return nested shape when flatMeta=false is explicitly passed, regardless of path', async () => {
+    const { req, res } = createMocks({
+      query: { limit: '10', withMeta: 'true', flatMeta: 'false' },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].meta).toEqual({
+      id: 100,
+      meta: {
+        Model: 'anima-preview',
+        cfgScale: 4,
+        prompt: 'masterpiece, best quality',
+      },
+    });
+  });
+
+  it('should return flat shape when flatMeta=true is explicitly passed, regardless of path', async () => {
+    const { req, res } = createMocks({
+      query: { imageId: '100', withMeta: 'true', flatMeta: 'true' },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].meta).toEqual({
+      Model: 'anima-preview',
+      cfgScale: 4,
+      prompt: 'masterpiece, best quality',
+    });
+  });
+
+  it('should return consistent nested wrapper for data-less images (meta: null, not bare null)', async () => {
+    // Image has no meta in cache — the wrapper shape must still be emitted, not bare null
+    mockImageMetaCacheFetch.mockResolvedValue({ 100: { id: 100, meta: undefined } });
+    const { req, res } = createMocks({
+      query: { imageId: '100', withMeta: 'true', flatMeta: 'false' },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    // Must be the wrapper shape, not bare null
+    expect(data.items[0].meta).toEqual({ id: 100, meta: null });
+  });
+
+  it('should return null (not a wrapper) for data-less images in flat mode', async () => {
+    mockImageMetaCacheFetch.mockResolvedValue({ 100: { id: 100, meta: undefined } });
+    const { req, res } = createMocks({
+      query: { limit: '10', withMeta: 'true', flatMeta: 'true' },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].meta).toBeNull();
+  });
+
+  it('should pass withMeta:false to getAllImages on legacy path regardless of query param', async () => {
+    const { req, res } = createMocks({ query: { imageId: '100', withMeta: 'true' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockGetAllImages).toHaveBeenCalledWith(expect.objectContaining({ withMeta: false }));
+  });
+
+  it('should return empty tags array when image has no tags', async () => {
+    mockGetImagesFromFeedSearch.mockResolvedValue({
+      ...mockImagesResult,
+      items: [{ ...mockImagesResult.items[0], tags: [] }],
+    });
+    const { req, res } = createMocks({ query: { limit: '10', withTags: 'true' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].tags).toEqual([]);
+  });
+
+  it('should return empty tags array when image tags field is absent', async () => {
+    const { tags: _, ...itemWithoutTags } = mockImagesResult.items[0];
+    mockGetImagesFromFeedSearch.mockResolvedValue({
+      ...mockImagesResult,
+      items: [itemWithoutTags],
+    });
+    const { req, res } = createMocks({ query: { limit: '10', withTags: 'true' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = res._getJSONData();
+    expect(data.items[0].tags).toEqual([]);
+  });
+});
+
+// ─── Transient upstream → retryable 503 (500→503 reclassification) ───────────
+//
+// The dominant remaining HTTP-500 source on this endpoint is the heavy per-user
+// feed (sort=Most Reactions & period=Year & withMeta=true) hitting a slow /
+// shed Meili backend. The feed library's inner meilisearch-js (0.33) calls
+// throw the SDK's OWN error types (MeiliSearchCommunicationError with
+// statusCode=408/503, MeiliSearchApiError with httpStatus, MeiliSearchTimeOutError)
+// — NOT TRPCErrors — so they were defaulting to a hard 500 with a bare
+// {"error":"Request Timeout"} / {"error":"Service Unavailable"} body. The
+// handler now classifies these (via isTransientMeiliError) as a retryable 503
+// with Cache-Control: no-store + Retry-After. A genuine app error / NOT_FOUND
+// must still map to its real status — NOT be masked as 503.
+describe('/api/v1/images transient-upstream 503 reclassification', () => {
+  // Faithful meilisearch-js 0.33 error shapes (see client.ts isTransientMeiliError).
+  const makeCommunicationError = (statusCode: number) => {
+    const e = new Error(statusCode === 408 ? 'Request Timeout' : 'Service Unavailable') as Error & {
+      name: string;
+      statusCode: number;
+    };
+    e.name = 'MeiliSearchCommunicationError';
+    e.statusCode = statusCode;
+    return e;
+  };
+  const makeApiError = (httpStatus: number) => {
+    const e = new Error('meilisearch upstream error') as Error & {
+      name: string;
+      httpStatus: number;
+    };
+    e.name = 'MeiliSearchApiError';
+    e.httpStatus = httpStatus;
+    return e;
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetServerAuthSession.mockResolvedValue(null);
+    mockGetFeatureFlags.mockReturnValue({ datapacketRead: false, canViewNsfw: false });
+    mockImageMetaCacheFetch.mockResolvedValue({});
+  });
+
+  it.each([408, 429, 502, 503, 504])(
+    'maps a MeiliSearchCommunicationError(statusCode=%i) to a retryable 503 (no-store + Retry-After)',
+    async (status) => {
+      mockGetImagesFromFeedSearch.mockRejectedValue(makeCommunicationError(status));
+      const { req, res } = createMocks({ query: { limit: '10' } });
+
+      await handler(req, res);
+
+      expect(res._getStatusCode()).toBe(503);
+      expect(res._getJSONData()).toEqual({
+        error: 'Image search is temporarily overloaded — please retry.',
+      });
+      expect(res._getHeader('Cache-Control')).toBe('no-store');
+      expect(res._getHeader('Retry-After')).toBe('2');
+    }
+  );
+
+  // A MeiliSearchApiError carries a STRUCTURED JSON error body — for a 5xx that
+  // is more likely a deterministic Meili-internal error than a transient
+  // brownout, so ONLY the unambiguous gateway statuses 502/503/504 reclassify to
+  // 503 (audit 🟡 #1). A JSON-body 408/429/500 ApiError is NOT masked.
+  it.each([502, 503, 504])(
+    'maps a MeiliSearchApiError(httpStatus=%i, gateway 5xx) to a retryable 503',
+    async (status) => {
+      mockGetImagesFromFeedSearch.mockRejectedValue(makeApiError(status));
+      const { req, res } = createMocks({ query: { limit: '10' } });
+
+      await handler(req, res);
+
+      expect(res._getStatusCode()).toBe(503);
+      expect(res._getHeader('Cache-Control')).toBe('no-store');
+      expect(res._getHeader('Retry-After')).toBe('2');
+    }
+  );
+
+  it.each([408, 429])(
+    'does NOT mask a MeiliSearchApiError(httpStatus=%i, JSON body) as 503 — only the Communication/transport path treats 408/429 as transient',
+    async (status) => {
+      mockGetImagesFromFeedSearch.mockRejectedValue(makeApiError(status));
+      const { req, res } = createMocks({ query: { limit: '10' } });
+
+      await handler(req, res);
+
+      expect(res._getStatusCode()).not.toBe(503);
+      expect(res._getHeader('Retry-After')).toBeUndefined();
+    }
+  );
+
+  it('maps a MeiliSearchTimeOutError to a retryable 503', async () => {
+    const e = new Error('timeout of 5000ms has exceeded ...') as Error & { name: string };
+    e.name = 'MeiliSearchTimeOutError';
+    mockGetImagesFromFeedSearch.mockRejectedValue(e);
+    const { req, res } = createMocks({ query: { limit: '10' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(503);
+    expect(res._getHeader('Retry-After')).toBe('2');
+  });
+
+  it('maps a TRPCError SERVICE_UNAVAILABLE (the service-wrapped path) to 503 WITH no-store + Retry-After', async () => {
+    // 🔴 A REAL `TRPCError`, not `Object.assign(new Error, { name: 'TRPCError' })`.
+    // The duck-typed stand-in this test used to build was indistinguishable from a
+    // real one under `getHTTPStatusCodeFromError` (which only reads `.code`) but
+    // NOT under `instanceof`, which both this route and `handleEndpointError` now
+    // use. The service layer constructs these with `new TRPCError`, and a repo-wide
+    // sweep finds no production site that fabricates a duck-typed one, so the real
+    // instance is the faithful fixture — the stand-in was quietly testing a shape
+    // production never produces.
+    const trpcError = new TRPCError({
+      code: 'SERVICE_UNAVAILABLE',
+      message: 'Image search is temporarily overloaded — please retry.',
+    });
+    mockGetImagesFromFeedSearch.mockRejectedValue(trpcError);
+    const { req, res } = createMocks({ query: { limit: '10' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(503);
+    expect(res._getHeader('Cache-Control')).toBe('no-store');
+    expect(res._getHeader('Retry-After')).toBe('2');
+    // 🔴 THE BODY, which this test never asserted. Status + headers were green
+    // through a draft of civitai#3845/TIER-1 in which this path fell through to
+    // `handleEndpointError` and answered `{ message }`, while the raw-SDK
+    // transient path two branches up answered `{ error }` — the same route
+    // emitting the retry hint under two different keys at 503, with nothing
+    // failing. Asserted by VALUE, and byte-identical to the raw-path assertion in
+    // the `MeiliSearchCommunicationError` case above: that equality is the
+    // property, so a future change that re-splits the two paths goes red here.
+    expect(res._getJSONData()).toEqual({
+      error: 'Image search is temporarily overloaded — please retry.',
+    });
+  });
+
+  it('does NOT mask a TRPCError NOT_FOUND as 503 — keeps its real 404 (no Retry-After)', async () => {
+    const notFound = new TRPCError({ code: 'NOT_FOUND', message: 'Image not found' });
+    mockGetImagesFromFeedSearch.mockRejectedValue(notFound);
+    const { req, res } = createMocks({ query: { limit: '10' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(404);
+    // 🔴 SHAPE CHANGE, civitai#3845 TIER 1. This route's non-2xx body used to be
+    // the hand-rolled `{ error: <message>, code: <tRPC code> }`. Delegating to
+    // `handleEndpointError` adopts the shared 4xx shape — `{ message }` — which is
+    // the same trade `/api/v1/users` made when it was consolidated. The `code`
+    // discriminator survives on a genericized 5xx, where the full envelope
+    // (`{ error, message, code }`) is emitted; at a 4xx the STATUS is the
+    // discriminator. Asserted by value so a future change to either is visible
+    // here rather than only to a consumer.
+    expect(res._getJSONData()).toEqual({ message: 'Image not found' });
+    expect(res._getHeader('Retry-After')).toBeUndefined();
+  });
+
+  it.each([400, 401, 403])(
+    'does NOT mask a non-transient upstream %i (real client/app error) as 503',
+    async (status) => {
+      // A 4xx-other from the SDK (e.g. malformed filter / auth) must surface as a
+      // hard error, NOT a retryable 503. It isn't a TRPCError, so it falls to the
+      // generic mapping → 500 (the correct "genuine failure must still surface"
+      // behaviour). The key assertion: it is NOT 503 and carries NO Retry-After.
+      mockGetImagesFromFeedSearch.mockRejectedValue(makeCommunicationError(status));
+      const { req, res } = createMocks({ query: { limit: '10' } });
+
+      await handler(req, res);
+
+      expect(res._getStatusCode()).not.toBe(503);
+      expect(res._getHeader('Retry-After')).toBeUndefined();
+    }
+  );
+
+  it('does NOT mask a deterministic MeiliSearchApiError(httpStatus=500) (JSON body) as 503 — bubbles to 500, no Retry-After', async () => {
+    // A structured-JSON Meili 500 is a deterministic Meili-internal error, NOT a
+    // transient brownout — it must surface as a hard error, never a retryable
+    // 503 (audit 🟡 #1 masking-guard). It isn't a TRPCError, so it falls to the
+    // generic mapping → 500.
+    mockGetImagesFromFeedSearch.mockRejectedValue(makeApiError(500));
+    const { req, res } = createMocks({ query: { limit: '10' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).not.toBe(503);
+    expect(res._getHeader('Retry-After')).toBeUndefined();
+  });
+
+  it('DOES map a transport-layer MeiliSearchCommunicationError(statusCode=500) (empty body) to a retryable 503', async () => {
+    // Contrast with the ApiError above: an empty/non-JSON-body 500 is the
+    // genuinely-transient transport case → 503 with Retry-After.
+    mockGetImagesFromFeedSearch.mockRejectedValue(makeCommunicationError(500));
+    const { req, res } = createMocks({ query: { limit: '10' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(503);
+    expect(res._getHeader('Cache-Control')).toBe('no-store');
+    expect(res._getHeader('Retry-After')).toBe('2');
+  });
+
+  it('does NOT mask a generic app error (null deref) as 503 — bubbles to 500', async () => {
+    mockGetImagesFromFeedSearch.mockRejectedValue(new Error('cannot read properties of undefined'));
+    const { req, res } = createMocks({ query: { limit: '10' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).not.toBe(503);
+    expect(res._getHeader('Retry-After')).toBeUndefined();
+  });
+
+  it('happy path is unchanged (200) with no Retry-After header', async () => {
+    mockGetImagesFromFeedSearch.mockResolvedValue(mockImagesResult);
+    const { req, res } = createMocks({ query: { limit: '10' } });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(res._getHeader('Retry-After')).toBeUndefined();
+  });
+
+  const mockImagesResult = {
+    items: [
+      {
+        id: 100,
+        url: 'test-uuid',
+        hash: 'U36kF+Z#',
+        width: 832,
+        height: 1216,
+        nsfwLevel: 1,
+        type: 'image',
+        createdAt: new Date('2026-03-04T16:10:46.428Z'),
+        postId: 27016856,
+        stats: {},
+        user: { username: 'forest919' },
+        baseModel: 'Anima',
+        modelVersionIds: [2653283],
+        tags: [],
+      },
+    ],
+    nextCursor: 'cursor_val',
+  };
+});
+
+// The feed (non-legacy) path reads `cursor` as a search OFFSET, never through `parseCursor`.
+describe('/api/v1/images feed-path offset cursor', () => {
+  const feedResult = { items: [], nextCursor: undefined };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetServerAuthSession.mockResolvedValue(null);
+    mockGetFeatureFlags.mockReturnValue({ datapacketRead: false, canViewNsfw: false });
+    mockGetImagesFromFeedSearch.mockResolvedValue(feedResult);
+    mockGetAllImages.mockResolvedValue(feedResult);
+    mockImageMetaCacheFetch.mockResolvedValue({});
+  });
+
+  async function request(query: Record<string, string>) {
+    const { req, res } = createMocks({ query: { limit: '1', ...query } });
+    await handler(req, res);
+    return res;
+  }
+
+  it.each([
+    ['-5', 'out of range'],
+    ['2147483648', 'out of range'],
+    ['99999999999', 'out of range'],
+    ['-5|1700000000123', 'out of range'],
+    ['1.5', 'not a feed offset'],
+    ['abc', 'not a feed offset'],
+    ['1|2|3', 'not a feed offset'],
+    ['2024-01-01T00:00:00.000Z', 'not a feed offset'],
+  ])('rejects cursor=%s with a 400 before searching', async (cursor, reason) => {
+    const res = await request({ cursor });
+
+    expect(res._getStatusCode()).toBe(400);
+    expect(res._getJSONData().message).toContain(`Invalid cursor: ${reason}`);
+    expect(mockGetImagesFromFeedSearch).not.toHaveBeenCalled();
+  });
+
+  it.each(['0', '1', '2147483647', '2|1700000000123', '2147483647|1700000000123', ''])(
+    '[invariant] accepts cursor=%j and hands it to the feed search unchanged',
+    async (cursor) => {
+      const res = await request({ cursor });
+
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockGetImagesFromFeedSearch).toHaveBeenCalledTimes(1);
+      expect(mockGetImagesFromFeedSearch.mock.calls[0][0].cursor).toBe(cursor);
+    }
+  );
+
+  it('[invariant] leaves the legacy path (modelId without modelVersionId) to parseCursor', async () => {
+    const res = await request({ cursor: '-5', modelId: '4201' });
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(mockGetAllImages).toHaveBeenCalledTimes(1);
+    expect(mockGetAllImages.mock.calls[0][0].cursor).toBe('-5');
+    expect(mockGetImagesFromFeedSearch).not.toHaveBeenCalled();
+  });
+
+  // Round trip through the REAL emitter and parser (event-engine-common feeds/base.ts): a
+  // `nextCursor` the feed issues must be accepted here and read back as the offset it encodes.
+  it('[invariant] accepts the nextCursors the feed emits, and the feed reads them back as the next offset', async () => {
+    const searchOffsets: number[] = [];
+    let withSortAt = true;
+    const index = {
+      search: vi.fn(async (_q: unknown, opts: { limit: number; offset: number }) => {
+        searchOffsets.push(opts.offset);
+        return {
+          hits: Array.from({ length: opts.limit }, (_, i) => ({
+            id: 900 + i,
+            ...(withSortAt && { sortAtUnix: 1700000000100 + i }),
+          })),
+        };
+      }),
+    };
+    const feed = new ImagesFeed(
+      () => ({ index: () => index } as never),
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never
+    );
+    const feedInput = { limit: 2, browsingLevel: 1 } as never;
+
+    const first = await feed.query(feedInput);
+    expect(first.nextCursor).toBe('2|1700000000101');
+
+    // Highest offset the bound admits; the emitter must still produce a cursor we accept.
+    const last = await feed.query({ ...(feedInput as object), cursor: '2147483645' } as never);
+    expect(last.nextCursor).toBe('2147483647|1700000000101');
+
+    // A document without `sortAtUnix` still yields a cursor, with a non-numeric suffix.
+    withSortAt = false;
+    const unsorted = await feed.query({ ...(feedInput as object), cursor: '4' } as never);
+    expect(unsorted.nextCursor).toBe('6|undefined');
+
+    const emittedCursors = [first.nextCursor, last.nextCursor, unsorted.nextCursor] as string[];
+    for (const emitted of emittedCursors) {
+      vi.clearAllMocks();
+      mockGetImagesFromFeedSearch.mockResolvedValue(feedResult);
+      const res = await request({ limit: '2', cursor: emitted });
+      expect(res._getStatusCode()).toBe(200);
+      expect(mockGetImagesFromFeedSearch.mock.calls[0][0].cursor).toBe(emitted);
+    }
+
+    await feed.query({ ...(feedInput as object), cursor: first.nextCursor } as never);
+    expect(searchOffsets).toEqual([0, 2147483645, 4, 2]);
+  });
+});

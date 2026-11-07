@@ -1,0 +1,378 @@
+# @civitai/db-queries
+
+The monorepo's shared data-access layer: typed Kysely query functions over each app's own Postgres pools,
+consumed by the main app and the SvelteKit spokes. Prisma stays the schema/migration source of truth and
+generates the `DB` type (`@civitai/db-schema/kysely`); **this package is queries only.**
+
+See [`docs/db-queries-kysely-plan.md`](../../docs/db-queries-kysely-plan.md) for the migration plan.
+
+## Structure
+
+- `src/infra/helpers.ts` — shared query helpers (`jsonArrayFrom`/`jsonObjectFrom` reads, `toJson` writes).
+- `src/<domain>.db.ts` — one query module per domain, exported at the subpath `@civitai/db-queries/<domain>`.
+  Domain modules are (re)ported on demand, per cutover, from current `main` (see the migration plan) rather
+  than kept ahead of their consumers where they'd drift. Today: `tag.db.ts` (the original **exemplar**, plus
+  the votable-tag vote lookups), `model.db.ts` and `image.db.ts`.
+
+  The first ported **hot read paths** are the per-user vote lookups behind the votable-tag endpoint
+  (`listImageTagVotes` / `listImageTagVotesMany` / `listModelTagVotes`) and the per-visible-set engagement
+  membership read (`listModelEngagements`). These went to Kysely specifically to keep the highest-volume
+  read statements off the Prisma query engine, whose in-process CPU cost scales with call volume. Their
+  behaviour parity with the Prisma originals is pinned against a real database by
+  `<civitai>/src/server/db/__tests__/kysely-prisma-parity.test.ts` — see Testing below.
+
+  `listImageReactionsMany` (`image.db.ts`) is the viewer's-own-reactions read behind
+  `getUserReactionsForImages` (image feeds, `reaction.getMyImageReactions`, App Block reactions). It is
+  served behind the default-off server Flipt flag `kysely-image-reactions` so the Prisma query-engine
+  CPU per query can be compared with it on and off; off, the original Prisma read runs. Parity is
+  pinned in the same suite.
+
+  `placement.db.ts` is the placement/sticker read family: the space resolution behind every placement
+  surface, the price range's score, `getCapTier`'s subscriptions, the free-placement display counts,
+  the pending-badge counts and the sticker listing. It replaced the Prisma reads (formerly behind the
+  `kysely-placement-reads` flag). Each read kept its database (`dbWrite` reads moved to `kyselyWrite`,
+  `dbRead` reads to `kyselyRead`), and the counts inside the free-placement claim transaction stay on
+  Prisma. `<civitai>/src/server/services/__tests__/placement-reads.kysely-parity.test.ts` pins the
+  rows to the values the Prisma reads returned, and runs in CI (the `unit` job wires it to its
+  Postgres service). The free-slot and allowance counts take the same where-object builders as the
+  claim's Prisma counts (`countPlacements`).
+
+  `hot-reads.db.ts` holds two nested reads that Prisma fans out into one query per relation: the model
+  page's `modelWithDetailsSelect` read (up to four statements) and the creator card (two statements),
+  each run sequentially on ONE pooled connection; plus the image tags and an image's thread. Every
+  VIEW (`UserStat`, `ModelReportStat`, `GenerationCoverage`, `ImageTag`) is filtered by its key as a
+  parameter, never joined: a join key cannot reach through the view's aggregation, so the view would
+  be computed for every row. They replaced the Prisma reads (formerly behind the `kysely-hot-reads-2`
+  flag). Each kept its database (the model read follows `getKyselyWithoutLag`, the creator card reads
+  `kyselyRead`). Nested relations use `jsonArrayFrom`/`jsonObjectFrom` only where every nested column
+  survives JSON unchanged. `<civitai>/src/server/services/__tests__/hot-reads-2.kysely-parity.test.ts`
+  pins them to the values the Prisma reads returned, and runs in CI (the `unit` job wires it to its
+  Postgres service). Its fixture builds the four views from their
+  production definitions, and it EXPLAINs every statement that reads one and asserts the view's base
+  scan carries the key.
+
+  `hot-reads-3.db.ts` holds the model page's default-version lookup (three Prisma queries, one
+  statement here), three reads `getModelHandler` makes after the model row (the suggested-resource
+  count, the owner's settings, the owner's posts on the versions), and the viewer's pending remix
+  gallery submissions. They replaced the Prisma reads (formerly behind a server Flipt flag), each on
+  the database the Prisma read used, and read base tables only.
+  `<civitai>/src/server/services/__tests__/hot-reads-3.kysely-parity.test.ts` pins them to the
+  values the Prisma reads returned, runs in CI on the same Postgres service, and also fails if any
+  statement names a relation declared as a view.
+
+  `hot-reads-4.db.ts` holds the model page's comment reads: the visible top-level comment count
+  (`comment.getVisibleCountByModel`) and the first page of `comment.getAll` (the unpinned list and the
+  pinned block, each with its author, reactions and model name in one statement where Prisma issues
+  one query per relation). Both apply one viewer filter (hidden and blocked users, ToS violations
+  outside the moderator view, the hidden view). They replaced the Prisma reads (formerly behind a
+  server Flipt flag), each on the database the Prisma read used, and read base tables only. A cursor
+  page or another sort of the unpinned list still reads through Prisma.
+  `<civitai>/src/server/services/__tests__/hot-reads-4.kysely-parity.test.ts` pins the counts and
+  the pinned block to the values the Prisma reads returned, compares the unpinned list with the Prisma
+  read that still serves the other pages, and runs on the same Postgres service with the same
+  no-view check.
+
+  `hot-reads-5.db.ts` holds high-volume single-row lookups (KeyValue configs, a post's linked
+  Model3D, dismissed announcement ids, a post's collaborators, a home block, the unclaimed prize
+  count, a model's version ids, a user's model reviews, the download path's model version, the image
+  reads of `reaction.toggle`, a model's `meta`), two of them joining what
+  Prisma read in two queries. They replaced the Prisma reads, each on the database the Prisma read
+  used, and read base tables only.
+  `<civitai>/src/server/services/__tests__/hot-reads-5.kysely-parity.test.ts` pins them to the values
+  the Prisma reads returned (and compares live with the three Prisma reads that still serve a path),
+  on the same Postgres service, with the same no-view check.
+
+  `hot-reads-6.db.ts` holds more high-volume lookups (a model version's owner and a post's detail
+  row, each with the user's cosmetics; a model's POI/owner check; user lookups by username; the
+  public donation goals cache's reads; a user's version engagements and recommended reviews; a
+  model's associated resources; the public API's metric-privacy inputs; the download path's file
+  list). They replaced the Prisma reads, each on the database the Prisma read used, and read base
+  tables only. `<civitai>/src/server/services/__tests__/hot-reads-6.kysely-parity.test.ts` pins them
+  to the values the Prisma reads returned (and compares live with the Prisma reads that still serve
+  a fallback or the primary), on the same Postgres service, with the same no-view check.
+
+  `hot-reads-7.db.ts` holds three feed-path lookups (the .com titles of a set of models; a set of
+  posts' model versions; a user's held items counted by definition, for one definition type and set
+  of statuses). They are served behind the
+  default-off server Flipt flag `kysely-hot-reads-7` and read base tables only. Parity is pinned by
+  `<civitai>/src/server/services/__tests__/hot-reads-7.kysely-parity.test.ts`, on the same Postgres
+  service, with the same no-view check.
+
+  `hot-reads-8.db.ts` holds three more (a page of posts' storyline chapters, with their storylines,
+  first chapters and posts; a user's cosmetics with each cosmetic; a model version with its model's
+  owner). They are served behind the default-off server Flipt flag `kysely-hot-reads-8` and read
+  base tables only. Parity is pinned by
+  `<civitai>/src/server/services/__tests__/hot-reads-8.kysely-parity.test.ts`, on the same Postgres
+  service, with the same no-view check.
+
+  `hot-reads-9.db.ts` holds the user profile read (the user with its profile picture, cosmetics,
+  links, rank, profile and the profile's two cover images with their tags) as ONE statement, where
+  the Prisma read issues one per relation. It is served behind the default-off server Flipt flag
+  `kysely-hot-reads-9`. It reads base tables plus "UserRank" (marked `/// @view` but a table) and
+  the "TagsOnImageDetails" projection view, whose base-table scan the parity suite EXPLAINs. Parity
+  is pinned by `<civitai>/src/server/services/__tests__/hot-reads-9.kysely-parity.test.ts`, on the
+  same Postgres service.
+
+  `hot-reads-10.db.ts` holds the collection read (the collection with its cover image and that
+  image's tags, its tags, and its owner with their profile picture and equipped cosmetics) as ONE
+  statement, where the Prisma read issues one per relation. It is served behind the default-off
+  server Flipt flag `kysely-hot-reads-10`. It reads base tables plus the "TagsOnImageDetails"
+  projection view, whose base-table scan the parity suite EXPLAINs. Parity is pinned by
+  `<civitai>/src/server/services/__tests__/hot-reads-10.kysely-parity.test.ts`, on the same
+  Postgres service.
+
+  `getImageGenerationFields` (`image.db.ts`) is the image row behind the image generation-data
+  endpoint, with its tool and technique links read as nested `json_agg` arrays in one statement. The
+  endpoint's response is a pure function of that row, so its parity is pinned at the row: Kysely vs
+  the original Prisma `findUnique`, key order included, by
+  `<civitai>/src/server/services/__tests__/image-generation-data.kysely-parity.test.ts`.
+
+## Client access — executor injection
+
+**Every query function takes a Kysely client as its first argument** (`db: Kysely<DB>`); the caller decides
+which client — read, write, a replica, or an open transaction. The package owns **no** client vars and does
+no boot-time wiring (no `connect()`, no globalThis, no proxies). Each app builds its clients over its
+**existing** pools and passes them in.
+
+```ts
+// a query module (illustrative)
+import type { Kysely } from 'kysely';
+import type { DB } from '@civitai/db-schema/kysely';
+
+export function setReportStatus(db: Kysely<DB>, input: { id; status; userId }) {
+  return db.updateTable('Report').set(/* … */).where('id', '=', input.id).executeTakeFirst();
+}
+```
+
+```ts
+// app — the app owns the clients (main app: src/server/db/kyselyDb.ts) and passes one per call
+import { kyselyRead, kyselyWrite } from '~/server/db/kyselyDb';
+await setReportStatus(kyselyWrite, input);
+await getReports(kyselyRead, input);
+```
+
+Why first-arg injection rather than an ambient singleton: it makes **transactions compose** (`Transaction<DB>`
+satisfies `Kysely<DB>`, so pass a `trx` to run several statements atomically), keeps functions
+**tree-shakeable** and trivially testable, and lets routing (read/write/replica/lag-aware) be a per-call
+decision instead of frozen into the query. The main-app-only tiers (`kyselyReadLong`, `kyselyDatapacket`) are
+just clients the app can choose to pass; a spoke that never builds them simply never passes them.
+
+**Binding once per scope (optional sugar):** if passing `db` at every call site is noisy in a hot handler, an
+app can wrap a domain — `const reports = createReportsRepo(db)` returning `db`-free methods — so `db` appears
+once per request/transaction. Keep this as an **app-local** convenience; the package exports plain
+functions (a factory object closing over every builder would defeat tree-shaking).
+
+## Authoring conventions
+
+- **Imports**: named imports only — no `import * as`.
+- **Function shape** — every exported query function follows the same signature so call sites read uniformly:
+  - **First parameter is always `db: Kysely<DB>`** — the executor the caller supplies (see Client access). A
+    compose function passes its `db` (or a `trx` it opens) through to each callee.
+  - **Inputs after `db`**: a single `input` object for anything with **two or more fields or any optional
+    field** — `setReportStatus(db, { id, status, userId })`. This is what makes `insertUserCosmeticGrant(db,
+{ userId, cosmeticIds })` right and `(db, userId, cosmeticIds)` wrong. **Never take two or more positional
+    data args.** A lone required id/array may be positional (`getImage(db, imageId)`, `getImages(db, ids)`) —
+    don't wrap a single value just for ceremony.
+  - **Always execute** — end the builder in `.execute()` / `.executeTakeFirst()` (or `sql\`…\`.execute(db)`) and
+return the result/`Promise`. Do **not** return an un-executed query builder for the caller to run; it
+    breaks the uniform call shape and hides the execution point.
+- **Prefer a generic `update<Entity>` over narrow single-column setters.** Each entity has one
+  `update<Entity>(db, input: Updateable<DB['<Entity>']> & { id: number })` (`{ id, ...data }`), which stamps
+  `updatedAt` automatically when the table has an `@updatedAt` column, and a `update<Entity>Many(db, { ids } &
+Updateable<…>)` bulk variant where needed (guarding the empty-id case). A trivial `SET <one column> WHERE id`
+  belongs at the call site as `updateX(db, { id, <col>: value })`, **not** a bespoke `set<Entity><Column>`
+  function. Keep a named function only when it (a) sets **two or more** columns as a specific semantic
+  transition (e.g. `setImageAppealRestored`), (b) needs a jsonb/`CASE`/expression or stored-proc write (the
+  generic sets columns raw — a jsonb column must go through `toJson()`, so it can't collapse), (c) toggles /
+  negates a column, or (d) keys on something other than `id`.
+- **Method names: `<verb><Entity>[Qualifier]`** — entity-prefixed so each name is self-identifying at the
+  call site.
+  - **Verbs**: `get` / `list` / `count` for reads; `set` / `upsert` / `insert` / `delete` for writes.
+  - **Singular entity + `Many` for bulk** — a bulk variant keeps the entity **singular** and appends `Many`:
+    `setReportStatus` → `setReportStatusMany` (not `setReportsStatusMany`).
+  - Examples: `getReportReporters`, `setReportStatus`, `setReportStatusMany`.
+- **Name collisions**: a db method may share a name with a higher-level service function (e.g. the spoke's
+  `setReportStatus` service wraps the db `setReportStatus`). Resolve with a local import alias in that file —
+  `import { setReportStatus as setReportStatusDb }` — the package export stays canonical.
+- **Transactions**: native Kysely. A compose function takes `db` and opens the transaction on it —
+  `db.transaction().execute((trx) => …)` — passing `trx` as the first arg to each statement function
+  (`Transaction<DB>` satisfies `Kysely<DB>`). Prefer a single atomic statement (e.g. bulk `UPDATE … WHERE id
+IN (…) RETURNING`) where it suffices. Kysely and Prisma transactions do **not** compose — migrate whole
+  transactional units together.
+- **Read-your-writes**: the caller picks the client. The main app's `getKyselyWithoutLag(type, id)` returns the
+  lag-correct client (read or write) via the shared lag tracker; pass its result as the query's `db`.
+
+## Reads — nested relations
+
+Replace a Prisma `include`/nested `select` with `jsonArrayFrom`/`jsonObjectFrom` (re-exported from this
+package). They build a correlated `jsonb` subquery and the result type is **inferred** — no hand-authored
+selector/GetPayload type. Postgres parses the jsonb itself (no result-parsing plugin needed).
+
+```ts
+import { jsonArrayFrom } from '@civitai/db-queries';
+db.selectFrom('Model').select((eb) => [
+  'Model.id',
+  'Model.name',
+  jsonArrayFrom(
+    eb
+      .selectFrom('ModelVersion')
+      .select(['id', 'name'])
+      .whereRef('ModelVersion.modelId', '=', 'Model.id')
+  ).as('versions'),
+]); // inferred: { id; name; versions: { id; name }[] }[]
+```
+
+**Gotcha**: dates/bigints nested inside the json come back as **strings** (JSON serialization) even though the
+inferred type says `Date`/`number`. Parse those fields where a real `Date`/`bigint` is needed.
+
+## Writes — Prisma-parity gotchas
+
+- **jsonb columns**: wrap the value in `toJson()`. node-postgres serializes a plain object fine but turns a JS
+  array into a Postgres array literal (`{1,2}`) — wrong for jsonb. `toJson()` is unambiguous for both:
+  `.set({ meta: toJson(metaObject) })`.
+- **`@updatedAt` is handled by a plugin — don't set it by hand.** Prisma bumped `@updatedAt` client-side;
+  Kysely doesn't. The app installs `updatedAtPlugin` (exported here) on its write client, which auto-stamps
+  `updatedAt` on every `UPDATE` to an `@updatedAt` table (the table set is generated from the schema). A ported
+  write just sets its own columns. **Consumers must install the plugin** (main app: `src/server/db/kyselyDb.ts`)
+  — a client without it silently stops bumping `updatedAt`. To _deliberately not_ bump (the source used raw
+  `$executeRaw` to dodge it — e.g. a scan recompute that must not reorder a "recently updated" feed), opt out
+  with `keepUpdatedAt`: `.set({ ..., updatedAt: keepUpdatedAt })`. The plugin only rewrites plain `UPDATE`s —
+  INSERTs and `ON CONFLICT DO UPDATE` still set `updatedAt` explicitly.
+- **Postgres enum-ARRAY columns need a parser.** pg has no parser for an array of a user-defined enum (dynamic
+  oid), so a `SomeEnum[]` column reads back as the raw `{a,b}` literal string. Consumers call
+  `registerEnumArrayTypeParsers(pool)` (from `@civitai/db/kysely`) once at startup — main app:
+  `src/instrumentation.node.ts`; SvelteKit spokes: a `ServerInit` `init` export in `hooks.server.ts`
+  (SvelteKit awaits `init` before the first request), using the `pool` returned by
+  `createKyselyClients`. Both register **fail-open**, so a read site that can receive an enum-array
+  column must still tolerate the raw literal — `{green,blue}` is a string that every array operation
+  accepts and iterates by character (see `toDomainArray` in `apps/creator-studio/src/lib/announcements.ts`).
+  Scalar enums are fine without it.
+- **Nested writes** (Prisma `connect`/`connectOrCreate`/nested `create`): decompose into explicit statement
+  functions, and have a compose function open `db.transaction().execute((trx) => …)` and pass `trx` as each
+  statement's `db`. See **Tag links** below for the canonical example.
+
+### Tag links (connectOrCreate / sync)
+
+Porting a Prisma `tagsOnModels`-style nested `connectOrCreate`/`deleteMany`: decompose into a
+`sync<Entity>Tags(db, { entityId, existingTagIds, newTagNames })` run inside the upsert transaction. It (1)
+unlinks tags not in the kept set (empty kept-set ⇒ unlink all), (2) creates brand-new tags by name via the
+shared `upsertTagsByName(db, names, target)` — **one batched `ON CONFLICT DO NOTHING` insert + one id lookup**,
+not a per-tag loop — (3) links kept + new ids in one idempotent batch. See `syncModelTags`.
+
+When a second simple tag join lands (Post/Article/Collection/Bounty — **not** the Image tag system, which has
+required `source`/`attributes` columns), promote to a generic `syncEntityTags(db, { joinTable, entityColumn,
+… })`. It needs `db.dynamic.ref` + a contained cast — Kysely can't statically type a dynamic table/column pair
+(same limitation as an abstract `getById`) — behind typed per-entity wrappers.
+
+## Correctness rules
+
+- **Guard empty arrays before `where('col', 'in', arr)`.** Kysely compiles `in ([])` to `IN ()`, a Postgres
+  **syntax error** (Prisma silently no-op'd). Any bulk query taking an id/array input must short-circuit:
+  `if (!input.ids.length) return [];` before executing. (See `setReportStatusMany`.)
+
+## Testing
+
+Every query gets a test. There are two tiers — the first is required, the second is required for hot paths:
+
+Run the in-package tests with `pnpm --filter @civitai/db-queries test` (Vitest; `test:watch` to iterate).
+They are wired into CI the same way the other packages' `vitest run` scripts are.
+
+### 1. Compiled-SQL tests (required, no DB)
+
+Assert the **exact SQL + parameters** a query function compiles to. This is the cheap, deterministic guard
+that runs in CI with no database: it catches a refactor that silently drops a `where` filter, reorders a
+`set` clause, or would emit `IN ()` for an empty array. Use the offline harness in
+[`src/test/harness.ts`](src/test/harness.ts) — `compileHarness()` returns a `db` (a Kysely `DummyDriver`
+client) you pass to the query; `.execute()` compiles the SQL (captured via the `log` hook) and resolves to an
+empty result without a pool.
+
+```ts
+import { compileHarness } from './test/harness';
+import { setReportStatusMany } from './reports.db';
+
+const h = compileHarness();
+
+it('bulk-updates the given ids in one statement', async () => {
+  await setReportStatusMany(h.db, { ids: [1, 2, 3], status: 'Actioned', userId: 99 });
+  const { sql, parameters } = h.lastQuery();
+  expect(sql).toContain('where "id" in ($4, $5, $6)');
+  expect(sql).not.toContain('in ()');
+  expect(parameters).toEqual(['Actioned', expect.any(Date), 99, 1, 2, 3, 'Actioned']);
+});
+
+it('short-circuits an empty id list without touching the DB', async () => {
+  const result = await setReportStatusMany(h.db, { ids: [], status: 'Actioned', userId: 99 });
+  expect(result).toEqual([]);
+  expect(h.queries).toHaveLength(0); // the empty-array guard the correctness rules require
+});
+```
+
+See [`src/tag.db.test.ts`](src/tag.db.test.ts) for a full example (insert/update/delete and the batched-upsert
+clauses, the single-row `setReportStatus`, and the empty-array guard).
+
+### 2. Behavior + execution-plan checks (required for hot paths, needs a live DB)
+
+The compiled-SQL test proves _what_ SQL runs, not that it's valid against the real schema. `explainHarness()`
+gives you a `db` (still the DummyDriver, so passing it to a query COMPILES without executing — safe for
+writes) plus `explainLast()`/`explainAll()`, which `EXPLAIN` (no ANALYZE) the compiled SQL against a live
+Postgres: it parses + plans the statement without running it, so a query whose columns/joins/types/proc
+signatures don't resolve fails here even though the compile test passed. Env-gated (`TEST_DATABASE_URL`, or
+the root `.env` `DATABASE_URL` locally); the suite `describe.skipIf(!h.hasDb)`-skips when no DB is reachable.
+Wrap it and destroy the client in `afterAll`. See [`src/tag.db.explain.test.ts`](src/tag.db.explain.test.ts).
+Stricter plan-regression assertions (no seq-scan on a hot path) need a prod-like dataset — dev-DB planner
+choices vary with table size — so keep those against real data, not this suite.
+
+### 3. Prisma-vs-Kysely behaviour parity (for a query ported off Prisma)
+
+Tiers 1 and 2 prove what SQL runs and that it plans. Neither proves the **caller sees the same thing it saw
+before**, which is the whole risk of porting a live read path. For that, run BOTH implementations against the
+SAME rows in the SAME database and deep-compare the results, rather than asserting the Kysely result against
+a hand-written expectation (which only re-states what the new code does). This lives in the consuming app,
+since the package itself must stay Prisma-free: `<civitai>/src/server/db/__tests__/kysely-prisma-parity.test.ts`
+for single-query ports, with its schema fixture alongside. A port whose rows feed a larger service
+function can get its own suite, as
+`<civitai>/src/server/services/__tests__/image-generation-data.kysely-parity.test.ts` does. Compare at the
+row when everything downstream is a pure function of it. Cover the empty
+result, an empty input array (the `IN ()` guard), and cross-user/cross-entity isolation — a dropped
+predicate shows up as extra rows, not as an empty diff.
+
+Both are opt-in via `KYSELY_PARITY_DATABASE_URL` and deliberately do NOT fall back to `DATABASE_URL`: they
+write fixtures, so they need a throwaway database. **CI does not set it, so they run locally only** — in CI
+a port is guarded by its tier-1 compiled-SQL test alone. The test headers have the one-line docker command.
+
+## Example
+
+```ts
+// example query module (illustrative)
+import type { Kysely } from 'kysely';
+import type { DB } from '@civitai/db-schema/kysely';
+
+// Single: transition one report, RETURNing the reporters only if it actually changed.
+export function setReportStatus(
+  db: Kysely<DB>,
+  input: { id: number; status: ReportStatusValue; userId: number }
+) {
+  return db
+    .updateTable('Report')
+    .set(/* … */)
+    .where('id', '=', input.id)
+    .where('status', '!=', input.status)
+    .returning(['userId', 'alsoReportedBy'])
+    .executeTakeFirst();
+}
+
+// Bulk: same transition across many reports in one atomic statement (no explicit transaction).
+export function setReportStatusMany(
+  db: Kysely<DB>,
+  input: { ids: number[]; status: ReportStatusValue; userId: number }
+) {
+  if (!input.ids.length) return []; // guard: Kysely compiles `in ([])` to `IN ()` (a syntax error)
+  return db
+    .updateTable('Report')
+    .set(/* … */)
+    .where('id', 'in', input.ids)
+    .where('status', '!=', input.status)
+    .returning(['id', 'userId', 'alsoReportedBy'])
+    .execute();
+}
+```

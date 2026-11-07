@@ -1,0 +1,299 @@
+import { timingSafeEqualStrings } from '~/server/utils/timing-safe-equal';
+import { createHmac } from 'crypto';
+import { env } from '~/env/server';
+import { HttpCaller } from '~/server/http/httpCaller';
+import { NOWPayments } from '~/server/http/nowpayments/nowpayments.schema';
+import { logToAxiom } from '~/server/logging/client';
+
+// DOCUMENTATION
+// https://documenter.getpostman.com/view/7907941/2s93JusNJt#api-documentation
+type NOWPaymentsAccessToken = {
+  accessToken: string;
+  expiresIn: number;
+  createdAt: number;
+};
+
+class NOWPaymentsCaller extends HttpCaller {
+  private static instance: NOWPaymentsCaller;
+  private static acessToken: NOWPaymentsAccessToken;
+  private static pendingAuth: Promise<string> | null = null;
+
+  protected constructor(baseUrl?: string) {
+    baseUrl ??= env.NOW_PAYMENTS_API_URL;
+    const apiKey = env.NOW_PAYMENTS_API_KEY;
+    if (!baseUrl) throw new Error('Missing NOW_PAYMENTS_API_URL env');
+    if (!apiKey) throw new Error('Missing NOW_PAYMENTS_API_KEY env');
+
+    super(baseUrl, {
+      headers: { 'x-api-key': apiKey, 'Content-Type': 'application/json' },
+    });
+  }
+
+  private sortObject = (obj: MixedObject): MixedObject => {
+    return Object.keys(obj)
+      .sort()
+      .reduce((result, key) => {
+        result[key] =
+          obj[key] && typeof obj[key] === 'object' ? this.sortObject(obj[key]) : obj[key];
+        return result;
+      }, {} as MixedObject);
+  };
+
+  validateWebhookEvent(signature: string, payload: MixedObject) {
+    if (!env.NOW_PAYMENTS_IPN_KEY) throw new Error('Missing NOW_PAYMENTS_IPN_KEY env');
+
+    const sortedPayload = this.sortObject(payload);
+
+    const hash = createHmac('sha512', env.NOW_PAYMENTS_IPN_KEY)
+      .update(JSON.stringify(sortedPayload))
+      .digest('hex');
+    return { isValid: timingSafeEqualStrings(hash.toLowerCase(), signature) };
+  }
+
+  static getInstance(): NOWPaymentsCaller {
+    if (!this.instance) {
+      this.instance = new NOWPaymentsCaller();
+    }
+
+    return this.instance;
+  }
+  async isAPIHealthy(): Promise<boolean | null> {
+    const response = await this.getRaw(`/status`);
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to get API status', response.statusText);
+      return false;
+    }
+    const { message } = (await response.json()) as { message: string };
+    return message === 'OK' ? true : false;
+  }
+
+  async getCurrencies(): Promise<NOWPayments.CurrenciesResponse | null> {
+    const response = await this.getRaw(`/currencies?fixed_rate=true`);
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to get currencies', response.statusText);
+      return null;
+    }
+    const data = await response.json();
+
+    // console.log('Currencies', data);
+    return NOWPayments.currenciesResponseSchema.parse(data);
+  }
+
+  async getMinimumPaymentAmount(
+    input: NOWPayments.MinAmountInput
+  ): Promise<NOWPayments.MinAmountResponse | null> {
+    const response = await this.getRaw(`/min-amount`, { queryParams: input });
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to get minimum payment amount', response.statusText);
+      return null;
+    }
+    const data = await response.json();
+    return NOWPayments.minAmountResponseSchema.parse(data);
+  }
+
+  async getPriceEstimate(
+    input: NOWPayments.EstimatePriceInput
+  ): Promise<NOWPayments.EstimatePriceResponse | null> {
+    const response = await this.getRaw(`/estimate`, { queryParams: input });
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to get price estimate', response.statusText);
+      return null;
+    }
+    const data = await response.json();
+    return NOWPayments.estimatePriceResponseSchema.parse(data);
+  }
+
+  async getExchangeRate(
+    input: NOWPayments.ExchangeRateInput
+  ): Promise<NOWPayments.ExchangeRateResponse | null> {
+    const response = await this.getRaw(`/exchange-rate`, { queryParams: input });
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to get exchange rate', response.statusText);
+      return null;
+    }
+    const data = await response.json();
+    return NOWPayments.exchangeRateResponseSchema.parse(data);
+  }
+
+  async createPaymentInvoice(
+    input: NOWPayments.CreatePaymentInvoiceInput
+  ): Promise<NOWPayments.CreatePaymentInvoiceResponse | null> {
+    const response = await this.postRaw(`/invoice`, { body: JSON.stringify(input) });
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to create payment invoice', response.statusText);
+      return null;
+    }
+    const data = await response.json();
+
+    return NOWPayments.createPaymentInvoiceResponseSchema.parse(data);
+  }
+
+  async createPayment(
+    input: NOWPayments.CreatePaymentInput
+  ): Promise<NOWPayments.CreatePaymentResponse | null> {
+    const response = await this.postRaw(`/payment`, { body: JSON.stringify(input) });
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to create payment', response.statusText);
+      return null;
+    }
+    const data = await response.json();
+    return NOWPayments.createPaymentResponseSchema.parse(data);
+  }
+
+  async getPaymentStatus(
+    payment_id: string | number
+  ): Promise<NOWPayments.CreatePaymentResponse | null> {
+    return (await this.lookupPayment(payment_id)).payment;
+  }
+
+  /** getPaymentStatus, keeping the HTTP status of a failed lookup. */
+  async lookupPayment(payment_id: string | number) {
+    const response = await this.getRaw(`/payment/${payment_id}`);
+    if (!response.ok) {
+      logToAxiom({
+        name: 'nowpayments-caller',
+        type: 'error',
+        stage: 'payment-status-failed',
+        paymentId: payment_id,
+        status: response.status,
+      }).catch(() => null);
+      return { payment: null, status: response.status };
+    }
+    const data = await response.json();
+    return {
+      payment: NOWPayments.createPaymentResponseSchema.parse(data),
+      status: response.status,
+    };
+  }
+
+  async getListPayments(params: {
+    limit?: number;
+    page?: number;
+    sortBy?: string;
+    orderBy?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    invoiceId?: number;
+  }): Promise<NOWPayments.PaymentsListResponse | null> {
+    const token = await this.authenticate();
+    const response = await this.getRaw(`/payment/`, {
+      queryParams: params,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to get payments list', response.statusText);
+      return null;
+    }
+    const data = await response.json();
+    return NOWPayments.paymentsListResponseSchema.parse(data);
+  }
+
+  /** Fetch all payments associated with an invoice (wallet). Handles pagination. */
+  async getPaymentsByInvoiceId(invoiceId: number): Promise<NOWPayments.CreatePaymentResponse[]> {
+    const PAGE_SIZE = 100;
+    let page = 0;
+    const all: NOWPayments.CreatePaymentResponse[] = [];
+
+    while (true) {
+      const result = await this.getListPayments({
+        limit: PAGE_SIZE,
+        page,
+        invoiceId,
+        sortBy: 'created_at',
+        orderBy: 'desc',
+      });
+
+      if (!result || result.data.length === 0) break;
+      all.push(...result.data);
+      if (result.data.length < PAGE_SIZE) break;
+      page++;
+    }
+
+    return all;
+  }
+
+  async getMerchantCoins(): Promise<NOWPayments.MerchantCoinsResponse | null> {
+    const response = await this.getRaw(`/merchant/coins`);
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to get merchant coins', response.statusText);
+      return null;
+    }
+    const data = await response.json();
+    return NOWPayments.merchantCoinsResponseSchema.parse(data);
+  }
+
+  async getFullCurrencies(): Promise<NOWPayments.FullCurrenciesResponse | null> {
+    const response = await this.getRaw(`/full-currencies`);
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to get full currencies', response.statusText);
+      return null;
+    }
+    const data = await response.json();
+    return NOWPayments.fullCurrenciesResponseSchema.parse(data);
+  }
+
+  async getPayoutCurrencies(): Promise<NOWPayments.PayoutCurrenciesResponse | null> {
+    const response = await this.getRaw(`/payout-currencies`);
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      console.error('Failed to get payout currencies', response.statusText);
+      return null;
+    }
+    const data = await response.json();
+    return NOWPayments.payoutCurrenciesResponseSchema.parse(data);
+  }
+
+  async authenticate(): Promise<string> {
+    // Check cached token first
+    if (
+      NOWPaymentsCaller.acessToken &&
+      Date.now() - NOWPaymentsCaller.acessToken.createdAt <
+        NOWPaymentsCaller.acessToken.expiresIn * 1000
+    ) {
+      return NOWPaymentsCaller.acessToken.accessToken;
+    }
+
+    // Prevent concurrent auth calls — reuse in-flight request
+    if (NOWPaymentsCaller.pendingAuth) {
+      return NOWPaymentsCaller.pendingAuth;
+    }
+
+    NOWPaymentsCaller.pendingAuth = this._doAuthenticate();
+    try {
+      return await NOWPaymentsCaller.pendingAuth;
+    } finally {
+      NOWPaymentsCaller.pendingAuth = null;
+    }
+  }
+
+  private async _doAuthenticate(): Promise<string> {
+    const response = await this.postRaw('/auth', {
+      body: JSON.stringify({
+        email: env.NOW_PAYMENTS_EMAIL,
+        password: env.NOW_PAYMENTS_PASSWORD,
+      }),
+    });
+    if (!response.ok) throw new Error('Failed to authenticate with NowPayments');
+    const data = await response.json();
+    const parsed = NOWPayments.authResponseSchema.parse(data);
+
+    NOWPaymentsCaller.acessToken = {
+      accessToken: parsed.token,
+      expiresIn: parsed.expires_in ?? 300, // 5min default
+      createdAt: Date.now(),
+    };
+    return parsed.token;
+  }
+}
+
+export default NOWPaymentsCaller.getInstance();

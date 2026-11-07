@@ -1,0 +1,265 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { generateKeyPairSync } from 'crypto';
+import { createAuthVerifier, createSessionSigner, type SessionClaims } from '@civitai/auth';
+// The REAL key constants, from the package. `~/server/redis/client` is mocked below and the
+// mock spreads this same package, so the shim production reads and the values asserted here
+// are pinned to one source. They used to be hand-typed in the hoisted block, and three of the
+// four had drifted: USER_TOKENS 'session:usertokens' vs the real 'session:user-tokens2',
+// USER.SESSION 'user:session' vs 'session:data2', TOKEN_STATE 'session:tokenstate' vs
+// 'session:token-state' (only SESSION.ALL was right). The suite passed the whole time —
+// both sides used the same wrong string, so it asserted against keys Redis never sees.
+import { REDIS_KEYS, REDIS_SYS_KEYS } from '@civitai/redis/client';
+
+// End-to-end revocation property (the coverage gap behind review finding B2): a banned/logged-out user's
+// active civ-token must stop verifying. The chain spans two modules that share sysRedis:
+//   hub mint  → trackToken(jti, userId)            (records jti in USER_TOKENS:{userId})   [seeded here]
+//   ban       → invalidateSession(userId)          (marks TOKEN_STATE[jti] = 'invalid')    [session-invalidation]
+//   request   → isRevoked({ jti })                 (TOKEN_STATE[jti] === 'invalid' → true) [session-verifier]
+// sysRedis is an in-memory store shared by both modules, so we exercise the real chain end-to-end.
+
+const h = vi.hoisted(() => {
+  const hashes = new Map<string, Map<string, string>>();
+  const strings = new Map<string, string>();
+  const sysRedis = {
+    hGetAll: async (k: string) => Object.fromEntries(hashes.get(k) ?? new Map<string, string>()),
+    // The revocation read scans for field NAMES rather than fetching every value. One page, complete scan —
+    // paging itself is covered in session-invalidation.test.ts; this suite is about the ban→revoke chain.
+    hScanNoValues: async (k: string) => ({
+      cursor: '0',
+      fields: [...(hashes.get(k)?.keys() ?? [])],
+    }),
+    hSet: async (k: string, obj: Record<string, string>) => {
+      const m = hashes.get(k) ?? new Map<string, string>();
+      for (const [f, v] of Object.entries(obj)) m.set(f, v);
+      hashes.set(k, m);
+    },
+    hExpire: async () => {},
+    hDel: async (k: string, fields: string[]) => {
+      for (const f of fields) hashes.get(k)?.delete(f);
+    },
+    hGet: async (k: string, f: string) => hashes.get(k)?.get(f) ?? null,
+    get: async (k: string) => strings.get(k) ?? null,
+    set: async (k: string, v: string) => {
+      strings.set(k, v);
+    },
+  };
+  return { hashes, strings, sysRedis };
+});
+
+// 🔴 Spread the REAL package for the key constants rather than re-typing them — the same shape
+// `src/__tests__/setup.ts` uses globally. Only the client and the control surface stay
+// overridden; every constant comes from production's own definitions.
+vi.mock('~/server/redis/client', async () => ({
+  ...(await import('@civitai/redis/client')),
+  sysRedis: h.sysRedis,
+  withSysReadDeadline: <T>(p: Promise<T>) => p, // transparent in tests (matches rate-limiting.test.ts)
+}));
+// session-invalidation marks TOKEN_STATE via the atomic eval helper (hSetMultiWithTTL); the
+// fake sysRedis above has no `eval`, so stub the helper to write straight to the in-memory hash.
+vi.mock('~/server/redis/atomic', () => ({
+  hSetWithTTL: async (_c: unknown, key: string, field: string, value: string | number) => {
+    const m = h.hashes.get(key) ?? new Map<string, string>();
+    m.set(field, String(value));
+    h.hashes.set(key, m);
+  },
+  hSetMultiWithTTL: async (_c: unknown, key: string, fields: Record<string, string | number>) => {
+    const m = h.hashes.get(key) ?? new Map<string, string>();
+    for (const [f, v] of Object.entries(fields)) m.set(f, String(v));
+    h.hashes.set(key, m);
+  },
+  hSetMultiWithTTLUnlessValue: async (
+    _c: unknown,
+    key: string,
+    fields: Record<string, string | number>,
+    _ttlMs: number,
+    keepValue: string
+  ) => {
+    const m = h.hashes.get(key) ?? new Map<string, string>();
+    for (const [f, v] of Object.entries(fields)) if (m.get(f) !== keepValue) m.set(f, String(v));
+    h.hashes.set(key, m);
+  },
+}));
+vi.mock('~/server/utils/cache-helpers', () => ({ clearCacheByPattern: async () => {} }));
+vi.mock('~/server/auth/session-cache', () => ({ clearSessionCache: async () => {} }));
+// invalidateAllSessions now routes the global cutoff through the hub (sessionClient.invalidateAll). Simulate
+// the hub here: write the SESSION.ALL marker the verifier reads, at a fixed cutoff (5000), so the end-to-end
+// "revoked iff signed before the cutoff" assertion stays deterministic.
+vi.mock('~/server/auth/session-client', () => ({
+  sessionClient: {
+    invalidateAll: async () => {
+      h.strings.set(REDIS_SYS_KEYS.SESSION.ALL, new Date(5000).toISOString());
+    },
+  },
+}));
+vi.mock('~/utils/signal-client', () => ({ signalClient: { send: async () => {} } }));
+vi.mock('~/server/redis/fail-open-log', () => ({ logSysRedisFailOpen: () => {} }));
+vi.mock('~/utils/logging', () => ({ createLogger: () => () => {} }));
+vi.mock('~/server/common/enums', () => ({ SignalMessages: { SessionRefresh: 'session:refresh' } }));
+// The global unit setup (src/__tests__/setup.ts) mocks session-invalidation to a stub; we need the REAL
+// module here to exercise the actual ban→revoke chain against our in-memory sysRedis.
+vi.unmock('~/server/auth/session-invalidation');
+
+import {
+  invalidateSession,
+  invalidateAllSessions,
+  refreshSession,
+} from '~/server/auth/session-invalidation';
+import { isRevoked } from '~/server/auth/session-verifier';
+
+const USER = 5;
+const TOKEN_STATE = REDIS_SYS_KEYS.SESSION.TOKEN_STATE;
+const claims = (jti: string, signedAt = 1000): SessionClaims => ({ jti, signedAt });
+
+// Mirror the hub's sessions.trackToken (session.ts): record the token's jti under the user's token hash.
+function trackToken(jti: string, userId: number) {
+  const key = `${REDIS_KEYS.SESSION.USER_TOKENS}:${userId}`;
+  const m = h.hashes.get(key) ?? new Map<string, string>();
+  m.set(jti, '1');
+  h.hashes.set(key, m);
+}
+
+beforeEach(() => {
+  h.hashes.clear();
+  h.strings.clear();
+});
+
+describe('ban / logout session revocation (B2 coverage)', () => {
+  it('revokes a tracked token after invalidateSession (ban path)', async () => {
+    trackToken('tok-1', USER);
+    expect(await isRevoked(claims('tok-1'))).toBe(false); // not yet banned
+
+    await invalidateSession(USER);
+
+    // marker written to the SAME hash the verifier reads, keyed by jti
+    expect(h.hashes.get(TOKEN_STATE)?.get('tok-1')).toBe('invalid');
+    expect(await isRevoked(claims('tok-1'))).toBe(true);
+  });
+
+  it('revokes ALL of a user’s tracked tokens at once', async () => {
+    trackToken('tok-a', USER);
+    trackToken('tok-b', USER);
+
+    await invalidateSession(USER);
+
+    expect(await isRevoked(claims('tok-a'))).toBe(true);
+    expect(await isRevoked(claims('tok-b'))).toBe(true);
+  });
+
+  it('does not revoke a different user’s token', async () => {
+    trackToken('mine', USER);
+    trackToken('theirs', 999);
+
+    await invalidateSession(USER); // ban USER only
+
+    expect(await isRevoked(claims('mine'))).toBe(true);
+    expect(await isRevoked(claims('theirs'))).toBe(false);
+  });
+
+  it('global invalidateAllSessions revokes tokens signed before the cutoff, not after', async () => {
+    await invalidateAllSessions(); // hub sets the cutoff (simulated at 5000 by the session-client mock)
+
+    expect(await isRevoked(claims('old', 4000))).toBe(true); // signed before the cutoff
+    expect(await isRevoked(claims('new', 6000))).toBe(false); // signed after
+  });
+
+  it('fails open (not revoked) when the token carries no jti', async () => {
+    expect(await isRevoked(claims('', 1000))).toBe(false);
+    expect(await isRevoked({ signedAt: 1000 })).toBe(false);
+  });
+
+  // refresh and invalid share the SAME TOKEN_STATE hash; only 'invalid' may revoke. A regression where
+  // isRevoked treated any non-null state as revoked would log out every active user on a benign refresh.
+  it('a refresh-marked token is NOT revoked (only invalid revokes)', async () => {
+    trackToken('tok-refresh', USER);
+
+    await refreshSession(USER, { sendSignal: false });
+
+    // the marker landed in the shared hash, but as 'refresh' — not a revocation
+    expect(h.hashes.get(TOKEN_STATE)?.get('tok-refresh')).toBe('refresh');
+    expect(await isRevoked(claims('tok-refresh'))).toBe(false);
+  });
+
+  // The shared-hash invariant from both directions: a later invalidate must override an earlier refresh.
+  it('invalidate after refresh still revokes (invalid wins on the same jti)', async () => {
+    trackToken('tok-x', USER);
+
+    await refreshSession(USER, { sendSignal: false });
+    expect(await isRevoked(claims('tok-x'))).toBe(false);
+
+    await invalidateSession(USER);
+    expect(h.hashes.get(TOKEN_STATE)?.get('tok-x')).toBe('invalid');
+    expect(await isRevoked(claims('tok-x'))).toBe(true);
+  });
+});
+
+describe('ban cuts (USER_CUT)', () => {
+  const before = () => Date.now() - 1000;
+  const after = () => Date.now() + 60_000;
+
+  it("a ban ends the user's tokens on hosts whose tracking lapsed, and not other accounts in the browser", async () => {
+    await invalidateSession(USER);
+
+    expect(await isRevoked({ jti: 'untracked', sub: String(USER), signedAt: before() })).toBe(true);
+    expect(await isRevoked({ jti: 'signed-in-later', sub: String(USER), signedAt: after() })).toBe(
+      false
+    );
+    expect(await isRevoked({ jti: 'other-account', sub: '6', signedAt: before() })).toBe(false);
+  });
+
+  it("a ban of the impersonated user leaves the moderator's own session alone", async () => {
+    const MOD = 100;
+    await invalidateSession(USER);
+
+    expect(
+      await isRevoked({ jti: 'imp', sub: String(USER), impersonatedBy: MOD, signedAt: before() })
+    ).toBe(true);
+    expect(await isRevoked({ jti: 'mod-own', sub: String(MOD), signedAt: before() })).toBe(false);
+  });
+
+  it('a ban of the moderator ends their impersonation tokens on every host', async () => {
+    const MOD = 100;
+    await invalidateSession(MOD);
+
+    const imp = { sub: String(USER), impersonatedBy: MOD, signedAt: before() };
+    expect(await isRevoked({ ...imp, jti: 'imp-com', sid: 'fam' })).toBe(true);
+    expect(await isRevoked({ ...imp, jti: 'imp-red', sid: 'fam' })).toBe(true);
+    expect(await isRevoked({ jti: 'target-own', sub: String(USER), signedAt: before() })).toBe(
+      false
+    );
+  });
+});
+
+describe('signed-out sessions stay signed out after a session refresh', () => {
+  const kp = generateKeyPairSync('ec', {
+    namedCurve: 'P-256',
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+  const issuer = 'https://auth.test';
+  const signer = createSessionSigner({
+    privateKeyPem: kp.privateKey,
+    publicKeyPem: kp.publicKey,
+    kid: 'k',
+    issuer,
+  });
+  const verifier = createAuthVerifier({ publicKeyPem: kp.publicKey, issuer, isRevoked });
+  const mint = (jti: string, extra: Record<string, unknown> = {}) =>
+    signer.mintSessionToken({ sub: String(USER), signedAt: Date.now(), ...extra }, { jti });
+
+  it('a replayed token from a signed-out family is refused after refreshSession', async () => {
+    const root = await mint('root');
+    const member = await mint('member', { sid: 'root' });
+    trackToken('root', USER);
+    trackToken('member', USER);
+    // What sign-out leaves behind: the caller's token and its family marked invalid.
+    h.hashes.set(TOKEN_STATE, new Map([['root', 'invalid']]));
+    h.hashes.set(REDIS_SYS_KEYS.SESSION.FAMILY_STATE, new Map([['root', 'invalid']]));
+
+    await refreshSession(USER, { sendSignal: false });
+
+    expect(h.hashes.get(REDIS_SYS_KEYS.SESSION.FAMILY_STATE)?.get('root')).toBe('invalid');
+    expect(await verifier.verifyToken(root)).toBeNull();
+    expect(await verifier.verifyToken(member)).toBeNull();
+    expect(await verifier.verifyToken(await mint('unrelated', { sid: 'other' }))).not.toBeNull();
+  });
+});

@@ -1,0 +1,5 @@
+.button {
+  &[data-loading]::before {
+    border-radius: 0;
+  }
+}

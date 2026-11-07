@@ -1,0 +1,699 @@
+# Schema ↔ database drift detector
+
+Parses `packages/civitai-db-schema/prisma/schema.full.prisma`, reads a live database's
+`pg_catalog`, and reports every constraint the schema **declares but the database does not
+enforce** — and every one the database enforces differently from what the schema promises.
+
+The schema is not the database. Migrations in this project are applied by hand, per
+environment, so a declaration can be true in the schema file and absent in the database for
+a long time without anything noticing. This tool makes that gap countable.
+
+## Run it
+
+```bash
+pnpm --filter @civitai/db-schema drift             # text report
+pnpm --filter @civitai/db-schema drift --json      # machine-readable
+pnpm --filter @civitai/db-schema drift --verbose   # + the list of skipped models
+
+# only the tables one migration touches (see "Scoped checks" below)
+pnpm --filter @civitai/db-schema drift --migration prisma/migrations/<dir>/migration.sql
+```
+
+The connection comes from `DATABASE_URL` in the environment. Nothing about where a
+database lives is baked into this tool, and nothing about it should be added.
+
+**It is read-only.** Every statement is a `SELECT` against `pg_catalog`. It never writes,
+never runs DDL, and never applies a migration.
+
+Other flags:
+
+| Flag                 | Effect                                                        |
+| -------------------- | ------------------------------------------------------------- |
+| `--schema <path>`    | Read a different Prisma schema                                |
+| `--catalog <path>`   | Compare against a captured catalog JSON instead of connecting |
+| `--dump-catalog`     | Capture the catalog as JSON and exit (pairs with `--catalog`) |
+| `--db-schema <name>` | Postgres schema to introspect (default `public`)              |
+| `--strict`           | Exit 1 when any drift is found. Default is always exit 0      |
+| `--tables <A,B,…>`   | Compare only these tables (exact names). Repeatable           |
+| `--migration <sql>`  | Compare only the tables this file touches. Repeatable         |
+| `--allow-unparsed`   | Proceed past statements `--migration` cannot classify         |
+
+`--strict` is opt-in on purpose. The database carries a real backlog of drift today, so a
+gate that failed on any finding would be red on every run, and a permanently-red gate just
+teaches everyone to click through it. Under `--strict` a referential action that could not
+be compared also fails the run: "not measured" is not "clean".
+
+**Exit 2 is not optional.** A comparison that visited nothing prints exactly the same clean
+page as a healthy database — which is what a typo'd `--db-schema`, a wrong `DATABASE_URL`,
+or a role without catalog visibility produces. The CLI checks its own coverage and exits 2
+regardless of `--strict` rather than reporting a reassuring zero.
+
+## Scoped checks: one migration, one table set
+
+The whole-schema report carries the whole backlog. After applying one migration, what you want
+to know is narrower: did _this_ change land the way the schema says it should? A scoped run
+answers that and nothing else.
+
+```bash
+# DATABASE_URL points at the target, with a role that can read pg_catalog. Read-only.
+pnpm --filter @civitai/db-schema drift --migration prisma/migrations/<dir>/migration.sql
+pnpm --filter @civitai/db-schema drift --tables Image,ImageResource
+pnpm --filter @civitai/db-schema drift --migration <a.sql> --migration <b.sql> --tables Post
+```
+
+Paths are relative to the package directory, which is where `pnpm --filter` runs. Both flags
+take a comma-separated list and can be repeated; the scope is the union.
+
+**The report header prints the exact table set it covered and where each table came from** —
+`<- --tables`, or `<- <file> (CREATE TABLE, CREATE INDEX)` listing the statement kinds that
+named it — followed by a per-file count of statements read, statements that touch no table,
+and statements it could not classify. Read the header before believing anything below it.
+
+**Which findings a scope includes.** A finding belongs to the table it is _on_. For a foreign
+key that is the **referencing** (constrained) table, never the referenced one: scoping to `User`
+reports `User`'s own columns and relations, not the hundreds of relations elsewhere that point
+at it. The referenced side is still reached when a migration names it — `REFERENCES "X"` puts
+`X` in the scope as a table of its own. Every count in a scoped report (relations checked,
+columns checked) is the scope's, not the schema's, so the positive control on a clean scoped
+report is about the tables it names.
+
+**A scope it cannot vouch for exits 2,** before any comparison:
+
+- a requested table no model maps to (scopes name **tables**, as the catalog does: `posts`, not
+  `Post`, for a model with `@@map("posts")`), or whose model is `@@ignore`d;
+- a requested table that is not an ordinary table in the catalog — absent (the migration has not
+  been applied there) or a view;
+- a table the migration drops or renames away that is still in the catalog or the schema;
+- an empty scope (a migration that touches no table, and no `--tables`).
+
+Each of these would otherwise filter the report down to nothing and print a clean page. The
+one exception: a scope whose tables are _all_ expected absent, and are, exits 0 with nothing to
+compare.
+
+### What `--migration` reads
+
+It splits the file on top-level `;` — not inside strings, quoted identifiers, comments (nested
+`/* */` included) or dollar-quoted bodies — and classifies every statement into exactly one of
+three buckets:
+
+| Bucket         | Statements                                                                                                                                                                                                                                                                                                                                                                                                     |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| tables read    | `CREATE TABLE` (with `REFERENCES`, `PARTITION OF`, `INHERITS`, `LIKE`), `ALTER TABLE [IF EXISTS] [ONLY]` (with `REFERENCES` / `FOREIGN KEY`, `ATTACH`/`DETACH PARTITION`), `RENAME TO` (old name expected absent, new name present), `DROP TABLE` (expected absent), `CREATE [UNIQUE] INDEX [CONCURRENTLY] … ON`, `COMMENT ON TABLE / COLUMN / CONSTRAINT`, `INSERT INTO`, `UPDATE`, `DELETE FROM`, `TRUNCATE` |
+| touch no table | transaction control, `SET`/`RESET`, enum and domain types, sequences, extensions, `GRANT`/`REVOKE`, `ANALYZE`/`VACUUM`, `LOCK`, comments on other object kinds. Listed in the count, not dropped silently                                                                                                                                                                                                      |
+| NOT classified | `DO` blocks, functions and procedures, triggers, views and materialized views, rules, policies, a bare `SELECT`/`WITH`/`CALL`, `DROP INDEX` and `ALTER INDEX` (they name an index, not its table), any statement-level `CASCADE`, a name qualified with a schema other than `--db-schema`, temporary tables, and anything unrecognised                                                                         |
+
+Names follow Postgres: `"Image"` is `Image`, unquoted `Image` folds to `image`, and
+`"public"."Image"` is `Image`. A table's final state is what the file leaves it as, in order —
+created then dropped is expected absent.
+
+**An unclassified statement stops the run** with exit 2 and a list of each one: its file and
+line, why it could not be read, and which schema tables its text mentions. The run will not
+guess a subset. Read the statements, then re-run with `--allow-unparsed`, naming in `--tables`
+every table they touch. The mentions are a hint and are **never** added to the scope on their
+own — a quoted name inside a function body may be a column, a table, or neither. With
+`--allow-unparsed` the statements are still printed in the report, under the scope header.
+
+Measured on this repo's migrations at the time of writing: 763 of 1,016 classify completely;
+of the last 30, 18 do and 12 contain a `DO` block, a function, a trigger or a `DROP INDEX`. Those
+12 are refused, which is the intended outcome. `__tests__/migration-tables.test.ts` pins all 30,
+table by table.
+
+### Limitations
+
+What the parser cannot see:
+
+- anything inside procedural code — it refuses those statements rather than reading them;
+- the table a `DROP INDEX` / `ALTER INDEX` affects (pass it with `--tables`);
+- what a `CASCADE` reaches;
+- a `search_path` change: an unqualified name is assumed to resolve to `--db-schema`;
+- dynamic SQL, `\i` includes, or anything outside the file.
+
+What the detector does not check is listed under "What it does **not** check" below and applies
+to scoped runs unchanged: a clean scoped report says the scoped tables' foreign keys, columns,
+nullability and unique declarations match. It says nothing about the triggers, functions,
+views, check constraints, defaults, types or indexes a migration may also have changed.
+
+`drift:gate` (the CI half, below) takes no scope flags. It compares a frozen snapshot against a
+baseline of the whole schema, and a subset would turn every out-of-scope baseline entry into a
+"no longer seen" line without making the verdict any sharper.
+
+## After applying a migration
+
+Migrations here are applied by hand, per environment. For each writable environment:
+
+1. **Dry run** the migration inside a transaction that is rolled back, against the target:
+   `BEGIN;` … the migration … `ROLLBACK;`. (A file that contains `CREATE INDEX CONCURRENTLY`
+   cannot run in a transaction block; dry-run the rest and apply that statement on its own.)
+2. **A human applies it.**
+3. **Scoped drift check** against the same target, read-only:
+
+   ```bash
+   DATABASE_URL=<target, read-only role> \
+     pnpm --filter @civitai/db-schema drift --migration prisma/migrations/<dir>/migration.sql
+   ```
+
+   If it refuses unparsed statements, read them, then add `--allow-unparsed --tables <…>`
+   covering what they touch. Add `--strict` to make any finding exit 1.
+
+4. **Either it is clean, or accept the delta with a reason.** Clean means every scoped table's
+   declarations match. If it is not clean, fix the migration or the schema — or, when the gap is
+   deliberate, accept it in the baseline (below) with a reason and the PR or migration that
+   decided it.
+
+Repeat step 3 for every writable environment: one environment being clean says nothing about
+another.
+
+## What it checks
+
+| Check                   | Schema side                                                | Database side                                                                   |
+| ----------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| **Foreign key present** | each owning-side `@relation(fields: […], references: […])` | a `pg_constraint` row with `contype = 'f'` on the same **ordered** column tuple |
+| **Referential action**  | `onDelete` / `onUpdate`, explicit or defaulted             | `confdeltype` / `confupdtype`                                                   |
+| **Column present**      | each scalar field                                          | a `pg_attribute` row on the table                                               |
+| **Nullability**         | field optionality (`?`)                                    | `pg_attribute.attnotnull`                                                       |
+| **Uniqueness**          | `@unique`, `@@unique`                                      | a `pg_index` row with `indisunique` and no `indpred`                            |
+
+`@@map` / `@map` are resolved to the real table and column names throughout.
+
+### Things worth knowing about how it decides
+
+- **A present-but-wrong referential action is a defect class of its own.** The constraint
+  exists, so nothing looks missing, but the database enforces a different rule from the one
+  the schema promises. Both `ON DELETE` and `ON UPDATE` are compared.
+- **Prisma's default `onDelete` is not `Cascade`.** An optional relation defaults to
+  `SetNull`, a required one to `Restrict`. Reading a bare relation as a cascade
+  mis-describes what a parent delete would actually do — on a required relation the truth
+  is the opposite: the delete is _rejected_, not propagated.
+- **`references:` is read, never assumed to be `id`.** Most relations in this schema do
+  reference `id`, but several reference `projectId,position`, `serialId`, `userId`, `type`
+  or `blockInstanceId`.
+- **Both spellings of the relation name are accepted** — positional
+  `@relation("X", fields: …)` and named-argument `@relation(name: "X", fields: …)`. Prisma
+  takes both. Handling only the first was not a partial result: the six relations written
+  the other way appeared in no counter and produced no finding, so the tool reported clean
+  on foreign keys it had never looked at. Three of those six have no foreign key in
+  production. The parser is now checked against an independently derived count of
+  owning-side relations, because a floor (`> 400`) cannot see an undercount.
+- **A declared column with no column in the table is its own finding**, not a nullability
+  mismatch. A Prisma read touching one fails outright with "column does not exist".
+- **Block attributes are read with comments stripped.** `@@map` / `@@ignore` / `@@unique`
+  are matched against the model body, so a stray `// @@ignore` left behind by a revert
+  would otherwise skip an entire model and every constraint on it, silently.
+- **Models mapped to a view or to a table that does not exist are skipped**, along with
+  models carrying `@@ignore`. They are counted and listed (`--verbose`), not reported as
+  drift: there is no table for a constraint to live on.
+- **Partial unique indexes do not count.** A `WHERE`-clause index enforces uniqueness only
+  over the rows it matches; a `@unique` declaration is a promise about every row.
+- **Expression indexes are dropped** rather than matched by name, so a `lower(email)` index
+  cannot masquerade as an index on `email`.
+- **Column aggregates are selected as `text[]`, not `name[]`.** `attname` is of type `name`,
+  and node-postgres has no array parser registered for `name[]` — `array_agg(a.attname)`
+  arrives in JavaScript as the literal string `"{projectId,position}"`. Nothing throws,
+  `.length` still answers, and every column-tuple comparison silently becomes a comparison
+  of characters. `assertParsedArray` rejects an unparsed list rather than returning a
+  plausible-looking catalog.
+- **A catalog read that answers uniformly is rejected**, loudly, before any comparison
+  happens. `NOTNULL` is a reserved word in Postgres: `SELECT a.attnotnull notnull` parses as
+  the _postfix_ `IS NOT NULL` operator and returns a constant `true` for every row. The
+  query succeeds and every nullable column reads as `NOT NULL`. That fabricated 626
+  one-directional findings before it was caught, so `assertCatalogSanity` now fails the run
+  instead.
+
+## What it does **not** check
+
+Not implemented. Their absence from a report is **not** evidence that they are clean —
+they are not audited at all:
+
+- check constraints
+- column defaults
+- column types (including length, precision and `@db.*` native types)
+- enum values and enum membership
+- non-unique indexes, and index method/ordering
+- **primary keys** — `@id` / `@@id`. The uniqueness check covers `@unique` and `@@unique`
+  only. There are 105 `@@id` declarations in this schema and none of them is verified
+- **programmability** — views, functions, triggers, rules. A deployed view can emit columns
+  its committed definition does not, and nothing here would see it. Two live instances:
+  `BountyRank_Live` emits five `commentCount` columns its committed definition does not, and
+  `BountyEntryRank_Live` ten (`tipped*`, `tippedAmount*`). The first matters because the
+  table rebuilds from the view every few minutes
+- columns and tables present in the database but absent from the schema (the reverse
+  direction _is_ checked)
+- row-level security, partition bounds
+- whether a foreign key's _referenced table_ matches the one the schema names (only the
+  constrained column tuple is matched)
+
+The text report ends with this list for the same reason.
+
+## Layout
+
+| File                     | Role                                                                    |
+| ------------------------ | ----------------------------------------------------------------------- |
+| `parse-prisma-schema.ts` | Schema → models, fields, mappings, relations, unique declarations       |
+| `catalog.ts`             | `pg_catalog` → `DbCatalog`. The only file that talks to a database      |
+| `compare.ts`             | `(schema, catalog[, tables]) → findings`. Pure: no I/O, no clock        |
+| `migration-tables.ts`    | Migration SQL → tables touched, statements ignored, statements refused  |
+| `scope.ts`               | `--tables` + `--migration` → the scope, its verification and its header |
+| `report.ts`              | Findings → text                                                         |
+| `cli.ts`                 | Argument handling and wiring                                            |
+| `gate.ts`, `gate-cli.ts` | The CI delta gate and the baseline writer (below)                       |
+
+The differ is pure so it can be driven from fixtures, including deliberately damaged ones.
+
+## Tests
+
+```bash
+pnpm --filter @civitai/db-schema test
+```
+
+`__tests__/fixtures/` holds a small curated schema and two curated catalogs — one aligned
+with it, one carrying exactly one seeded defect per drift class — plus two real production
+captures used by `production-snapshot.test.ts` and the gate.
+
+The suite includes both controls at two levels — the differ and the command people
+actually run — because a detector that returns nothing is indistinguishable from one wired
+to nothing until you have watched it do both:
+
+- a **negative control** — an aligned pair is compared, the run is asserted silent, one
+  foreign key is then removed from the catalog and the same comparison is asserted to
+  report exactly that key;
+- a **positive control** on the zero — the aligned run also asserts non-zero
+  _checked_ counts (4 relations, 3 unique declarations, >15 columns), so an empty finding
+  list cannot come from a comparison that visited nothing;
+- **the same pair at the CLI level** (`cli.test.ts` runs the real entry point as a
+  process): an empty catalog must exit 2 with "not trustworthy", and a covering catalog
+  must exit 0. Without the second assertion the first could be passing for any reason.
+
+`catalog.test.ts` drives the reader with a fake query runner: it covers row decoding
+(action codes, ordered tuples, unparsed arrays, expression indexes) and pins the
+load-bearing SQL predicates (`indpred IS NULL`, `relkind IN ('r','p')`, `WITH ORDINALITY`,
+`attname::text`). It does **not** execute the SQL. A fake runner hands the reader
+already-parsed JavaScript arrays, which is precisely how the `name[]` bug above stayed
+invisible to it — so a green suite here is not a claim that the queries behave correctly
+against a real server. Check that by running the tool.
+
+## The current snapshot, 2026-10-20
+
+`__tests__/fixtures/catalog-production-2026-10-20.json` is what the CI gate compares against
+(`gate-cli.ts`'s default). It was captured read-only with `drift --dump-catalog` after the
+`Model` .com face migration (`20261016120000_model_sfw_face`) was applied in production. It
+differs from the 2026-10-19 capture it replaces only in those four nullable `Model` columns,
+which that capture reported missing; every relation, nullability and uniqueness finding is the
+same, so `drift-baseline.json` is unchanged. Reproduce with:
+
+```bash
+pnpm --filter @civitai/db-schema drift \
+  --catalog src/schema-drift/__tests__/fixtures/catalog-production-2026-10-20.json
+```
+
+```
+declared owning-side relations : 611
+checked against the database   : 582
+skipped (view / absent table)  : 29
+MISSING foreign key            : 32
+wrong referential action       : 67  (all ON UPDATE; ON DELETE agrees on every one)
+MISSING column                 : 0
+nullability checked            : 3343
+nullability drift              : 11
+uniqueness declarations checked: 159
+missing unique index           : 2
+```
+
+That makes 112 findings, and `drift-baseline.json` accepts all 112. The 2026-10-19 capture had
+followed the `Thread` entity-FK cascade migration (`20261101120000_thread_entity_fk_cascade`,
+#6155); against the baseline as it stood before that recapture (119 entries), 16 dropped out and
+9 were added:
+
+- **Dropped (16).** The 15 `Thread` entity relations that were declared `ON DELETE Cascade`
+  against a database `SetNull`, and `missing-foreign-key|Thread|challengeId`, which never had a
+  foreign key. The cascade migration flipped the 15 and added the sixteenth; all are validated.
+- **Added (9).** All `referential-action`, all `ON UPDATE` only (`Cascade` declared, `NoAction`
+  in the database), on the hand-written mystery-box keys (`BoxTier`, `BoxRevision`,
+  `BoxOddsSnapshot`, three on `BoxContent`, `ItemDefinition.cosmeticId`,
+  `Item.itemDefinitionId`, `CosmeticShopItem.itemDefinitionId`). Same inert class as the App
+  Blocks batch below; `ON DELETE` agrees on every one.
+
+The 2026-10-16 capture that the 2026-10-19 one replaced is not kept: it lagged the schema on nothing the
+2026-08-03 fixture does not already cover, and a 640 KB fixture earns its place only by
+exercising a path.
+
+## The previous snapshot, 2026-10-16
+
+The 2026-10-16 capture was the first to include `ON DELETE`/`ON UPDATE` and `validated` for
+each foreign key. Its report:
+
+```
+declared owning-side relations : 600
+checked against the database   : 571
+skipped (view / absent table)  : 29
+MISSING foreign key            : 33
+wrong referential action       : 58  (all ON UPDATE; ON DELETE agrees on every one)
+MISSING column                 : 0
+nullability checked            : 3200
+nullability drift              : 11
+uniqueness declarations checked: 155
+missing unique index           : 2
+```
+
+That makes 104 findings, and `drift-baseline.json` accepts all 104. Against the 2026-08-03
+baseline (67 entries), 22 dropped out and 59 were added:
+
+- **Dropped (22).** Five missing foreign keys are now in place, each one validated:
+  `ImageTagForReview.imageId`, `ImageTool.imageId`, `ImageTechnique.imageId`,
+  `Thread.imageId` and `UserProfile.sfwCoverImageId`. Fourteen were missing columns that have
+  since been migrated. The last three were nullability findings that no longer reproduce:
+  `Chat.hash`, `CosmeticShopItem.cosmeticId` and `UserCosmeticShopPurchases.cosmeticId`.
+- **Added (59).** 58 are `referential-action` findings that the old snapshot could not
+  measure. Each one is declared `ON UPDATE Cascade` while the database has `NoAction`, on the
+  hand-written App Blocks tables. Ids are never updated, so these are inert in practice
+  (see "Referential actions: measured since 2026-10-16" below). The other one is
+  `AnnouncementSpend(announcementId)`. Its migration creates a partial unique index
+  (`WHERE "announcementId" IS NOT NULL`), the schema comment calls that deliberate, and the
+  differ reads only total unique indexes. Postgres treats NULLs as distinct, so duplicates
+  are still rejected. It is not the same as a full index, though: `ON CONFLICT
+("announcementId")` cannot use a partial index, so a Prisma `upsert` keyed on
+  `announcementId` would type-check and then fail at runtime. The only writer today is a
+  plain `create`.
+
+The 2026-08-03 capture below is kept as a test fixture. It is the only real catalog that
+lags the schema, so it is the only one that exercises the pending tier, the escalation
+guard and the "referential actions not compared" path. Tests for those use it explicitly.
+
+## Measured against the previous snapshot, 2026-08-05
+
+`__tests__/fixtures/catalog-production-2026-08-03.json` is a point-in-time capture of the
+production constraint catalogs — table and column names, nullability, foreign-key and
+unique-index column tuples. Schema metadata only: no row data, and nothing about where the
+database runs. Reproduce with:
+
+```bash
+pnpm --filter @civitai/db-schema drift \
+  --catalog src/schema-drift/__tests__/fixtures/catalog-production-2026-08-03.json
+```
+
+```
+declared owning-side relations : 509
+checked against the database   : 448
+skipped (view / absent table)  : 61
+MISSING foreign key            : 40
+wrong referential action       : 0   <- see below
+MISSING column                 : 18
+nullability checked            : 2348
+nullability drift              : 13
+uniqueness declarations checked: 122
+missing unique index           : 1
+```
+
+72 findings in total. The 13 nullability findings are `Purchase.userId`,
+`ChallengeEvent.createdById`, nine `*Metric.updatedAt` columns, and
+`CosmeticShopItem.cosmeticId` / `UserCosmeticShopPurchases.cosmeticId`. Those last two are
+artefacts of the snapshot's age, not live drift: the packs migration made them nullable on
+2026-08-04 and the database has it. A recapture drops them. The 18 missing columns are
+`ModelFlag.sfwOnly`, `UserCosmeticShopPurchases.meta`, `Challenge.judgingEngine`,
+`ChallengeJudge.judgingEngine`, `Collection.collaborationDisabledAt`,
+`CollectionItem.rejectionDetail`, three `Announcement.*`, three `Cosmetic.pHash*`,
+four `UserProfile.sfw*`, and two `app_block_publish_requests.source*`. The single uniqueness finding is
+`ImageResource(modelVersionId, name, imageId)`.
+
+**Nullability was 246 when this tool shipped.** #3592 then marked the seven `*Rank` families'
+columns optional to match the database and 235 of them went away — a real remediation, and
+the reason this section is dated separately from the snapshot. Nothing observed it at the
+time, because no CI job ran this package's suite; the two assertions that pinned those 235
+were red on `main` from the moment #3592 merged until the packages were wired into CI.
+
+**The `0` on referential actions is "not measured", not "clean".** This snapshot predates
+that check and carries no `ON DELETE`/`ON UPDATE` data, so all 408 comparable foreign keys
+report as _not comparable_ and the tool says so on its own line. A live run does measure
+them: the first one found **45**, all `ON UPDATE` (declared `Cascade`, database `NoAction`),
+with zero `ON DELETE` mismatches.
+
+### Why not the checked-in `02_all_dll.sql`?
+
+`containers/db/docker-init/02_all_dll.sql` is a real, checked-in `pg_dump`, and reusing it
+instead of shipping a snapshot would be the tidier answer. Measured, it cannot serve: it is
+a **dev bootstrap DDL, not a production mirror**. It defines 195 tables against production's
+342, omits 178 production foreign keys, and — the part that matters — declares 25 foreign
+keys production does **not** have.
+
+Compared against the 37 missing foreign keys in the 2026-08-03 baseline, that dump would:
+
+|                | count |                                                  |
+| -------------- | ----- | ------------------------------------------------ |
+| **contradict** | 19    | the dump has the constraint; production does not |
+| **not see**    | 7     | the table is absent from the dump entirely       |
+| agree          | 11    |                                                  |
+
+All three `Club` image relations are in the contradicted 19, so pinning to it would assert
+that the very foreign keys this tool found missing are present. It agrees on the `*Rank`
+nullability shape (`UserRank`: 40 columns, 1 `NOT NULL`, no `thumbs*`) and on
+`ModelFlag.sfwOnly` being absent — a spot check there reads as a match, which is exactly how
+it looks like a usable substitute until you enumerate the foreign keys.
+
+### A note on `/// @view`
+
+The tool does not read the `/// @view` annotation, and does not need to. Whether a model is
+backed by a view is decided from the catalog — `relkind IN ('r','p')` — so a model on a view
+is skipped because the database says it is a view, not because the schema says so. That
+matters, because the annotation is unreliable: the strip regex in
+`scripts/prisma-migrate-with-views-workaround.mjs` requires `/// @view` to be immediately
+followed by `model`, and 26 of the 32 annotated models have a blank line in between.
+
+These totals are a fact about this schema and this snapshot together. The snapshot is frozen
+and the schema is not, so the totals drift as the schema grows — a field added tomorrow has
+no column in a catalog captured today. `production-snapshot.test.ts` therefore asserts the
+named findings survive rather than pinning the totals, so ordinary schema work does not red
+the suite for reasons that have nothing to do with this tool. Re-run the command above for
+current numbers.
+
+## In CI
+
+The root `unit` Vitest project globs `src/**` and `scripts/**` — both root-relative — and the
+`Unit tests` job runs `vitest run --project unit`, so for a while nothing in CI invoked this
+package's suite, or any of the eight other `packages/*` suites. 616 tests, 81 of them this
+tool's, ran only for whoever remembered `pnpm --filter <pkg> test` by hand.
+
+They now run in the `Package unit tests` job, from the `packages/*/vitest.config.*` entries in
+the root `vitest.config.mts`:
+
+```bash
+pnpm run test:packages:run          # every package suite
+pnpm --filter @civitai/db-schema test   # just this one
+```
+
+That job asserts a ledger — every workspace package that has a vitest config and a test file
+on disk must appear in the results, having executed at least one non-skipped test — because
+`--project` matching nothing exits 0, and so does a config whose globs stopped resolving, and
+so does a suite that skips itself entirely.
+
+Two things it is worth being precise about, because both are easy to overstate:
+
+- **It is not an interlock.** `main` has branch protection but no `required_status_checks`, so
+  a red `Package unit tests` does not prevent a merge. It renders red rather than
+  red-but-ignored, which is the real difference from the `Unit tests` job.
+- **`apps/*` runs in a sibling job**, `App unit tests + typecheck` (the `App suites` workflow), closed the same way: another
+  glob in the same `projects` array, and the ledger script takes the workspace (`packages` or
+  `apps`) as an argument rather than hardcoding one.
+
+## Gating a pull request
+
+`drift:gate` is the CI half. It FAILS on a pull request that makes the gap WORSE, and only
+that — see "What it can and cannot catch" below for why "fails" rather than "blocks".
+
+```bash
+pnpm --filter @civitai/db-schema drift:gate       # verdict; exit 1 on new enforced drift
+pnpm --filter @civitai/db-schema drift:baseline   # accept the current findings
+```
+
+It never opens a database connection. `gate-cli.ts` has no database code path to reach — it
+compares the schema against the committed catalog snapshot and nothing else. That is a
+requirement rather than a convenience: this repo is public and so are its CI logs.
+
+### What it can and cannot catch — read this before trusting it
+
+Because the database side is a **frozen capture**, the gate sees only one direction:
+
+|              |                                                                                   |
+| ------------ | --------------------------------------------------------------------------------- |
+| **Catches**  | a schema edit promising something the captured database did not have              |
+| **Misses**   | anything the _database_ does — a constraint dropped in production is invisible    |
+| **Degrades** | drift on any column created _after_ the capture, which can only ever be warn-only |
+
+That third row is the one to watch. It is **not** a bug a recapture fixes once; it is the
+standing behaviour of comparing against a frozen artefact, and it means blocking coverage
+shrinks as the snapshot ages while the check stays green. That is why the verdict prints the
+snapshot's capture date and age on **every** run, and shouts past 90 days. The honest name for
+this tool is a _schema-edit_ gate; recapturing the snapshot is what keeps it closer to a drift
+gate.
+
+Nothing mechanically enforces it either: `main` has branch protection but **no
+`required_status_checks`**, so a red gate does not stop a merge today. It is a loud, reviewable
+signal, not an interlock. Adding `Schema drift gate` to the required checks is what would make
+"blocks" literally true.
+
+### Why a baseline and not `--strict`
+
+`--strict` fails on any finding, and there are 112 on `main` today. A gate red on every run
+teaches everyone to click through it, so it would be switched off within a week — the same
+reasoning behind the report-only ESLint and Prettier steps in `.github/workflows/lint.yml`.
+
+`drift-baseline.json`, next to this README, records those 112 as accepted. The gate reports
+only what is **not** in it. The baseline is committed, so accepting new drift is a reviewable
+act: the gate tells you the exact command, and the resulting diff shows a reviewer precisely
+which constraint the change gave up on.
+
+The fingerprint excludes the `declared`/`actual` prose — #3589 corrected eight declared
+referential actions and touched no constraint, and folding that in would have retired eight
+entries and raised eight identical-looking new ones. Three things are deliberately folded back
+in, because they _are_ the finding rather than prose about it:
+
+- **nullability direction**, so flipping a field to required against a NULLABLE column cannot
+  inherit the old entry's pass;
+- **a missing foreign key's referenced table**, so repointing a relation from `Image` to `Post`
+  — same model, same field, same constrained column — cannot either;
+- **a referential-action finding's declared and actual actions**, so changing `onDelete` on a
+  relation already accepted for an inert `ON UPDATE` mismatch is a new finding, not a match.
+
+The file is in `.prettierignore`. Prettier and the generator disagree about its formatting by
+246 lines, so with both formatting it a no-op refresh produced a ~250-line reformat that buried
+the one entry that actually changed — defeating the reason for committing it. The generator
+owns the format; a no-op refresh is now a zero-line diff, and accepting one finding an
+eleven-line one. The catalog snapshot is owned the same way, for the same measured reason:
+with prettier owning it, a content-identical `--dump-catalog` re-dump was a 21,522-line diff.
+
+It is checked against the catalog it was captured with. A baseline measured against a
+different snapshot describes a different database, so the gate exits 2 rather than comparing
+them.
+
+### Every accepted finding carries a reason
+
+Each entry has a `reason` (why the drift is accepted) and a `ref` (where that was decided: a PR,
+`#1234`, or a migration directory name, `20261220120000_event_turf`). Before these fields, the
+only record of why a finding passed was a PR description somewhere in the file's history, so
+"accepted for a reason" and "accepted because someone ran the refresh to turn the gate green"
+were the same line.
+
+- **The gate fails (exit 1) on any entry without a valid reason or ref**, and names it. It always
+  prints `baseline entries without a valid reason: N of M`, so a zero is visibly a zero over the
+  whole file.
+- **A valid reason** is at least 20 characters and 4 distinct words, and is not a placeholder —
+  `TODO`, `TBD`, `FIXME`, `accepted`, `n/a`, `pre-existing` and the like are refused, as is any
+  reason that starts with `TODO`/`TBD`/`FIXME`. A **valid ref** is `#<number>` or a migration
+  directory name; free text is refused, because a ref nobody can resolve is a second reason
+  field, not a pointer.
+- **The writer requires them for new entries and preserves old ones.** `drift:baseline` carries
+  every existing entry's reason and ref over, byte for byte, when the fingerprint **and the
+  tier** both match. A tier change is a new acceptance: an entry accepted as `pending` that is
+  now `enforced` was accepted for a reason that is no longer true, and the refusal says it rose
+  from pending to enforced. Any entry that needs one (a finding the previous baseline did not
+  have, one whose tier changed, or one it had without a valid reason) takes `--reason` and
+  `--ref`; if either is missing or invalid the writer refuses, lists the entries, exits 2 and
+  **writes nothing**. The shared backfill reason below is refused as the `--reason` for a new
+  entry: it records that an entry was not reviewed.
+- **The 112 entries present when this was introduced** share one honest reason — pre-existing at
+  the 2026-10-20 capture, accepted wholesale when the baseline was created, not reviewed entry by
+  entry — and the ref of the PR that last regenerated the entry set (#6323; the 2026-10-20
+  recapture, #6423, re-paired the file with the new catalog without changing an entry). Nobody
+  reviewed them one at a time, so no per-entry reason is claimed. Replacing that shared reason
+  with a specific one, entry by entry, is the way to pay this down.
+
+### Two severities, and why the split is structural
+
+Migrations here are applied **by hand**, per environment. A declaration being ahead of the
+database is therefore a normal intermediate state, not a defect — and a gate that could not
+tell that apart from real drift would block every pull request that adds a column.
+
+The discriminator is not a taste ranking. It is: does the finding concern database surface
+that **already exists**?
+
+|              |                                                                |                     |
+| ------------ | -------------------------------------------------------------- | ------------------- |
+| **enforced** | the columns are in the catalog and the constraint is not       | **fails the check** |
+| **pending**  | the column is not in the catalog, so the schema is ahead of it | warns               |
+
+`missing-column` is always pending by construction — the column's absence _is_ the finding.
+`nullability` and `uniqueness` are always enforced by construction — the differ only emits
+them for columns it found. `missing-foreign-key` is the only kind that can be either, decided
+by looking **every** one of its constrained columns up in the catalog: a composite key with one
+column migrated and one not is still pending, because there is nothing to put a constraint on.
+
+**A tier can rise, and a rise fails the check.** A finding accepted as `pending` — "that column does not
+exist yet" — becomes enforceable the moment the migration lands _without_ its constraint. The
+fingerprint does not change, so the gate
+compares the current tier against the tier recorded in the baseline and reports
+`pending -> enforced` as a failure. Without that, the escalation is absorbed into the matched
+count and the run exits 0.
+
+That guard is **entirely forward-looking**. Escalation needs an entry that is both `pending`
+and `missing-foreign-key`. Since the 2026-10-16 recapture the baseline has **no** pending
+entries at all. The only one it ever had, `UserProfile.sfwCoverImageId`, went away because the
+column and its foreign key both landed. So the guard can fire only on entries accepted from
+here on.
+
+It also has a bypass worth knowing about: a catalog only gains a column via a **recapture**,
+and the documented procedure for a recapture is to refresh the baseline in the same commit —
+which turns the escalation into a tier flip inside a regenerated file rather than a gate
+failure. `drift:baseline` therefore prints every `pending -> enforced` transition it absorbs,
+so it lands in the recapture commit's log instead of nowhere.
+
+An enforced finding is a hazard the moment it merges: declaring `@unique` on a live column
+with no unique index, or flipping a live NULLABLE column to required, makes Prisma hand
+callers a type the database does not back.
+
+### Referential actions: measured since 2026-10-16
+
+Until the 2026-10-16 recapture, the committed snapshot had no `ON DELETE`/`ON UPDATE` data.
+All ~408 comparable foreign keys read as "not comparable", and the gate could not produce a
+`referential-action` finding. The recapture includes those actions, so they are now compared.
+There are **58** findings, up from 45 on the first live run, and every one is the same shape:
+`ON UPDATE` is declared `Cascade` but the database has `NoAction`, on a hand-written App
+Blocks foreign key. `ON DELETE` matches on all of them. Ids are never updated, so they are
+inert in practice.
+
+All 58 are accepted in the baseline. That was a triage decision, not a bulk accept, and two
+things keep it from hiding a live `ON DELETE` hazard:
+
+- **At PR time:** a referential-action fingerprint includes both action pairs. Changing
+  `onDelete` on one of these relations therefore produces a NEW enforced finding, and the gate
+  exits 1.
+- **At recapture time:** `production-snapshot.test.ts` asserts that every referential-action
+  finding in the current snapshot differs on `ON UPDATE` only. That test is pinned to this
+  snapshot, so the next recapture has to carry it over to the new fixture.
+
+### What a developer sees
+
+Adding a column, or a relation on new columns, warns and passes: the schema is ahead of the
+snapshot, which is what an unapplied migration looks like.
+
+Adding drift on a live column fails the check, names the finding, and offers three routes — fix the
+declaration, write and apply the migration, or accept it in the baseline with the reason in
+the PR description.
+
+### Refreshing
+
+- **Accepting a finding:**
+
+  ```bash
+  pnpm --filter @civitai/db-schema drift:baseline \
+    --reason "<why this drift is acceptable, specifically>" --ref "#<this PR>"
+  ```
+
+  The new entries take that reason; every existing entry keeps its own. The diff is two added
+  lines (`reason`, `ref`) on each new entry, in fingerprint order, so a reviewer sees exactly
+  what was accepted and why. If the refresh would accept findings you did not intend to accept
+  — the schema is often ahead of the snapshot — they are listed, and they take the same reason:
+  read the list before passing one.
+
+- **After the drift is genuinely fixed:** the gate lists the entry under "no longer reports"
+  without failing; `drift:baseline` prunes it. The refresh still needs `--reason` and `--ref`
+  whenever any finding in the run is outside the baseline — a new pending finding included, since
+  the schema is often ahead of the snapshot — or has changed tier since it was accepted.
+- **After the catalog snapshot is recaptured:** `drift:baseline` in the same commit, with a
+  `--reason` and `--ref` for whatever the recapture adds. The
+  catalog and the baseline are a pair and the gate enforces that they stay one. Diff the old
+  baseline against the new one and list what dropped and what was added in the PR. Explain
+  every addition: drift that appeared since the previous capture, drift the old capture
+  could not measure, or a finding the differ cannot read correctly (the 2026-10-16 recapture
+  had all three). Move the current-snapshot block in `production-snapshot.test.ts` (the ON
+  UPDATE-only check and the `capturedAt` pin) onto the new fixture, re-point
+  `dump-catalog-stamp.test.ts`, the two capture-date regexes in `gate.test.ts` and
+  `DEFAULT_CATALOG` in `gate-cli.ts`, and delete the superseded fixture. Keep the 2026-08-03
+  fixture: the backlog tests need a catalog that lags the schema.

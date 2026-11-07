@@ -1,0 +1,825 @@
+import * as z from 'zod';
+import type { MediaType } from '~/shared/utils/prisma/enums';
+import {
+  ChallengeReviewCostType,
+  ChallengeSource,
+  ChallengeStatus,
+  MetricTimeframe,
+  PrizeMode,
+  PoolTrigger,
+} from '~/shared/utils/prisma/enums';
+import {
+  allBrowsingLevelsFlag,
+  sfwBrowsingLevelsFlag,
+} from '~/shared/constants/browsingLevel.constants';
+import {
+  CHALLENGE_MAX_DURATION_DAYS,
+  CHALLENGE_MAX_DURATION_MS,
+  CHALLENGE_MAX_ENTRY_FEE,
+  CHALLENGE_MAX_INITIAL_PRIZE,
+  CHALLENGE_MIN_DURATION_HOURS,
+  CHALLENGE_MIN_DURATION_MS,
+  CHALLENGE_MIN_ENTRY_FEE,
+  RESOURCE_CONCEPT_MAX_LENGTH,
+} from '~/shared/constants/challenge.constants';
+import { JUDGING_ENGINES } from '~/server/games/daily-challenge/challenge-judging-engine';
+import { infiniteQuerySchema } from './base.schema';
+import { imageReferenceInputSchema } from './image.schema';
+import type { ProfileImage } from '~/server/selectors/image.selector';
+import type { UserWithCosmetics } from '~/server/selectors/user.selector';
+import type { JudgeScore } from '~/server/games/daily-challenge/daily-challenge.utils';
+
+// Lives here rather than in the service util that derives it: the util and the client-side card
+// helpers both need it, and services depend on schema, never the reverse.
+export type MyChallengeResult = 'won' | 'placed' | 'judging' | 'entered' | 'hosting';
+
+// Cover image type for challenges (compatible with ImageGuard2)
+export type ChallengeCoverImage = {
+  id: number;
+  url: string;
+  nsfwLevel: number;
+  hash: string | null;
+  width: number | null;
+  height: number | null;
+  type: MediaType;
+};
+
+// Sort options for challenges
+export const ChallengeSort = {
+  Newest: 'Newest',
+  EndingSoon: 'EndingSoon',
+  MostEntries: 'MostEntries',
+  HighestPrize: 'HighestPrize',
+} as const;
+export type ChallengeSort = (typeof ChallengeSort)[keyof typeof ChallengeSort];
+
+// Prize structure
+export const prizeSchema = z.object({
+  // Floors: these feed winner payouts (createBuzzTransaction). A negative prize would be a
+  // grant-instead-of-charge / broken-payout vector, so never allow below zero.
+  buzz: z.number().min(0),
+  points: z.number().min(0),
+});
+export type Prize = z.infer<typeof prizeSchema>;
+
+export const prizeDistributionSchema = z
+  .array(z.number().min(1).max(100))
+  .length(3)
+  .refine((arr) => arr.reduce((a, b) => a + b, 0) === 100, {
+    message: 'Distribution must sum to 100%',
+  })
+  .default([50, 30, 20]);
+
+// Types for challenge data
+export type ChallengeListItem = {
+  id: number;
+  title: string;
+  theme: string | null;
+  invitation: string | null;
+  coverImage: ChallengeCoverImage | null;
+  startsAt: Date;
+  endsAt: Date;
+  status: ChallengeStatus;
+  source: ChallengeSource;
+  buzzType: 'green' | 'yellow';
+  nsfwLevel: number;
+  allowedNsfwLevel: number;
+  prizePool: number;
+  entryCount: number;
+  commentCount: number;
+  modelVersionIds: number[];
+  collectionId: number | null;
+  createdById: number;
+  createdBy: ChallengeDisplayUser;
+  judge: ChallengeJudgeInfo | null;
+};
+
+// The viewer's own challenges — entered or created — for the Challenges Center "Your Challenges" row.
+export const getMyChallengesSchema = z.object({
+  limit: z.number().min(1).max(20).default(6),
+});
+export type GetMyChallengesInput = z.infer<typeof getMyChallengesSchema>;
+
+export type MyChallengeItem = ChallengeListItem & {
+  myPlace: number | null;
+  myResult: MyChallengeResult;
+  isLive: boolean;
+  // Entry time for challenges you entered; creation time for ones you host.
+  myActivityAt: Date;
+};
+
+// Completion summary stored in Challenge.metadata when winners are picked
+const challengeCompletionSummarySchema = z.object({
+  judgingProcess: z.string(),
+  outcome: z.string(),
+  completedAt: z.string(),
+});
+export type ChallengeCompletionSummary = z.infer<typeof challengeCompletionSummarySchema>;
+
+// Zod schema for Challenge.metadata (Json? column)
+//
+// Every key the column can hold must be declared here. `parseChallengeMetadata` uses this schema's
+// default strip behaviour, so an undeclared key is SILENTLY DROPPED — and several call sites parse
+// the metadata and then write the parsed object back wholesale, which deletes anything missing from
+// this list. Two fields written by raw SQL elsewhere were lost that way; see the notes below. When
+// adding a key to Challenge.metadata anywhere in the codebase, add it here in the same change.
+//
+// 🔴 DECLARING A KEY RAISES THE STAKES ON ITS TYPE. An undeclared key with a bad value is merely
+// stripped and its siblings survive; a DECLARED key with a bad value fails the whole `safeParse`,
+// and `parseChallengeMetadata` then returns `{}` — so the write-back sites above would wipe the
+// ENTIRE metadata column, including `reconciliation.paidUserIds`, which gates participation
+// back-pay. There is no live exposure today (every writer is type-safe by construction —
+// `Date.now()` for the numbers, `toISOString()` for the strings — and all production rows conform),
+// but a new key whose writer can emit a wrong type is a much bigger liability declared than
+// undeclared. Prefer a permissive type over an exact one when the writer is not provably narrow.
+export const challengeMetadataSchema = z.object({
+  challengeType: z.string().optional(),
+  resourceUserId: z.number().optional(),
+  resourceModelId: z.number().optional(),
+  articleId: z.number().optional(),
+  themeElements: z.array(z.string()).optional(),
+  // Truncated rather than rejected: a `.max()` here would fail the whole safeParse and wipe the
+  // metadata column (see the note above). Cap rationale lives with RESOURCE_CONCEPT_MAX_LENGTH.
+  resourceConcept: z
+    .string()
+    .transform((s) => s.slice(0, RESOURCE_CONCEPT_MAX_LENGTH))
+    .optional(),
+  completionSummary: challengeCompletionSummarySchema.optional(),
+  // Epoch millis of the last review pass, written as a bare JSON number by a raw jsonb merge in
+  // daily-challenge-processing. Two readers:
+  //   1. getActiveChallengesFromDb's `ORDER BY cast(metadata->>'reviewedAt' as bigint) NULLS FIRST`
+  //      round-robin across Active challenges.
+  //   2. The review job's since-last-review window (`ci."reviewedAt" >= lastReviewedAt`) for free
+  //      challenges. Losing the key rewinds it to the challenge start and widens the candidate pool.
+  reviewedAt: z.number().optional(),
+  // Entries the review job owes a review whatever its sampling, window or per-user cap: imageId ->
+  // failed attempts. Changed only by raw jsonb SQL; a parsed write-back copies it unchanged.
+  pendingReview: z.record(z.string(), z.number()).optional(),
+  // ISO timestamp stamped by claimChallengeForCompletion when a run claims a challenge into
+  // Completing. Read back two ways: the time-based stuck-challenge reset, and the completion job's
+  // claim-ownership check that gates its telemetry. Both read the RAW jsonb, not a parsed object,
+  // so the strip never affected a read — what it cost was durability across a parse-then-write-back.
+  // The one concrete case: a slow run whose claim was reset would strip the stamp on its late write,
+  // so the run that re-claimed saw none, failed open, and both emitted. Declaring it makes that a
+  // single emit. NOTE this does NOT make a stampless Completing row impossible — that row is
+  // unrecoverable (the reset's comparison is NULL-propagating, so it is never selected), and it is
+  // still reachable via a stale full-column metadata replace that was never carrying the stamp to
+  // begin with. See the note on the completing-stuck gauge in challenge.metrics.ts.
+  completingClaimedAt: z.string().optional(),
+  // Written once by the admin/temp challenge migration endpoint. No reader today, so losing it is
+  // cosmetic — declared because the rule above is only worth anything if it is applied uniformly.
+  migratedAt: z.string().optional(),
+  reconciliation: z
+    .object({
+      paidUserIds: z.array(z.number()).optional(),
+      lastRunAt: z.string().optional(),
+      done: z.boolean().optional(),
+    })
+    .optional(),
+});
+export type ChallengeMetadata = z.infer<typeof challengeMetadataSchema>;
+
+/** Safely parse Challenge.metadata from a raw Json? value. */
+export function parseChallengeMetadata(raw: unknown): ChallengeMetadata {
+  if (!raw || typeof raw !== 'object') return {};
+  const result = challengeMetadataSchema.safeParse(raw);
+  return result.success ? result.data : {};
+}
+
+// The author shown on a challenge card/detail. For User challenges this is the real creator; for
+// System/Mod challenges the client swaps in the judge (see getChallengeDisplayUser). `createdBy`
+// always carries the real creator regardless — the swap is display-only.
+export type ChallengeDisplayUser = {
+  id: number;
+  username: string | null;
+  image: string | null;
+  profilePicture?: ProfileImage | null;
+  cosmetics?: UserWithCosmetics['cosmetics'] | null;
+  deletedAt?: Date | null;
+};
+
+// `id` is the ChallengeJudge row id; `userId` + the User fields identify the account the judge posts
+// as, so the judge can render as an author avatar.
+export type ChallengeJudgeInfo = {
+  id: number;
+  userId: number;
+  name: string;
+  bio: string | null;
+  username: string | null;
+  image: string | null;
+  deletedAt: Date | null;
+  profilePicture?: ProfileImage | null;
+  cosmetics?: UserWithCosmetics['cosmetics'] | null;
+};
+
+export type ChallengeDetail = {
+  id: number;
+  title: string;
+  description: string | null;
+  theme: string | null;
+  invitation: string | null;
+  coverImage: ChallengeCoverImage | null;
+  startsAt: Date;
+  endsAt: Date;
+  visibleAt: Date;
+  status: ChallengeStatus;
+  source: ChallengeSource;
+  buzzType: 'green' | 'yellow';
+  eventId: number | null;
+  nsfwLevel: number;
+  allowedNsfwLevel: number;
+  modelVersionIds: number[];
+  models: Array<{
+    id: number;
+    name: string;
+    versionId: number;
+    versionName: string;
+    baseModel: string;
+    image: {
+      id: number;
+      url: string;
+      nsfwLevel: number;
+      hash: string;
+      width: number;
+      height: number;
+      type: MediaType;
+    } | null;
+  }>;
+  collectionId: number | null;
+  maxEntriesPerUser: number;
+  entryFee: number;
+  prizes: Prize[];
+  entryPrize: Prize | null;
+  entryPrizeRequirement: number;
+  prizePool: number;
+  prizeMode: PrizeMode;
+  basePrizePool: number;
+  buzzPerAction: number;
+  poolTrigger: PoolTrigger | null;
+  maxPrizePool: number | null;
+  prizeDistribution: number[] | null;
+  reviewCostType: ChallengeReviewCostType;
+  reviewCost: number;
+  entryCount: number;
+  createdById: number;
+  createdBy: ChallengeDisplayUser;
+  judge: ChallengeJudgeInfo | null;
+  winners: Array<{
+    place: number;
+    userId: number;
+    username: string;
+    imageId: number | null;
+    imageUrl: string | null;
+    imageNsfwLevel: number | null;
+    imageHash: string | null;
+    buzzAwarded: number;
+    reason: string | null;
+    judgeScore?: JudgeScore | Record<string, number> | null;
+    profilePicture?: ProfileImage | null;
+    cosmetics?: UserWithCosmetics['cosmetics'] | null;
+  }>;
+  completionSummary: ChallengeCompletionSummary | null;
+  judgedTagId: number | null;
+  judgingCategories: ChallengeJudgingCategory[] | null;
+};
+
+// Extended type with sensitive/internal fields for moderator edit form
+export type ChallengeDetailForEdit = ChallengeDetail & {
+  judgingPrompt: string | null;
+  reviewPercentage: number;
+  operationBudget: number;
+  themeElements: string[] | null;
+  entryFee: number;
+  maxParticipants: number | null;
+};
+
+export type ModeratorChallengeListItem = {
+  id: number;
+  title: string;
+  theme: string | null;
+  startsAt: Date;
+  endsAt: Date;
+  visibleAt: Date;
+  status: ChallengeStatus;
+  source: ChallengeSource;
+  prizePool: number;
+  reviewCostType: ChallengeReviewCostType;
+  reviewCost: number;
+  entryCount: number;
+  collectionId: number;
+  createdById: number;
+  creatorUsername: string | null;
+};
+
+export type UpcomingTheme = {
+  date: string;
+  theme: string;
+  modelName: string;
+  modelCreator: string | null;
+};
+
+// Composite cursor for stable pagination across all sort types
+// Format: "sortValue:id" where sortValue depends on sort type
+export const challengeCursorSchema = z.string().optional();
+
+// Participation filter for user-centric challenge filtering
+export const ChallengeParticipation = {
+  Entered: 'entered',
+  NotEntered: 'not_entered',
+  Won: 'won',
+  Created: 'created',
+  Tracking: 'tracking',
+} as const;
+export type ChallengeParticipation =
+  (typeof ChallengeParticipation)[keyof typeof ChallengeParticipation];
+
+// Query schema for infinite challenge list
+export type GetInfiniteChallengesInput = z.infer<typeof getInfiniteChallengesSchema>;
+export const getInfiniteChallengesSchema = z.object({
+  ...infiniteQuerySchema.omit({ cursor: true }).shape,
+  // Override cursor to be a string for composite cursor support
+  cursor: challengeCursorSchema,
+  query: z.string().optional(),
+  status: z.enum(ChallengeStatus).array().optional(),
+  source: z.enum(ChallengeSource).array().optional(),
+  period: z.enum(MetricTimeframe).default(MetricTimeframe.AllTime),
+  sort: z
+    .enum([
+      ChallengeSort.Newest,
+      ChallengeSort.EndingSoon,
+      ChallengeSort.MostEntries,
+      ChallengeSort.HighestPrize,
+    ])
+    .default(ChallengeSort.Newest),
+  userId: z.number().optional(),
+  modelVersionId: z.number().optional(),
+  participation: z
+    .enum([
+      ChallengeParticipation.Entered,
+      ChallengeParticipation.NotEntered,
+      ChallengeParticipation.Won,
+      ChallengeParticipation.Created,
+      ChallengeParticipation.Tracking,
+    ])
+    .optional(),
+  includeEnded: z.boolean().default(false),
+  excludeEventChallenges: z.boolean().default(false),
+  challengeEventId: z.number().optional(),
+  browsingLevel: z.number().optional(),
+  limit: z.coerce.number().min(1).max(100).default(20),
+});
+
+// Note: Challenge entries are stored as CollectionItems in the challenge's collection.
+// Use collection endpoints to query entries.
+
+// Query schema for challenge winners
+export type GetChallengeWinnersInput = z.infer<typeof getChallengeWinnersSchema>;
+export const getChallengeWinnersSchema = z.object({
+  challengeId: z.number(),
+});
+
+// Query schema for user entry count
+export type GetUserEntryCountInput = z.infer<typeof getUserEntryCountSchema>;
+export const getUserEntryCountSchema = z.object({
+  challengeId: z.number(),
+});
+
+// Toggle "notify me" tracking on a challenge
+export const toggleChallengeNotifySchema = z.object({
+  challengeId: z.number(),
+  setTo: z.boolean().optional(),
+});
+export type ToggleChallengeNotifyInput = z.infer<typeof toggleChallengeNotifySchema>;
+
+// Moderator: Get all challenges (including drafts and hidden)
+export type GetModeratorChallengesInput = z.infer<typeof getModeratorChallengesSchema>;
+export const getModeratorChallengesSchema = infiniteQuerySchema.merge(
+  z.object({
+    query: z.string().optional(),
+    status: z.enum(ChallengeStatus).array().optional(),
+    source: z.enum(ChallengeSource).array().optional(),
+    limit: z.coerce.number().min(1).max(100).default(30),
+  })
+);
+
+// Judging categories, shared by the moderator and user upsert schemas. The client submits only
+// `{ key, weight }` (any client-sent label/criteria are stripped here); the service derives
+// label + criteria from the ChallengeCategory library (resolveJudgingCategories) before persisting,
+// so client text can never reach the AI judge prompt. Keys are validated against the library at
+// resolve time — categories are DB-owned, so there is no static enum to check against.
+export const challengeJudgingCategoryInputSchema = z.object({
+  key: z.string().trim().min(1).max(50),
+  weight: z.number().int().min(1).max(100),
+});
+export type ChallengeJudgingCategoryInput = z.infer<typeof challengeJudgingCategoryInputSchema>;
+
+// Persisted shape: label + criteria were server-derived at write time and are trusted on read.
+export const challengeJudgingCategorySchema = challengeJudgingCategoryInputSchema.extend({
+  label: z.string(),
+  criteria: z.string(),
+});
+export type ChallengeJudgingCategory = z.infer<typeof challengeJudgingCategorySchema>;
+
+const judgingCategoryRefinements = (
+  cats: { key: string; weight: number }[],
+  ctx: z.RefinementCtx
+) => {
+  if (cats.filter((c) => c.key === 'theme').length !== 1)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Theme is required exactly once' });
+  const keys = cats.map((c) => c.key);
+  if (new Set(keys).size !== keys.length)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Each category can be used once' });
+  if (cats.reduce((s, c) => s + c.weight, 0) !== 100)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Category weights must sum to 100%' });
+};
+
+export const challengeJudgingCategoriesInputSchema = z
+  .array(challengeJudgingCategoryInputSchema)
+  .min(1)
+  .max(4)
+  .superRefine(judgingCategoryRefinements);
+
+export const challengeJudgingCategoriesSchema = z
+  .array(challengeJudgingCategorySchema)
+  .min(1)
+  .max(4)
+  .superRefine(judgingCategoryRefinements);
+
+// Moderator: create/update a ChallengeCategory library row (playground Categories tab).
+// `key` is the PK and the join key on stored Challenge.judgingCategories, so it is create-only.
+export type UpsertChallengeCategoryInput = z.infer<typeof upsertChallengeCategorySchema>;
+export const upsertChallengeCategorySchema = z.object({
+  key: z
+    .string()
+    .trim()
+    .min(1)
+    .max(50)
+    .regex(/^[a-z0-9_-]+$/, 'Key must be lowercase letters, numbers, hyphens, or underscores'),
+  label: z.string().trim().min(1).max(100),
+  group: z.string().trim().min(1).max(50),
+  criteria: z.string().trim().min(1).max(500),
+  rubric: z.string().optional().nullable(),
+  rubricNsfw: z.string().optional().nullable(),
+  sortOrder: z.number().int().default(0),
+  active: z.boolean().default(true),
+});
+
+// Moderator: Create/Update challenge
+// Base schema is a ZodObject so the form can use .omit().extend()
+export const upsertChallengeBaseSchema = z.object({
+  id: z.number().optional(),
+  title: z.string().min(3).max(200),
+  description: z.string().optional(),
+  theme: z.string().min(1),
+  themeElements: z.array(z.string()).optional(),
+  invitation: z.string().optional(),
+  coverImage: imageReferenceInputSchema,
+  nsfwLevel: z.number().min(1).max(32).default(1),
+  allowedNsfwLevel: z.number().min(1).max(63).default(sfwBrowsingLevelsFlag),
+  modelVersionIds: z.array(z.number()).default([]),
+  judgeId: z.number().optional().nullable(),
+  judgingPrompt: z.string().optional().nullable(),
+  judgingCategories: challengeJudgingCategoriesInputSchema.optional().nullable(),
+  reviewPercentage: z.number().min(0).max(100).default(100),
+  maxReviews: z.number().optional().nullable(),
+  maxEntriesPerUser: z.number().min(1).max(100).default(20),
+  prizes: z.array(prizeSchema).default([]),
+  entryPrize: prizeSchema.optional().nullable(),
+  entryPrizeRequirement: z.number().min(1).max(100).default(10),
+  prizePool: z.number().min(0).default(0),
+  operationBudget: z.number().min(0).default(0),
+  prizeMode: z.nativeEnum(PrizeMode).default(PrizeMode.Fixed),
+  basePrizePool: z.number().min(0).default(0),
+  buzzPerAction: z.number().min(0).default(0),
+  poolTrigger: z.nativeEnum(PoolTrigger).optional().nullable(),
+  maxPrizePool: z.number().min(0).optional().nullable(),
+  prizeDistribution: prizeDistributionSchema.optional().nullable(),
+  reviewCostType: z.enum(ChallengeReviewCostType).default(ChallengeReviewCostType.None),
+  reviewCost: z.number().min(0).default(0),
+  startsAt: z.date(),
+  endsAt: z.date(),
+  visibleAt: z.date(),
+  status: z.enum(ChallengeStatus).default(ChallengeStatus.Scheduled),
+  source: z.enum(ChallengeSource).default(ChallengeSource.System),
+  eventId: z.number().optional().nullable(),
+});
+
+// Refined schema with cross-field validation (used by tRPC router)
+export const upsertChallengeSchema = upsertChallengeBaseSchema.refine(
+  (data) => data.endsAt > data.startsAt,
+  { message: 'End date must be after start date', path: ['endsAt'] }
+);
+export type UpsertChallengeInput = z.infer<typeof upsertChallengeSchema>;
+
+// --- User (public) challenge create/update ---
+// A restricted, safe subset of the moderator upsert: no free-form judgingPrompt, no
+// arbitrary status/source/prizePool. Judging is category-based; funding is entry-fee.
+// The judge must be an existing active judge (validated server-side).
+export const userChallengeUpsertBaseSchema = z.object({
+  id: z.number().optional(),
+  title: z.string().trim().min(3).max(200),
+  description: z.string().min(1).max(5000),
+  theme: z.string().trim().min(1).max(100),
+  themeElements: z.array(z.string().max(100)).max(20).optional(),
+  invitation: z.string().max(300).optional(),
+  coverImage: imageReferenceInputSchema,
+  // Capped at the browsable-levels flag (31): 32 is NsfwLevel.Blocked, and accepting it would
+  // let a user create a Blocked-level challenge whose collection admits Blocked images.
+  allowedNsfwLevel: z.number().min(1).max(allBrowsingLevelsFlag).default(sfwBrowsingLevelsFlag),
+  modelVersionIds: z.array(z.number().int().positive()).max(20).default([]),
+  judgeId: z.number().int().positive(),
+  judgingCategories: challengeJudgingCategoriesInputSchema,
+  entryFee: z.number().int().min(CHALLENGE_MIN_ENTRY_FEE).max(CHALLENGE_MAX_ENTRY_FEE),
+  initialPrizeBuzz: z.number().int().min(0).max(CHALLENGE_MAX_INITIAL_PRIZE).default(0),
+  prizeDistribution: prizeDistributionSchema,
+  maxParticipants: z.number().int().min(1).max(100_000).optional(),
+  maxEntriesPerUser: z.number().int().min(1).max(100).default(5),
+  buzzType: z.enum(['green', 'yellow']).optional(),
+  startsAt: z.date(),
+  endsAt: z.date(),
+});
+
+export const userChallengeUpsertSchema = userChallengeUpsertBaseSchema
+  .refine((data) => data.endsAt > data.startsAt, {
+    message: 'End date must be after start date',
+    path: ['endsAt'],
+  })
+  // Duration bounds only apply once the dates are ordered — otherwise the reversed-date case
+  // would stack a spurious "must run for at least" issue on top of the ordering error above.
+  .refine(
+    (data) =>
+      data.endsAt <= data.startsAt ||
+      data.endsAt.getTime() - data.startsAt.getTime() >= CHALLENGE_MIN_DURATION_MS,
+    {
+      message: `Challenge must run for at least ${CHALLENGE_MIN_DURATION_HOURS} hours.`,
+      path: ['endsAt'],
+    }
+  )
+  .refine(
+    (data) =>
+      data.endsAt <= data.startsAt ||
+      data.endsAt.getTime() - data.startsAt.getTime() <= CHALLENGE_MAX_DURATION_MS,
+    {
+      message: `Challenge cannot run longer than ${CHALLENGE_MAX_DURATION_DAYS} days.`,
+      path: ['endsAt'],
+    }
+  );
+export type UserChallengeUpsertInput = z.infer<typeof userChallengeUpsertSchema>;
+
+// Moderator: Delete challenge
+export type DeleteChallengeInput = z.infer<typeof deleteChallengeSchema>;
+export const deleteChallengeSchema = z.object({
+  id: z.number(),
+});
+
+// Separate from `deleteChallengeSchema` because that one is also the event-delete input, which has
+// no notion of force and should not accept a parameter it ignores.
+export type ModeratorDeleteChallengeInput = z.infer<typeof moderatorDeleteChallengeSchema>;
+export const moderatorDeleteChallengeSchema = deleteChallengeSchema.extend({
+  force: z.boolean().optional(),
+});
+
+// Moderator: Quick actions
+export type ChallengeQuickActionInput = z.infer<typeof challengeQuickActionSchema>;
+export const challengeQuickActionSchema = z.object({
+  id: z.number(),
+});
+
+export type GetUpcomingThemesInput = z.infer<typeof getUpcomingThemesSchema>;
+export const getUpcomingThemesSchema = z.object({
+  count: z.number().min(1).max(10).default(3),
+});
+
+// Check entry eligibility for challenge submission
+export type CheckEntryEligibilityInput = z.infer<typeof checkEntryEligibilitySchema>;
+export const checkEntryEligibilitySchema = z.object({
+  challengeId: z.number(),
+  imageIds: z.array(z.number()).min(1).max(100),
+});
+
+export type ImageEligibilityResult = {
+  imageId: number;
+  eligible: boolean;
+  reasons: string[];
+};
+
+// System challenge config update schema
+export const updateChallengeConfigSchema = z.object({
+  defaultJudgeId: z.number().nullable(),
+});
+export type UpdateChallengeConfigInput = z.infer<typeof updateChallengeConfigSchema>;
+
+// --- Paid Review ---
+
+// Request paid review for entries
+export type RequestReviewInput = z.infer<typeof requestReviewSchema>;
+export const requestReviewSchema = z.object({
+  challengeId: z.number(),
+  imageIds: z.array(z.number()).min(1).max(20).optional(),
+});
+
+// Get user's unjudged entries for a challenge
+export type GetUserUnjudgedEntriesInput = z.infer<typeof getUserUnjudgedEntriesSchema>;
+export const getUserUnjudgedEntriesSchema = z.object({
+  challengeId: z.number(),
+});
+
+export type UserChallengeEntry = {
+  imageId: number;
+  url: string;
+  tagId: number | null;
+  reviewStatus: 'pending' | 'queued' | 'reviewed';
+};
+
+export type UserChallengeEntriesResult = {
+  entries: UserChallengeEntry[];
+  hasFlatRatePurchase: boolean;
+};
+
+// --- Previous Winners Page ---
+
+// Lightweight winner for list views
+export type ChallengeWinnerSummary = {
+  place: number;
+  userId: number;
+  username: string;
+  imageId: number | null;
+  imageUrl: string | null;
+  imageNsfwLevel: number | null;
+  imageHash: string | null;
+  buzzAwarded: number;
+  reason?: string | null;
+  judgeScore?: JudgeScore | Record<string, number> | null;
+  profilePicture?: ProfileImage | null;
+  cosmetics?: UserWithCosmetics['cosmetics'] | null;
+};
+
+// Challenge list item with inline winners
+export type ChallengeWithWinnersListItem = ChallengeListItem & {
+  winners: ChallengeWinnerSummary[];
+  completionSummary: ChallengeCompletionSummary | null;
+  judgingCategories: ChallengeJudgingCategory[] | null;
+};
+
+// Input schema for completed challenges with winners
+export type GetCompletedChallengesWithWinnersInput = z.infer<
+  typeof getCompletedChallengesWithWinnersSchema
+>;
+export const getCompletedChallengesWithWinnersSchema = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce.number().min(1).max(100).default(20),
+  eventId: z.number().optional(),
+  browsingLevel: z.number().optional(),
+  query: z.string().optional(),
+  source: z.enum(ChallengeSource).array().optional(),
+});
+
+// --- Winner Cooldown ---
+
+export type WinnerCooldownStatus = {
+  onCooldown: boolean;
+  cooldownEndsAt: Date | null;
+  lastWinDate: Date | null;
+  lastWinChallengeId: number | null;
+  cooldownDays: number;
+};
+
+export type GetWinnerCooldownStatusInput = z.infer<typeof getWinnerCooldownStatusSchema>;
+export const getWinnerCooldownStatusSchema = z.object({
+  challengeId: z.number(),
+});
+
+// --- Challenge Events ---
+
+export type ChallengeEventListItem = {
+  id: number;
+  title: string;
+  description: string | null;
+  titleColor: string | null;
+  coverImage: ChallengeCoverImage | null;
+  startDate: Date;
+  endDate: Date;
+  challenges: ChallengeListItem[];
+};
+
+// Valid title colors for challenge events (maps to Tailwind color classes)
+export const challengeEventTitleColors = [
+  'blue',
+  'purple',
+  'red',
+  'orange',
+  'yellow',
+  'green',
+  'pink',
+] as const;
+
+// Moderator: Create/Update challenge event
+export const upsertChallengeEventBaseSchema = z.object({
+  id: z.number().optional(),
+  title: z.string().min(3).max(200),
+  description: z.string().optional().nullable(),
+  titleColor: z.enum(challengeEventTitleColors).optional().nullable(),
+  startDate: z.date(),
+  endDate: z.date(),
+  active: z.boolean().default(true),
+  winnerCooldownDays: z.number().int().min(0).max(365).nullable().optional(),
+  coverImage: imageReferenceInputSchema.nullable().optional(),
+});
+
+export const upsertChallengeEventSchema = upsertChallengeEventBaseSchema.refine(
+  (data) => data.endDate > data.startDate,
+  { message: 'End date must be after start date', path: ['endDate'] }
+);
+export type UpsertChallengeEventInput = z.infer<typeof upsertChallengeEventSchema>;
+
+// Moderator: Get events list
+export type GetChallengeEventsInput = z.infer<typeof getChallengeEventsSchema>;
+export const getChallengeEventsSchema = z.object({
+  activeOnly: z.boolean().default(false),
+});
+
+// --- Judge Playground ---
+
+// Get a single judge by ID (full data including all prompts)
+export type GetJudgeByIdInput = z.infer<typeof getJudgeByIdSchema>;
+export const getJudgeByIdSchema = z.object({
+  id: z.number(),
+});
+
+// Create or update a judge
+export type UpsertJudgeInput = z.infer<typeof upsertJudgeSchema>;
+export const upsertJudgeSchema = z.object({
+  id: z.number().optional(),
+  userId: z.number().optional(),
+  name: z.string().min(1).max(255),
+  bio: z.string().optional().nullable(),
+  sourceCollectionId: z.number().optional().nullable(),
+  systemPrompt: z.string().optional().nullable(),
+  collectionPrompt: z.string().optional().nullable(),
+  contentPrompt: z.string().optional().nullable(),
+  reviewPrompt: z.string().optional().nullable(),
+  reviewTemplate: z.string().optional().nullable(),
+  winnerSelectionPrompt: z.string().optional().nullable(),
+  active: z.boolean().optional(),
+  userSelectable: z.boolean().optional(),
+  judgingEngine: z.enum(Object.values(JUDGING_ENGINES)).optional(),
+});
+
+// Playground: Generate content for a model version
+export type PlaygroundGenerateContentInput = z.infer<typeof playgroundGenerateContentSchema>;
+export const playgroundGenerateContentSchema = z.object({
+  modelVersionId: z.number(),
+  judgeId: z.number().optional(),
+  promptOverrides: z
+    .object({
+      systemMessage: z.string().optional(),
+      content: z.string().optional(),
+    })
+    .optional(),
+  aiModel: z.string().min(1).optional(),
+});
+
+// Playground: Review an image
+export type PlaygroundReviewImageInput = z.infer<typeof playgroundReviewImageSchema>;
+export const playgroundReviewImageSchema = z.object({
+  imageId: z.number(),
+  theme: z.string(),
+  themeElements: z.array(z.string()).optional(),
+  creator: z.string().optional(),
+  judgeId: z.number().optional(),
+  promptOverrides: z
+    .object({
+      systemMessage: z.string().optional(),
+      review: z.string().optional(),
+    })
+    .optional(),
+  reviewTemplate: z.string().optional(),
+  aiModel: z.string().min(1).optional(),
+  judgingCategories: challengeJudgingCategoriesInputSchema.optional(),
+  nsfw: z.boolean().optional(),
+});
+
+// Playground: dry-run a challenge's field through the pairwise ladder. Writes nothing — see
+// runLadderDryRun — but the comparisons are real LLM calls and really cost Buzz.
+export type PlaygroundRunLadderInput = z.infer<typeof playgroundRunLadderSchema>;
+export const playgroundRunLadderSchema = z.object({
+  challengeId: z.number(),
+  // Bounded well below the production K by default: a moderator experimenting should not be able
+  // to start a several-thousand-comparison run from a form field by accident.
+  topK: z.number().int().min(2).max(60).optional(),
+  includePodium: z.boolean().optional(),
+});
+
+// Playground: Pick winners from a challenge
+export type PlaygroundPickWinnersInput = z.infer<typeof playgroundPickWinnersSchema>;
+export const playgroundPickWinnersSchema = z.object({
+  challengeId: z.number(),
+  judgeId: z.number().optional(),
+  promptOverrides: z
+    .object({
+      systemMessage: z.string().optional(),
+      winner: z.string().optional(),
+    })
+    .optional(),
+  aiModel: z.string().min(1).optional(),
+});

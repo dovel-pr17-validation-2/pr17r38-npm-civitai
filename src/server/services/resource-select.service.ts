@@ -1,0 +1,426 @@
+import { TRPCError } from '@trpc/server';
+import type { SearchParams, SearchResponse } from 'meilisearch';
+import { uniq } from 'lodash-es';
+import { constants, MODELS_SEARCH_INDEX } from '~/server/common/constants';
+import { dbRead } from '~/server/db/client';
+import {
+  isTransientMeiliError,
+  searchClient,
+  searchWithSignal,
+  withMeiliResourceSelect,
+} from '~/server/meilisearch/client';
+import { REDIS_KEYS } from '~/server/redis/client';
+
+import { coverageFilter } from '~/shared/generation/coverage-fields';
+import { coverageAudience } from '~/server/services/generation/coverage-source';
+import { fetchThroughCache } from '~/server/utils/cache-helpers';
+import type { GetResourceSelectInput } from '~/server/schema/model.schema';
+import type { TrainingDetailsObj } from '~/server/schema/model-version.schema';
+import {
+  getFeaturedModels,
+  getRecentlyBid,
+  getRecentlyManuallyAdded,
+  getRecentlyRecommended,
+  type GetFeaturedModels,
+} from '~/server/services/model.service';
+import { getUserBookmarkedModels } from '~/server/services/user.service';
+import {
+  getModelSearchIndexRecords,
+  type ModelSearchIndexRecord,
+} from '~/server/search-index/models.search-index';
+import {
+  modelPricingFilterClause,
+  versionSatisfiesPricingFilter,
+} from '~/shared/search/model-pricing-filter';
+import { transformModelHits } from '~/shared/search/models-transform';
+import { and, eq, inArray, ne, not, or } from '~/shared/utils/meili-filter';
+import { Availability, ModelStatus, ModelUploadType } from '~/shared/utils/prisma/enums';
+import { parseAIRSafe } from '~/utils/string-helpers';
+import { isDefined } from '~/utils/type-guards';
+
+/** Dropping `tier`/`isModerator` here silently makes `coverageAudience` read every user as free. */
+type ServiceUser = { id: number; tier?: string; isModerator?: boolean } | undefined;
+
+const FEATURED_LIMIT = 1000;
+
+// The own/official tabs let a creator link any of their own / the official
+// component models regardless of base-model match (e.g. a VAE shared across SDXL
+// variants). Mirrors the client-side skipBaseModelForOwnTabs predicate.
+function skipBaseModelForOwnTabs(
+  tab: GetResourceSelectInput['tab'],
+  selectSource: string
+): boolean {
+  return (tab === 'mine' || tab === 'official') && selectSource === 'modelVersion';
+}
+
+function meiliSortFor(sort: GetResourceSelectInput['sort']): string[] | undefined {
+  switch (sort) {
+    case 'popularity':
+      return ['metrics.thumbsUpCount:desc'];
+    case 'newest':
+      return ['createdAt:desc'];
+    case 'relevance':
+    default:
+      return undefined;
+  }
+}
+
+// Resolve the model-id set a tab restricts to (recent/liked/featured). Returns
+// `null` when the tab imposes no id restriction (all/official/mine). An empty
+// array still restricts (matches nothing) — matching the prior client behavior.
+async function resolveTabIds(
+  input: GetResourceSelectInput,
+  user: ServiceUser
+): Promise<number[] | null> {
+  const { tab, selectSource } = input;
+  if (tab === 'liked') return user ? await getUserBookmarkedModels({ userId: user.id }) : [];
+  if (tab !== 'recent') return null;
+  if (!user) return [];
+
+  const take = 20;
+  switch (selectSource) {
+    case 'generation':
+      return input.restrictToIds ?? [];
+    case 'addResource':
+      return getRecentlyManuallyAdded({ take, userId: user.id });
+    case 'modelVersion':
+      return getRecentlyRecommended({ take, userId: user.id });
+    case 'auction':
+      return getRecentlyBid({ take, userId: user.id });
+    case 'training': {
+      const trainingModels = await dbRead.model.findMany({
+        where: {
+          userId: user.id,
+          uploadType: ModelUploadType.Trained,
+          status: { notIn: [ModelStatus.Deleted] },
+        },
+        select: { modelVersions: { select: { trainingDetails: true } } },
+        orderBy: { updatedAt: 'desc' },
+        take,
+      });
+      return uniq(
+        trainingModels.flatMap((m) =>
+          m.modelVersions
+            .map(
+              (mv) =>
+                parseAIRSafe((mv.trainingDetails as TrainingDetailsObj | undefined)?.baseModel)
+                  ?.model
+            )
+            .filter(isDefined)
+        )
+      );
+    }
+    default:
+      return null;
+  }
+}
+
+export function buildFilter({
+  input,
+  user,
+  featuredModels,
+  tabIds,
+  excludeIds,
+  coverageNext,
+  member,
+}: {
+  input: GetResourceSelectInput;
+  user: ServiceUser;
+  featuredModels?: GetFeaturedModels;
+  tabIds: number[] | null;
+  /** Which indexed coverage field is live — the index carries both. */
+  coverageNext?: boolean;
+  /** Whether this user gets the expansion; a non-member also keeps what is already resident. */
+  member: boolean;
+  // Ids pinned to the front from Postgres — excluded from the Meili stream so a
+  // naturally-ranked official model isn't emitted twice across pages.
+  excludeIds?: number[];
+}): string | null {
+  const {
+    tab,
+    selectSource,
+    canGenerate,
+    resources,
+    filterTypes,
+    filterBaseModels,
+    filterLoaded,
+    filterTurbo,
+    tagName,
+    hidePaid,
+  } = input;
+
+  // Featured checkpoints span ecosystems (picking one switches it), so only their base models are
+  // skipped.
+  const featuredByType = new Map<string, number[]>();
+  if (tab === 'featured' && featuredModels?.length) {
+    for (const fm of featuredModels) {
+      const ids = featuredByType.get(fm.type) ?? [];
+      ids.push(fm.modelId);
+      featuredByType.set(fm.type, ids);
+    }
+  }
+
+  const skipBaseModel = skipBaseModelForOwnTabs(tab, selectSource);
+
+  const typeClauses = resources.map(({ type, baseModels = [] }) => {
+    const _type = filterTypes.length > 0 ? filterTypes.find((x) => x === type) : type;
+    if (!_type) return null;
+
+    const _baseModels =
+      skipBaseModel || (featuredByType.size > 0 && _type === 'Checkpoint')
+        ? []
+        : filterBaseModels.length > 0
+        ? filterBaseModels.filter((baseModel) => baseModels.includes(baseModel))
+        : baseModels;
+
+    return _baseModels.length
+      ? and(eq('type', _type), inArray('versions.baseModel', _baseModels))
+      : eq('type', _type);
+  });
+
+  const featuredIds =
+    featuredByType.size > 0
+      ? [
+          ...new Set(
+            featuredModels!
+              .filter((fm) => resources.some((r) => r.type === fm.type))
+              .map((fm) => fm.modelId)
+          ),
+        ]
+      : [];
+
+  return and(
+    // Visibility
+    selectSource === 'auction' || !user?.id
+      ? ne('availability', Availability.Private)
+      : or(ne('availability', Availability.Private), eq('user.id', user.id)),
+    coverageFilter({ canGenerate, coverageNext: !!coverageNext, member }),
+    selectSource === 'auction' && not(eq('cannotPromote', true)),
+    or(...typeClauses),
+    featuredIds.length > 0 && inArray('id', featuredIds),
+    filterTypes.length > 0 && inArray('type', filterTypes),
+    filterBaseModels.length > 0 && inArray('versions.baseModel', filterBaseModels),
+    // Any version resident, not the one the card happens to show — Meili matches a nested array.
+    filterLoaded && eq('versions.generatorLoaded', true),
+    filterTurbo && eq('versions.turbo', true),
+    tagName ? eq('tags.name', tagName) : null,
+    modelPricingFilterClause({ hidePaid }),
+    tabIds && inArray('id', tabIds),
+    tab === 'mine' && user ? eq('user.id', user.id) : null,
+    tab === 'official' ? eq('user.id', constants.system.officialUserId) : null,
+    excludeIds && excludeIds.length > 0 ? not(inArray('id', excludeIds)) : null,
+    // Always exclude celebrity-tagged models
+    not(eq('tags.name', 'celebrity'))
+  );
+}
+
+async function searchModels(
+  query: string,
+  request: SearchParams,
+  signal?: AbortSignal
+): Promise<SearchResponse<ModelSearchIndexRecord>> {
+  if (!searchClient)
+    return { hits: [], estimatedTotalHits: 0 } as unknown as SearchResponse<ModelSearchIndexRecord>;
+  const client = searchClient;
+  try {
+    return await withMeiliResourceSelect(
+      (searchSignal) =>
+        searchWithSignal<ModelSearchIndexRecord>(
+          client.index(MODELS_SEARCH_INDEX),
+          query,
+          request,
+          searchSignal
+        ),
+      { signal }
+    );
+  } catch (err) {
+    if (isTransientMeiliError(err)) {
+      throw new TRPCError({
+        code: 'SERVICE_UNAVAILABLE',
+        message: 'Model search is temporarily overloaded — please retry.',
+        cause: err,
+      });
+    }
+    throw err;
+  }
+}
+
+// Small, mod-curated set — cache it like getFeaturedModels. `isOfficial` is a
+// non-filterable Meili field on purpose (making it filterable forces a full-index
+// reindex), so the pin is sourced from Postgres and hydrated via a Meili `id IN`.
+//
+// `retryCount: 0` and the catch keep the pin off the critical path. On a cold key
+// with the refresh lock already held, fetchThroughCache's default retry sleeps
+// lockTTL/2 (5s) up to three times before giving up — inside the request. This runs
+// on the picker's initial state and the browse feed's Hot + base-model view, so that stall lands
+// on every concurrent modal open after a deploy or a Redis eviction even though the
+// lock winner populates the key in ~300ms. Failing to [] instead costs the pin for
+// one request and nothing else.
+export async function getOfficialModelIds() {
+  try {
+    return await fetchThroughCache(
+      REDIS_KEYS.CACHES.OFFICIAL_MODELS,
+      async () => {
+        const models = await dbRead.model.findMany({
+          where: { isOfficial: true, status: ModelStatus.Published },
+          select: { id: true, type: true },
+        });
+        return models;
+      },
+      { ttl: 60 * 5, retryCount: 0 }
+    );
+  } catch (err) {
+    console.error('getOfficialModelIds :: pin unavailable, continuing without it', err);
+    return [];
+  }
+}
+
+// Meilisearch only, never `getModelSearchIndexRecords`: the index holds published, searchable models
+// and `buildFilter` adds the rest of the visibility rules, so a pasted id finds nothing a search
+// could not.
+async function lookupResourceSelectModel(
+  input: GetResourceSelectInput,
+  { modelId, modelVersionId }: NonNullable<GetResourceSelectInput['lookup']>,
+  {
+    user,
+    signal,
+    coverageNext,
+    member,
+  }: { user: ServiceUser; signal?: AbortSignal; coverageNext: boolean; member: boolean }
+) {
+  const filter = and(
+    buildFilter({
+      input: {
+        ...input,
+        tab: 'all',
+        tagName: undefined,
+        resources: [],
+        filterTypes: [],
+        filterBaseModels: [],
+        filterLoaded: false,
+        filterTurbo: false,
+        hidePaid: false,
+      },
+      user,
+      tabIds: null,
+      coverageNext,
+      member,
+    }),
+    !!modelId && eq('id', modelId),
+    !!modelVersionId && eq('versions.id', modelVersionId)
+  );
+
+  const results = await searchModels('', { filter: filter ?? undefined, limit: 1 }, signal);
+  return { items: transformModelHits(results.hits), nextCursor: undefined, coverageNext, member };
+}
+
+export async function getResourceSelectModels(
+  input: GetResourceSelectInput,
+  { user, signal }: { user: ServiceUser; signal?: AbortSignal }
+) {
+  const {
+    tab,
+    query = '',
+    sort,
+    cursor,
+    limit,
+    filterTypes,
+    filterBaseModels,
+    filterLoaded,
+    tagName,
+  } = input;
+
+  const { next: coverageNext, member } = await coverageAudience(user);
+  if (input.lookup)
+    return lookupResourceSelectModel(input, input.lookup, { user, signal, coverageNext, member });
+
+  const featuredModels = tab === 'featured' ? await getFeaturedModels() : undefined;
+  const tabIds = await resolveTabIds(input, user);
+
+  // The official pin only applies to the default `all` browse: no search query and
+  // no active facet filters (type/baseModel/category) — otherwise it would force
+  // off-filter models to the front. When active, the matching official ids are
+  // excluded from the Meili stream on EVERY page (so a naturally-ranked official
+  // model isn't emitted twice) and prepended, from Postgres, on the first page.
+  const officialPinActive =
+    tab === 'all' &&
+    !query &&
+    filterTypes.length === 0 &&
+    filterBaseModels.length === 0 &&
+    !filterLoaded &&
+    !input.filterTurbo &&
+    !tagName;
+
+  // Filtered by type only (cheap, cached). Type-matching ids that don't match the
+  // ecosystem base model aren't in the Meili stream anyway, so excluding them is a
+  // no-op; the actual pin below narrows to base-model matches.
+  // `?? []` is belt-and-braces over the cache-helper fix: the pin is a nice-to-have,
+  // so it must never be able to take the whole picker down with it.
+  const officialIdsForType = officialPinActive
+    ? ((await getOfficialModelIds()) ?? [])
+        .filter((m) => input.resources.some((r) => r.type === m.type))
+        .map((m) => m.id)
+    : [];
+
+  // Featured tab loads its whole set (client re-sorts by podium position); every
+  // other tab paginates via a Meili offset cursor.
+  const isFeatured = tab === 'featured';
+  const offset = isFeatured ? 0 : cursor ?? 0;
+  const take = isFeatured ? FEATURED_LIMIT : limit;
+
+  const filter = buildFilter({
+    input,
+    user,
+    featuredModels,
+    tabIds,
+    excludeIds: officialIdsForType,
+    coverageNext,
+    member,
+  });
+
+  const results = await searchModels(
+    query,
+    {
+      filter: filter ?? undefined,
+      sort: meiliSortFor(sort),
+      offset,
+      limit: take,
+    },
+    signal
+  );
+
+  // Images are returned at every browsing level on purpose: the picker filters them by the
+  // viewer's level before rendering (ResourceHitList). Product decision, 2026-09-22: do not
+  // add server-side level filtering here without revisiting it.
+  let items = transformModelHits(results.hits);
+
+  // Prepend the official models on the first page only. Sourced straight from
+  // Postgres — NOT through Meili — so they always surface regardless of index
+  // freshness. Kept to the requested type + base-model so an Anima checkpoint
+  // picker pins the Anima model but not, say, a Krea 2 official checkpoint.
+  if (officialPinActive && !cursor && officialIdsForType.length) {
+    const officialItems = transformModelHits(
+      await getModelSearchIndexRecords(officialIdsForType)
+    ).filter((m) => {
+      // buildFilter never sees the pin, so anything it would have excluded is re-applied here —
+      // pricing and base model only. `canGenerate`, the private-availability split and the celebrity
+      // exclusion are NOT re-applied; `getOfficialModelIds` scopes on isOfficial + Published alone,
+      // so a mod flagging a private or non-generatable model official would pin it past all three.
+      if (
+        input.hidePaid &&
+        !m.versions.some((v) => versionSatisfiesPricingFilter(v.pricing, input))
+      )
+        return false;
+      const baseModels = input.resources
+        .filter((r) => r.type === m.type)
+        .flatMap((r) => r.baseModels);
+      return baseModels.length === 0 || m.versions.some((v) => baseModels.includes(v.baseModel));
+    });
+    // The Meili stream already excludes these ids, so no cross-page dupes.
+    items = [...officialItems, ...items];
+  }
+
+  const nextCursor = !isFeatured && results.hits.length === take ? offset + take : undefined;
+
+  return { items, nextCursor, coverageNext, member };
+}

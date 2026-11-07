@@ -1,0 +1,390 @@
+import * as z from 'zod';
+
+import { APP_LISTING_VISIBILITIES } from '~/shared/utils/app-listing-visibility';
+
+/**
+ * App Store Listings (W13) — P3b OFF-SITE MODERATION schemas.
+ *
+ * The user-facing REPORT affordance + the mod-facing report-queue read. Kept in a
+ * DEDICATED schema module (parallel to the P3a `offsite-listing.schema`) so the
+ * post-approval moderation surface (report now; delist / relist / claim in PR3)
+ * stays cleanly separated from the submission lifecycle.
+ *
+ * Imports ONLY zod, so this module is safe to pull into the client bundle (the
+ * report modal + its pure view-model reuse the reason tuple as the single source
+ * of truth — the CHECK constraint in the migration `.sql` is the DB-layer mirror).
+ *
+ * The reason / status tuples MUST match the CHECK constraints applied in
+ * `packages/civitai-db-schema/prisma/migrations/20260706120050_w13_p3b_app_listing_reports/migration.sql`:
+ *   reason IN (impersonation, phishing-malware, broken, inappropriate, spam, other)
+ *   status IN (pending, resolved, dismissed)
+ * A drift here would let the proc write a value the DB rejects (23514). A unit
+ * test pins the tuple against those documented values.
+ */
+
+/** Report reasons — MUST equal the `app_listing_reports_reason_check` CHECK set. */
+export const APP_LISTING_REPORT_REASONS = [
+  'impersonation',
+  'phishing-malware',
+  'broken',
+  'inappropriate',
+  'spam',
+  'other',
+] as const;
+export type AppListingReportReason = (typeof APP_LISTING_REPORT_REASONS)[number];
+
+/** Report lifecycle — MUST equal the `app_listing_reports_status_check` CHECK set. */
+export const APP_LISTING_REPORT_STATUSES = ['pending', 'resolved', 'dismissed'] as const;
+export type AppListingReportStatus = (typeof APP_LISTING_REPORT_STATUSES)[number];
+
+/** Free-text elaboration bound (mirrors the off-site description/changelog bound). */
+export const OFFSITE_REPORT_DETAILS_MAX = 2000;
+
+/**
+ * USER report of an approved off-site listing.
+ *
+ * `appListingId` is the target listing id (`apl_<ULID>`); the reporter is ALWAYS
+ * bound to `ctx.user.id` in the service (there is NO reporter field here — a
+ * caller can never file a report as someone else). `reason` is validated against
+ * the shared tuple (the CHECK mirror); `details` is optional + bounded.
+ */
+export const reportListingSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  reason: z.enum(APP_LISTING_REPORT_REASONS),
+  details: z.string().max(OFFSITE_REPORT_DETAILS_MAX).optional(),
+});
+export type ReportListingInput = z.infer<typeof reportListingSchema>;
+
+/**
+ * MOD keyset-paginate the report queue. Optional `status` filter (default: the
+ * whole queue; the queue UI passes `pending`); FIFO oldest-first in the service.
+ * `limit` is capped at 50 (a smaller page than the submission queues — a report
+ * row carries the reporter chip + target listing projection).
+ */
+export const listListingReportsSchema = z.object({
+  status: z.enum(APP_LISTING_REPORT_STATUSES).optional(),
+  cursor: z.string().min(1).max(64).optional(),
+  limit: z.number().int().min(1).max(50).optional(),
+});
+export type ListListingReportsInput = z.infer<typeof listListingReportsSchema>;
+
+// ---------------------------------------------------------------------------
+// P3b PR3 — mod ACTIONS (delist / relist / purge / resolve / dismiss) + the
+// per-listing moderation-history read.
+// ---------------------------------------------------------------------------
+
+/**
+ * Moderation-event action taxonomy — MUST equal the `app_listing_mod_events_action_check`
+ * CHECK set. The base six were shipped in migration
+ * `20260706120100_w13_p3b_app_listing_moderation_events`; the last three
+ * (`reset-to-pending`/`owner-unpublish`/`owner-republish`) are added by the W13
+ * post-approval-mgmt widen `20260713120000_w13_post_approval_mod_actions` (a strict
+ * superset — additive DROP+ADD CHECK), `message-owner` by
+ * `20260824120000_app_listing_mod_action_message_owner`, `purge-user-storage` by
+ * `20260912120000_app_listing_mod_action_purge_user_storage`, `set-visibility` by
+ * `20261004120000_app_listing_mod_action_set_visibility`, and `rating-change` by
+ * `20261010130000_app_listing_mod_action_rating_change`. A drift here would let a proc
+ * write an `action` the DB rejects (23514). The action-agreement unit test pins this
+ * tuple against the LATEST action-CHECK migration's IN-list.
+ *
+ * 🔴 THAT TEST IS A CODE/DDL AGREEMENT CHECK, NOT AN APPLY, AND THE DIFFERENCE BIT THIS
+ * TUPLE ONCE. `set-visibility` shipped as a bare inline literal at its create site with no
+ * entry here and no widen migration: nothing failed, because all three of this repo's gates
+ * for this class (`UnclassifiedModerationAction`, the partition test, the agreement test)
+ * fire on REGISTERING an action, and an unregistered one is invisible to every one of them.
+ * Measured on prod AGAINST THE REVISION THAT SHIPPED, in which the level `UPDATE` and its
+ * event INSERT were TWO SEPARATE ROUND TRIPS: the insert was rejected with 23514 while the
+ * level write had already committed, leaving a changed audience with no audit row.
+ *
+ * ⚠️ THAT MEASUREMENT IS HISTORY, NOT CURRENT BEHAVIOUR, AND THIS SITE DID NOT SAY SO UNTIL
+ * ROUND 5 OF THE AUDIT — the two sites in `app-listing-visibility-write.service.ts` that
+ * carry the same measurement each open with the scoping qualifier and this one did not, in a
+ * different file, so a reader arriving here had none of that context. NOW:
+ * `setListingVisibilityAsModerator` runs both halves on ONE interactive transaction, so a
+ * rejected event ABORTS the transaction and the `UPDATE` rolls back with it — the proc 500s
+ * and NOTHING is written: no level change, no audit row. The scope is spelled out rather
+ * than left to the reader because the stale version INVERTS THE REMEDIATION: whoever
+ * registers the next action is the same person who deploys without the DDL, and read as
+ * current this sentence sends them to plan a data reconciliation over
+ * `app_listings.visibility` for orphaned level changes that cannot exist.
+ *
+ * Registering the action is what ARMS those gates — so add the tuple member and
+ * the migration TOGETHER, and reference a named constant at the create site rather than a
+ * literal, or the next one is invisible in exactly the same way.
+ *
+ * NOTE the hyphen form (`report-resolve`/`report-dismiss`/`reset-to-pending`/
+ * `owner-unpublish`/`owner-republish`) — it matches the shipped/widened migration
+ * CHECK verbatim.
+ */
+export const APP_LISTING_MODERATION_ACTIONS = [
+  'delist',
+  'relist',
+  'claim',
+  'purge',
+  'report-resolve',
+  'report-dismiss',
+  // W13 post-approval management (Phase 1):
+  'reset-to-pending',
+  'owner-unpublish',
+  'owner-republish',
+  // Moderator → app-developer messaging. The ONE action here that changes NO state:
+  // it records that a moderator sent the app's owner a free-text message, with the
+  // subject in `reason` and the body in `detail`. It is in this taxonomy rather than a
+  // table of its own because it is a moderator action against a listing, attributable
+  // to an actor and reviewable in the same history — which is all a message needs.
+  'message-owner',
+  // App Blocks per-user STORAGE takedown. Like `message-owner` it changes no
+  // listing state — the row exists to make a destructive act against a USER's
+  // stored data attributable and reviewable.
+  //
+  // `reason` carries the moderator's rationale and `before.targetUserId` the
+  // target. The rest of the shape is PATH-DEPENDENT, and this docstring twice
+  // described only one path:
+  //
+  //   `before` — a MODERATOR purge (`initiator: 'moderator'`) carries a per-row
+  //     snapshot: key, block instance, size, `updatedAt`, and an md5 fingerprint
+  //     of the value, never the value itself. An ACCOUNT-WIPE purge
+  //     (`initiator: 'system:account-wipe'`) carries NO per-row detail at all —
+  //     just counts and bytes, plus `rowDetailWithheld: 'erasure'`. Writing the
+  //     key names and fingerprints of an erased account into a permanent row
+  //     would be a durable derived artefact of the content being erased.
+  //   `after` — NOT simply "what was removed". `outcome` is `'purged'`,
+  //     `'failed'` or `'unknown'`; on `'unknown'` the count is deliberately
+  //     ABSENT and `observedDeleteRowCount` bounds what MAY be gone.
+  //
+  // `user-storage-purge.service.ts` is the authority on both; its header block
+  // enumerates every `after` state. Do not re-describe them here — this comment
+  // has been falsified by a later commit of the same change twice already.
+  'purge-user-storage',
+  // The per-listing VISIBILITY LEVEL, set by a MODERATOR on someone else's listing
+  // (`setListingVisibilityAsModerator`). Like `message-owner` and `purge-user-storage` it
+  // changes NO listing state: `app_listings.status` is untouched and the act is confined to
+  // the `visibility` column, so it must never displace the event that explains a removal.
+  //
+  // `reason`  — the moderator's required rationale (3..1000 chars), surfaced in the OWNER's
+  //             own history so a discoverability change is never silent to them.
+  // `before`  — { visibility: <level|null> } — the pre-state. 🔴 `null` is a REAL value here
+  //             meaning "no choice expressed", NOT the `private` level; recording it as
+  //             `private` would misreport what the moderator changed.
+  // `after`   — { visibility: <level> }.
+  //
+  // 🔴 NO `status` IN EITHER SNAPSHOT, deliberately — every sibling records a status
+  // transition because that is what it changed; this one changes none, so a `status` key
+  // would describe a transition that did not happen.
+  'set-visibility',
+  // The listing's content rating moved without anyone setting it by hand: a go-live or
+  // asset edit floored it at its media, a review replaced it, or a moderator re-rated one of
+  // its images (`app-listing-rating.ts` is the only writer). Changes no `status`.
+  //
+  // `reason` — the owner-facing sentence, e.g. "Rating changed G → R: store imagery was
+  //            rated R." The owner history shows only this, so it carries both values.
+  // `detail` — the cause, a `ListingRatingChangeCause`.
+  // `before` — { contentRating }.   `after` — { contentRating }.
+  'rating-change',
+  // App Blocks DOCUMENT STORE takedown (`apps.mod.docStore.*`): a moderator hid, unhid,
+  // hard-deleted, or dismissed the reports on, one SHARED document in an app's store. Like `purge-user-storage` it changes
+  // no listing state and acts on content a USER authored, so it is withheld from the owner's
+  // history. `reason` is the moderator's rationale; `before` is the document snapshot
+  // (collection, key, author user id, report count, hidden state, size, md5 of the data —
+  // never the data); `after` is the outcome. `doc-store-moderation.service.ts` writes them.
+  'storage-doc-hide',
+  'storage-doc-unhide',
+  'storage-doc-delete',
+  // Reviewed and kept: the document's open reports were dismissed (later reports re-open it).
+  'storage-doc-dismiss',
+  // A moderator edited the listing's details or store media without holding a seat on it
+  // (`app-listing-moderator-edit.ts`). Changes no `status`; owner-visible.
+  // `reason` — the owner-facing sentence.   `detail` — `details` | `media`.
+  'moderator-edit',
+  // A moderator marked or unmarked the listing Official (`app-listing-official.service.ts`).
+  // Writes `is_official` only; no `status`.
+  // `reason` — the owner-facing sentence.   `before` / `after` — { isOfficial }.
+  'set-official',
+] as const;
+export type AppListingModerationAction = (typeof APP_LISTING_MODERATION_ACTIONS)[number];
+
+/**
+ * Bounds for the mod-supplied rationale (`reason`, REQUIRED on delist/relist/purge)
+ * and the optional resolution `note` (resolve/dismiss). The reason is the audit
+ * trail's human record of WHY a takedown happened, so a small non-empty floor is
+ * enforced (mirrors the reject-reason discipline, lighter).
+ */
+export const OFFSITE_MOD_REASON_MIN = 3;
+export const OFFSITE_MOD_REASON_MAX = 1000;
+export const OFFSITE_MOD_NOTE_MAX = 1000;
+
+const modReason = z.string().min(OFFSITE_MOD_REASON_MIN).max(OFFSITE_MOD_REASON_MAX);
+const modNote = z.string().max(OFFSITE_MOD_NOTE_MAX).optional();
+
+/**
+ * MOD delist an APPROVED off-site listing (approved → removed). `reason` is
+ * required (audit); `reportId` optionally links the report that triggered the
+ * takedown (resolved in the same tx). The reviewer is bound to `ctx.user.id` in
+ * the service — never supplied by the client.
+ */
+export const delistListingSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  reason: modReason,
+  reportId: z.string().min(1).max(64).optional(),
+});
+export type DelistListingInput = z.infer<typeof delistListingSchema>;
+
+/** MOD relist a REMOVED off-site listing (removed → approved). Reversibility. */
+export const relistListingSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  reason: modReason,
+});
+export type RelistListingInput = z.infer<typeof relistListingSchema>;
+
+/**
+ * MOD mark / unmark a listing Official ("made by the Civitai team"). The acting moderator is
+ * bound to `ctx.user.id` in the router, never supplied by the client. No `reason`: it is a
+ * label, not a takedown, and the event's owner-facing sentence is fixed server-side.
+ */
+export const setListingOfficialSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  isOfficial: z.boolean(),
+});
+export type SetListingOfficialInput = z.infer<typeof setListingOfficialSchema>;
+
+/**
+ * MOD set the per-listing VISIBILITY LEVEL on ANY listing (D2's moderator half).
+ *
+ * 🔴 `reason` IS REQUIRED HERE AND OPTIONAL ON THE OWNER PATH, AND THAT ASYMMETRY IS THE
+ * POINT. This is a moderator writing a discoverability change to someone else's app — the
+ * same class of act as `delist`/`relist`/`claim`, every one of which takes a `modReason`
+ * and lands a moderation event. An owner changing their own listing's level owes nobody an
+ * explanation; a moderator doing it to a stranger's app owes an audit trail, and the
+ * `reason` is what makes the resulting event legible in the listing history the OWNER can
+ * read (`listMyListingModerationEvents`).
+ *
+ * The acting moderator is bound to `ctx.user.id` in the service and is never supplied by
+ * the client, matching every other proc in this file.
+ */
+export const setListingVisibilityAsModeratorSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  visibility: z.enum(APP_LISTING_VISIBILITIES),
+  reason: modReason,
+});
+export type SetListingVisibilityAsModeratorInput = z.infer<
+  typeof setListingVisibilityAsModeratorSchema
+>;
+
+/**
+ * MOD claim (reassign ownership of) an off-site listing (PR4) — mod-arbitrated
+ * ownership transfer of an `approved` OR `removed` off-site listing to a
+ * mod-verified owner. `targetUserId` is the numeric id of the NEW owner (a real
+ * `User`, validated in the service); `reason` is the required ownership-verification
+ * audit note. The reviewer (the acting mod) is bound to `ctx.user.id` in the service
+ * — never client-supplied. There is NO self-service / `protectedProcedure` claim
+ * endpoint: a mod is the whole trust boundary (a mod MAY reassign to any real user,
+ * including resolving an impersonation by re-pointing to the verified owner).
+ *
+ * `reportId` optionally links the report that triggered the claim (the substantive
+ * resolution of an impersonation report → delist → claim → ban flow) — resolved in
+ * the same tx, listing-scoped, exactly like `delistListingSchema.reportId`.
+ */
+export const claimListingSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  targetUserId: z.number().int().positive(),
+  reason: modReason,
+  reportId: z.string().min(1).max(64).optional(),
+});
+export type ClaimListingInput = z.infer<typeof claimListingSchema>;
+
+/**
+ * MOD hard-delete (purge) an off-site listing — the final expunge that also makes
+ * the delist round-trip self-cleaning. Destructive: the UI gates it behind a
+ * confirm. `reason` required for the audit event (which SURVIVES the delete via
+ * the SetNull FK + the denormalized slug snapshot).
+ */
+export const purgeListingSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  reason: modReason,
+});
+export type PurgeListingInput = z.infer<typeof purgeListingSchema>;
+
+/** MOD resolve a PENDING report (pending → resolved). Optional resolution note. */
+export const resolveReportSchema = z.object({
+  reportId: z.string().min(1).max(64),
+  note: modNote,
+});
+export type ResolveReportInput = z.infer<typeof resolveReportSchema>;
+
+/** MOD dismiss a PENDING report (pending → dismissed; no action taken). */
+export const dismissReportSchema = z.object({
+  reportId: z.string().min(1).max(64),
+  note: modNote,
+});
+export type DismissReportInput = z.infer<typeof dismissReportSchema>;
+
+/** MOD per-listing moderation-history read (keyset, newest-first). */
+export const listModerationEventsSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  cursor: z.string().min(1).max(64).optional(),
+  limit: z.number().int().min(1).max(50).optional(),
+});
+export type ListModerationEventsInput = z.infer<typeof listModerationEventsSchema>;
+
+// ---------------------------------------------------------------------------
+// W13 post-approval listing management (Phase 1) — reset-to-pending (mod),
+// owner unpublish/republish, and the owner-scoped moderation-history read.
+// ---------------------------------------------------------------------------
+
+/**
+ * MOD reset an APPROVED off-site listing back into the review queue
+ * (approved → pending). `reason` is REQUIRED (audit — same bounds as delist/relist)
+ * because a reset un-publishes a live listing and re-opens a review. The service
+ * re-enters the listing into the queue by minting a fresh `pending`
+ * `AppListingPublishRequest` (owned by the listing owner) so a mod can then
+ * approve/reject it through the existing flow. The reviewer is bound to
+ * `ctx.user.id` — never client-supplied.
+ */
+export const resetListingToPendingSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  reason: modReason,
+});
+export type ResetListingToPendingInput = z.infer<typeof resetListingToPendingSchema>;
+
+/**
+ * OWNER unpublish their OWN approved off-site listing (approved → removed). A pure
+ * self-service visibility toggle — NO re-review, NO content-rating re-derive, NO
+ * publish request. `reason` is OPTIONAL (the owner is acting on their own listing).
+ * The owner is bound to `ctx.user.id` in the service (a caller can only unpublish a
+ * listing they own — FORBIDDEN otherwise).
+ */
+export const unpublishOwnListingSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  reason: modNote,
+});
+export type UnpublishOwnListingInput = z.infer<typeof unpublishOwnListingSchema>;
+
+/**
+ * OWNER republish their OWN owner-unpublished off-site listing (removed → approved).
+ * 🔴 SAFETY GUARD (enforced in the service): republish is allowed ONLY when the
+ * most-recent `AppListingModerationEvent` for the listing is an `owner-unpublish` —
+ * i.e. the removal was owner-initiated. If the last event is a moderator
+ * `delist`/`purge` (a takedown-for-cause), republish is FORBIDDEN (an owner may not
+ * restore a listing a moderator removed). Pure visibility toggle — no re-derive, no
+ * publish request. `reason` is OPTIONAL. Owner-bound to `ctx.user.id`.
+ */
+export const republishOwnListingSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  reason: modNote,
+});
+export type RepublishOwnListingInput = z.infer<typeof republishOwnListingSchema>;
+
+/**
+ * OWNER per-listing moderation-history read (keyset, newest-first) — the owner's
+ * "why was this hidden / un-approved" view. Mirrors `listModerationEventsSchema` but
+ * the service asserts the caller OWNS the listing (FORBIDDEN otherwise); a mod uses
+ * `listModerationEventsSchema` / `listModerationEvents` instead.
+ */
+export const listMyListingModerationEventsSchema = z.object({
+  appListingId: z.string().min(1).max(64),
+  cursor: z.string().min(1).max(64).optional(),
+  limit: z.number().int().min(1).max(50).optional(),
+});
+export type ListMyListingModerationEventsInput = z.infer<
+  typeof listMyListingModerationEventsSchema
+>;

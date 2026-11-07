@@ -1,0 +1,187 @@
+import { Box, Center, Group, Stack, Text, Title } from '@mantine/core';
+import type { InferGetServerSidePropsType } from 'next/types';
+import { SortFilter } from '~/components/Filters';
+import { MasonryContainer } from '~/components/MasonryColumns/MasonryContainer';
+import { MasonryProvider } from '~/components/MasonryColumns/MasonryProvider';
+import { Meta } from '~/components/Meta/Meta';
+import { ownDomainCanonical } from '~/components/Meta/canonical';
+import { ModelFiltersDropdown } from '~/components/Model/Infinite/ModelFiltersDropdown';
+import { ModelsInfinite } from '~/components/Model/Infinite/ModelsInfinite';
+import { useModelQueryParams } from '~/components/Model/model.utils';
+import { env } from '~/env/client';
+import { constants } from '~/server/common/constants';
+import type { TagPageSeoData } from '~/server/services/tag.service';
+import { useAppContext } from '~/providers/AppProvider';
+import { createServerSideProps } from '~/server/utils/server-side-helpers';
+import { getModelUrl } from '~/utils/string-helpers';
+import { tagDisplayName } from '~/utils/tag-display-name';
+import { trpc } from '~/utils/trpc';
+import styles from './[tagname].module.scss';
+
+export const getServerSideProps = createServerSideProps({
+  useSSG: true,
+  resolver: async ({ ctx, ssg, features }) => {
+    const tagname = ctx.query.tagname as string;
+
+    if (tagname) {
+      const { getBlockedBrowsingTags } = await import('~/server/services/system-cache');
+      const blocked = await getBlockedBrowsingTags();
+      const normalized = tagname.toLowerCase();
+      if (blocked.some((t) => t.name.toLowerCase() === normalized)) return { notFound: true };
+    }
+
+    if (tagname) await ssg?.tag.getTagWithModelCount.prefetch({ name: tagname });
+
+    const isGreen = !!features?.isGreen;
+    let seoData: TagPageSeoData = { count: 0, models: [] };
+    let deIndexForDomain = false;
+    let greenCanonical: string | null = null;
+    let claimsCanonical = false;
+    if (tagname) {
+      const {
+        getTagPageSeoData,
+        shouldDeIndexAdultTermOnGreen,
+        shouldDeIndexMatureOnlyTag,
+        shouldDeIndexSafeOnlyTag,
+        shouldPointTagCanonicalAtGreen,
+      } = await import('~/server/services/tag.service');
+      seoData = await getTagPageSeoData({ name: tagname, safeOnly: isGreen });
+      deIndexForDomain = isGreen
+        ? shouldDeIndexAdultTermOnGreen(seoData) || shouldDeIndexMatureOnlyTag(seoData)
+        : shouldDeIndexSafeOnlyTag(seoData);
+
+      const pointsAtGreen =
+        !isGreen && !deIndexForDomain && shouldPointTagCanonicalAtGreen(seoData);
+      // A green handover with no green host configured keeps the old relative canonical rather
+      // than claiming the tag for red.
+      claimsCanonical = !isGreen && !pointsAtGreen;
+      if (pointsAtGreen) {
+        // Read the green host directly: `getBaseUrl('green')` falls back to this deployment's own
+        // URL when SERVER_DOMAIN_GREEN is unset, which would hand red a self-canonical that looks
+        // right in the HTML and quietly cancels the rule.
+        const { serverDomainPrimaryMap } = await import('~/server/utils/server-domain');
+        const greenHost = serverDomainPrimaryMap.green;
+        if (greenHost) greenCanonical = `https://${greenHost}/tag/${encodeURIComponent(tagname)}`;
+      }
+    }
+
+    // GAM keys on the page's context, not only its grid: "Hentai AI Models" is a policy risk
+    // however safely green filters the models below it. Viewer-independent for the reason
+    // `isAdGatedContent` is — a single auction from anyone puts the URL in the violation centre.
+    // Red is exempt: it serves direct ads, no auction.
+    const suppressAds = isGreen && seoData.nsfwTerm === true;
+
+    return {
+      props: { tagname, seoData, deIndexForDomain, greenCanonical, claimsCanonical },
+      suppressAds,
+    };
+  },
+});
+
+export default function TagPage({
+  tagname,
+  seoData,
+  deIndexForDomain,
+  greenCanonical,
+  claimsCanonical,
+}: InferGetServerSidePropsType<typeof getServerSideProps>) {
+  const { set, ...queryFilters } = useModelQueryParams();
+  const { domain, serverDomains } = useAppContext();
+
+  const { data = [] } = trpc.tag.getTagWithModelCount.useQuery({ name: tagname });
+  const [tag] = data;
+
+  const baseUrl = env.NEXT_PUBLIC_BASE_URL ?? 'https://civitai.com';
+  const displayName = tagDisplayName({
+    name: tag?.name ?? tagname,
+    displayName: tag?.displayName,
+  });
+  const count = seoData.count;
+  const description = `Browse ${
+    count > 0 ? `${count.toLocaleString('en-US')} ` : ''
+  }AI models tagged "${displayName}" on Civitai, including checkpoints and LoRAs for Illustrious, Pony, SDXL, Flux and more. Download or generate online.`;
+  const title = `${displayName} AI Models${
+    count > 0 ? ` (${count.toLocaleString('en-US')})` : ''
+  } | Civitai`;
+
+  const schema =
+    tag && seoData.models.length > 0
+      ? {
+          '@context': 'https://schema.org',
+          '@type': 'CollectionPage',
+          name: `${displayName} AI Models`,
+          description,
+          url: `${baseUrl}/tag/${tagname}`,
+          numberOfItems: seoData.count,
+          hasPart: seoData.models.map((m) => ({
+            '@type': 'SoftwareApplication',
+            name: m.name,
+            applicationCategory: m.type,
+            url: `${baseUrl}${getModelUrl({ modelId: m.id, modelName: m.name })}`,
+            author: { '@type': 'Person', name: m.creator },
+            interactionStatistic: [
+              {
+                '@type': 'InteractionCounter',
+                interactionType: 'http://schema.org/DownloadAction',
+                userInteractionCount: m.stats.downloadCount,
+              },
+              {
+                '@type': 'InteractionCounter',
+                interactionType: 'http://schema.org/LikeAction',
+                userInteractionCount: m.stats.thumbsUpCount,
+              },
+            ],
+          })),
+        }
+      : undefined;
+
+  return (
+    <>
+      <Meta
+        title={title}
+        description={description}
+        canonical={
+          greenCanonical ??
+          (claimsCanonical
+            ? ownDomainCanonical(`/tag/${tagname}`, domain, serverDomains)
+            : `/tag/${tagname}`)
+        }
+        deIndex={(tag?.unfeatured ?? false) || deIndexForDomain}
+        schema={schema}
+      />
+      {tag && (
+        <Box className={styles.banner} mb="md">
+          <Center>
+            <Stack gap="xs">
+              <Title order={1} className="text-center">
+                {displayName}
+              </Title>
+              <Text className="text-center" color="dimmed">
+                {description}
+              </Text>
+            </Stack>
+          </Center>
+        </Box>
+      )}
+      <MasonryProvider
+        columnWidth={constants.cardSizes.model}
+        maxColumnCount={7}
+        maxSingleColumnWidth={450}
+      >
+        <MasonryContainer>
+          <Stack gap="xs">
+            <Group justify="flex-end">
+              <SortFilter type="models" />
+              <ModelFiltersDropdown size="compact-sm" />
+            </Group>
+            <ModelsInfinite
+              filters={{ ...queryFilters, followed: false, newCreators: false, hidden: false }}
+              showEof
+              showAds
+            />
+          </Stack>
+        </MasonryContainer>
+      </MasonryProvider>
+    </>
+  );
+}
